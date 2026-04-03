@@ -75,6 +75,27 @@ python3 -m venv .venv
 http://127.0.0.1:8000/dashboard
 ```
 
+## Run With Docker
+
+Start the app with Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8000/dashboard
+```
+
+Notes:
+
+- SQLite data is persisted in your local [storage](/Users/vincent/LAB/claudecode/ana/storage) directory.
+- Raw and normalized market data stay in your local [data](/Users/vincent/LAB/claudecode/ana/data) directory.
+- The container currently installs only the core dependencies from `requirements.txt`.
+- If you want OpenBB or Qlib inside Docker later, we can extend the image with optional dependency targets.
+
 ## Optional Dependencies
 
 Install OpenBB support if you want live market sync:

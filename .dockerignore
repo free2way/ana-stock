@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+__pycache__
+*.py[cod]
+
+storage/*.db
+storage/*.sqlite
+storage/*.sqlite3
+
+data/raw
+data/normalized
+data/qlib
+data/artifacts
+
+tests/__pycache__
