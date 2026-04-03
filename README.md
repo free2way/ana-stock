@@ -148,6 +148,8 @@ Sync -> Build Dataset -> Train -> Backtest
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
+GitHub Actions also runs this regression suite automatically on `push` to `main` and on pull requests.
+
 ## Key Routes
 
 HTML pages:
