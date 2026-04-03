@@ -142,6 +142,12 @@ There is also a one-click pipeline action that runs:
 Sync -> Build Dataset -> Train -> Backtest
 ```
 
+## Run Tests
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
 ## Key Routes
 
 HTML pages:

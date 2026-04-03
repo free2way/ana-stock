@@ -13,6 +13,16 @@ engine = create_engine(f"sqlite:///{settings.sqlite_path}", future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
+def configure_database() -> None:
+    global settings, engine
+
+    old_engine = engine
+    settings = get_settings()
+    engine = create_engine(f"sqlite:///{settings.sqlite_path}", future=True)
+    SessionLocal.configure(bind=engine)
+    old_engine.dispose()
+
+
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
 

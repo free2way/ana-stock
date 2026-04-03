@@ -38,3 +38,7 @@ def get_settings() -> Settings:
     settings = Settings()
     settings.ensure_directories()
     return settings
+
+
+def reset_settings_cache() -> None:
+    get_settings.cache_clear()
