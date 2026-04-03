@@ -1,0 +1,138 @@
+from sqlalchemy import Float, ForeignKey, Integer, Text, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.models.base import Base
+
+
+class TimestampMixin:
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class Symbol(Base, TimestampMixin):
+    __tablename__ = "symbols"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    market: Mapped[str | None] = mapped_column(Text, nullable=True)
+    exchange: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sector: Mapped[str | None] = mapped_column(Text, nullable=True)
+    industry: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+
+class PriceSyncState(Base):
+    __tablename__ = "price_sync_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"), nullable=False, unique=True)
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    last_synced_date: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str | None] = mapped_column(Text, nullable=True)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+    symbol: Mapped[Symbol] = relationship()
+
+
+class ModelRun(Base):
+    __tablename__ = "model_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    model_type: Mapped[str] = mapped_column(Text, nullable=False)
+    market: Mapped[str | None] = mapped_column(Text, nullable=True)
+    universe: Mapped[str | None] = mapped_column(Text, nullable=True)
+    train_start: Mapped[str | None] = mapped_column(Text, nullable=True)
+    train_end: Mapped[str | None] = mapped_column(Text, nullable=True)
+    test_start: Mapped[str | None] = mapped_column(Text, nullable=True)
+    test_end: Mapped[str | None] = mapped_column(Text, nullable=True)
+    config_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    artifact_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    finished_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class Prediction(Base):
+    __tablename__ = "predictions"
+    __table_args__ = (UniqueConstraint("model_run_id", "symbol_id", "trade_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    model_run_id: Mapped[int] = mapped_column(ForeignKey("model_runs.id"), nullable=False)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"), nullable=False)
+    trade_date: Mapped[str] = mapped_column(Text, nullable=False)
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rank_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+    model_run: Mapped[ModelRun] = relationship()
+    symbol: Mapped[Symbol] = relationship()
+
+
+class StrategyRun(Base):
+    __tablename__ = "strategy_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    model_run_id: Mapped[int | None] = mapped_column(ForeignKey("model_runs.id"), nullable=True)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    strategy_type: Mapped[str] = mapped_column(Text, nullable=False)
+    start_date: Mapped[str | None] = mapped_column(Text, nullable=True)
+    end_date: Mapped[str | None] = mapped_column(Text, nullable=True)
+    config_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    finished_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    model_run: Mapped[ModelRun | None] = relationship()
+
+
+class StrategyDailyMetric(Base):
+    __tablename__ = "strategy_daily_metrics"
+    __table_args__ = (UniqueConstraint("strategy_run_id", "trade_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_run_id: Mapped[int] = mapped_column(ForeignKey("strategy_runs.id"), nullable=False)
+    trade_date: Mapped[str] = mapped_column(Text, nullable=False)
+    nav: Mapped[float | None] = mapped_column(Float, nullable=True)
+    daily_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    benchmark_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    drawdown: Mapped[float | None] = mapped_column(Float, nullable=True)
+    turnover: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+    strategy_run: Mapped[StrategyRun] = relationship()
+
+
+class Watchlist(Base, TimestampMixin):
+    __tablename__ = "watchlists"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+
+
+class WatchlistItem(Base):
+    __tablename__ = "watchlist_items"
+    __table_args__ = (UniqueConstraint("watchlist_id", "symbol_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    watchlist_id: Mapped[int] = mapped_column(ForeignKey("watchlists.id"), nullable=False)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"), nullable=False)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+    watchlist: Mapped[Watchlist] = relationship()
+    symbol: Mapped[Symbol] = relationship()
+
+
+class DataJob(Base):
+    __tablename__ = "data_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_type: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    started_at: Mapped[str] = mapped_column(Text, nullable=False)
+    finished_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    params_json: Mapped[str | None] = mapped_column(Text, nullable=True)
