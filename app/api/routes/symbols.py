@@ -184,6 +184,7 @@ def symbol_page(ticker: str, db: Session = Depends(get_db_session)) -> str:
             <article class="card">
               <div class="eyebrow">Quick Links</div>
               <div><a href="/dashboard">Open dashboard</a></div>
+              <div><a href="/insights/{overview['ticker']}">Open insight page</a></div>
               <div><a href="/symbols/{overview['ticker']}/history">JSON history</a></div>
               <div><a href="/symbols/{overview['ticker']}/signals">JSON signals</a></div>
               <div><a href="/symbols/{overview['ticker']}/signals?latest_run_only=false">All run signals</a></div>

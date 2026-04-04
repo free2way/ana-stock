@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     qlib_data_dir: Path = Field(default=ROOT_DIR / "data" / "qlib")
     artifacts_dir: Path = Field(default=ROOT_DIR / "data" / "artifacts")
     sqlite_path: Path = Field(default=ROOT_DIR / "storage" / "app.db")
+    tushare_token: str | None = Field(default=None)
 
     model_config = SettingsConfigDict(env_prefix="PQW_", env_file=".env", extra="ignore")
 

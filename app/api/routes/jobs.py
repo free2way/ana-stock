@@ -5,8 +5,12 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db_session
+from app.services.auto_analysis import auto_analysis_service
+from app.services.auth import is_authenticated, login_redirect
 from app.services.backtester import BacktestRunner
+from app.services.cn_fundamentals import sync_cn_fundamentals
 from app.services.dataset_build import build_dataset
+from app.services.global_fundamentals import sync_global_fundamentals
 from app.services.market_sync import sync_market_data
 from app.services.repository import DataJobRepository, PriceSyncStateRepository
 from app.services.sample_data import seed_sample_data
@@ -43,6 +47,8 @@ async def _request_value(request: Request, key: str, default=None):
 def job_templates() -> list[dict[str, str]]:
     return [
         {"job_type": "sync_market_data", "description": "Fetch and persist market data with OpenBB."},
+        {"job_type": "sync_cn_fundamentals", "description": "Fetch and persist A-share fundamentals with TuShare Pro."},
+        {"job_type": "sync_global_fundamentals", "description": "Fetch and persist US/HK fundamentals with yfinance."},
         {"job_type": "build_dataset", "description": "Normalize price files and build a Qlib dataset."},
         {"job_type": "train_model", "description": "Train a signal model with Qlib."},
         {"job_type": "run_backtest", "description": "Run a backtest from stored predictions."},
@@ -61,8 +67,17 @@ def recent_jobs(limit: int = 20, db: Session = Depends(get_db_session)) -> list[
     return repo.list_recent_jobs(limit=limit)
 
 
+@router.get("/auto-analysis")
+def auto_analysis_status(request: Request):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    return auto_analysis_service.get_status()
+
+
 @router.post("/seed-sample-data")
 async def run_seed_sample_data(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
     job_repo = DataJobRepository(db)
     job = job_repo.create_job(job_type="seed_sample_data", status="running")
@@ -79,6 +94,8 @@ async def run_seed_sample_data(request: Request, db: Session = Depends(get_db_se
 
 @router.post("/sync-market-data")
 async def run_sync_market_data(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
     tickers_raw = await _request_value(request, "tickers", "")
     provider = str(await _request_value(request, "provider", "yfinance")).strip() or "yfinance"
@@ -124,6 +141,8 @@ async def run_sync_market_data(request: Request, db: Session = Depends(get_db_se
 
 @router.post("/build-dataset")
 async def run_build_dataset(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
     normalize_only_raw = await _request_value(request, "normalize_only", False)
     normalize_only = str(normalize_only_raw).lower() in {"1", "true", "yes", "on"}
     redirect_to = await _request_value(request, "redirect_to")
@@ -153,8 +172,60 @@ async def run_build_dataset(request: Request, db: Session = Depends(get_db_sessi
     return _maybe_redirect(redirect_to, payload)
 
 
+@router.post("/sync-cn-fundamentals")
+async def run_sync_cn_fundamentals(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    tickers_raw = await _request_value(request, "tickers", "")
+    tickers = [item.strip().upper() for item in str(tickers_raw).split(",") if item.strip()] or None
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type="sync_cn_fundamentals",
+        status="running",
+        params={"tickers": tickers},
+    )
+    try:
+        result = sync_cn_fundamentals(tickers=tickers)
+        status = "success" if result["status"] == "success" else "partial"
+        job_repo.complete_job(job.id, status=status, message=result["message"])
+        payload = {"job_id": job.id, **result, "status": status}
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        job_repo.complete_job(job.id, status="failed", message=str(exc))
+        payload = {"status": "failed", "job_id": job.id, "message": str(exc)}
+        return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/sync-global-fundamentals")
+async def run_sync_global_fundamentals(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    tickers_raw = await _request_value(request, "tickers", "")
+    tickers = [item.strip().upper() for item in str(tickers_raw).split(",") if item.strip()] or None
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type="sync_global_fundamentals",
+        status="running",
+        params={"tickers": tickers},
+    )
+    try:
+        result = sync_global_fundamentals(tickers=tickers)
+        status = "success" if result["status"] == "success" else "partial"
+        job_repo.complete_job(job.id, status=status, message=result["message"])
+        payload = {"job_id": job.id, **result, "status": status}
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        job_repo.complete_job(job.id, status="failed", message=str(exc))
+        payload = {"status": "failed", "job_id": job.id, "message": str(exc)}
+        return _maybe_redirect(redirect_to, payload)
+
+
 @router.post("/train")
 async def run_train(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
     run_name = await _request_value(request, "run_name", "baseline_momentum")
     run_name = str(run_name).strip() or "baseline_momentum"
@@ -193,6 +264,8 @@ async def run_train(request: Request, db: Session = Depends(get_db_session)):
 
 @router.post("/backtest")
 async def run_backtest(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
     top_n_raw = await _request_value(request, "top_n", 1)
     try:
         top_n = int(top_n_raw)
@@ -239,6 +312,8 @@ async def run_backtest(request: Request, db: Session = Depends(get_db_session)):
 
 @router.post("/run-pipeline")
 async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
     tickers_raw = await _request_value(request, "tickers", "")
     provider = str(await _request_value(request, "provider", "yfinance")).strip() or "yfinance"
@@ -308,4 +383,50 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
     except Exception as exc:
         job_repo.complete_job(job.id, status="failed", message=str(exc))
         payload = {"status": "failed", "job_id": job.id, "message": str(exc)}
+        return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/auto-analysis/config")
+async def update_auto_analysis_config(request: Request):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    enabled_raw = await _request_value(request, "enabled", "")
+    interval_hours = await _request_value(request, "interval_hours", 24)
+    provider = await _request_value(request, "provider", "yfinance")
+    start_date = await _request_value(request, "start_date", "2025-01-01")
+    signal_type = await _request_value(request, "signal_type", "momentum")
+    lookback_days = await _request_value(request, "lookback_days", 3)
+    top_n = await _request_value(request, "top_n", 1)
+    enabled = str(enabled_raw).lower() in {"1", "true", "yes", "on"}
+
+    status = auto_analysis_service.save_config(
+        {
+            "enabled": enabled,
+            "interval_hours": interval_hours,
+            "provider": provider,
+            "start_date": start_date,
+            "signal_type": signal_type,
+            "lookback_days": lookback_days,
+            "top_n": top_n,
+        }
+    )
+    payload = {
+        "status": "success",
+        "message": "Auto analysis settings saved.",
+        "config": status,
+    }
+    return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/run-watchlist-analysis")
+async def run_watchlist_analysis(request: Request):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    try:
+        payload = auto_analysis_service.run_watchlist_analysis(trigger="manual")
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = {"status": "failed", "message": str(exc)}
         return _maybe_redirect(redirect_to, payload)

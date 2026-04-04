@@ -1,6 +1,6 @@
 from collections.abc import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
@@ -25,6 +25,21 @@ def configure_database() -> None:
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    _run_migrations()
+
+
+def _run_migrations() -> None:
+    inspector = inspect(engine)
+    if "watchlist_items" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("watchlist_items")}
+        if "sync_enabled" not in columns:
+            with engine.begin() as connection:
+                connection.execute(text("ALTER TABLE watchlist_items ADD COLUMN sync_enabled INTEGER NOT NULL DEFAULT 0"))
+    if "fundamental_snapshots" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("fundamental_snapshots")}
+        if "dividend_yield" not in columns:
+            with engine.begin() as connection:
+                connection.execute(text("ALTER TABLE fundamental_snapshots ADD COLUMN dividend_yield FLOAT"))
 
 
 def get_db_session() -> Generator[Session, None, None]:

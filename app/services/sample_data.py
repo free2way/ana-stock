@@ -21,6 +21,18 @@ SAMPLE_DATA = {
         {"date": "2026-04-02", "symbol": "MSFT", "open": 99, "high": 100, "low": 96, "close": 97, "volume": 850000, "adj_close": 97, "dividend": "", "split_ratio": ""},
         {"date": "2026-04-03", "symbol": "MSFT", "open": 97, "high": 98, "low": 95, "close": 96, "volume": 870000, "adj_close": 96, "dividend": "", "split_ratio": ""},
     ],
+    "ASTS": [
+        {"date": "2026-03-23", "symbol": "ASTS", "open": 20.2, "high": 20.9, "low": 19.9, "close": 20.7, "volume": 1600000, "adj_close": 20.7, "dividend": "", "split_ratio": ""},
+        {"date": "2026-03-24", "symbol": "ASTS", "open": 20.8, "high": 21.4, "low": 20.5, "close": 21.1, "volume": 1720000, "adj_close": 21.1, "dividend": "", "split_ratio": ""},
+        {"date": "2026-03-25", "symbol": "ASTS", "open": 21.1, "high": 21.9, "low": 20.9, "close": 21.8, "volume": 1800000, "adj_close": 21.8, "dividend": "", "split_ratio": ""},
+        {"date": "2026-03-26", "symbol": "ASTS", "open": 21.7, "high": 22.4, "low": 21.4, "close": 22.1, "volume": 1940000, "adj_close": 22.1, "dividend": "", "split_ratio": ""},
+        {"date": "2026-03-27", "symbol": "ASTS", "open": 22.2, "high": 22.9, "low": 21.8, "close": 22.6, "volume": 2050000, "adj_close": 22.6, "dividend": "", "split_ratio": ""},
+        {"date": "2026-03-30", "symbol": "ASTS", "open": 22.5, "high": 23.2, "low": 22.3, "close": 23.0, "volume": 2100000, "adj_close": 23.0, "dividend": "", "split_ratio": ""},
+        {"date": "2026-03-31", "symbol": "ASTS", "open": 22.9, "high": 23.5, "low": 22.4, "close": 22.8, "volume": 1980000, "adj_close": 22.8, "dividend": "", "split_ratio": ""},
+        {"date": "2026-04-01", "symbol": "ASTS", "open": 22.7, "high": 23.6, "low": 22.2, "close": 23.4, "volume": 2260000, "adj_close": 23.4, "dividend": "", "split_ratio": ""},
+        {"date": "2026-04-02", "symbol": "ASTS", "open": 23.3, "high": 24.1, "low": 23.0, "close": 23.9, "volume": 2410000, "adj_close": 23.9, "dividend": "", "split_ratio": ""},
+        {"date": "2026-04-03", "symbol": "ASTS", "open": 23.8, "high": 24.5, "low": 23.4, "close": 24.2, "volume": 2520000, "adj_close": 24.2, "dividend": "", "split_ratio": ""},
+    ],
 }
 
 

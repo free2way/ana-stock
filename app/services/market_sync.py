@@ -3,8 +3,10 @@ import csv
 from app.core.config import get_settings
 from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
+from app.services.normalizer import MarketDataNormalizer
 from app.services.openbb_client import HistoricalPriceRequest, OpenBBClient
 from app.services.repository import PriceSyncStateRepository, SymbolRepository
+from app.services.ticker_format import normalize_ticker_for_market, provider_ticker_candidates
 
 
 RAW_FIELDS = [
@@ -38,6 +40,7 @@ def sync_market_data(
 ) -> list[dict]:
     settings = get_settings()
     client = OpenBBClient()
+    normalizer = MarketDataNormalizer()
     results: list[dict] = []
 
     with SessionLocal() as db:
@@ -62,31 +65,45 @@ def sync_market_data(
 
         for symbol in symbols:
             try:
-                rows = client.fetch_historical_prices(
-                    HistoricalPriceRequest(
-                        ticker=symbol.ticker,
-                        start_date=start_date,
-                        end_date=end_date,
-                        provider=provider,
+                provider_ticker = normalize_ticker_for_market(symbol.ticker, symbol.market)
+                provider_candidates = provider_ticker_candidates(symbol.ticker, symbol.market)
+                rows: list[dict] = []
+                selected_provider_ticker = provider_ticker
+                for candidate in provider_candidates:
+                    candidate_rows = client.fetch_historical_prices(
+                        HistoricalPriceRequest(
+                            ticker=candidate,
+                            start_date=start_date,
+                            end_date=end_date,
+                            provider=provider,
+                        )
                     )
-                )
+                    if candidate_rows and len(candidate_rows) > len(rows):
+                        rows = candidate_rows
+                        selected_provider_ticker = candidate
+                if not rows:
+                    raise RuntimeError(f"No market data returned for {provider_ticker}")
                 raw_path = settings.raw_data_dir / f"{symbol.ticker}.csv"
                 write_raw_csv(raw_path, rows)
+                normalized_path = settings.normalized_data_dir / f"{symbol.ticker}.csv"
+                normalizer.normalize_symbol_file(raw_path, normalized_path)
                 last_synced_date = rows[-1]["date"] if rows else None
                 sync_repo.upsert_state(
                     symbol_id=symbol.id,
-                    provider=provider,
+                    provider=getattr(client, "last_source_used", provider) or provider,
                     last_synced_date=last_synced_date,
                     status="success",
-                    message=f"Wrote {len(rows)} rows to {raw_path.name}",
+                    message=f"Wrote {len(rows)} rows to {raw_path.name} via {selected_provider_ticker}",
                 )
                 results.append(
                     {
                         "ticker": symbol.ticker,
                         "status": "success",
                         "rows": len(rows),
+                        "provider_ticker": selected_provider_ticker,
                         "last_synced_date": last_synced_date,
                         "raw_path": str(raw_path),
+                        "normalized_path": str(normalized_path),
                     }
                 )
             except Exception as exc:

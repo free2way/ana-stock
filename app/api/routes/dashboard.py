@@ -6,6 +6,8 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db_session
+from app.services.auto_analysis import auto_analysis_service
+from app.services.auth import is_authenticated, login_redirect
 from app.services.repository import (
     BacktestRepository,
     DataJobRepository,
@@ -27,6 +29,8 @@ def _load_summary(db: Session) -> dict:
 
     return {
         "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "auto_analysis": auto_analysis_service.get_status(),
+        "data_sources": _build_data_sources(sync_repo.list_states_with_symbols()),
         "latest_model": model_repo.get_latest_run_summary(),
         "recent_model_runs": model_repo.list_recent_runs(limit=8),
         "latest_signals": signal_repo.list_latest_predictions(limit=10),
@@ -37,15 +41,182 @@ def _load_summary(db: Session) -> dict:
     }
 
 
+def _build_data_sources(sync_states: list[dict]) -> dict:
+    counts: dict[str, int] = {}
+    for item in sync_states:
+        provider = item.get("provider") or "unknown"
+        counts[provider] = counts.get(provider, 0) + 1
+    breakdown = [
+        {"provider": provider, "count": count}
+        for provider, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
+    ]
+    primary_provider = breakdown[0]["provider"] if breakdown else None
+    return {
+        "historical_price_strategy": [
+            "Try OpenBB first",
+            "Fallback to yfinance if OpenBB is unavailable or fails",
+            "Persist locally into raw and normalized files before analysis",
+        ],
+        "symbol_profile_strategy": [
+            "Try OpenBB company profile first",
+            "Fallback to yfinance profile if needed",
+            "Fallback to local catalog only when live profile data is unavailable",
+        ],
+        "current_provider_breakdown": breakdown,
+        "primary_provider": primary_provider,
+    }
+
+
 @router.get("/summary")
 def dashboard_summary(db: Session = Depends(get_db_session)) -> dict:
     return _load_summary(db)
 
 
+@router.get("/data-sources", response_class=HTMLResponse)
+def dashboard_data_sources(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard/data-sources")
+    summary = _load_summary(db)
+    data_sources = summary["data_sources"]
+    sync_states = summary["sync_states"]
+    provider_rows = "".join(
+        f"<tr><td>{item['provider']}</td><td>{item['count']}</td></tr>"
+        for item in data_sources["current_provider_breakdown"]
+    ) or "<tr><td colspan='2'>No provider usage yet</td></tr>"
+    symbol_rows = "".join(
+        f"<tr><td><a href='/insights/{item['ticker']}'>{item['ticker']}</a></td><td>{item['name'] or item['ticker']}</td><td>{item['provider'] or '-'}</td><td>{item['status'] or '-'}</td><td>{item['last_synced_date'] or '-'}</td><td class='message-cell'>{item['message'] or '-'}</td></tr>"
+        for item in sync_states
+    ) or "<tr><td colspan='6'>No sync history yet</td></tr>"
+    history_steps = "".join(f"<li>{step}</li>" for step in data_sources["historical_price_strategy"])
+    profile_steps = "".join(f"<li>{step}</li>" for step in data_sources["symbol_profile_strategy"])
+    synced_count = len(sync_states)
+    provider_count = len(data_sources["current_provider_breakdown"])
+    return f"""
+    <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Data Sources</title>
+        <style>
+          :root {{
+            --bg: #f5efe2;
+            --panel: #fffdf7;
+            --ink: #1f2937;
+            --muted: #6b7280;
+            --line: #d6cfc2;
+            --accent: #0f766e;
+            --accent-soft: #dff5ef;
+          }}
+          * {{ box-sizing: border-box; }}
+          body {{
+            margin: 0;
+            font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color: var(--ink);
+            background:
+              radial-gradient(circle at top left, #fff6d8 0, transparent 30%),
+              radial-gradient(circle at top right, #d9f3ee 0, transparent 35%),
+              var(--bg);
+          }}
+          .wrap {{ max-width:1080px; margin:0 auto; padding:32px 20px 56px; }}
+          .card {{ background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; margin-bottom:16px; box-shadow:0 8px 24px rgba(31,41,55,0.05); }}
+          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
+          h1 {{ margin:0 0 8px; font-size:38px; line-height:1.05; }}
+          .lead {{ margin:0; color:var(--muted); max-width:760px; }}
+          .muted {{ color:var(--muted); font-size:14px; }}
+          .metric {{ font-size:28px; font-weight:700; margin:6px 0; }}
+          .toolbar {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:18px; }}
+          .pill {{ display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:999px; background:#eef8f5; color:#0f766e; font-size:13px; font-weight:700; }}
+          a {{ color:#0f766e; text-decoration:none; font-weight:700; }}
+          .table-wrap {{ width:100%; overflow-x:auto; border-radius:14px; }}
+          table {{ width:100%; border-collapse:collapse; font-size:14px; min-width:760px; }}
+          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
+          th {{ color:var(--muted); font-weight:600; }}
+          .message-cell {{
+            max-width: 340px;
+            white-space: normal;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+            line-height: 1.45;
+            color: #374151;
+          }}
+          ul {{ margin:10px 0 0 18px; padding:0; }}
+          li {{ margin:6px 0; }}
+          .grid {{ display:grid; gap:16px; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); margin-bottom:16px; }}
+          code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: #f3f4f6; padding: 2px 6px; border-radius: 8px; }}
+        </style>
+      </head>
+      <body>
+        <main class="wrap">
+          <div class="toolbar">
+            <a href="/dashboard">← Back to dashboard</a>
+            <span class="pill">Primary provider: {data_sources['primary_provider'] or '-'}</span>
+            <span class="muted">Synced symbols: {synced_count}</span>
+          </div>
+          <div class="card">
+            <div class="eyebrow">Data Sources</div>
+            <h1>Where This App Gets Data</h1>
+            <p class="lead">This page separates the app's intended data strategy from the provider each stock actually used most recently.</p>
+          </div>
+          <section class="grid">
+            <article class="card">
+              <div class="eyebrow">Primary Provider</div>
+              <div class="metric">{data_sources['primary_provider'] or 'None'}</div>
+              <div class="muted">Dominant provider across the current sync history.</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">Tracked Providers</div>
+              <div class="metric">{provider_count}</div>
+              <div class="muted">Distinct providers currently present in sync records.</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">Tracked Symbols</div>
+              <div class="metric">{synced_count}</div>
+              <div class="muted">Symbols with stored sync metadata in the local database.</div>
+            </article>
+          </div>
+          <section class="grid">
+            <article class="card">
+              <div class="eyebrow">Historical Prices</div>
+              <ul>{history_steps}</ul>
+            </article>
+            <article class="card">
+              <div class="eyebrow">Company Profiles</div>
+              <ul>{profile_steps}</ul>
+            </article>
+          </section>
+          <section class="card">
+            <div class="eyebrow">Provider Breakdown</div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Provider</th><th>Stocks</th></tr></thead>
+                <tbody>{provider_rows}</tbody>
+              </table>
+            </div>
+          </section>
+          <section class="card">
+            <div class="eyebrow">Per Symbol Sync Source</div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Ticker</th><th>Name</th><th>Provider</th><th>Status</th><th>Last Sync</th><th>Message</th></tr></thead>
+                <tbody>{symbol_rows}</tbody>
+              </table>
+            </div>
+          </section>
+        </main>
+      </body>
+    </html>
+    """
+
+
 @router.get("", response_class=HTMLResponse)
 def dashboard_page(request: Request, db: Session = Depends(get_db_session)) -> str:
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
     summary = _load_summary(db)
     generated_at = summary["generated_at"]
+    auto_analysis = summary["auto_analysis"]
+    data_sources = summary["data_sources"]
     latest_model = summary["latest_model"]
     recent_model_runs = summary["recent_model_runs"]
     latest_backtest = summary["latest_backtest"]
@@ -58,12 +229,12 @@ def dashboard_page(request: Request, db: Session = Depends(get_db_session)) -> s
     job_message = request.query_params.get("job_message")
 
     signal_items = "".join(
-        f"<tr><td><a href='/symbols/{item['ticker']}'>{item['ticker']}</a></td><td>{item['trade_date']}</td><td>{item['score']:.6f}</td><td>{int(item['rank_value'])}</td></tr>"
+        f"<tr><td><a href='/insights/{item['ticker']}'>{item['ticker']}</a></td><td>{item['trade_date']}</td><td>{item['score']:.6f}</td><td>{int(item['rank_value'])}</td></tr>"
         for item in latest_signals
     ) or "<tr><td colspan='4'>No signals yet</td></tr>"
 
     sync_items = "".join(
-        f"<tr><td><a href='/symbols/{item['ticker']}'>{item['ticker']}</a></td><td>{item['provider']}</td><td>{item['last_synced_date'] or '-'}</td><td>{item['status'] or '-'}</td></tr>"
+        f"<tr><td><a href='/insights/{item['ticker']}'>{item['ticker']}</a></td><td>{item['provider']}</td><td>{item['last_synced_date'] or '-'}</td><td>{item['status'] or '-'}</td></tr>"
         for item in sync_states
     ) or "<tr><td colspan='4'>No sync history yet</td></tr>"
 
@@ -252,6 +423,30 @@ def dashboard_page(request: Request, db: Session = Depends(get_db_session)) -> s
             font-size: 13px;
             font-weight: 700;
           }}
+          .switch-row {{
+            display:flex;
+            align-items:center;
+            justify-content:space-between;
+            gap:12px;
+            margin-top:12px;
+          }}
+          .switch-pill {{
+            display:inline-flex;
+            align-items:center;
+            gap:8px;
+            padding:8px 12px;
+            border-radius:999px;
+            font-size:13px;
+            font-weight:700;
+          }}
+          .switch-pill.on {{
+            background:#dcfce7;
+            color:#166534;
+          }}
+          .switch-pill.off {{
+            background:#fee2e2;
+            color:#991b1b;
+          }}
           button {{
             border: 1px solid #0f766e;
             background: #0f766e;
@@ -398,9 +593,49 @@ def dashboard_page(request: Request, db: Session = Depends(get_db_session)) -> s
             </label>
             <button id="refresh-now" type="button">Refresh Now</button>
             <span class="muted">Last updated: {generated_at}</span>
+            <a href="/watchlist" style="color:#0f766e;font-weight:700;text-decoration:none;">Open Watchlist</a>
+            <a href="/screeners" style="color:#0f766e;font-weight:700;text-decoration:none;">Open Screener</a>
+            <a href="/dashboard/data-sources" style="color:#0f766e;font-weight:700;text-decoration:none;">Data Sources</a>
+            <a href="/logout" style="color:#0f766e;font-weight:700;text-decoration:none;">Logout</a>
+          </div>
+          <div class="card" style="margin-bottom:16px;">
+            <div class="eyebrow">Stock Insight Search</div>
+            <form action="/insights/open" method="get" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+              <input type="text" name="ticker" placeholder="Type a ticker like ASTS" style="min-width:260px;" />
+              <button type="submit">Open Insight Page</button>
+              <span class="muted">This view turns market data into a trend score, buy zone, take-profit zone, and risk level.</span>
+            </form>
           </div>
 
           <section class="grid">
+            <article class="card">
+              <div class="eyebrow">Auto Analysis</div>
+              <div class="metric">{'On' if auto_analysis['enabled'] else 'Off'}</div>
+              <div class="muted">Every {auto_analysis['interval_hours']} hour(s)</div>
+              <div class="muted">Next run: {auto_analysis['next_run_at'] or '-'}</div>
+              <div class="switch-row">
+                <span class="switch-pill {'on' if auto_analysis['enabled'] else 'off'}">
+                  {'Enabled' if auto_analysis['enabled'] else 'Disabled'}
+                </span>
+                <form action="/jobs/auto-analysis/config" method="post" style="margin:0;">
+                  <input type="hidden" name="redirect_to" value="/dashboard" />
+                  <input type="hidden" name="enabled" value="{'false' if auto_analysis['enabled'] else 'true'}" />
+                  <input type="hidden" name="interval_hours" value="{auto_analysis['interval_hours']}" />
+                  <input type="hidden" name="provider" value="{auto_analysis['provider']}" />
+                  <input type="hidden" name="start_date" value="{auto_analysis['start_date']}" />
+                  <input type="hidden" name="signal_type" value="{auto_analysis['signal_type']}" />
+                  <input type="hidden" name="lookback_days" value="{auto_analysis['lookback_days']}" />
+                  <input type="hidden" name="top_n" value="{auto_analysis['top_n']}" />
+                  <button type="submit">{'Turn Off' if auto_analysis['enabled'] else 'Turn On'}</button>
+                </form>
+              </div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">Data Source</div>
+              <div class="metric">{data_sources['primary_provider'] or 'None'}</div>
+              <div class="muted">Current dominant provider across synced symbols</div>
+              <div class="muted"><a href="/dashboard/data-sources">Open detailed source page</a></div>
+            </article>
             <article class="card">
               <div class="eyebrow">Latest Model</div>
               <div class="metric">{latest_model['name'] if latest_model else 'None'}</div>
@@ -482,6 +717,47 @@ def dashboard_page(request: Request, db: Session = Depends(get_db_session)) -> s
                 </div>
                 <button type="submit">Run Full Pipeline</button>
               </form>
+              <form class="action-form" action="/jobs/auto-analysis/config" method="post">
+                <input type="hidden" name="redirect_to" value="/dashboard" />
+                <label class="checkbox-row">
+                  <input type="checkbox" name="enabled" value="true" {'checked' if auto_analysis['enabled'] else ''} />
+                  Auto analyze my watchlist
+                </label>
+                <div class="action-row">
+                  <label for="auto-interval" class="muted">Interval Hours</label>
+                  <input id="auto-interval" type="number" name="interval_hours" min="1" step="1" value="{auto_analysis['interval_hours']}" />
+                </div>
+                <div class="action-row">
+                  <label for="auto-provider" class="muted">Provider</label>
+                  <select id="auto-provider" name="provider">
+                    <option value="yfinance" {'selected' if auto_analysis['provider'] == 'yfinance' else ''}>yfinance</option>
+                  </select>
+                </div>
+                <div class="action-row">
+                  <label for="auto-start" class="muted">Start Date</label>
+                  <input id="auto-start" type="text" name="start_date" value="{auto_analysis['start_date']}" />
+                </div>
+                <div class="action-row">
+                  <label for="auto-signal" class="muted">Signal</label>
+                  <select id="auto-signal" name="signal_type">
+                    <option value="momentum" {'selected' if auto_analysis['signal_type'] == 'momentum' else ''}>Momentum</option>
+                    <option value="reversal" {'selected' if auto_analysis['signal_type'] == 'reversal' else ''}>Reversal</option>
+                  </select>
+                </div>
+                <div class="action-row">
+                  <label for="auto-lookback" class="muted">Lookback</label>
+                  <input id="auto-lookback" type="number" name="lookback_days" min="1" step="1" value="{auto_analysis['lookback_days']}" />
+                </div>
+                <div class="action-row">
+                  <label for="auto-top-n" class="muted">Top N</label>
+                  <input id="auto-top-n" type="number" name="top_n" min="1" step="1" value="{auto_analysis['top_n']}" />
+                </div>
+                <button type="submit">Save Auto Analysis</button>
+              </form>
+              <form class="action-form" action="/jobs/run-watchlist-analysis" method="post">
+                <input type="hidden" name="redirect_to" value="/dashboard" />
+                <button type="submit">Run Watchlist Analysis Now</button>
+              </form>
               <form class="action-form" action="/jobs/build-dataset" method="post">
                 <input type="hidden" name="redirect_to" value="/dashboard" />
                 <label class="checkbox-row">
@@ -489,6 +765,22 @@ def dashboard_page(request: Request, db: Session = Depends(get_db_session)) -> s
                   Normalize only
                 </label>
                 <button type="submit">Build Dataset</button>
+              </form>
+              <form class="action-form" action="/jobs/sync-cn-fundamentals" method="post">
+                <input type="hidden" name="redirect_to" value="/dashboard" />
+                <div class="action-row" style="display:block;">
+                  <label for="cn-fundamental-tickers" class="muted" style="display:block;margin-bottom:6px;">CN Tickers</label>
+                  <input id="cn-fundamental-tickers" type="text" name="tickers" placeholder="600519.SH,000001.SZ" />
+                </div>
+                <button type="submit">Sync CN Fundamentals</button>
+              </form>
+              <form class="action-form" action="/jobs/sync-global-fundamentals" method="post">
+                <input type="hidden" name="redirect_to" value="/dashboard" />
+                <div class="action-row" style="display:block;">
+                  <label for="global-fundamental-tickers" class="muted" style="display:block;margin-bottom:6px;">US / HK Tickers</label>
+                  <input id="global-fundamental-tickers" type="text" name="tickers" placeholder="ASTS,RKLB,0700.HK,0883.HK" />
+                </div>
+                <button type="submit">Sync US/HK Fundamentals</button>
               </form>
               <form class="action-form" action="/jobs/train" method="post">
                 <input type="hidden" name="redirect_to" value="/dashboard" />

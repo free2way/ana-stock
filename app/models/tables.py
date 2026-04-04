@@ -71,6 +71,22 @@ class Prediction(Base):
     symbol: Mapped[Symbol] = relationship()
 
 
+class PredictionExplanation(Base):
+    __tablename__ = "prediction_explanations"
+    __table_args__ = (UniqueConstraint("prediction_id", "feature_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    prediction_id: Mapped[int] = mapped_column(ForeignKey("predictions.id"), nullable=False)
+    feature_name: Mapped[str] = mapped_column(Text, nullable=False)
+    feature_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    contribution: Mapped[float | None] = mapped_column(Float, nullable=True)
+    direction: Mapped[str | None] = mapped_column(Text, nullable=True)
+    display_order: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+    prediction: Mapped[Prediction] = relationship()
+
+
 class StrategyRun(Base):
     __tablename__ = "strategy_runs"
 
@@ -120,6 +136,7 @@ class WatchlistItem(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     watchlist_id: Mapped[int] = mapped_column(ForeignKey("watchlists.id"), nullable=False)
     symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"), nullable=False)
+    sync_enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[str] = mapped_column(Text, nullable=False)
 
     watchlist: Mapped[Watchlist] = relationship()
@@ -136,3 +153,34 @@ class DataJob(Base):
     finished_at: Mapped[str | None] = mapped_column(Text, nullable=True)
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
     params_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class FundamentalSnapshot(Base):
+    __tablename__ = "fundamental_snapshots"
+    __table_args__ = (UniqueConstraint("symbol_id", "report_date", "source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"), nullable=False)
+    report_date: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    listing_date: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pe_ttm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dividend_yield: Mapped[float | None] = mapped_column(Float, nullable=True)
+    market_cap: Mapped[float | None] = mapped_column(Float, nullable=True)
+    roe_avg_3y: Mapped[float | None] = mapped_column(Float, nullable=True)
+    net_profit_yoy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    revenue_yoy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    debt_to_assets: Mapped[float | None] = mapped_column(Float, nullable=True)
+    data_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+    symbol: Mapped[Symbol] = relationship()

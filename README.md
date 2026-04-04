@@ -110,11 +110,25 @@ Install Qlib support if you want to build Qlib datasets:
 .venv/bin/pip install -r requirements-qlib.txt
 ```
 
+Install TuShare Pro support if you want A-share fundamentals for multi-model screeners:
+
+```bash
+.venv/bin/pip install -r requirements-tushare.txt
+```
+
 Notes:
 
 - OpenBB is optional. Without it, sample data and local workflows still work.
 - Qlib is optional. The app can still train and backtest via the built-in baseline flow.
+- TuShare Pro is optional. It is used for A-share fundamental templates such as `高成长低估值`.
+- The screener now supports multiple templates, including `高成长低估值` and `高ROE稳增长`.
 - On this machine, `pyqlib` was not available for Python 3.14, so the baseline path is the default working mode.
+
+To enable CN fundamentals, set:
+
+```bash
+export PQW_TUSHARE_TOKEN=your_token_here
+```
 
 ## Main Workflows
 
@@ -196,6 +210,7 @@ Job triggers:
 - `POST /jobs/seed-sample-data`
 - `POST /jobs/sync-market-data`
 - `POST /jobs/build-dataset`
+- `POST /jobs/sync-cn-fundamentals`
 - `POST /jobs/train`
 - `POST /jobs/backtest`
 - `POST /jobs/run-pipeline`
