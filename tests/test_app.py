@@ -6762,6 +6762,63 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual(0, settings_comparison.source_count)
         self.assertEqual(1, settings_comparison.target_count)
 
+    def test_database_migration_keeps_completed_tables_when_later_copy_fails(self) -> None:
+        source_path = self.temp_path / "storage" / "partial_source.db"
+        target_path = self.temp_path / "storage" / "partial_target.db"
+
+        from sqlalchemy import create_engine, text
+        from app.models.base import Base
+        from app.models import tables  # noqa: F401
+
+        source_engine = create_engine(f"sqlite:///{source_path}", future=True)
+        target_engine = create_engine(f"sqlite:///{target_path}", future=True)
+        Base.metadata.create_all(bind=source_engine)
+        Base.metadata.create_all(bind=target_engine)
+
+        with source_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO symbols (id, ticker, name, market, exchange, sector, industry, is_active, created_at, updated_at)
+                    VALUES (1, '600000.SS', 'PF Bank', 'CN', 'SSE', NULL, NULL, 1, '2026-04-10T09:00:00', '2026-04-10T09:00:00')
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO app_settings (key, value, updated_at)
+                    VALUES ('close_review_config', '{"enabled": true}', '2026-04-10T09:00:00')
+                    """
+                )
+            )
+
+        service = DatabaseMigrationService()
+        original_copy = service._copy_table_rows
+        copied_tables: list[str] = []
+
+        def flaky_copy(*, target_table, **kwargs):
+            if copied_tables:
+                raise RuntimeError("simulated second-table failure")
+            row_count = original_copy(target_table=target_table, **kwargs)
+            copied_tables.append(target_table.name)
+            return row_count
+
+        with patch.object(service, "_copy_table_rows", side_effect=flaky_copy):
+            with self.assertRaisesRegex(RuntimeError, "simulated second-table failure"):
+                service.migrate(
+                    source_url=f"sqlite:///{source_path}",
+                    target_url=f"sqlite:///{target_path}",
+                    truncate_target=True,
+                )
+
+        self.assertEqual(1, len(copied_tables))
+        copied_table = copied_tables[0]
+        with target_engine.connect() as connection:
+            copied_count = connection.execute(text(f"SELECT COUNT(*) FROM {copied_table}")).scalar_one()
+
+        self.assertGreater(copied_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
