@@ -800,6 +800,8 @@ async def update_close_review_config(request: Request):
     overlap_days = await _request_value(request, "overlap_days", 3)
     refresh_limit = await _request_value(request, "refresh_limit", 0)
     stale_job_hours = await _request_value(request, "stale_job_hours", 12)
+    retry_cooldown_minutes = await _request_value(request, "retry_cooldown_minutes", 60)
+    max_attempts_per_day = await _request_value(request, "max_attempts_per_day", 4)
     enabled = str(enabled_raw).lower() in {"1", "true", "yes", "on"}
     status = close_review_scheduler_service.save_config(
         {
@@ -811,6 +813,8 @@ async def update_close_review_config(request: Request):
             "overlap_days": overlap_days,
             "refresh_limit": refresh_limit,
             "stale_job_hours": stale_job_hours,
+            "retry_cooldown_minutes": retry_cooldown_minutes,
+            "max_attempts_per_day": max_attempts_per_day,
         }
     )
     payload = {"status": "success", "message": "Close review settings saved.", "config": status}

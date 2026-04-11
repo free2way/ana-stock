@@ -4191,6 +4191,8 @@ def dashboard_ops_sync_page(request: Request, lang: str = "en", lookback_runs: i
             <div class="muted">{'计划时间' if lang == 'zh' else 'Scheduled Time'}: <strong>{close_review_status['run_hour']:02d}:{close_review_status['run_minute']:02d}</strong> CST</div>
             <div class="muted">{'下次运行' if lang == 'zh' else 'Next Run'}: <strong>{close_review_status.get('next_run_at') or '-'}</strong></div>
             <div class="muted">{'上次运行日期' if lang == 'zh' else 'Last Run Date'}: <strong>{close_review_status.get('last_run_date') or '-'}</strong></div>
+            <div class="muted">{'失败后重试冷却' if lang == 'zh' else 'Retry Cooldown'}: <strong>{close_review_status.get('retry_cooldown_minutes', 60)}</strong> {'分钟' if lang == 'zh' else 'minute(s)'}</div>
+            <div class="muted">{'当日最多尝试' if lang == 'zh' else 'Max Daily Attempts'}: <strong>{close_review_status.get('max_attempts_per_day', 4)}</strong></div>
             <div style="height:10px;"></div>
             <form action="/jobs/close-review/config" method="post">
               <input type="hidden" name="redirect_to" value="{dashboard_redirect}" />
@@ -4202,6 +4204,8 @@ def dashboard_ops_sync_page(request: Request, lang: str = "en", lookback_runs: i
               <input type="hidden" name="overlap_days" value="{close_review_status['overlap_days']}" />
               <input type="hidden" name="refresh_limit" value="{close_review_status['refresh_limit']}" />
               <input type="hidden" name="stale_job_hours" value="{close_review_status['stale_job_hours']}" />
+              <input type="hidden" name="retry_cooldown_minutes" value="{close_review_status.get('retry_cooldown_minutes', 60)}" />
+              <input type="hidden" name="max_attempts_per_day" value="{close_review_status.get('max_attempts_per_day', 4)}" />
               <button type="submit">{('关闭自动复盘' if close_review_status['enabled'] else '开启自动复盘') if lang == 'zh' else ('Disable Close Review' if close_review_status['enabled'] else 'Enable Close Review')}</button>
             </form>
             <div style="height:10px;"></div>

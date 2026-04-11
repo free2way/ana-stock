@@ -23,6 +23,10 @@ DEFAULT_CLOSE_REVIEW_CONFIG = {
     "overlap_days": 3,
     "refresh_limit": 500,
     "stale_job_hours": 12,
+    "retry_cooldown_minutes": 60,
+    "max_attempts_per_day": 4,
+    "last_attempt_at": None,
+    "last_attempt_count": 0,
     "last_attempt_date": None,
     "last_run_date": None,
     "last_run_at": None,
@@ -73,6 +77,9 @@ class CloseReviewSchedulerService:
         config["overlap_days"] = max(0, _safe_int(config.get("overlap_days"), 3))
         config["refresh_limit"] = max(0, _safe_int(config.get("refresh_limit"), 0))
         config["stale_job_hours"] = max(1, _safe_int(config.get("stale_job_hours"), 12))
+        config["retry_cooldown_minutes"] = max(1, _safe_int(config.get("retry_cooldown_minutes"), 60))
+        config["max_attempts_per_day"] = max(1, _safe_int(config.get("max_attempts_per_day"), 4))
+        config["last_attempt_count"] = max(0, _safe_int(config.get("last_attempt_count"), 0))
         config["provider"] = str(config.get("provider") or "tushare").strip() or "tushare"
         return config
 
@@ -84,6 +91,8 @@ class CloseReviewSchedulerService:
             now = sh_now()
             if enabled and (now.hour, now.minute) >= (_safe_int(config.get("run_hour"), 16), _safe_int(config.get("run_minute"), 0)):
                 config["last_attempt_date"] = now.date().isoformat()
+                config["last_attempt_at"] = now.isoformat()
+                config["last_attempt_count"] = config.get("max_attempts_per_day", 4)
             AppSettingRepository(db).set(CLOSE_REVIEW_CONFIG_KEY, json.dumps(config))
             return self.get_status(db=db)
 
@@ -134,8 +143,21 @@ class CloseReviewSchedulerService:
         if (now.hour, now.minute) < (config["run_hour"], config["run_minute"]):
             return None
         today = now.date().isoformat()
-        if config.get("last_run_date") == today or config.get("last_attempt_date") == today:
+        if config.get("last_run_date") == today:
             return None
+        if config.get("last_attempt_date") == today:
+            if int(config.get("last_attempt_count") or 0) >= int(config.get("max_attempts_per_day") or 4):
+                return None
+            last_attempt_at = str(config.get("last_attempt_at") or "").strip()
+            if last_attempt_at:
+                try:
+                    retry_after = datetime.fromisoformat(last_attempt_at) + timedelta(
+                        minutes=int(config.get("retry_cooldown_minutes") or 60)
+                    )
+                    if retry_after > now:
+                        return None
+                except ValueError:
+                    pass
         return self.run_close_review(trigger="scheduler")
 
     def run_close_review(self, trigger: str = "manual") -> dict:
@@ -244,7 +266,11 @@ class CloseReviewSchedulerService:
     def _persist_last_attempt(self, db) -> None:
         config = self.get_config(db=db)
         now = sh_now()
-        config["last_attempt_date"] = now.date().isoformat()
+        today = now.date().isoformat()
+        previous_count = int(config.get("last_attempt_count") or 0) if config.get("last_attempt_date") == today else 0
+        config["last_attempt_date"] = today
+        config["last_attempt_at"] = now.isoformat()
+        config["last_attempt_count"] = previous_count + 1
         AppSettingRepository(db).set(CLOSE_REVIEW_CONFIG_KEY, json.dumps(config))
 
     def _prepare_close_review_run(self, trigger: str) -> tuple[dict, int, int]:

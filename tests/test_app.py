@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 import json
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -6160,6 +6161,121 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("enabled", status)
         self.assertIn("run_hour", status)
         self.assertEqual("tushare", status["provider"])
+
+    def test_close_review_scheduler_can_retry_failed_runs_after_cooldown(self) -> None:
+        from unittest.mock import patch
+
+        from app.core.db import SessionLocal
+        from app.services.close_review_scheduler import close_review_scheduler_service
+        from app.services.repository import AppSettingRepository
+
+        with SessionLocal() as db:
+            AppSettingRepository(db).set(
+                "close_review_scheduler_config",
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "run_hour": 16,
+                        "run_minute": 0,
+                        "provider": "tushare",
+                        "days_back": 7,
+                        "overlap_days": 3,
+                        "refresh_limit": 500,
+                        "stale_job_hours": 12,
+                        "retry_cooldown_minutes": 30,
+                        "max_attempts_per_day": 3,
+                        "last_run_date": None,
+                        "last_attempt_date": "2026-04-10",
+                        "last_attempt_at": "2026-04-10T16:00:00+08:00",
+                        "last_attempt_count": 1,
+                    }
+                ),
+            )
+
+        fake_now = datetime.fromisoformat("2026-04-10T16:45:00+08:00")
+        with patch("app.services.close_review_scheduler.sh_now", return_value=fake_now), patch(
+            "app.services.close_review_scheduler.close_review_scheduler_service.run_close_review",
+            return_value={"status": "success"},
+        ) as mocked_run:
+            result = close_review_scheduler_service.run_due_job()
+
+        self.assertEqual({"status": "success"}, result)
+        mocked_run.assert_called_once_with(trigger="scheduler")
+
+    def test_close_review_scheduler_respects_retry_cooldown_and_attempt_cap(self) -> None:
+        from unittest.mock import patch
+
+        from app.core.db import SessionLocal
+        from app.services.close_review_scheduler import close_review_scheduler_service
+        from app.services.repository import AppSettingRepository
+
+        with SessionLocal() as db:
+            AppSettingRepository(db).set(
+                "close_review_scheduler_config",
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "run_hour": 16,
+                        "run_minute": 0,
+                        "provider": "tushare",
+                        "days_back": 7,
+                        "overlap_days": 3,
+                        "refresh_limit": 500,
+                        "stale_job_hours": 12,
+                        "retry_cooldown_minutes": 60,
+                        "max_attempts_per_day": 2,
+                        "last_run_date": None,
+                        "last_attempt_date": "2026-04-10",
+                        "last_attempt_at": "2026-04-10T16:20:00+08:00",
+                        "last_attempt_count": 1,
+                    }
+                ),
+            )
+
+        with patch(
+            "app.services.close_review_scheduler.sh_now",
+            return_value=datetime.fromisoformat("2026-04-10T16:45:00+08:00"),
+        ), patch(
+            "app.services.close_review_scheduler.close_review_scheduler_service.run_close_review"
+        ) as mocked_run:
+            result = close_review_scheduler_service.run_due_job()
+
+        self.assertIsNone(result)
+        mocked_run.assert_not_called()
+
+        with SessionLocal() as db:
+            AppSettingRepository(db).set(
+                "close_review_scheduler_config",
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "run_hour": 16,
+                        "run_minute": 0,
+                        "provider": "tushare",
+                        "days_back": 7,
+                        "overlap_days": 3,
+                        "refresh_limit": 500,
+                        "stale_job_hours": 12,
+                        "retry_cooldown_minutes": 30,
+                        "max_attempts_per_day": 2,
+                        "last_run_date": None,
+                        "last_attempt_date": "2026-04-10",
+                        "last_attempt_at": "2026-04-10T15:00:00+08:00",
+                        "last_attempt_count": 2,
+                    }
+                ),
+            )
+
+        with patch(
+            "app.services.close_review_scheduler.sh_now",
+            return_value=datetime.fromisoformat("2026-04-10T17:00:00+08:00"),
+        ), patch(
+            "app.services.close_review_scheduler.close_review_scheduler_service.run_close_review"
+        ) as mocked_run:
+            result = close_review_scheduler_service.run_due_job()
+
+        self.assertIsNone(result)
+        mocked_run.assert_not_called()
 
     def test_ai_daily_report_defaults_to_cn_market_scope(self) -> None:
         from app.services.ai_daily_report import build_ai_daily_report
