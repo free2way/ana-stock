@@ -921,7 +921,9 @@ def open_insight(
 
 
 @router.get("/{ticker}/summary")
-def insight_summary(ticker: str, lang: str = Query("en"), db: Session = Depends(get_db_session)) -> dict:
+def insight_summary(request: Request, ticker: str, lang: str = Query("en"), db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect(f"/insights/{ticker.strip().upper()}?lang={'zh' if lang == 'zh' else 'en'}")
     lang = "zh" if lang == "zh" else "en"
     context = _build_model_context(ticker=ticker, lang=lang, db=db)
     insight = context["insight"]
@@ -931,7 +933,9 @@ def insight_summary(ticker: str, lang: str = Query("en"), db: Session = Depends(
 
 
 @router.get("/{ticker}/model-output")
-def insight_model_output(ticker: str, lang: str = Query("en"), db: Session = Depends(get_db_session)) -> dict:
+def insight_model_output(request: Request, ticker: str, lang: str = Query("en"), db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect(f"/insights/{ticker.strip().upper()}?lang={'zh' if lang == 'zh' else 'en'}")
     lang = "zh" if lang == "zh" else "en"
     context = _build_model_context(ticker=ticker, lang=lang, db=db)
     model_output = context["model_output"]
@@ -947,7 +951,9 @@ def insight_model_output(ticker: str, lang: str = Query("en"), db: Session = Dep
 
 
 @router.get("/{ticker}/chart-data")
-def insight_chart_data(ticker: str, lang: str = Query("en"), db: Session = Depends(get_db_session)) -> dict:
+def insight_chart_data(request: Request, ticker: str, lang: str = Query("en"), db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect(f"/insights/{ticker.strip().upper()}?lang={'zh' if lang == 'zh' else 'en'}")
     lang = "zh" if lang == "zh" else "en"
     insight = InsightEngine().get_insight(ticker, lang=lang)
     if insight is None:
