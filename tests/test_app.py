@@ -305,6 +305,7 @@ class AppFlowTests(unittest.TestCase):
         fresh_client = TestClient(self.client.app)
         try:
             protected_gets = [
+                "/dashboard/summary",
                 "/symbols",
                 "/symbols/600000.SS",
                 "/symbols/600000.SS/combined-analysis",
@@ -315,6 +316,7 @@ class AppFlowTests(unittest.TestCase):
                 "/signals/latest",
                 "/backtests",
                 "/backtests/latest/curve",
+                "/jobs/templates",
                 "/jobs/recent",
                 "/jobs/sync-states",
             ]

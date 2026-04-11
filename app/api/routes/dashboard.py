@@ -1563,7 +1563,9 @@ def _excludes_execution_tag_filter(tags: list[str] | None, exclude_execution_tag
 
 
 @router.get("/summary")
-def dashboard_summary(lookback_runs: int = 5, db: Session = Depends(get_db_session)) -> dict:
+def dashboard_summary(request: Request, lookback_runs: int = 5, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
     return _load_summary(db, lookback_runs=_clamp_lookback_runs(lookback_runs))
 
 

@@ -102,7 +102,9 @@ def _result_status(result: dict, *, partial_default: bool = True) -> str:
 
 
 @router.get("/templates")
-def job_templates() -> list[dict[str, str]]:
+def job_templates(request: Request):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
     return [
         {"job_type": "sync_market_data", "description": "Fetch and persist market data with OpenBB."},
         {"job_type": "sync_cn_symbol_universe", "description": "Sync the A-share stock universe into local symbols."},
