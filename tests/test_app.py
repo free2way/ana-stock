@@ -86,6 +86,18 @@ class AppFlowTests(unittest.TestCase):
             "PQW_ARTIFACTS_DIR",
             "PQW_SQLITE_PATH",
             "PQW_TUSHARE_TOKEN",
+            "PQW_DATABASE_URL",
+            "PQW_POSTGRES_POOL_SIZE",
+            "PQW_POSTGRES_MAX_OVERFLOW",
+            "PQW_POSTGRES_POOL_TIMEOUT_SECONDS",
+            "PQW_POSTGRES_POOL_RECYCLE_SECONDS",
+            "PQW_POSTGRES_CONNECT_TIMEOUT_SECONDS",
+            "PQW_POSTGRES_STATEMENT_TIMEOUT_MS",
+            "PQW_POSTGRES_IDLE_TRANSACTION_TIMEOUT_MS",
+            "PQW_POSTGRES_APPLICATION_NAME",
+            "PQW_AUTH_USERNAME",
+            "PQW_AUTH_PASSWORD",
+            "PQW_AUTH_SECRET",
         ):
             os.environ.pop(key, None)
 
@@ -109,6 +121,10 @@ class AppFlowTests(unittest.TestCase):
         os.environ["PQW_QLIB_DATA_DIR"] = str(qlib_dir)
         os.environ["PQW_ARTIFACTS_DIR"] = str(artifacts_dir)
         os.environ["PQW_SQLITE_PATH"] = str(sqlite_path)
+        os.environ["PQW_DATABASE_URL"] = ""
+        os.environ["PQW_AUTH_USERNAME"] = "admin"
+        os.environ["PQW_AUTH_PASSWORD"] = "admin1234"
+        os.environ["PQW_AUTH_SECRET"] = "test-secret"
 
     def _login(self) -> None:
         response = self.client.post(
@@ -241,7 +257,8 @@ class AppFlowTests(unittest.TestCase):
         try:
             login_page = fresh_client.get("/login")
             self.assertEqual(200, login_page.status_code)
-            self.assertIn("admin1234", login_page.text)
+            self.assertNotIn("admin1234", login_page.text)
+            self.assertNotIn('value="admin"', login_page.text)
             self.assertIn('name="next" value="/dashboard"', login_page.text)
 
             protected = fresh_client.get("/dashboard", follow_redirects=False)
@@ -263,6 +280,15 @@ class AppFlowTests(unittest.TestCase):
             )
             self.assertEqual(303, default_login_submit.status_code)
             self.assertEqual("/dashboard", default_login_submit.headers["location"])
+
+            forged_client = TestClient(self.client.app)
+            try:
+                forged_client.cookies.set("pqw_auth", "admin")
+                forged = forged_client.get("/dashboard", follow_redirects=False)
+                self.assertEqual(303, forged.status_code)
+                self.assertIn("/login", forged.headers["location"])
+            finally:
+                forged_client.close()
         finally:
             fresh_client.close()
 

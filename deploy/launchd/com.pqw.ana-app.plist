@@ -6,7 +6,7 @@
     <string>com.pqw.ana-app</string>
     <key>ProgramArguments</key>
     <array>
-      <string>/Volumes/STORAGE_Jackyhu/code/ana/.venv/bin/python</string>
+      <string>/Users/YOUR_USER/YOUR_PROJECT_PATH/.venv/bin/python</string>
       <string>-m</string>
       <string>uvicorn</string>
       <string>app.api.main:app</string>
@@ -16,14 +16,14 @@
       <string>8000</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Volumes/STORAGE_Jackyhu/code/ana</string>
+    <string>/Users/YOUR_USER/YOUR_PROJECT_PATH</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Volumes/STORAGE_Jackyhu/code/ana/storage/ana-app.out.log</string>
+    <string>/Users/YOUR_USER/YOUR_PROJECT_PATH/storage/ana-app.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/Volumes/STORAGE_Jackyhu/code/ana/storage/ana-app.err.log</string>
+    <string>/Users/YOUR_USER/YOUR_PROJECT_PATH/storage/ana-app.err.log</string>
   </dict>
 </plist>

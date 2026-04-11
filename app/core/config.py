@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     feishu_webhook_url: str | None = Field(default=None)
     telegram_bot_token: str | None = Field(default=None)
     telegram_chat_id: str | None = Field(default=None)
+    auth_username: str = Field(default="admin")
+    auth_password: str | None = Field(default=None)
+    auth_secret: str | None = Field(default=None)
+    auth_cookie_max_age_seconds: int = Field(default=60 * 60 * 24 * 7)
 
     model_config = SettingsConfigDict(env_prefix="PQW_", env_file=".env", extra="ignore")
 

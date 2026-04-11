@@ -1,7 +1,11 @@
+from html import escape
+from urllib.parse import quote
+
 from fastapi import APIRouter, Form, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from app.services.auth import AUTH_COOKIE_NAME, DEFAULT_PASSWORD, DEFAULT_USERNAME
+from app.core.config import get_settings
+from app.services.auth import AUTH_COOKIE_NAME, build_auth_cookie_value, verify_credentials
 
 
 router = APIRouter(tags=["auth"])
@@ -9,10 +13,18 @@ router = APIRouter(tags=["auth"])
 
 @router.get("/login", response_class=HTMLResponse)
 def login_page(next: str = Query("/dashboard"), error: str | None = None) -> str:
+    settings = get_settings()
+    configured = bool(settings.auth_password and settings.auth_secret)
     error_html = (
-        f"<div class='error'>{error}</div>"
+        f"<div class='error'>{escape(error)}</div>"
         if error
         else ""
+    )
+    hint_html = (
+        "<div class='hint'>Set <code>PQW_AUTH_USERNAME</code>, <code>PQW_AUTH_PASSWORD</code>, "
+        "and <code>PQW_AUTH_SECRET</code> in your local environment to enable sign-in.</div>"
+        if not configured
+        else "<div class='hint'>Use your configured account credentials to access the app.</div>"
     )
     return f"""
     <!DOCTYPE html>
@@ -95,15 +107,15 @@ def login_page(next: str = Query("/dashboard"), error: str | None = None) -> str
         <main class="card">
           <div class="eyebrow">Secure Access</div>
           <h1>Sign In</h1>
-          <p>Use the default credentials to access the local app.</p>
+          <p>Sign in with the credentials configured for this deployment.</p>
           {error_html}
           <form class="stack" action="/login" method="post">
-            <input type="hidden" name="next" value="{next}" />
-            <input type="text" name="username" placeholder="Username" value="{DEFAULT_USERNAME}" required />
-            <input type="password" name="password" placeholder="Password" value="{DEFAULT_PASSWORD}" required />
+            <input type="hidden" name="next" value="{escape(next, quote=True)}" />
+            <input type="text" name="username" placeholder="Username" autocomplete="username" required />
+            <input type="password" name="password" placeholder="Password" autocomplete="current-password" required />
             <button type="submit">Login</button>
           </form>
-          <div class="hint">Default credentials: <strong>{DEFAULT_USERNAME}</strong> / <strong>{DEFAULT_PASSWORD}</strong></div>
+          {hint_html}
         </main>
       </body>
     </html>
@@ -116,11 +128,26 @@ def login_submit(
     password: str = Form(...),
     next: str = Form("/dashboard"),
 ) -> RedirectResponse:
-    if username == DEFAULT_USERNAME and password == DEFAULT_PASSWORD:
+    settings = get_settings()
+    if not settings.auth_password or not settings.auth_secret:
+        return RedirectResponse(
+            url=f"/login?next={quote(next or '/dashboard', safe='/?=&')}&error=Authentication+is+not+configured",
+            status_code=303,
+        )
+    if verify_credentials(username, password):
         response = RedirectResponse(url=next or "/dashboard", status_code=303)
-        response.set_cookie(AUTH_COOKIE_NAME, DEFAULT_USERNAME, httponly=True, samesite="lax")
+        response.set_cookie(
+            AUTH_COOKIE_NAME,
+            build_auth_cookie_value(settings.auth_username),
+            httponly=True,
+            samesite="lax",
+            max_age=max(60, int(settings.auth_cookie_max_age_seconds)),
+        )
         return response
-    return RedirectResponse(url=f"/login?next={next}&error=Invalid+username+or+password", status_code=303)
+    return RedirectResponse(
+        url=f"/login?next={quote(next or '/dashboard', safe='/?=&')}&error=Invalid+username+or+password",
+        status_code=303,
+    )
 
 
 @router.get("/logout")
