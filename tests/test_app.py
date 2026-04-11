@@ -281,6 +281,14 @@ class AppFlowTests(unittest.TestCase):
             self.assertEqual(303, default_login_submit.status_code)
             self.assertEqual("/dashboard", default_login_submit.headers["location"])
 
+            external_redirect_submit = fresh_client.post(
+                "/login",
+                data={"username": "admin", "password": "admin1234", "next": "https://evil.example/phish"},
+                follow_redirects=False,
+            )
+            self.assertEqual(303, external_redirect_submit.status_code)
+            self.assertEqual("/dashboard", external_redirect_submit.headers["location"])
+
             forged_client = TestClient(self.client.app)
             try:
                 forged_client.cookies.set("pqw_auth", "admin")

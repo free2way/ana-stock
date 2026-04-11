@@ -5,7 +5,7 @@ from fastapi import APIRouter, Form, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.core.config import get_settings
-from app.services.auth import AUTH_COOKIE_NAME, build_auth_cookie_value, verify_credentials
+from app.services.auth import AUTH_COOKIE_NAME, build_auth_cookie_value, sanitize_next_path, verify_credentials
 
 
 router = APIRouter(tags=["auth"])
@@ -129,13 +129,14 @@ def login_submit(
     next: str = Form("/dashboard"),
 ) -> RedirectResponse:
     settings = get_settings()
+    safe_next = sanitize_next_path(next)
     if not settings.auth_password or not settings.auth_secret:
         return RedirectResponse(
-            url=f"/login?next={quote(next or '/dashboard', safe='/?=&')}&error=Authentication+is+not+configured",
+            url=f"/login?next={quote(safe_next, safe='/?=&')}&error=Authentication+is+not+configured",
             status_code=303,
         )
     if verify_credentials(username, password):
-        response = RedirectResponse(url=next or "/dashboard", status_code=303)
+        response = RedirectResponse(url=safe_next, status_code=303)
         response.set_cookie(
             AUTH_COOKIE_NAME,
             build_auth_cookie_value(settings.auth_username),
@@ -145,7 +146,7 @@ def login_submit(
         )
         return response
     return RedirectResponse(
-        url=f"/login?next={quote(next or '/dashboard', safe='/?=&')}&error=Invalid+username+or+password",
+        url=f"/login?next={quote(safe_next, safe='/?=&')}&error=Invalid+username+or+password",
         status_code=303,
     )
 

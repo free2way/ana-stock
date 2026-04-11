@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import time
+from urllib.parse import urlsplit
 from urllib.parse import quote
 
 from fastapi import Request
@@ -62,3 +63,15 @@ def is_authenticated(request: Request) -> bool:
 
 def login_redirect(next_path: str) -> RedirectResponse:
     return RedirectResponse(url=f"/login?next={quote(next_path, safe='/?=&')}", status_code=303)
+
+
+def sanitize_next_path(next_path: str | None, fallback: str = "/dashboard") -> str:
+    candidate = (next_path or "").strip()
+    if not candidate:
+        return fallback
+    parsed = urlsplit(candidate)
+    if parsed.scheme or parsed.netloc:
+        return fallback
+    if not candidate.startswith("/") or candidate.startswith("//"):
+        return fallback
+    return candidate
