@@ -142,6 +142,9 @@ Sample `launchd` files are included:
 - `deploy/launchd/com.pqw.ana-app.example.plist`
 - `deploy/launchd/com.pqw.cloudflared.example.plist`
 
+The repository intentionally keeps only `.example` templates here.
+Create your real local files under `~/.cloudflared/` and `~/Library/LaunchAgents/` instead of committing machine-specific deployment files back into git.
+
 Before loading them:
 
 1. Replace `YOUR_USER`
