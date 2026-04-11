@@ -8,7 +8,7 @@ router = APIRouter(tags=["auth"])
 
 
 @router.get("/login", response_class=HTMLResponse)
-def login_page(next: str = Query("/watchlist"), error: str | None = None) -> str:
+def login_page(next: str = Query("/dashboard"), error: str | None = None) -> str:
     error_html = (
         f"<div class='error'>{error}</div>"
         if error
@@ -114,7 +114,7 @@ def login_page(next: str = Query("/watchlist"), error: str | None = None) -> str
 def login_submit(
     username: str = Form(...),
     password: str = Form(...),
-    next: str = Form("/watchlist"),
+    next: str = Form("/dashboard"),
 ) -> RedirectResponse:
     if username == DEFAULT_USERNAME and password == DEFAULT_PASSWORD:
         response = RedirectResponse(url=next or "/dashboard", status_code=303)

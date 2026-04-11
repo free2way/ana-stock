@@ -14,10 +14,12 @@ def normalize_ticker_for_market(ticker: str, market: str | None) -> str:
     if market_value == "CN":
         if normalized.endswith(".SH"):
             return f"{normalized[:-3]}.SS"
-        if normalized.endswith(".SS") or normalized.endswith(".SZ"):
+        if normalized.endswith(".SS") or normalized.endswith(".SZ") or normalized.endswith(".BJ"):
             return normalized
         if normalized.isdigit() and len(normalized) == 6:
-            if normalized.startswith(("5", "6", "9")):
+            if normalized.startswith(("4", "8", "92")):
+                return f"{normalized}.BJ"
+            if normalized.startswith(("5", "6")):
                 return f"{normalized}.SS"
             return f"{normalized}.SZ"
         return normalized

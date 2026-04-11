@@ -1,15 +1,24 @@
 from datetime import date, datetime
+import json
 
 from app.core.db import SessionLocal
+from app.models.schema import SymbolCreate
 from app.services.insight_engine import InsightEngine
+from app.services.runtime_cache import get_or_set
 from app.services.repository import (
     FundamentalSnapshotRepository,
     PredictionExplanationRepository,
     PredictionRepository,
+    PredictionTradePlanRepository,
     PriceSyncStateRepository,
     SymbolRepository,
+    TechnicalSnapshotRepository,
     WatchlistRepository,
 )
+from app.services.model_signal_summary import build_model_state, enrich_model_output, summarize_explanations
+from app.services.technical_patterns import TechnicalPatternService
+from app.services.tradingview_client import TradingViewClient
+from app.services.tushare_client import TushareClient
 
 
 MODEL_TEMPLATES = {
@@ -18,6 +27,79 @@ MODEL_TEMPLATES = {
         "description": "Use the current insight engine to rank stocks by trend strength and volume support.",
         "market": "ALL",
         "mode": "technical",
+    },
+    "cn_limit_up_watch": {
+        "label": "昨日涨停观察",
+        "description": "A-share tactical template for names that hit limit-up yesterday and still deserve today's attention.",
+        "market": "CN",
+        "mode": "technical_pattern",
+        "required_patterns": ["limit_up_yesterday"],
+    },
+    "cn_volume_breakout": {
+        "label": "底部放量突破",
+        "description": "A-share technical template for base breakouts supported by expanding volume.",
+        "market": "CN",
+        "mode": "technical_pattern",
+        "required_patterns": ["volume_breakout"],
+    },
+    "cn_bullish_ma_stack": {
+        "label": "均线多头排列",
+        "description": "A-share trend template for bullish moving-average alignment and rising medium-term structure.",
+        "market": "CN",
+        "mode": "technical_pattern",
+        "required_patterns": ["bullish_ma_stack"],
+    },
+    "cn_macd_underwater_cross": {
+        "label": "MACD水下金叉",
+        "description": "A-share early-reversal template for MACD bullish crossover below the zero line.",
+        "market": "CN",
+        "mode": "technical_pattern",
+        "required_patterns": ["macd_underwater_cross"],
+    },
+    "cn_ma_cluster_breakout_watch": {
+        "label": "均线密集待突破",
+        "description": "A-share compression template for names with tightly clustered moving averages before a directional move.",
+        "market": "CN",
+        "mode": "technical_pattern",
+        "required_patterns": ["ma_cluster"],
+    },
+    "cn_bollinger_squeeze_watch": {
+        "label": "布林带收口待突破",
+        "description": "A-share volatility compression template for names with Bollinger Band squeeze and coiled price action.",
+        "market": "CN",
+        "mode": "technical_pattern",
+        "required_patterns": ["bollinger_squeeze"],
+    },
+    "cn_three_white_soldiers": {
+        "label": "三连阳强势延续",
+        "description": "A-share candlestick template for names showing three consecutive bullish candles with improving closes.",
+        "market": "CN",
+        "mode": "technical_pattern",
+        "required_patterns": ["three_white_soldiers"],
+    },
+    "cn_bullish_engulfing_reversal": {
+        "label": "看涨吞没反转",
+        "description": "A-share reversal template for names printing a bullish engulfing candle after weakness.",
+        "market": "CN",
+        "mode": "technical_pattern",
+        "required_patterns": ["bullish_engulfing"],
+    },
+    "cn_hammer_reversal": {
+        "label": "锤子线反转",
+        "description": "A-share reversal template for names printing a hammer candle after short-term weakness.",
+        "market": "CN",
+        "mode": "technical_pattern",
+        "required_patterns": ["hammer_reversal"],
+    },
+    "tv_multi_timeframe_bullish": {
+        "label": "TradingView多周期共振",
+        "description": "Use TradingView daily, weekly, and monthly ratings to find names with broad multi-timeframe alignment.",
+        "market": "ALL",
+        "mode": "technical_rating",
+        "defaults": {
+            "min_trend_score": 55,
+            "min_volume_ratio": 0.8,
+        },
     },
     "global_growth_value": {
         "label": "Global Growth at Reasonable Value",
@@ -109,9 +191,63 @@ MARKET_SORT_ORDER = {
 }
 
 
+SIGNAL_FILTER_MAP = {
+    "ALL": None,
+    "BUY": "buy",
+    "WATCH": "watch",
+    "SELL": "sell",
+    "HOLD": "hold",
+}
+
+PATTERN_MATCH_LABELS = {
+    "limit_up_yesterday": "昨日涨停",
+    "volume_breakout": "底部放量突破",
+    "ma_cluster": "均线密集缠绕",
+    "bullish_ma_stack": "均线多头排列",
+    "macd_underwater_cross": "MACD水下金叉",
+    "bollinger_squeeze": "布林带收口",
+    "three_white_soldiers": "三连阳",
+    "bullish_engulfing": "看涨吞没",
+    "hammer_reversal": "锤子线",
+}
+
+
+def _matches_execution_tag_filter(tags: list[str] | None, execution_tag_filter: str) -> bool:
+    normalized = str(execution_tag_filter or "").strip().lower()
+    if not normalized or normalized == "all":
+        return True
+    requested = [part.strip() for part in normalized.split(",") if part.strip() and part.strip() != "all"]
+    if not requested:
+        return True
+    values = [str(tag).strip().lower() for tag in (tags or []) if str(tag).strip()]
+    return any(tag in values for tag in requested)
+
+
+def _excludes_execution_tag_filter(tags: list[str] | None, exclude_execution_tag_filter: str) -> bool:
+    normalized = str(exclude_execution_tag_filter or "").strip().lower()
+    if not normalized or normalized == "all":
+        return True
+    requested = [part.strip() for part in normalized.split(",") if part.strip() and part.strip() != "all"]
+    if not requested:
+        return True
+    values = [str(tag).strip().lower() for tag in (tags or []) if str(tag).strip()]
+    return not any(tag in values for tag in requested)
+
+
+def _normalize_action_value(value: str | None) -> str:
+    normalized = str(value or "").strip().lower().replace(" ", "_")
+    if normalized in {"trim_into_strength", "avoid_or_wait", "continue_to_watch", "continue_watching"}:
+        return "wait"
+    if normalized in {"buy_the_dip", "wait_for_breakout", "hold_and_watch", "wait"}:
+        return normalized
+    return normalized
+
+
 class ScreenerService:
     def __init__(self) -> None:
         self.insight_engine = InsightEngine()
+        self.technical_patterns = TechnicalPatternService()
+        self.tradingview = TradingViewClient()
 
     def screen(
         self,
@@ -131,6 +267,12 @@ class ScreenerService:
         max_debt_to_assets: float = 100.0,
         min_dividend_yield: float = 0.0,
         exclude_bottom_market_cap_pct: float = 10.0,
+        recent_snapshot_runs: int = 0,
+        min_snapshot_hits: int = 0,
+        model_signal_filter: str = "ALL",
+        min_model_signal_strength: float = 0.0,
+        execution_tag_filter: str = "ALL",
+        exclude_execution_tag_filter: str = "ALL",
         sort_by: str = "default",
         sort_order: str = "desc",
         limit: int = 50,
@@ -155,6 +297,31 @@ class ScreenerService:
                 max_debt_to_assets=max_debt_to_assets,
                 min_dividend_yield=min_dividend_yield,
                 exclude_bottom_market_cap_pct=exclude_bottom_market_cap_pct,
+                recent_snapshot_runs=recent_snapshot_runs,
+                min_snapshot_hits=min_snapshot_hits,
+            )
+        elif template["mode"] == "technical_pattern":
+            fixed_market = template.get("market")
+            effective_market = fixed_market if fixed_market and fixed_market != "ALL" else market
+            results = self._screen_technical_patterns(
+                template_key=model_template,
+                required_patterns=template.get("required_patterns", []),
+                universe=universe,
+                market=effective_market,
+                min_trend_score=min_trend_score,
+                action_filter=action_filter,
+                min_volume_ratio=min_volume_ratio,
+                recent_snapshot_runs=recent_snapshot_runs,
+                min_snapshot_hits=min_snapshot_hits,
+            )
+        elif template["mode"] == "technical_rating":
+            fixed_market = template.get("market")
+            effective_market = fixed_market if fixed_market and fixed_market != "ALL" else market
+            results = self._screen_tradingview_alignment(
+                universe=universe,
+                market=effective_market,
+                min_trend_score=min_trend_score,
+                min_volume_ratio=min_volume_ratio,
             )
         else:
             results = self._screen_technical(
@@ -163,8 +330,242 @@ class ScreenerService:
                 min_trend_score=min_trend_score,
                 action_filter=action_filter,
                 min_volume_ratio=min_volume_ratio,
+                recent_snapshot_runs=recent_snapshot_runs,
+                min_snapshot_hits=min_snapshot_hits,
             )
+        results = self._apply_model_signal_filter(
+            results,
+            model_signal_filter=model_signal_filter,
+            min_model_signal_strength=min_model_signal_strength,
+        )
+        results = self._apply_execution_tag_filter(
+            results,
+            execution_tag_filter=execution_tag_filter,
+            exclude_execution_tag_filter=exclude_execution_tag_filter,
+        )
         return self._sort_results(results, sort_by=sort_by, sort_order=sort_order)[:limit]
+
+    def build_market_snapshot(
+        self,
+        *,
+        market: str = "CN",
+        limit_per_board: int = 12,
+        mode: str = "monitor",
+    ) -> list[dict]:
+        snapshot_mode = (mode or "monitor").strip().lower()
+        cache_key = json.dumps({"market": market, "limit": limit_per_board, "mode": snapshot_mode}, sort_keys=True)
+
+        def _load() -> list[dict]:
+            boards = [
+                {
+                    "key": "leaders",
+                    "template": "technical_momentum",
+                    "title_en": "Momentum Leaders",
+                    "title_zh": "强势榜",
+                    "description_en": "Trend and volume leaders from the latest local market data.",
+                    "description_zh": "基于本地行情与量价结构筛出的趋势强股。",
+                    "sort_by": "trend_score",
+                },
+                {
+                    "key": "squeeze",
+                    "template": "cn_bollinger_squeeze_watch",
+                    "title_en": "Squeeze Watch",
+                    "title_zh": "收口榜",
+                    "description_en": "Names with compressed Bollinger Bands and coiled price action.",
+                    "description_zh": "波动率收缩、价格待选择方向的候选股。",
+                    "sort_by": "volume_ratio",
+                },
+                {
+                    "key": "three_white_soldiers",
+                    "template": "cn_three_white_soldiers",
+                    "title_en": "Three White Soldiers",
+                    "title_zh": "连阳榜",
+                    "description_en": "Stocks showing three consecutive strong bullish candles.",
+                    "description_zh": "连续三根强势阳线、收盘逐步抬高的股票。",
+                    "sort_by": "momentum_5",
+                },
+                {
+                    "key": "volume_breakout",
+                    "template": "cn_volume_breakout",
+                    "title_en": "Volume Breakout",
+                    "title_zh": "放量榜",
+                    "description_en": "Base breakouts supported by expanding turnover and confirmation volume.",
+                    "description_zh": "底部放量突破、量能确认更充分的候选股。",
+                    "sort_by": "volume_ratio",
+                },
+            ]
+            snapshot: list[dict] = []
+            for board in boards:
+                rows = self.screen(
+                    model_template=board["template"],
+                    universe="full_market",
+                    market=market,
+                    min_trend_score=45 if board["template"] == "technical_momentum" else 35,
+                    action_filter="ALL",
+                    min_volume_ratio=0.0,
+                    limit=limit_per_board,
+                    sort_by=board["sort_by"],
+                    sort_order="desc",
+                )
+                for row in rows:
+                    row["snapshot_score"] = self._market_snapshot_score(board["key"], row, snapshot_mode)
+                    row["snapshot_score_breakdown"] = self._market_snapshot_score_breakdown(board["key"], row, snapshot_mode)
+                rows.sort(
+                    key=lambda item: (
+                        -(item.get("snapshot_score") or 0),
+                        -(item.get("trend_score") or 0),
+                        -(item.get("volume_ratio") or 0),
+                        item.get("ticker", ""),
+                    )
+                )
+                snapshot.append({**board, "rows": rows, "mode": snapshot_mode})
+            return snapshot
+
+        return get_or_set("market_snapshot", cache_key, ttl_seconds=90.0, loader=_load)
+
+    def _market_snapshot_score(self, board_key: str, row: dict, mode: str = "monitor") -> int:
+        trend_score = max(0.0, min(100.0, float(row.get("trend_score") or 0.0)))
+        momentum_5 = max(-20.0, min(30.0, float(row.get("momentum_5") or 0.0)))
+        volume_ratio = max(0.0, min(4.0, float(row.get("volume_ratio") or 0.0)))
+        model_signal = max(0.0, min(100.0, float(row.get("model_signal_strength") or 0.0)))
+        pattern_bonus = min(len(row.get("matched_patterns") or []), 3) * 4
+        tradingview_bonus = self._tradingview_alignment_score(row.get("tradingview_ratings") or {})
+
+        score = 0.0
+        score += trend_score * 0.45
+        score += max(momentum_5, 0.0) * 1.2
+        score += volume_ratio * 8.0
+        score += model_signal * 0.12
+        score += pattern_bonus
+        score += tradingview_bonus * 2.0
+
+        if board_key == "leaders":
+            score += max(float(row.get("momentum_20") or 0.0), 0.0) * 0.6
+        elif board_key == "squeeze":
+            breakout_distance = abs(float(row.get("distance_to_breakout_pct") or 0.0))
+            score += max(0.0, 10.0 - breakout_distance)
+        elif board_key == "three_white_soldiers":
+            score += max(momentum_5, 0.0) * 0.8
+        elif board_key == "volume_breakout":
+            score += volume_ratio * 6.0
+            score += max(0.0, 8.0 - abs(float(row.get("distance_to_breakout_pct") or 0.0)))
+
+        if mode == "premarket":
+            score += volume_ratio * 4.0
+            score += max(momentum_5, 0.0) * 0.5
+        elif mode == "postmarket":
+            score += max(float(row.get("momentum_20") or 0.0), 0.0) * 0.9
+            score += model_signal * 0.08
+        else:
+            score += pattern_bonus * 0.5
+
+        return int(round(score))
+
+    def _market_snapshot_score_breakdown(self, board_key: str, row: dict, mode: str = "monitor") -> list[str]:
+        parts: list[str] = []
+        parts.append(f"mode {mode}")
+        if row.get("trend_score") is not None:
+            parts.append(f"trend {int(float(row.get('trend_score') or 0))}")
+        if row.get("volume_ratio") is not None:
+            parts.append(f"volume {float(row.get('volume_ratio') or 0):.1f}x")
+        if row.get("momentum_5") is not None:
+            parts.append(f"5D {float(row.get('momentum_5') or 0):.1f}%")
+        patterns = row.get("matched_patterns") or []
+        if patterns:
+            parts.append(" / ".join(patterns[:2]))
+        ratings = row.get("tradingview_ratings") or {}
+        if ratings:
+            parts.append(f"TV {self._tradingview_alignment_score(ratings)}")
+        if board_key == "squeeze" and row.get("distance_to_breakout_pct") is not None:
+            parts.append(f"breakout {float(row.get('distance_to_breakout_pct') or 0):.1f}%")
+        return parts[:5]
+
+    def _screen_technical_patterns(
+        self,
+        *,
+        template_key: str,
+        required_patterns: list[str],
+        universe: str,
+        market: str,
+        min_trend_score: int,
+        action_filter: str,
+        min_volume_ratio: float,
+        recent_snapshot_runs: int,
+        min_snapshot_hits: int,
+    ) -> list[dict]:
+        tickers = self._load_universe(universe=universe, market=market)
+        with SessionLocal() as db:
+            model_repo = PredictionRepository(db)
+            explanation_repo = PredictionExplanationRepository(db)
+            trade_plan_repo = PredictionTradePlanRepository(db)
+            technical_snapshot_repo = TechnicalSnapshotRepository(db)
+            model_context_by_ticker = {
+                ticker: self._build_model_highlights(
+                    model_repo.get_latest_model_output_for_ticker(ticker),
+                    explanation_repo.get_latest_for_ticker(ticker),
+                    trade_plan_repo.get_latest_for_ticker(ticker),
+                )
+                for ticker in tickers
+            }
+            cached_snapshot_map = {}
+            if universe == "full_market" and market == "CN":
+                cached_snapshot_map = {
+                    item["ticker"]: item
+                    for item in technical_snapshot_repo.list_latest_for_market(market=market, tickers=tickers)
+                }
+        results: list[dict] = []
+        for ticker in tickers:
+            cached_snapshot = cached_snapshot_map.get(ticker)
+            snapshot = self._snapshot_from_cache(cached_snapshot) if cached_snapshot is not None else self.technical_patterns.evaluate_ticker(ticker)
+            if snapshot is None:
+                continue
+            if required_patterns and not self._matches_required_patterns(snapshot, required_patterns):
+                continue
+            insight = self.insight_engine.get_insight(ticker, lang="en")
+            if insight:
+                if insight["trend_score"] < min_trend_score:
+                    continue
+                if action_filter != "ALL" and _normalize_action_value(insight["action_label"]) != _normalize_action_value(action_filter):
+                    continue
+                if (insight.get("volume_ratio") or 0.0) < min_volume_ratio:
+                    continue
+                row = self._build_result_from_insight(insight, model_context_by_ticker.get(ticker))
+            else:
+                row = self._build_result_from_fallback_pattern(snapshot, model_context_by_ticker.get(ticker))
+            row["matched_patterns"] = list(snapshot.matched_patterns or [])
+            row["selection_reason"] = self._build_pattern_reason(template_key, row["matched_patterns"], row)
+            results.append(row)
+
+        results = self._apply_snapshot_persistence_filter(
+            results,
+            recent_snapshot_runs=recent_snapshot_runs,
+            min_snapshot_hits=min_snapshot_hits,
+        )
+        results.sort(
+            key=lambda item: (
+                -(item.get("model_signal_strength") or 0),
+                -(item.get("trend_score") or 0),
+                -(item.get("volume_ratio") or 0),
+                item.get("ticker", ""),
+            )
+        )
+        return results
+
+    def _snapshot_from_cache(self, payload: dict | None):
+        if not payload:
+            return None
+        return type("CachedTechnicalSnapshot", (), payload)()
+
+    def _matches_required_patterns(self, snapshot, required_patterns: list[str]) -> bool:
+        matched_patterns = {str(item).strip() for item in (getattr(snapshot, "matched_patterns", None) or []) if str(item).strip()}
+        for pattern in required_patterns:
+            if getattr(snapshot, pattern, False):
+                continue
+            label = PATTERN_MATCH_LABELS.get(pattern)
+            if label and label in matched_patterns:
+                continue
+            return False
+        return True
 
     def _screen_technical(
         self,
@@ -174,15 +575,19 @@ class ScreenerService:
         min_trend_score: int,
         action_filter: str,
         min_volume_ratio: float,
+        recent_snapshot_runs: int,
+        min_snapshot_hits: int,
     ) -> list[dict]:
         tickers = self._load_universe(universe=universe, market=market)
         with SessionLocal() as db:
             model_repo = PredictionRepository(db)
             explanation_repo = PredictionExplanationRepository(db)
+            trade_plan_repo = PredictionTradePlanRepository(db)
             model_context_by_ticker = {
                 ticker: self._build_model_highlights(
                     model_repo.get_latest_model_output_for_ticker(ticker),
                     explanation_repo.get_latest_for_ticker(ticker),
+                    trade_plan_repo.get_latest_for_ticker(ticker),
                 )
                 for ticker in tickers
             }
@@ -193,15 +598,76 @@ class ScreenerService:
                 continue
             if insight["trend_score"] < min_trend_score:
                 continue
-            if action_filter != "ALL" and insight["action_label"] != action_filter:
+            if action_filter != "ALL" and _normalize_action_value(insight["action_label"]) != _normalize_action_value(action_filter):
                 continue
             volume_ratio = insight.get("volume_ratio") or 0.0
             if volume_ratio < min_volume_ratio:
                 continue
             results.append(self._build_result_from_insight(insight, model_context_by_ticker.get(ticker)))
 
+        results = self._apply_snapshot_persistence_filter(
+            results,
+            recent_snapshot_runs=recent_snapshot_runs,
+            min_snapshot_hits=min_snapshot_hits,
+        )
         results.sort(
             key=lambda item: (-(item["trend_score"] or 0), -(item["volume_ratio"] or 0), item["ticker"])
+        )
+        return results
+
+    def _screen_tradingview_alignment(
+        self,
+        *,
+        universe: str,
+        market: str,
+        min_trend_score: int,
+        min_volume_ratio: float,
+    ) -> list[dict]:
+        candidate_tickers = self._load_universe(universe=universe, market=market)
+        if universe == "full_market" and len(candidate_tickers) > 120:
+            candidate_rows = self._screen_technical(
+                universe=universe,
+                market=market,
+                min_trend_score=min_trend_score,
+                action_filter="ALL",
+                min_volume_ratio=min_volume_ratio,
+                recent_snapshot_runs=0,
+                min_snapshot_hits=0,
+            )
+            candidate_tickers = [row["ticker"] for row in candidate_rows[:120]]
+
+        symbol_meta = self._load_symbol_meta(candidate_tickers)
+        results: list[dict] = []
+        for ticker in candidate_tickers:
+            insight = self.insight_engine.get_insight(ticker, lang="en")
+            if not insight:
+                continue
+            if (insight.get("trend_score") or 0) < min_trend_score:
+                continue
+            if (insight.get("volume_ratio") or 0.0) < min_volume_ratio:
+                continue
+
+            meta = symbol_meta.get(ticker, {})
+            ratings = self._load_tradingview_ratings(
+                ticker=ticker,
+                market=meta.get("market") or self._infer_market(ticker),
+                exchange=meta.get("exchange"),
+            )
+            if not ratings or not self._is_bullish_multi_timeframe(ratings):
+                continue
+
+            row = self._build_result_from_insight(insight)
+            row["tradingview_ratings"] = ratings
+            row["selection_reason"] = self._build_tradingview_alignment_reason(ratings, row)
+            results.append(row)
+
+        results.sort(
+            key=lambda item: (
+                -self._tradingview_alignment_score(item.get("tradingview_ratings") or {}),
+                -(item.get("trend_score") or 0),
+                -(item.get("volume_ratio") or 0),
+                item.get("ticker", ""),
+            )
         )
         return results
 
@@ -223,6 +689,8 @@ class ScreenerService:
         max_debt_to_assets: float,
         min_dividend_yield: float,
         exclude_bottom_market_cap_pct: float,
+        recent_snapshot_runs: int,
+        min_snapshot_hits: int,
     ) -> list[dict]:
         tickers = self._load_universe(universe=universe, market=market)
         with SessionLocal() as db:
@@ -230,10 +698,12 @@ class ScreenerService:
             fundamentals = repo.list_latest_for_market(market, tickers=tickers)
             model_repo = PredictionRepository(db)
             explanation_repo = PredictionExplanationRepository(db)
+            trade_plan_repo = PredictionTradePlanRepository(db)
             model_context_by_ticker = {
                 ticker: self._build_model_highlights(
                     model_repo.get_latest_model_output_for_ticker(ticker),
                     explanation_repo.get_latest_for_ticker(ticker),
+                    trade_plan_repo.get_latest_for_ticker(ticker),
                 )
                 for ticker in tickers
             }
@@ -268,7 +738,7 @@ class ScreenerService:
             )
             if (base.get("trend_score") or 0) < min_trend_score and insight:
                 continue
-            if action_filter != "ALL" and insight and base.get("action_label") != action_filter:
+            if action_filter != "ALL" and insight and _normalize_action_value(base.get("action_label")) != _normalize_action_value(action_filter):
                 continue
             if (base.get("volume_ratio") or 0.0) < min_volume_ratio and insight:
                 continue
@@ -289,6 +759,11 @@ class ScreenerService:
             )
             results.append(base)
 
+        results = self._apply_snapshot_persistence_filter(
+            results,
+            recent_snapshot_runs=recent_snapshot_runs,
+            min_snapshot_hits=min_snapshot_hits,
+        )
         results.sort(
             key=lambda row: (
                 -(row.get("dividend_yield") or 0)
@@ -299,6 +774,38 @@ class ScreenerService:
             )
         )
         return results
+
+    def _apply_snapshot_persistence_filter(
+        self,
+        results: list[dict],
+        *,
+        recent_snapshot_runs: int,
+        min_snapshot_hits: int,
+    ) -> list[dict]:
+        for row in results:
+            row["snapshot_hits"] = 0
+            row["snapshot_runs"] = recent_snapshot_runs
+        if recent_snapshot_runs <= 0 or min_snapshot_hits <= 0 or not results:
+            return results
+
+        with SessionLocal() as db:
+            snapshots = PredictionRepository(db).list_recent_prediction_snapshots(
+                top_n=10,
+                limit_runs=recent_snapshot_runs,
+            )
+        hit_counts: dict[str, int] = {}
+        for snapshot in snapshots:
+            for item in snapshot["items"]:
+                ticker = item["ticker"]
+                hit_counts[ticker] = hit_counts.get(ticker, 0) + 1
+
+        filtered: list[dict] = []
+        for row in results:
+            hits = hit_counts.get(row["ticker"], 0)
+            row["snapshot_hits"] = hits
+            if hits >= min_snapshot_hits:
+                filtered.append(row)
+        return filtered
 
     def _sort_results(self, results: list[dict], *, sort_by: str, sort_order: str) -> list[dict]:
         reverse = sort_order != "asc"
@@ -317,6 +824,8 @@ class ScreenerService:
             "revenue_yoy",
             "dividend_yield",
             "debt_to_assets",
+            "snapshot_hits",
+            "model_signal_strength",
         }
         if sort_by in numeric_fields:
             return sorted(
@@ -325,6 +834,41 @@ class ScreenerService:
                 reverse=reverse,
             )
         return sorted(results, key=lambda row: str(row.get(sort_by, "")).lower(), reverse=reverse)
+
+    def _apply_model_signal_filter(
+        self,
+        results: list[dict],
+        *,
+        model_signal_filter: str,
+        min_model_signal_strength: float,
+    ) -> list[dict]:
+        normalized_filter = SIGNAL_FILTER_MAP.get((model_signal_filter or "ALL").upper(), None)
+        filtered: list[dict] = []
+        for row in results:
+            signal_label = (row.get("model_signal_label") or "").strip().lower()
+            if normalized_filter and signal_label != normalized_filter:
+                continue
+            if (row.get("model_signal_strength") or 0.0) < min_model_signal_strength:
+                continue
+            filtered.append(row)
+        return filtered
+
+    def _apply_execution_tag_filter(
+        self,
+        results: list[dict],
+        *,
+        execution_tag_filter: str,
+        exclude_execution_tag_filter: str,
+    ) -> list[dict]:
+        filtered: list[dict] = []
+        for row in results:
+            tags = row.get("model_execution_tags") or []
+            if not _matches_execution_tag_filter(tags, execution_tag_filter):
+                continue
+            if not _excludes_execution_tag_filter(tags, exclude_execution_tag_filter):
+                continue
+            filtered.append(row)
+        return filtered
 
     def _default_sort_key(self, row: dict) -> tuple:
         if row.get("dividend_yield") is not None:
@@ -346,7 +890,16 @@ class ScreenerService:
     def _load_universe(self, *, universe: str, market: str) -> list[str]:
         market_value = market.upper()
         with SessionLocal() as db:
-            if universe == "synced":
+            if universe == "full_market":
+                symbol_repo = SymbolRepository(db)
+                tickers = [
+                    symbol.ticker
+                    for symbol in symbol_repo.list_symbols()
+                    if market_value == "ALL" or (symbol.market or "").upper() == market_value
+                ]
+                if market_value == "CN" and not tickers:
+                    tickers = self._hydrate_cn_symbol_universe(symbol_repo)
+            elif universe == "synced":
                 states = PriceSyncStateRepository(db).list_states_with_symbols()
                 tickers = [item["ticker"] for item in states if item["status"] == "success"]
             else:
@@ -358,6 +911,24 @@ class ScreenerService:
         if market_value == "ALL":
             return tickers
         return [ticker for ticker in tickers if self._infer_market(ticker) == market_value]
+
+    def _hydrate_cn_symbol_universe(self, symbol_repo: SymbolRepository) -> list[str]:
+        rows = TushareClient().fetch_cn_symbol_universe()
+        tickers: list[str] = []
+        for row in rows:
+            ticker = str(row.get("ticker") or "").upper()
+            if not ticker:
+                continue
+            symbol_repo.get_or_create_symbol(
+                SymbolCreate(
+                    ticker=ticker,
+                    name=row.get("name"),
+                    market="CN",
+                    exchange=row.get("exchange"),
+                )
+            )
+            tickers.append(ticker)
+        return tickers
 
     def _passes_fundamental_template_rules(
         self,
@@ -434,8 +1005,23 @@ class ScreenerService:
             "momentum_20": insight.get("momentum_20"),
             "volume_ratio": insight.get("volume_ratio"),
             "distance_to_breakout_pct": insight.get("distance_to_breakout_pct"),
+            "snapshot_hits": 0,
+            "snapshot_runs": 0,
             "model_summary": (model_context or {}).get("summary"),
             "model_highlights": (model_context or {}).get("highlights", []),
+            "model_state": (model_context or {}).get("state"),
+            "model_confidence": (model_context or {}).get("confidence"),
+            "model_signal_label": (model_context or {}).get("signal_label"),
+            "model_signal_strength": (model_context or {}).get("signal_strength"),
+            "model_conviction_bucket": (model_context or {}).get("conviction_bucket"),
+            "model_position_size_hint": (model_context or {}).get("position_size_hint"),
+            "model_entry_style": (model_context or {}).get("entry_style"),
+            "model_execution_tags": (model_context or {}).get("execution_tags", []),
+            "model_percentile": (model_context or {}).get("percentile"),
+            "model_horizon_days": (model_context or {}).get("target_horizon_days"),
+            "model_reward_risk_ratio": (model_context or {}).get("model_reward_risk_ratio"),
+            "model_expected_drawdown_20d": (model_context or {}).get("expected_drawdown_20d"),
+            "matched_patterns": [],
             "selection_reason": self._build_technical_reason(insight, model_context),
         }
 
@@ -453,9 +1039,59 @@ class ScreenerService:
             "momentum_20": None,
             "volume_ratio": None,
             "distance_to_breakout_pct": None,
+            "snapshot_hits": 0,
+            "snapshot_runs": 0,
             "model_summary": (model_context or {}).get("summary"),
             "model_highlights": (model_context or {}).get("highlights", []),
+            "model_state": (model_context or {}).get("state"),
+            "model_confidence": (model_context or {}).get("confidence"),
+            "model_signal_label": (model_context or {}).get("signal_label"),
+            "model_signal_strength": (model_context or {}).get("signal_strength"),
+            "model_conviction_bucket": (model_context or {}).get("conviction_bucket"),
+            "model_position_size_hint": (model_context or {}).get("position_size_hint"),
+            "model_entry_style": (model_context or {}).get("entry_style"),
+            "model_execution_tags": (model_context or {}).get("execution_tags", []),
+            "model_percentile": (model_context or {}).get("percentile"),
+            "model_horizon_days": (model_context or {}).get("target_horizon_days"),
+            "model_reward_risk_ratio": (model_context or {}).get("model_reward_risk_ratio"),
+            "model_expected_drawdown_20d": (model_context or {}).get("expected_drawdown_20d"),
+            "matched_patterns": [],
             "selection_reason": "Passed the selected fundamental template.",
+        }
+
+    def _build_result_from_fallback_pattern(self, snapshot, model_context: dict | None = None) -> dict:
+        resolved_name = self._resolve_symbol_name(snapshot.ticker) or snapshot.ticker
+        return {
+            "ticker": snapshot.ticker,
+            "name": resolved_name,
+            "market": self._infer_market(snapshot.ticker),
+            "as_of_date": snapshot.as_of_date,
+            "trend_score": None,
+            "action_label": "technical_pattern",
+            "action_summary": "Matched the selected technical pattern.",
+            "latest_close": None,
+            "momentum_5": None,
+            "momentum_20": None,
+            "volume_ratio": None,
+            "distance_to_breakout_pct": None,
+            "snapshot_hits": 0,
+            "snapshot_runs": 0,
+            "model_summary": (model_context or {}).get("summary"),
+            "model_highlights": (model_context or {}).get("highlights", []),
+            "model_state": (model_context or {}).get("state"),
+            "model_confidence": (model_context or {}).get("confidence"),
+            "model_signal_label": (model_context or {}).get("signal_label"),
+            "model_signal_strength": (model_context or {}).get("signal_strength"),
+            "model_conviction_bucket": (model_context or {}).get("conviction_bucket"),
+            "model_position_size_hint": (model_context or {}).get("position_size_hint"),
+            "model_entry_style": (model_context or {}).get("entry_style"),
+            "model_execution_tags": (model_context or {}).get("execution_tags", []),
+            "model_percentile": (model_context or {}).get("percentile"),
+            "model_horizon_days": (model_context or {}).get("target_horizon_days"),
+            "model_reward_risk_ratio": (model_context or {}).get("model_reward_risk_ratio"),
+            "model_expected_drawdown_20d": (model_context or {}).get("expected_drawdown_20d"),
+            "matched_patterns": list(snapshot.matched_patterns or []),
+            "selection_reason": ", ".join(snapshot.matched_patterns or []) or "Matched the selected technical pattern.",
         }
 
     def _build_technical_reason(self, insight: dict, model_context: dict | None = None) -> str:
@@ -507,35 +1143,51 @@ class ScreenerService:
             )
         return base.get("selection_reason") or "Matched the active template."
 
-    def _build_model_highlights(self, model_output: dict | None, explanations: list[dict]) -> dict:
+    def _build_pattern_reason(self, template_key: str, matched_patterns: list[str], row: dict) -> str:
+        matched = " / ".join(matched_patterns or []) or "技术形态触发"
+        signal_label = row.get("model_signal_label")
+        signal_strength = row.get("model_signal_strength")
+        trend = row.get("trend_score")
+        extras: list[str] = [matched]
+        if signal_label:
+            if signal_strength is not None:
+                extras.append(f"signal {signal_label} {int(float(signal_strength))}")
+            else:
+                extras.append(f"signal {signal_label}")
+        if trend is not None:
+            extras.append(f"trend {int(float(trend))}")
+        return ", ".join(extras)
+
+    def _build_tradingview_alignment_reason(self, ratings: dict[str, dict], row: dict) -> str:
+        parts: list[str] = []
+        for interval in ("1d", "1w", "1M"):
+            payload = ratings.get(interval) or {}
+            recommendation = payload.get("recommendation")
+            if recommendation:
+                parts.append(f"{interval} {recommendation}")
+        trend = row.get("trend_score")
+        if trend is not None:
+            parts.append(f"trend {int(float(trend))}")
+        volume_ratio = row.get("volume_ratio")
+        if volume_ratio is not None:
+            parts.append(f"volume {float(volume_ratio):.2f}x")
+        return ", ".join(parts) if parts else "Multi-timeframe TradingView alignment."
+
+    def _build_model_highlights(
+        self,
+        model_output: dict | None,
+        explanations: list[dict],
+        trade_plan: dict | None,
+    ) -> dict:
         if not model_output:
             return {"summary": None, "highlights": []}
-        highlights: list[str] = []
-        for item in explanations:
-            contribution = item.get("contribution")
-            if contribution is None:
-                continue
-            feature_name = str(item.get("feature_name") or "")
-            if feature_name == "recent_daily_return":
-                label = "recent move"
-            elif feature_name.startswith("lag_return_"):
-                label = feature_name.replace("lag_return_", "lag ").replace("d", "d")
-            elif feature_name == "price_vs_ma20":
-                label = "price vs MA20"
-            elif feature_name == "ma_alignment":
-                label = "MA alignment"
-            elif feature_name == "volume_ratio_20d":
-                label = "volume support"
-            elif feature_name.startswith("lookback_momentum_"):
-                label = "lookback momentum"
-            else:
-                label = feature_name
-            direction = "+" if contribution >= 0 else ""
-            highlights.append(f"{label} {direction}{contribution:.2f}")
+        enriched = enrich_model_output(dict(model_output), lang="en") or model_output
+        highlights = summarize_explanations(explanations, lang="en", limit=3)
+        execution_tags = list((trade_plan or {}).get("execution_tags") or [])
         summary = None
-        score = model_output.get("score")
-        rank_value = model_output.get("rank_value")
-        universe_size = model_output.get("universe_size")
+        score = enriched.get("score")
+        rank_value = enriched.get("rank_value")
+        universe_size = enriched.get("universe_size")
         if score is not None:
             if rank_value is not None and universe_size:
                 summary = f"model {score:.3f}, rank {int(rank_value)}/{int(universe_size)}"
@@ -544,6 +1196,18 @@ class ScreenerService:
         return {
             "summary": summary,
             "highlights": highlights[:3],
+            "state": enriched.get("state") or build_model_state(score, lang="en"),
+            "confidence": enriched.get("confidence"),
+            "signal_label": enriched.get("signal_label"),
+            "signal_strength": enriched.get("signal_strength"),
+            "conviction_bucket": enriched.get("conviction_bucket"),
+            "position_size_hint": enriched.get("position_size_hint"),
+            "entry_style": enriched.get("entry_style"),
+            "execution_tags": execution_tags,
+            "percentile": enriched.get("percentile"),
+            "target_horizon_days": enriched.get("target_horizon_days"),
+            "model_reward_risk_ratio": enriched.get("model_reward_risk_ratio"),
+            "expected_drawdown_20d": enriched.get("expected_drawdown_20d"),
         }
 
     def _fmt(self, value: float | None) -> str:
@@ -568,3 +1232,59 @@ class ScreenerService:
         if upper.endswith(".SS") or upper.endswith(".SZ") or upper.endswith(".SH"):
             return "CN"
         return "US"
+
+    def _load_symbol_meta(self, tickers: list[str]) -> dict[str, dict]:
+        normalized = {ticker.upper() for ticker in tickers}
+        with SessionLocal() as db:
+            symbols = [symbol for symbol in SymbolRepository(db).list_symbols() if symbol.ticker in normalized]
+        return {
+            symbol.ticker: {
+                "market": (symbol.market or "").upper() or None,
+                "exchange": (symbol.exchange or "").upper() or None,
+            }
+            for symbol in symbols
+        }
+
+    def _load_tradingview_ratings(
+        self,
+        *,
+        ticker: str,
+        market: str | None,
+        exchange: str | None,
+    ) -> dict[str, dict]:
+        ratings: dict[str, dict] = {}
+        for interval in ("1d", "1w", "1M"):
+            payload = self.tradingview.get_technical_rating(
+                ticker=ticker,
+                market=market,
+                exchange=exchange,
+                interval=interval,
+            )
+            if not payload or payload.get("status") != "success":
+                return {}
+            ratings[interval] = payload
+        return ratings
+
+    def _is_bullish_multi_timeframe(self, ratings: dict[str, dict]) -> bool:
+        bullish = {"BUY", "STRONG_BUY"}
+        bearish = {"SELL", "STRONG_SELL"}
+        recommendations = [
+            str((ratings.get(interval) or {}).get("recommendation") or "").upper()
+            for interval in ("1d", "1w", "1M")
+        ]
+        if any(rec in bearish for rec in recommendations):
+            return False
+        return sum(1 for rec in recommendations if rec in bullish) >= 2 and recommendations[0] in bullish
+
+    def _tradingview_alignment_score(self, ratings: dict[str, dict]) -> int:
+        scores = {
+            "STRONG_BUY": 4,
+            "BUY": 3,
+            "NEUTRAL": 1,
+            "SELL": -2,
+            "STRONG_SELL": -3,
+        }
+        return sum(
+            scores.get(str((ratings.get(interval) or {}).get("recommendation") or "").upper(), 0)
+            for interval in ("1d", "1w", "1M")
+        )

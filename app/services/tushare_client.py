@@ -21,6 +21,16 @@ class CNFundamentalRow:
     raw_data: dict | None = None
 
 
+@dataclass(slots=True)
+class CNConceptRow:
+    ticker: str
+    concept_name: str
+    report_date: str
+    concept_code: str | None = None
+    name: str | None = None
+    raw_data: dict | None = None
+
+
 class TushareClient:
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -117,6 +127,141 @@ class TushareClient:
                     },
                 )
             )
+        return rows
+
+    def fetch_cn_symbol_universe(self) -> list[dict]:
+        if not self.token:
+            return []
+
+        try:
+            import tushare as ts  # type: ignore
+        except ImportError:
+            return []
+
+        pro = ts.pro_api(self.token)
+        if pro is None:
+            return []
+        stock_df = pro.stock_basic(
+            exchange="",
+            list_status="L",
+            fields="ts_code,symbol,name,exchange,list_date",
+        )
+        if stock_df is None or stock_df.empty:
+            return []
+
+        rows: list[dict] = []
+        for _, row in stock_df.iterrows():
+            row_dict = row.to_dict()
+            ts_code = str(row_dict.get("ts_code") or "").strip().upper()
+            if not ts_code:
+                continue
+            rows.append(
+                {
+                    "ticker": self._to_app_ticker(ts_code),
+                    "name": row_dict.get("name"),
+                    "exchange": row_dict.get("exchange"),
+                    "listing_date": self._normalize_date(row_dict.get("list_date")),
+                }
+            )
+        return rows
+
+    def fetch_cn_daily_history(
+        self,
+        ticker: str,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> list[dict]:
+        if not self.token:
+            return []
+
+        try:
+            import tushare as ts  # type: ignore
+        except ImportError:
+            return []
+
+        pro = ts.pro_api(self.token)
+        if pro is None:
+            return []
+
+        ts_code = self._to_ts_code(ticker)
+        try:
+            daily_df = pro.daily(
+                ts_code=ts_code,
+                start_date=(start_date or "19700101").replace("-", ""),
+                end_date=(end_date or date.today().strftime("%Y%m%d")).replace("-", ""),
+                fields="ts_code,trade_date,open,high,low,close,vol,amount",
+            )
+        except Exception:
+            return []
+
+        if daily_df is None or daily_df.empty:
+            return []
+
+        rows: list[dict] = []
+        for _, row in daily_df.iterrows():
+            row_dict = row.to_dict()
+            volume = self._to_float(row_dict.get("vol"))
+            if volume is not None:
+                volume *= 100.0
+            rows.append(
+                {
+                    "date": self._normalize_date(row_dict.get("trade_date")),
+                    "symbol": ticker.strip().upper(),
+                    "open": self._to_float(row_dict.get("open")),
+                    "high": self._to_float(row_dict.get("high")),
+                    "low": self._to_float(row_dict.get("low")),
+                    "close": self._to_float(row_dict.get("close")),
+                    "volume": volume,
+                    "adj_close": self._to_float(row_dict.get("close")),
+                    "dividend": None,
+                    "split_ratio": None,
+                }
+            )
+
+        rows.sort(key=lambda item: item["date"] or "")
+        return rows
+
+    def fetch_cn_concepts(self, tickers: list[str] | None = None) -> list[CNConceptRow]:
+        if not self.token:
+            return []
+
+        try:
+            import tushare as ts  # type: ignore
+        except ImportError:
+            return []
+
+        pro = ts.pro_api(self.token)
+        if pro is None:
+            return []
+        normalized = [self._to_ts_code(ticker) for ticker in (tickers or []) if ticker]
+        if not normalized:
+            return []
+
+        rows: list[CNConceptRow] = []
+        report_date = date.today().isoformat()
+        for ts_code in normalized:
+            detail_df = pro.concept_detail(
+                ts_code=ts_code,
+                fields="id,concept_name,ts_code,name,in_date,out_date",
+            )
+            if detail_df is None or detail_df.empty:
+                continue
+            for _, row in detail_df.iterrows():
+                row_dict = row.to_dict()
+                concept_name = str(row_dict.get("concept_name") or "").strip()
+                if not concept_name:
+                    continue
+                rows.append(
+                    CNConceptRow(
+                        ticker=self._to_app_ticker(ts_code),
+                        concept_name=concept_name,
+                        concept_code=str(row_dict.get("id") or "").strip() or None,
+                        report_date=report_date,
+                        name=row_dict.get("name"),
+                        raw_data=row_dict,
+                    )
+                )
         return rows
 
     def _to_ts_code(self, ticker: str) -> str:

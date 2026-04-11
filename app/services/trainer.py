@@ -2,10 +2,12 @@ import csv
 from collections import defaultdict
 from pathlib import Path
 
+from app.services.model_signal_summary import enrich_model_output, summarize_model_output
 from app.core.config import get_settings
 from app.core.db import SessionLocal
 from app.services.repository import (
     ModelRunRepository,
+    PredictionDetailRepository,
     PredictionExplanationRepository,
     PredictionWriteRepository,
     SymbolRepository,
@@ -74,6 +76,7 @@ class SignalTrainer:
             raise RuntimeError("signal_type must be either 'momentum' or 'reversal'.")
 
         signal_rows: list[dict] = []
+        detail_rows: list[dict] = []
         explanation_rows: list[dict] = []
         by_date: dict[str, list[dict]] = defaultdict(list)
         close_history_by_symbol: dict[str, list[float]] = defaultdict(list)
@@ -83,6 +86,7 @@ class SignalTrainer:
             symbol_repo = SymbolRepository(db)
             model_repo = ModelRunRepository(db)
             prediction_repo = PredictionWriteRepository(db)
+            detail_repo = PredictionDetailRepository(db)
             explanation_repo = PredictionExplanationRepository(db)
 
             dates = sorted({row["date"] for row in rows if row.get("date")})
@@ -212,6 +216,41 @@ class SignalTrainer:
                 ranked = sorted(date_rows, key=lambda item: item["score"], reverse=True)
                 for idx, record in enumerate(ranked, start=1):
                     record["rank_value"] = float(idx)
+                    enriched = enrich_model_output(
+                        {
+                            "score": record["score"],
+                            "rank_value": record["rank_value"],
+                            "universe_size": len(ranked),
+                            "percentile": round(max(0.0, min(100.0, (1 - ((float(idx) - 1) / max(len(ranked), 1))) * 100.0)), 1),
+                            "target_horizon_days": max(5, min(20, lookback_days * 5)),
+                            "model_run": {"name": run_name},
+                        },
+                        lang="en",
+                    ) or {}
+                    detail_rows.append(
+                        {
+                            "symbol_id": record["symbol_id"],
+                            "trade_date": record["trade_date"],
+                            "confidence": enriched.get("confidence"),
+                            "bullish_prob": enriched.get("bullish_prob"),
+                            "bearish_prob": enriched.get("bearish_prob"),
+                            "expected_return_5d": enriched.get("expected_return_5d"),
+                            "expected_return_20d": enriched.get("expected_return_20d"),
+                            "expected_drawdown_20d": enriched.get("expected_drawdown_20d"),
+                            "model_reward_risk_ratio": enriched.get("model_reward_risk_ratio"),
+                            "risk_score": enriched.get("risk_score"),
+                            "target_horizon_days": enriched.get("target_horizon_days"),
+                            "universe_size": enriched.get("universe_size"),
+                            "percentile": enriched.get("percentile"),
+                            "regime_label": enriched.get("regime_label"),
+                            "conviction_bucket": enriched.get("conviction_bucket"),
+                            "position_size_hint": enriched.get("position_size_hint"),
+                            "entry_style": enriched.get("entry_style"),
+                            "signal_label": enriched.get("signal_label"),
+                            "signal_strength": enriched.get("signal_strength"),
+                            "summary_text": enriched.get("summary_text") or summarize_model_output(enriched, lang="en"),
+                        }
+                    )
                     explanation_rows.extend(record.pop("_explanations", []))
                     signal_rows.append(record)
 
@@ -222,6 +261,7 @@ class SignalTrainer:
                 )
 
             count = prediction_repo.replace_for_model_run(run.id, signal_rows)
+            detail_repo.replace_for_model_run(run.id, detail_rows)
             explanation_repo.replace_for_model_run(run.id, explanation_rows)
             artifact_path = str((self.settings.artifacts_dir / f"model_run_{run.id}.json").resolve())
             Path(artifact_path).write_text(

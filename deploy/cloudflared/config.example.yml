@@ -1,0 +1,7 @@
+tunnel: YOUR_TUNNEL_ID
+credentials-file: /Users/YOUR_USER/.cloudflared/YOUR_TUNNEL_ID.json
+
+ingress:
+  - hostname: quant.YOUR_DOMAIN
+    service: http://127.0.0.1:8000
+  - service: http_status:404

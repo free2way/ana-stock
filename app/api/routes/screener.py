@@ -9,10 +9,12 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db_session
 from app.services.auth import is_authenticated, login_redirect
+from app.services.market_intelligence import build_market_sentiment_snapshot
 from app.models.schema import SymbolCreate
 from app.services.market_sync import sync_market_data
 from app.services.repository import AppSettingRepository, SymbolRepository, WatchlistRepository
 from app.services.screener import MODEL_TEMPLATES, ScreenerService
+from app.services.focus_pool import add_to_today_focus_pool, enrich_focus_pool_with_symbols, load_today_focus_pool
 
 
 router = APIRouter(prefix="/screeners", tags=["screeners"])
@@ -26,6 +28,14 @@ ACTION_OPTIONS = [
     ("wait", "Wait"),
 ]
 
+MODEL_SIGNAL_OPTIONS = [
+    ("ALL", {"en": "All signals", "zh": "全部信号"}),
+    ("BUY", {"en": "Buy", "zh": "买点"}),
+    ("WATCH", {"en": "Watch", "zh": "观察"}),
+    ("SELL", {"en": "Sell", "zh": "卖点"}),
+    ("HOLD", {"en": "Hold", "zh": "持有"}),
+]
+
 SCREENERS_PRESETS_KEY = "screener_saved_presets"
 
 LANG_OPTIONS = [("en", "English"), ("zh", "中文")]
@@ -35,7 +45,10 @@ SCREEN_TEXT = {
         "back_to_dashboard": "Back to dashboard",
         "open_watchlist": "Open Watchlist",
         "sync_cn_fundamentals": "Sync CN Fundamentals",
+        "open_focus_pool": "Open Today Focus",
+        "open_market_snapshot": "Open Market Snapshot",
         "quant_screener": "Quant Screener",
+        "market_snapshot": "Market Snapshot",
         "title": "Rule-Based Stock Selection",
         "rules": "Rules",
         "results": "Results",
@@ -55,6 +68,12 @@ SCREEN_TEXT = {
         "max_debt": "Maximum Debt To Assets (%)",
         "min_dividend": "Minimum Dividend Yield (%)",
         "exclude_bottom_cap": "Exclude Bottom Market Cap (%)",
+        "recent_snapshot_runs": "Recent Snapshot Window",
+        "min_snapshot_hits": "Minimum Snapshot Hits",
+        "model_signal_filter": "Model Signal",
+        "min_model_signal_strength": "Minimum Signal Strength",
+        "execution_tag_filter": "Execution Tag",
+        "exclude_execution_tag_filter": "Exclude Tag",
         "run_screener": "Run Screener",
         "save_strategy": "Save Current Strategy",
         "strategy_name": "My strategy name",
@@ -63,6 +82,9 @@ SCREEN_TEXT = {
         "only_add_top_n": "Only add top N results (0 = all)",
         "auto_enable_sync": "Auto-enable Sync for added stocks",
         "add_current_results": "Add Current Results To Watchlist",
+        "focus_top_n": "Add top N to today's focus (0 = all)",
+        "add_current_results_to_focus": "Add Current Results To Today Focus",
+        "add_to_today_focus": "Add To Today Focus",
         "no_results_to_add": "No Results To Add",
         "stocks_matched": "stocks matched your current rules.",
         "ticker": "Ticker",
@@ -71,6 +93,7 @@ SCREEN_TEXT = {
         "action": "Action",
         "close": "Close",
         "model": "Model",
+        "technical_rating": "Technical Rating",
         "why_selected": "Why Selected",
         "watchlist": "Watchlist",
         "insight": "Insight",
@@ -94,12 +117,31 @@ SCREEN_TEXT = {
         "sync_top_n_now": "Sync Top N Results Now",
         "sync_top_n_help": "Sync top N current results (0 = all in watchlist results)",
         "drag_hint": "Drag the bar below to see more columns",
+        "risk_overview": "Risk Overview",
+        "tagged_names": "Tagged Names",
+        "common_risks": "Common Risks",
+        "risk_examples": "Examples",
+        "no_execution_risks": "No execution warnings in the current screener view.",
+        "today_focus_pool": "Today Focus Pool",
+        "pattern_hits": "Pattern Hits",
+        "snapshot_empty": "No candidates are available in this board yet.",
+        "added_to_focus_message": "Added {ticker} to today focus pool.",
+        "snapshot_score": "Snapshot Score",
+        "score_breakdown": "Score Drivers",
+        "market_sentiment": "Market Sentiment",
+        "view_mode": "View Mode",
+        "mode_premarket": "Premarket",
+        "mode_monitor": "Monitor",
+        "mode_postmarket": "Postmarket",
     },
     "zh": {
         "back_to_dashboard": "返回总览",
         "open_watchlist": "打开自选股",
         "sync_cn_fundamentals": "同步A股基本面",
+        "open_focus_pool": "打开今日重点盯盘池",
+        "open_market_snapshot": "打开市场快照榜单",
         "quant_screener": "量化选股器",
+        "market_snapshot": "市场快照榜单",
         "title": "基于规则的选股",
         "rules": "筛选条件",
         "results": "结果",
@@ -119,6 +161,12 @@ SCREEN_TEXT = {
         "max_debt": "资产负债率上限 (%)",
         "min_dividend": "股息率下限 (%)",
         "exclude_bottom_cap": "剔除底部市值比例 (%)",
+        "recent_snapshot_runs": "最近快照窗口",
+        "min_snapshot_hits": "最少连续入选次数",
+        "model_signal_filter": "模型信号",
+        "min_model_signal_strength": "最低信号强度",
+        "execution_tag_filter": "执行提醒标签",
+        "exclude_execution_tag_filter": "排除标签",
         "run_screener": "开始选股",
         "save_strategy": "保存当前策略",
         "strategy_name": "我的策略名称",
@@ -127,6 +175,9 @@ SCREEN_TEXT = {
         "only_add_top_n": "只加入前 N 名（0 代表全部）",
         "auto_enable_sync": "加入后自动开启同步",
         "add_current_results": "将当前结果加入自选",
+        "focus_top_n": "加入今日重点盯盘池前 N 名（0 代表全部）",
+        "add_current_results_to_focus": "将当前结果加入今日重点盯盘池",
+        "add_to_today_focus": "加入今日重点盯盘池",
         "no_results_to_add": "当前没有可加入结果",
         "stocks_matched": "只股票符合当前规则。",
         "ticker": "代码",
@@ -135,6 +186,7 @@ SCREEN_TEXT = {
         "action": "动作",
         "close": "收盘价",
         "model": "模型",
+        "technical_rating": "技术评级",
         "why_selected": "入选原因",
         "watchlist": "自选状态",
         "insight": "分析页",
@@ -158,11 +210,37 @@ SCREEN_TEXT = {
         "sync_top_n_now": "立即同步前 N 个结果",
         "sync_top_n_help": "同步当前结果里的前 N 个（0 代表全部自选结果）",
         "drag_hint": "可拖动底部滚动条查看更多列",
+        "risk_overview": "风险概览",
+        "tagged_names": "带提醒股票数",
+        "common_risks": "常见提醒",
+        "risk_examples": "示例股票",
+        "no_execution_risks": "当前选股结果里没有执行提醒。",
+        "today_focus_pool": "今日重点盯盘池",
+        "pattern_hits": "命中形态",
+        "snapshot_empty": "这个榜单里暂时还没有候选股。",
+        "added_to_focus_message": "已将 {ticker} 加入今日重点盯盘池。",
+        "snapshot_score": "快照分",
+        "score_breakdown": "分数驱动",
+        "market_sentiment": "市场情绪",
+        "view_mode": "查看模式",
+        "mode_premarket": "盘前",
+        "mode_monitor": "盘中观察",
+        "mode_postmarket": "盘后复盘",
     },
 }
 
 TEMPLATE_LABELS = {
     "technical_momentum": {"en": "Technical Momentum", "zh": "技术动量"},
+    "cn_limit_up_watch": {"en": "Yesterday Limit-Up Watch", "zh": "昨日涨停观察"},
+    "cn_volume_breakout": {"en": "Volume Breakout From Base", "zh": "底部放量突破"},
+    "cn_bullish_ma_stack": {"en": "Bullish Moving Average Stack", "zh": "均线多头排列"},
+    "cn_macd_underwater_cross": {"en": "MACD Underwater Golden Cross", "zh": "MACD水下金叉"},
+    "cn_ma_cluster_breakout_watch": {"en": "MA Cluster Compression", "zh": "均线密集待突破"},
+    "cn_bollinger_squeeze_watch": {"en": "Bollinger Squeeze Watch", "zh": "布林带收口待突破"},
+    "cn_three_white_soldiers": {"en": "Three White Soldiers", "zh": "三连阳强势延续"},
+    "cn_bullish_engulfing_reversal": {"en": "Bullish Engulfing Reversal", "zh": "看涨吞没反转"},
+    "cn_hammer_reversal": {"en": "Hammer Reversal", "zh": "锤子线反转"},
+    "tv_multi_timeframe_bullish": {"en": "TradingView Multi-Timeframe Bullish", "zh": "TradingView多周期共振"},
     "global_growth_value": {"en": "Global Growth at Reasonable Value", "zh": "全球成长合理估值"},
     "global_income_quality": {"en": "Global Income and Quality", "zh": "全球高质量股息"},
     "cn_growth_value": {"en": "High Growth, Reasonable Value", "zh": "高成长低估值"},
@@ -351,6 +429,16 @@ def _highlight_chip(text: str) -> str:
     )
 
 
+def _execution_tag_chip(text: str) -> str:
+    return (
+        "<span style='display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;"
+        "background:#fff7ed;color:#c2410c;font-weight:700;font-size:12px;line-height:1.2;"
+        "border:1px solid #fed7aa;'>"
+        f"{text}"
+        "</span>"
+    )
+
+
 def _watchlist_summary(existing: dict | None, lang: str) -> str:
     chips: list[str] = []
     if existing:
@@ -371,10 +459,165 @@ def _watchlist_summary(existing: dict | None, lang: str) -> str:
     return "<div class='detail-chip-row'>" + "".join(chips) + "</div>"
 
 
+def _tradingview_rating_cell(ratings: dict | None, lang: str) -> str:
+    if not ratings:
+        return "-"
+    labels = {"1d": "1D", "1w": "1W", "1M": "1M"}
+    chips: list[str] = []
+    for interval in ("1d", "1w", "1M"):
+        payload = ratings.get(interval) or {}
+        recommendation = str(payload.get("recommendation") or "-").upper()
+        bg = "#f3f4f6"
+        fg = "#374151"
+        if recommendation in {"BUY", "STRONG_BUY"}:
+            bg, fg = "#dcfce7", "#166534"
+        elif recommendation in {"SELL", "STRONG_SELL"}:
+            bg, fg = "#fee2e2", "#991b1b"
+        elif recommendation == "NEUTRAL":
+            bg, fg = "#fef3c7", "#92400e"
+        chips.append(
+            "<span style='display:inline-flex;align-items:center;gap:6px;padding:6px 10px;"
+            f"border-radius:999px;background:{bg};color:{fg};font-weight:700;font-size:12px;'>"
+            f"{labels[interval]} {recommendation}"
+            "</span>"
+        )
+    return "<div class='detail-chip-row'>" + "".join(chips) + "</div>"
+
+
+def _pattern_hits_inline(patterns: list[str] | None) -> str:
+    values = [str(item).strip() for item in (patterns or []) if str(item).strip()]
+    if not values:
+        return "-"
+    return " / ".join(values[:3])
+
+
+def _snapshot_score_badge(value: float | int | None) -> str:
+    if value is None:
+        return "-"
+    try:
+        numeric = int(round(float(value)))
+    except (TypeError, ValueError):
+        return str(value)
+    bg = "#eef2ff"
+    fg = "#3730a3"
+    if numeric >= 85:
+        bg, fg = "#dcfce7", "#166534"
+    elif numeric >= 70:
+        bg, fg = "#dbeafe", "#1d4ed8"
+    elif numeric >= 55:
+        bg, fg = "#fef3c7", "#92400e"
+    return (
+        "<span style='display:inline-flex;align-items:center;padding:5px 10px;border-radius:999px;"
+        f"background:{bg};color:{fg};font-weight:800;font-size:12px;'>{numeric}</span>"
+    )
+
+
+def _signal_chip(label: str, value: str) -> str:
+    normalized = str(value or "-").replace("_", " ").upper()
+    bg = "#f3f4f6"
+    fg = "#374151"
+    if "RISK ON" in normalized or "BUY" in normalized or "BULLISH" in normalized:
+        bg, fg = "#dcfce7", "#166534"
+    elif "RISK OFF" in normalized or "SELL" in normalized or "BEARISH" in normalized:
+        bg, fg = "#fee2e2", "#991b1b"
+    elif "NEUTRAL" in normalized or "MIXED" in normalized:
+        bg, fg = "#fef3c7", "#92400e"
+    return (
+        "<span style='display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;"
+        f"background:{bg};color:{fg};font-weight:700;font-size:12px;'>{label} {normalized}</span>"
+    )
+
+
+def _score_breakdown_inline(parts: list[str] | None) -> str:
+    values = [str(item).strip() for item in (parts or []) if str(item).strip()]
+    if not values:
+        return "-"
+    return "<div class='detail-chip-row' style='margin-top:0;'>" + "".join(_highlight_chip(item) for item in values[:4]) + "</div>"
+
+
+def _mode_switch_html(base_path: str, current_mode: str, lang: str) -> str:
+    options = [
+        ("premarket", _lang_text(lang, "mode_premarket")),
+        ("monitor", _lang_text(lang, "mode_monitor")),
+        ("postmarket", _lang_text(lang, "mode_postmarket")),
+    ]
+    chips: list[str] = []
+    for value, label in options:
+        active = value == current_mode
+        style = (
+            "background:#0f766e;color:#fff;border-color:#0f766e;"
+            if active
+            else "background:#fffdf7;color:#0f766e;border-color:#cde9e4;"
+        )
+        chips.append(
+            f"<a href='{base_path}?{urlencode({'lang': lang, 'mode': value})}' "
+            "style='display:inline-flex;align-items:center;padding:8px 12px;border-radius:999px;"
+            f"border:1px solid;{style}text-decoration:none;font-weight:800;font-size:12px;'>{label}</a>"
+        )
+    return "<div style='display:flex;gap:8px;flex-wrap:wrap;'>" + "".join(chips) + "</div>"
+
+
+def _market_snapshot_table(rows: list[dict], watchlist_map: dict[str, dict], lang: str) -> str:
+    if not rows:
+        return f"<div class='muted'>{_lang_text(lang, 'snapshot_empty')}</div>"
+    body_rows: list[str] = []
+    for item in rows:
+        ticker = str(item.get("ticker") or "").upper()
+        existing = watchlist_map.get(ticker)
+        body_rows.append(
+            "<tr>"
+            f"<td><a class='main-open-link' href='/insights/{ticker}?lang={lang}'>{ticker}</a></td>"
+            f"<td>{item.get('name') or ticker}</td>"
+            f"<td>{_snapshot_score_badge(item.get('snapshot_score'))}</td>"
+            f"<td>{_trend_badge(item.get('trend_score'))}</td>"
+            f"<td>{_change_chip(item.get('momentum_5'))}</td>"
+            f"<td>{_number_badge(item.get('volume_ratio'))}</td>"
+            f"<td>{_pattern_hits_inline(item.get('matched_patterns'))}</td>"
+            f"<td>{_score_breakdown_inline(item.get('snapshot_score_breakdown'))}</td>"
+            f"<td>{_tradingview_rating_cell(item.get('tradingview_ratings'), lang)}</td>"
+            f"<td>{_watchlist_summary(existing, lang) if existing else '-'}</td>"
+            "<td>"
+            "<form method='post' action='/screeners/market-snapshot/add-to-focus' style='margin:0;'>"
+            f"<input type='hidden' name='lang' value='{lang}' />"
+            f"<input type='hidden' name='ticker' value='{ticker}' />"
+            f"<input type='hidden' name='name' value='{item.get('name') or ticker}' />"
+            f"<input type='hidden' name='market' value='{item.get('market') or 'CN'}' />"
+            f"<input type='hidden' name='selection_reason' value='{item.get('selection_reason') or ''}' />"
+            f"<input type='hidden' name='matched_patterns' value='{_pattern_hits_inline(item.get('matched_patterns'))}' />"
+            f"<button type='submit'>{_lang_text(lang, 'add_to_today_focus')}</button>"
+            "</form>"
+            "</td>"
+            "</tr>"
+        )
+    return (
+        "<div class='table-wrap'>"
+        "<table>"
+        "<thead>"
+        "<tr>"
+        f"<th>{_lang_text(lang, 'ticker')}</th>"
+        f"<th>{_lang_text(lang, 'name')}</th>"
+        f"<th>{_lang_text(lang, 'snapshot_score')}</th>"
+        f"<th>{_lang_text(lang, 'trend')}</th>"
+        "<th>5D %</th>"
+        "<th>Volume</th>"
+        f"<th>{_lang_text(lang, 'pattern_hits')}</th>"
+        f"<th>{_lang_text(lang, 'score_breakdown')}</th>"
+        f"<th>{_lang_text(lang, 'technical_rating')}</th>"
+        f"<th>{_lang_text(lang, 'watchlist')}</th>"
+        f"<th>{_lang_text(lang, 'today_focus_pool')}</th>"
+        "</tr>"
+        "</thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table>"
+        "</div>"
+    )
+
+
 def _detail_panel(item: dict, watchlist_map: dict[str, dict], current_params: dict, lang: str) -> str:
     details_label = "Details" if lang == "en" else "展开"
     collapse_label = "Collapse" if lang == "en" else "收起"
     model_highlights = item.get("model_highlights") or []
+    model_execution_tags = list(item.get("model_execution_tags") or [])
     action_badge = _action_badge(item.get("action_label"), lang)
     trend_badge = _trend_badge(item.get("trend_score"))
     existing = watchlist_map.get(item["ticker"])
@@ -389,7 +632,15 @@ def _detail_panel(item: dict, watchlist_map: dict[str, dict], current_params: di
         if model_highlights
         else f"<div style='margin-top:8px;color:#6b7280;'>-</div>"
     )
+    execution_tags_html = (
+        "<div class='detail-chip-row' style='margin-top:10px;'>"
+        + "".join(_execution_tag_chip(tag) for tag in model_execution_tags)
+        + "</div>"
+        if model_execution_tags
+        else ""
+    )
     why_selected_html = _why_selected_cell(item.get("selection_reason"), lang)
+    tradingview_html = _tradingview_rating_cell(item.get("tradingview_ratings"), lang)
     watchlist_html = _watchlist_action_cell(item, watchlist_map, current_params, lang)
     watchlist_summary_html = _watchlist_summary(existing, lang)
     last_sync = existing.get("last_synced_date") if existing else None
@@ -408,6 +659,10 @@ def _detail_panel(item: dict, watchlist_map: dict[str, dict], current_params: di
         "<div class='detail-card'>"
         f"<div class='detail-label'>{_lang_text(lang, 'why_selected')}</div>"
         f"{why_selected_html}"
+        "</div>"
+        "<div class='detail-card'>"
+        f"<div class='detail-label'>{_lang_text(lang, 'technical_rating')}</div>"
+        f"{tradingview_html}"
         "</div>"
         "<div class='detail-card'>"
         f"<div class='detail-label'>{_lang_text(lang, 'watchlist')}</div>"
@@ -429,6 +684,7 @@ def _detail_panel(item: dict, watchlist_map: dict[str, dict], current_params: di
         f"<div class='detail-label'>{_lang_text(lang, 'model')}</div>"
         f"<div class='detail-value'>{item.get('model_summary') or '-'}</div>"
         f"{model_highlights_html}"
+        f"{execution_tags_html}"
         "</div>"
         "</div>"
         f"<div class='detail-collapse-note'>{collapse_label}</div>"
@@ -439,39 +695,71 @@ def _detail_panel(item: dict, watchlist_map: dict[str, dict], current_params: di
 def _model_cell(item: dict, lang: str) -> str:
     summary = item.get("model_summary")
     highlights = item.get("model_highlights") or []
-    if not summary and not highlights:
+    state = item.get("model_state") or {}
+    confidence = item.get("model_confidence")
+    signal_label = item.get("model_signal_label")
+    signal_strength = item.get("model_signal_strength")
+    model_percentile = item.get("model_percentile")
+    model_horizon_days = item.get("model_horizon_days")
+    model_reward_risk_ratio = item.get("model_reward_risk_ratio")
+    model_expected_drawdown_20d = item.get("model_expected_drawdown_20d")
+    model_conviction_bucket = item.get("model_conviction_bucket")
+    model_position_size_hint = item.get("model_position_size_hint")
+    model_entry_style = item.get("model_entry_style")
+    model_execution_tags = list(item.get("model_execution_tags") or [])
+    if not summary and not highlights and not state:
         return "-"
-    score = None
-    summary_lower = str(summary or "").lower()
-    try:
-        if summary_lower.startswith("model "):
-            score = float(summary_lower.split(",")[0].replace("model ", "").strip())
-    except (TypeError, ValueError):
-        score = None
-    bg = "#f3f4f6"
-    fg = "#374151"
-    badge_text = "Neutral" if lang == "en" else "中性"
-    if score is not None:
-        if score >= 0.18:
-            bg, fg, badge_text = "#dcfce7", "#166534", ("Strong" if lang == "en" else "强")
-        elif score >= 0.05:
-            bg, fg, badge_text = "#ecfccb", "#3f6212", ("Positive" if lang == "en" else "偏强")
-        elif score <= -0.05:
-            bg, fg, badge_text = "#fee2e2", "#991b1b", ("Weak" if lang == "en" else "偏弱")
+    bg = state.get("bg", "#f3f4f6")
+    fg = state.get("fg", "#374151")
+    badge_text = state.get("label", ("Neutral" if lang == "en" else "中性"))
     compact = highlights[0] if highlights else (_lang_text(lang, "drag_hint") if False else "")
     details_label = "Details" if lang == "en" else "展开"
     detail_rows = "".join(
         f"<li style='margin:4px 0;color:#4b5563;line-height:1.45;white-space:normal;'>{highlight}</li>"
         for highlight in highlights
     )
+    confidence_html = (
+        f"<div style='margin-top:6px;font-size:12px;color:#6b7280;'>{'Confidence' if lang == 'en' else '置信度'}: {confidence}%</div>"
+        if confidence is not None
+        else ""
+    )
+    meta_bits = []
+    if model_percentile is not None:
+        meta_bits.append(f"{'Pct' if lang == 'en' else '分位'} {float(model_percentile):.1f}%")
+    if model_horizon_days is not None:
+        meta_bits.append(f"{'Horizon' if lang == 'en' else '周期'} {int(model_horizon_days)}d")
+    if model_reward_risk_ratio is not None:
+        meta_bits.append(f"{'R/R' if lang == 'en' else '盈亏比'} {float(model_reward_risk_ratio):.2f}")
+    if model_expected_drawdown_20d is not None:
+        meta_bits.append(f"{'DD20' if lang == 'en' else '20日回撤'} {float(model_expected_drawdown_20d):.1f}%")
+    if model_conviction_bucket:
+        meta_bits.append(model_conviction_bucket)
+    if model_position_size_hint:
+        meta_bits.append(model_position_size_hint)
+    if model_entry_style:
+        meta_bits.append(model_entry_style)
+    if model_execution_tags:
+        meta_bits.extend(model_execution_tags[:2])
+    meta_html = (
+        f"<div style='margin-top:6px;font-size:12px;color:#6b7280;'>{' · '.join(meta_bits)}</div>"
+        if meta_bits
+        else ""
+    )
+    signal_html = (
+        f"<div style='margin-top:6px;font-size:12px;color:#6b7280;'>{signal_label or ('Hold' if lang == 'en' else '持有')}"
+        f"{' · ' + str(int(signal_strength)) if signal_strength is not None else ''}</div>"
+    )
     detail_block = (
         "<details style='margin-top:4px;'>"
         f"<summary style='cursor:pointer;color:#6b7280;font-size:12px;font-weight:700;list-style:none;'>{compact or details_label}</summary>"
         f"<ul style='margin:8px 0 0 18px;padding:0;'>{detail_rows}</ul>"
+        f"{signal_html}"
+        f"{meta_html}"
+        f"{confidence_html}"
         f"<div style='margin-top:6px;font-size:12px;color:#6b7280;'>{details_label}</div>"
         "</details>"
         if highlights
-        else ""
+        else signal_html + meta_html + confidence_html
     )
     return (
         f"<div style='min-width:180px;white-space:normal;'>"
@@ -632,6 +920,12 @@ def _current_params(
     max_debt_to_assets: float,
     min_dividend_yield: float,
     exclude_bottom_market_cap_pct: float,
+    recent_snapshot_runs: int,
+    min_snapshot_hits: int,
+    model_signal_filter: str,
+    min_model_signal_strength: float,
+    execution_tag_filter: str,
+    exclude_execution_tag_filter: str,
     sort_by: str,
     sort_order: str,
     lang: str,
@@ -652,6 +946,12 @@ def _current_params(
         "max_debt_to_assets": max_debt_to_assets,
         "min_dividend_yield": min_dividend_yield,
         "exclude_bottom_market_cap_pct": exclude_bottom_market_cap_pct,
+        "recent_snapshot_runs": recent_snapshot_runs,
+        "min_snapshot_hits": min_snapshot_hits,
+        "model_signal_filter": model_signal_filter,
+        "min_model_signal_strength": min_model_signal_strength,
+        "execution_tag_filter": execution_tag_filter,
+        "exclude_execution_tag_filter": exclude_execution_tag_filter,
         "sort_by": sort_by,
         "sort_order": sort_order,
         "lang": lang,
@@ -675,6 +975,12 @@ def _run_screen(service: ScreenerService, params: dict) -> list[dict]:
         max_debt_to_assets=float(params.get("max_debt_to_assets", 100.0)),
         min_dividend_yield=float(params.get("min_dividend_yield", 0.0)),
         exclude_bottom_market_cap_pct=float(params.get("exclude_bottom_market_cap_pct", 10.0)),
+        recent_snapshot_runs=int(float(params.get("recent_snapshot_runs", 0))),
+        min_snapshot_hits=int(float(params.get("min_snapshot_hits", 0))),
+        model_signal_filter=str(params.get("model_signal_filter", "ALL")),
+        min_model_signal_strength=float(params.get("min_model_signal_strength", 0.0)),
+        execution_tag_filter=str(params.get("execution_tag_filter", "ALL")),
+        exclude_execution_tag_filter=str(params.get("exclude_execution_tag_filter", "ALL")),
         sort_by=str(params.get("sort_by", "default")),
         sort_order=str(params.get("sort_order", "desc")),
         limit=500,
@@ -755,6 +1061,12 @@ def screener_page(
     max_debt_to_assets: float = Query(100.0),
     min_dividend_yield: float = Query(0.0),
     exclude_bottom_market_cap_pct: float = Query(10.0),
+    recent_snapshot_runs: int = Query(0),
+    min_snapshot_hits: int = Query(0),
+    model_signal_filter: str = Query("ALL"),
+    min_model_signal_strength: float = Query(0.0),
+    execution_tag_filter: str = Query("ALL"),
+    exclude_execution_tag_filter: str = Query("ALL"),
     sort_by: str = Query("default"),
     sort_order: str = Query("desc"),
     db: Session = Depends(get_db_session),
@@ -784,10 +1096,29 @@ def screener_page(
         max_debt_to_assets=max_debt_to_assets,
         min_dividend_yield=min_dividend_yield,
         exclude_bottom_market_cap_pct=exclude_bottom_market_cap_pct,
+        recent_snapshot_runs=recent_snapshot_runs,
+        min_snapshot_hits=min_snapshot_hits,
+        model_signal_filter=model_signal_filter,
+        min_model_signal_strength=min_model_signal_strength,
+        execution_tag_filter=execution_tag_filter,
+        exclude_execution_tag_filter=exclude_execution_tag_filter,
         sort_by=sort_by,
         sort_order=sort_order,
     )
     results = _run_screen(service, current_params)
+    risk_counts: dict[str, int] = {}
+    risk_examples: list[dict[str, object]] = []
+    tagged_names = 0
+    for item in results:
+        tags = [str(tag).strip() for tag in (item.get("model_execution_tags") or []) if str(tag).strip()]
+        if not tags:
+            continue
+        tagged_names += 1
+        for tag in tags:
+            risk_counts[tag] = risk_counts.get(tag, 0) + 1
+        risk_examples.append({"ticker": item.get("ticker"), "tags": tags[:2]})
+    risk_examples = risk_examples[:3]
+    risk_top_tags = sorted(risk_counts.items(), key=lambda pair: (-pair[1], pair[0]))[:3]
     if sort_by == "watchlist_state":
         reverse = sort_order != "asc"
         results = sorted(
@@ -812,6 +1143,7 @@ def screener_page(
     universe_options = [
         ("watchlist", "My Watchlist"),
         ("synced", "Synced Stocks"),
+        ("full_market", "Full Market"),
     ]
     market_options = [
         ("ALL", "All Markets"),
@@ -828,6 +1160,10 @@ def screener_page(
         f"<option value='{value}' {'selected' if action_filter == value else ''}>{label}</option>"
         for value, label in ACTION_OPTIONS
     )
+    signal_option_html = "".join(
+        f"<option value='{value}' {'selected' if model_signal_filter == value else ''}>{label_map[lang]}</option>"
+        for value, label_map in MODEL_SIGNAL_OPTIONS
+    )
     universe_option_html = "".join(
         f"<option value='{value}' {'selected' if universe == value else ''}>{label}</option>"
         for value, label in universe_options
@@ -842,10 +1178,15 @@ def screener_page(
     for item in results:
         current_market = (item.get("market") or "").upper()
         sync_badge = _sync_status_badge(watchlist_map.get(item["ticker"]), lang)
+        snapshot_badge = _number_badge(
+            item.get("snapshot_hits"),
+            suffix=f"/{item.get('snapshot_runs') or 0}",
+            higher_is_good=True,
+        )
         if current_market != previous_market:
             row_chunks.append(
                 "<tr class='market-section-row'>"
-                f"<td colspan='17'>{_market_section_label(current_market, lang)}</td>"
+                f"<td colspan='18'>{_market_section_label(current_market, lang)}</td>"
                 "</tr>"
             )
             previous_market = current_market
@@ -859,6 +1200,7 @@ def screener_page(
             f"<td>{_price_badge(item['latest_close'])}</td>"
             f"<td>{_model_cell(item, lang)}</td>"
             f"<td>{sync_badge}</td>"
+            f"<td>{snapshot_badge}</td>"
             f"<td>{_change_chip(item['momentum_5'])}</td>"
             f"<td>{_change_chip(item['momentum_20'])}</td>"
             f"<td>{_number_badge(item['volume_ratio'], suffix='x', higher_is_good=True)}</td>"
@@ -870,10 +1212,10 @@ def screener_page(
             f"<td><a class='main-open-link' href='/insights/{item['ticker']}?lang={lang}'>{_lang_text(lang, 'open_insight')}</a></td>"
             "</tr>"
             "<tr class='detail-row'>"
-            f"<td colspan='17'>{_detail_panel(item, watchlist_map, current_params, lang)}</td>"
+            f"<td colspan='18'>{_detail_panel(item, watchlist_map, current_params, lang)}</td>"
             "</tr>"
         )
-    rows = "".join(row_chunks) or f"<tr><td colspan='17'>{_lang_text(lang, 'no_match')}</td></tr>"
+    rows = "".join(row_chunks) or f"<tr><td colspan='18'>{_lang_text(lang, 'no_match')}</td></tr>"
     preset_rows = "".join(
         "<tr>"
         f"<td>{preset['name']}</td>"
@@ -886,6 +1228,12 @@ def screener_page(
         for preset in saved_presets
     ) or f"<tr><td colspan='6'>{_lang_text(lang, 'no_saved')}</td></tr>"
     banner_html = _banner_html(message, lang)
+    risk_top_tags_html = "".join(
+        f"<span class='linkbtn'>{tag} · {count}</span>" for tag, count in risk_top_tags
+    ) or f"<span class='muted'>{_lang_text(lang, 'no_execution_risks')}</span>"
+    risk_examples_html = " · ".join(
+        f"{item['ticker']} ({' / '.join(item['tags'])})" for item in risk_examples
+    ) or "-"
     hidden_fields = "".join(
         f"<input type='hidden' name='{key}' value='{value}' />"
         for key, value in current_params.items()
@@ -928,12 +1276,138 @@ def screener_page(
           .toolbar {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }}
           .toolbar a {{ color: var(--accent); text-decoration:none; font-weight:700; }}
           .card {{ background: var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); margin-bottom:16px; min-width:0; overflow:hidden; }}
+          .nav-grid {{ display:grid; gap:16px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-bottom:16px; }}
+          .nav-card {{
+            display:block;
+            text-decoration:none;
+            color:inherit;
+            background:linear-gradient(180deg, #fffdf7 0%, #f8faf7 100%);
+            border:1px solid var(--line);
+            border-radius:18px;
+            padding:18px;
+            box-shadow:0 8px 24px rgba(31,41,55,0.05);
+          }}
+          .nav-card:hover {{ border-color:#0f766e; box-shadow:0 12px 28px rgba(15,118,110,0.10); }}
+          .nav-head {{ display:flex; align-items:center; gap:12px; margin-bottom:10px; }}
+          .nav-icon {{
+            width:42px; height:42px; border-radius:14px; display:inline-flex; align-items:center; justify-content:center;
+            background:#eef8f5; color:#0f766e; font-size:12px; font-weight:900; letter-spacing:0.04em; border:1px solid #cde9e4; flex:0 0 auto;
+          }}
+          .nav-title {{ font-size:18px; font-weight:800; color:#0f766e; }}
+          .nav-kicker {{ color:var(--muted); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; }}
           .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
           h1 {{ margin:0 0 8px; font-size:38px; }}
           .lead {{ margin:0; color:var(--muted); max-width:760px; }}
           .stack {{ display:grid; gap:12px; }}
           .section-stack {{ display:grid; gap:16px; }}
           .rules-grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); align-items:end; }}
+          .action-grid {{ display:grid; gap:12px; grid-template-columns:repeat(2, minmax(0, 1fr)); }}
+          .action-form {{
+            display:grid;
+            gap:10px;
+            align-content:start;
+            height:100%;
+            padding:14px;
+            border:1px solid var(--line);
+            border-radius:16px;
+            background:#fbfaf5;
+          }}
+          .action-head {{
+            display:flex;
+            align-items:flex-start;
+            justify-content:space-between;
+            gap:12px;
+          }}
+          .action-kicker {{
+            color:var(--muted);
+            font-size:11px;
+            font-weight:800;
+            letter-spacing:0.06em;
+            text-transform:uppercase;
+            margin-bottom:4px;
+          }}
+          .action-title {{
+            color:var(--ink);
+            font-size:16px;
+            font-weight:800;
+            line-height:1.2;
+          }}
+          .action-icon {{
+            width:36px;
+            height:36px;
+            border-radius:12px;
+            background:#eef8f5;
+            border:1px solid #cde9e4;
+            color:#0f766e;
+            display:inline-flex;
+            align-items:center;
+            justify-content:center;
+            font-size:11px;
+            font-weight:900;
+            letter-spacing:0.05em;
+            flex:0 0 auto;
+          }}
+          .action-label {{
+            color:var(--muted);
+            font-size:12px;
+            font-weight:800;
+            letter-spacing:0.04em;
+            text-transform:uppercase;
+            min-height:28px;
+            display:flex;
+            align-items:flex-end;
+          }}
+          .action-row {{
+            display:grid;
+            grid-template-columns:minmax(0, 1fr);
+            gap:10px;
+          }}
+          .action-input-wrap {{
+            min-height:42px;
+            display:flex;
+            align-items:center;
+          }}
+          .action-checkbox {{
+            display:flex;
+            align-items:center;
+            gap:8px;
+            min-height:42px;
+            color:var(--muted);
+            font-size:14px;
+            font-weight:600;
+          }}
+          .action-checkbox input {{
+            width:18px;
+            min-width:18px;
+            height:18px;
+            margin:0;
+            padding:0;
+            border-radius:6px;
+          }}
+          .action-submit {{
+            min-height:42px;
+            display:flex;
+            align-items:flex-end;
+          }}
+          .action-submit button {{
+            width:100%;
+            min-width:0;
+          }}
+          .results-toolbar {{
+            display:flex;
+            align-items:center;
+            justify-content:space-between;
+            gap:12px;
+            flex-wrap:wrap;
+            margin-bottom:12px;
+          }}
+          .results-toolbar form {{
+            margin:0;
+          }}
+          .results-toolbar button {{
+            width:auto;
+            min-width:140px;
+          }}
           input, select, button {{
             border-radius:12px;
             border:1px solid var(--line);
@@ -950,13 +1424,14 @@ def screener_page(
           .table-wrap::-webkit-scrollbar-track {{ background:#efe7d7; border-radius:999px; }}
           .table-wrap::-webkit-scrollbar-thumb {{ background:#c6b79e; border-radius:999px; border:2px solid #efe7d7; }}
           .table-wrap::-webkit-scrollbar-thumb:hover {{ background:#a9987d; }}
-          table {{ width:100%; border-collapse:collapse; min-width:1560px; font-size:14px; table-layout:auto; }}
+          table {{ width:100%; border-collapse:collapse; min-width:1660px; font-size:14px; table-layout:auto; }}
           th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; white-space:nowrap; }}
           th {{ color:var(--muted); font-weight:600; white-space:nowrap; }}
           td {{ white-space:nowrap; }}
           .table-wrap th:nth-child(7), .table-wrap td:nth-child(7) {{ min-width:220px; width:220px; }}
           .table-wrap th:nth-child(8), .table-wrap td:nth-child(8) {{ min-width:120px; width:120px; }}
-          .table-wrap th:nth-child(17), .table-wrap td:nth-child(17) {{ min-width:110px; width:110px; }}
+          .table-wrap th:nth-child(9), .table-wrap td:nth-child(9) {{ min-width:100px; width:100px; }}
+          .table-wrap th:nth-child(18), .table-wrap td:nth-child(18) {{ min-width:110px; width:110px; }}
           .sticky-col {{ position:sticky; background:var(--panel); z-index:2; }}
           th.sticky-col {{ z-index:4; }}
           .sticky-col-1 {{ left:0; min-width:124px; box-shadow: 10px 0 14px rgba(31,41,55,0.05); }}
@@ -1046,12 +1521,14 @@ def screener_page(
           .lang-switch {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-left:auto; }}
           @media (max-width: 920px) {{
             .rules-grid {{ grid-template-columns:1fr; }}
+            .action-grid {{ grid-template-columns:1fr; }}
             .wrap {{ padding: 20px 14px 40px; }}
             h1 {{ font-size:30px; }}
             .sticky-col, .sticky-col-1, .sticky-col-2 {{ position:static; box-shadow:none; min-width:auto; }}
             .table-wrap th:nth-child(7), .table-wrap td:nth-child(7),
             .table-wrap th:nth-child(8), .table-wrap td:nth-child(8),
-            .table-wrap th:nth-child(17), .table-wrap td:nth-child(17) {{ width:auto; min-width:unset; }}
+            .table-wrap th:nth-child(9), .table-wrap td:nth-child(9),
+            .table-wrap th:nth-child(18), .table-wrap td:nth-child(18) {{ width:auto; min-width:unset; }}
             .detail-card-wide {{ grid-column:span 1; }}
             .row-detail-toggle > summary {{ align-items:flex-start; flex-direction:column; }}
             .detail-summary-meta {{ margin-left:0; }}
@@ -1063,12 +1540,66 @@ def screener_page(
           <div class="toolbar">
             <a href="/dashboard">← {_lang_text(lang, 'back_to_dashboard')}</a>
             <a href="/watchlist">{_lang_text(lang, 'open_watchlist')}</a>
+            <a href="/screeners/focus/today?lang={lang}">{_lang_text(lang, 'open_focus_pool')}</a>
+            <a href="/screeners/market-snapshot?lang={lang}">{_lang_text(lang, 'open_market_snapshot')}</a>
             <a href="/dashboard#cn-fundamental-tickers">{_lang_text(lang, 'sync_cn_fundamentals')}</a>
             <div class="lang-switch">
               <span class="muted">{_lang_text(lang, 'language')}:</span>
               {lang_switch_html}
             </div>
           </div>
+          <section class="nav-grid">
+            <a class="nav-card" href="/dashboard?lang={lang}">
+              <div class="nav-head">
+                <span class="nav-icon">HOME</span>
+                <div>
+                  <div class="nav-kicker">{'总览' if lang == 'zh' else 'Overview'}</div>
+                  <div class="nav-title">Dashboard</div>
+                </div>
+              </div>
+              <div class="muted">{'返回首页，看系统状态和主要入口。' if lang == 'zh' else 'Return to the hub for system status and primary navigation.'}</div>
+            </a>
+            <a class="nav-card" href="/watchlist">
+              <div class="nav-head">
+                <span class="nav-icon">LIST</span>
+                <div>
+                  <div class="nav-kicker">{'跟踪' if lang == 'zh' else 'Tracking'}</div>
+                  <div class="nav-title">{_lang_text(lang, 'open_watchlist')}</div>
+                </div>
+              </div>
+              <div class="muted">{'把筛出来的股票加入自选，并统一管理同步。' if lang == 'zh' else 'Move screened candidates into your watchlist and manage sync from one place.'}</div>
+            </a>
+            <a class="nav-card" href="/dashboard/continuous-leaders?lang={lang}">
+              <div class="nav-head">
+                <span class="nav-icon">RUN</span>
+                <div>
+                  <div class="nav-kicker">{'持续入选' if lang == 'zh' else 'Persistence'}</div>
+                  <div class="nav-title">{'连续强势股' if lang == 'zh' else 'Continuous Leaders'}</div>
+                </div>
+              </div>
+              <div class="muted">{'查看最近几次模型快照里持续入选的股票。' if lang == 'zh' else 'Inspect names that keep recurring across recent model snapshots.'}</div>
+            </a>
+            <a class="nav-card" href="/screeners/focus/today?lang={lang}">
+              <div class="nav-head">
+                <span class="nav-icon">FOCUS</span>
+                <div>
+                  <div class="nav-kicker">{'盯盘池' if lang == 'zh' else 'Focus'}</div>
+                  <div class="nav-title">{_lang_text(lang, 'today_focus_pool')}</div>
+                </div>
+              </div>
+              <div class="muted">{'把技术形态和模型信号最值得看的股票先放进今日重点盯盘池。' if lang == 'zh' else 'Collect today’s highest-priority names before deciding what goes into the watchlist.'}</div>
+            </a>
+            <a class="nav-card" href="/screeners/market-snapshot?lang={lang}">
+              <div class="nav-head">
+                <span class="nav-icon">SCAN</span>
+                <div>
+                  <div class="nav-kicker">{'盘面快照' if lang == 'zh' else 'Snapshot'}</div>
+                  <div class="nav-title">{_lang_text(lang, 'market_snapshot')}</div>
+                </div>
+              </div>
+              <div class="muted">{'把强势、收口、连阳、放量四类候选股集中成一页，方便盘前盘后快速扫一遍。' if lang == 'zh' else 'Open a single page for momentum, squeeze, candle continuation, and volume-breakout boards.'}</div>
+            </a>
+          </section>
           <div class="card">
             <div class="eyebrow">{_lang_text(lang, 'quant_screener')}</div>
             <h1>{_lang_text(lang, 'title')}</h1>
@@ -1144,47 +1675,162 @@ def screener_page(
                       <label class="muted">{_lang_text(lang, 'exclude_bottom_cap')}</label>
                       <input type="number" name="exclude_bottom_market_cap_pct" min="0" max="49" step="1" value="{exclude_bottom_market_cap_pct}" />
                     </div>
+                    <div>
+                      <label class="muted">{_lang_text(lang, 'recent_snapshot_runs')}</label>
+                      <input type="number" name="recent_snapshot_runs" min="0" max="10" step="1" value="{recent_snapshot_runs}" />
+                    </div>
+                    <div>
+                      <label class="muted">{_lang_text(lang, 'min_snapshot_hits')}</label>
+                      <input type="number" name="min_snapshot_hits" min="0" max="10" step="1" value="{min_snapshot_hits}" />
+                    </div>
+                    <div>
+                      <label class="muted">{_lang_text(lang, 'model_signal_filter')}</label>
+                      <select name="model_signal_filter">{signal_option_html}</select>
+                    </div>
+                    <div>
+                      <label class="muted">{_lang_text(lang, 'min_model_signal_strength')}</label>
+                      <input type="number" name="min_model_signal_strength" min="0" max="100" step="1" value="{min_model_signal_strength}" />
+                    </div>
+                    <div>
+                      <label class="muted">{_lang_text(lang, 'execution_tag_filter')}</label>
+                      <input type="text" name="execution_tag_filter" list="execution-tag-options" value="{execution_tag_filter if str(execution_tag_filter).upper() != 'ALL' else ''}" placeholder="gap-risk, earnings-soon" />
+                    </div>
+                    <div>
+                      <label class="muted">{_lang_text(lang, 'exclude_execution_tag_filter')}</label>
+                      <input type="text" name="exclude_execution_tag_filter" list="execution-tag-options" value="{exclude_execution_tag_filter if str(exclude_execution_tag_filter).upper() != 'ALL' else ''}" placeholder="gap-risk, earnings-soon" />
+                    </div>
                   </div>
+                  <div style="margin-top:12px;">
+                    <div class="muted" style="margin-bottom:8px;font-weight:700;">{'Quick Tags' if lang == 'en' else '快捷标签'}</div>
+                    <div style="display:flex;flex-wrap:wrap;gap:8px;">
+                      <button type="button" onclick="appendExecutionTag('execution_tag_filter', 'gap-risk')">gap-risk</button>
+                      <button type="button" onclick="appendExecutionTag('execution_tag_filter', 'earnings-soon')">earnings-soon</button>
+                      <button type="button" onclick="appendExecutionTag('execution_tag_filter', 'thin-liquidity')">thin-liquidity</button>
+                      <button type="button" onclick="appendExecutionTag('exclude_execution_tag_filter', 'gap-risk')">{'exclude gap-risk' if lang == 'en' else '排除 gap-risk'}</button>
+                      <button type="button" onclick="clearExecutionTags()">{'Clear Tags' if lang == 'en' else '清空标签'}</button>
+                    </div>
+                  </div>
+                  <datalist id="execution-tag-options">
+                    <option value="gap-risk"></option>
+                    <option value="earnings-soon"></option>
+                    <option value="thin-liquidity"></option>
+                  </datalist>
                 </div>
                 <button type="submit">{_lang_text(lang, 'run_screener')}</button>
               </form>
             </article>
             <article class="card">
-              <div class="rules-grid" style="margin-bottom:14px;">
-                <form class="stack" method="post" action="/screeners/save">
-                  <label class="muted">{_lang_text(lang, 'save_strategy')}</label>
-                  <input type="text" name="preset_name" placeholder="{_lang_text(lang, 'strategy_name')}" required />
+              <div class="eyebrow">{_lang_text(lang, 'risk_overview')}</div>
+              <div class="rules-grid">
+                <div class="detail-card" style="background:#f9f7f0;">
+                  <div class="detail-label">{_lang_text(lang, 'tagged_names')}</div>
+                  <div style="font-size:28px;font-weight:800;margin:6px 0;">{tagged_names}</div>
+                  <div class="muted">{_lang_text(lang, 'risk_examples')}</div>
+                </div>
+                <div class="detail-card detail-card-wide" style="background:#f9f7f0;">
+                  <div class="detail-label">{_lang_text(lang, 'common_risks')}</div>
+                  <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
+                    {risk_top_tags_html}
+                  </div>
+                  <div class="muted">{_lang_text(lang, 'risk_examples')}: {risk_examples_html}</div>
+                </div>
+              </div>
+            </article>
+            <article class="card">
+              <div class="action-grid" style="margin-bottom:14px;">
+                <form class="action-form" method="post" action="/screeners/save">
+                  <div class="action-head">
+                    <div>
+                      <div class="action-kicker">{'Strategy' if lang == 'en' else '策略'}</div>
+                      <div class="action-title">{_lang_text(lang, 'save_strategy')}</div>
+                    </div>
+                    <span class="action-icon">SAVE</span>
+                  </div>
+                  <div class="action-row">
+                    <label class="action-label">{_lang_text(lang, 'strategy_name')}</label>
+                    <div class="action-input-wrap">
+                      <input type="text" name="preset_name" placeholder="{_lang_text(lang, 'strategy_name')}" required />
+                    </div>
+                  </div>
                   {hidden_fields}
-                  <button type="submit">{_lang_text(lang, 'save_as_strategy')}</button>
+                  <div class="action-submit">
+                    <button type="submit">{_lang_text(lang, 'save_as_strategy')}</button>
+                  </div>
                 </form>
-                <form class="stack" method="get" action="/screeners/export">
-                  <label class="muted">{_lang_text(lang, 'export_csv')}</label>
+                <form class="action-form" method="post" action="/screeners/add-all-to-watchlist">
+                  <div class="action-head">
+                    <div>
+                      <div class="action-kicker">{'Watchlist' if lang == 'en' else '自选股'}</div>
+                      <div class="action-title">{_lang_text(lang, 'add_current_results')}</div>
+                    </div>
+                    <span class="action-icon">LIST</span>
+                  </div>
                   {hidden_fields}
-                  <button type="submit">{_lang_text(lang, 'export_csv')}</button>
-                </form>
-                <form class="stack" method="post" action="/screeners/add-all-to-watchlist">
-                  <label class="muted">{_lang_text(lang, 'only_add_top_n')}</label>
-                  {hidden_fields}
-                  <input type="number" name="bulk_top_n" min="0" value="0" />
-                  <label style="display:flex;align-items:center;gap:8px;" class="muted">
+                  <div class="action-row">
+                    <label class="action-label">{_lang_text(lang, 'only_add_top_n')}</label>
+                    <div class="action-input-wrap">
+                      <input type="number" name="bulk_top_n" min="0" value="0" />
+                    </div>
+                  </div>
+                  <label class="action-checkbox">
                     <input type="checkbox" name="auto_enable_sync" value="1" />
                     {_lang_text(lang, 'auto_enable_sync')}
                   </label>
-                  <button type="submit" {bulk_add_disabled}>{bulk_add_label}</button>
+                  <div class="action-submit">
+                    <button type="submit" {bulk_add_disabled}>{bulk_add_label}</button>
+                  </div>
                 </form>
-                <form class="stack" method="post" action="/screeners/sync-top-results">
-                  <label class="muted">{_lang_text(lang, 'sync_top_n_help')}</label>
+                <form class="action-form" method="post" action="/screeners/add-to-focus">
+                  <div class="action-head">
+                    <div>
+                      <div class="action-kicker">{'Focus' if lang == 'en' else '盯盘池'}</div>
+                      <div class="action-title">{_lang_text(lang, 'add_current_results_to_focus')}</div>
+                    </div>
+                    <span class="action-icon">FOCUS</span>
+                  </div>
                   {hidden_fields}
-                  <input type="number" name="sync_top_n" min="0" value="5" />
-                  <button type="submit">{_lang_text(lang, 'sync_top_n_now')}</button>
+                  <div class="action-row">
+                    <label class="action-label">{_lang_text(lang, 'focus_top_n')}</label>
+                    <div class="action-input-wrap">
+                      <input type="number" name="focus_top_n" min="0" value="10" />
+                    </div>
+                  </div>
+                  <div class="action-submit">
+                    <button type="submit" {bulk_add_disabled}>{_lang_text(lang, 'add_current_results_to_focus')}</button>
+                  </div>
+                </form>
+                <form class="action-form" method="post" action="/screeners/sync-top-results">
+                  <div class="action-head">
+                    <div>
+                      <div class="action-kicker">{'Sync' if lang == 'en' else '同步'}</div>
+                      <div class="action-title">{_lang_text(lang, 'sync_top_n_now')}</div>
+                    </div>
+                    <span class="action-icon">SYNC</span>
+                  </div>
+                  {hidden_fields}
+                  <div class="action-row">
+                    <label class="action-label">{_lang_text(lang, 'sync_top_n_help')}</label>
+                    <div class="action-input-wrap">
+                      <input type="number" name="sync_top_n" min="0" value="5" />
+                    </div>
+                  </div>
+                  <div class="action-submit">
+                    <button type="submit">{_lang_text(lang, 'sync_top_n_now')}</button>
+                  </div>
                 </form>
               </div>
               <div class="eyebrow">{_lang_text(lang, 'results')}</div>
-              <div class="muted" style="margin-bottom:12px;">{len(results)} {_lang_text(lang, 'stocks_matched')}</div>
+              <div class="results-toolbar">
+                <div class="muted">{len(results)} {_lang_text(lang, 'stocks_matched')}</div>
+                <form method="get" action="/screeners/export">
+                  {hidden_fields}
+                  <button type="submit">{_lang_text(lang, 'export_csv')}</button>
+                </form>
+              </div>
               <div class="table-wrap">
                 <table>
                   <thead>
-                    <tr><th class='sticky-col sticky-col-1'>{header_link(_lang_text(lang, 'ticker'), 'ticker')}</th><th class='sticky-col sticky-col-2'>{_lang_text(lang, 'name')}</th><th>{_lang_text(lang, 'market')}</th><th>{header_link(_lang_text(lang, 'trend'), 'trend_score')}</th><th>{_lang_text(lang, 'action')}</th><th>{header_link(_lang_text(lang, 'close'), 'latest_close')}</th><th>{_lang_text(lang, 'model')}</th><th>{header_link(_lang_text(lang, 'watchlist'), 'watchlist_state')}</th><th>{header_link('5D %', 'momentum_5')}</th><th>{header_link('20D %', 'momentum_20')}</th><th>{header_link('Volume', 'volume_ratio')}</th><th>{header_link('PE', 'pe_ttm')}</th><th>{header_link('ROE 3Y', 'roe_avg_3y')}</th><th>{header_link('Profit YoY', 'net_profit_yoy')}</th><th>{header_link('Dividend %', 'dividend_yield')}</th><th>{header_link('Breakout %', 'distance_to_breakout_pct')}</th><th>{_lang_text(lang, 'insight')}</th></tr>
+                    <tr><th class='sticky-col sticky-col-1'>{header_link(_lang_text(lang, 'ticker'), 'ticker')}</th><th class='sticky-col sticky-col-2'>{_lang_text(lang, 'name')}</th><th>{_lang_text(lang, 'market')}</th><th>{header_link(_lang_text(lang, 'trend'), 'trend_score')}</th><th>{_lang_text(lang, 'action')}</th><th>{header_link(_lang_text(lang, 'close'), 'latest_close')}</th><th>{header_link(_lang_text(lang, 'model'), 'model_signal_strength')}</th><th>{header_link(_lang_text(lang, 'watchlist'), 'watchlist_state')}</th><th>{header_link('Hits', 'snapshot_hits')}</th><th>{header_link('5D %', 'momentum_5')}</th><th>{header_link('20D %', 'momentum_20')}</th><th>{header_link('Volume', 'volume_ratio')}</th><th>{header_link('PE', 'pe_ttm')}</th><th>{header_link('ROE 3Y', 'roe_avg_3y')}</th><th>{header_link('Profit YoY', 'net_profit_yoy')}</th><th>{header_link('Dividend %', 'dividend_yield')}</th><th>{header_link('Breakout %', 'distance_to_breakout_pct')}</th><th>{_lang_text(lang, 'insight')}</th></tr>
                   </thead>
                   <tbody>{rows}</tbody>
                 </table>
@@ -1202,6 +1848,30 @@ def screener_page(
             </table>
           </section>
         </main>
+        <script>
+          function appendExecutionTag(inputName, tag) {{
+            const form = document.querySelector('form[action="/screeners"]');
+            if (!form) return;
+            const input = form.querySelector(`input[name="${{inputName}}"]`);
+            if (!input) return;
+            const values = input.value.split(",").map((item) => item.trim()).filter(Boolean);
+            if (!values.includes(tag)) {{
+              values.push(tag);
+            }}
+            input.value = values.join(", ");
+            input.focus();
+          }}
+
+          function clearExecutionTags() {{
+            const form = document.querySelector('form[action="/screeners"]');
+            if (!form) return;
+            const includeInput = form.querySelector('input[name="execution_tag_filter"]');
+            const excludeInput = form.querySelector('input[name="exclude_execution_tag_filter"]');
+            if (includeInput) includeInput.value = "";
+            if (excludeInput) excludeInput.value = "";
+            if (includeInput) includeInput.focus();
+          }}
+        </script>
       </body>
     </html>
     """
@@ -1227,6 +1897,12 @@ def save_screener_preset(
     max_debt_to_assets: float = Form(100.0),
     min_dividend_yield: float = Form(0.0),
     exclude_bottom_market_cap_pct: float = Form(10.0),
+    recent_snapshot_runs: int = Form(0),
+    min_snapshot_hits: int = Form(0),
+    model_signal_filter: str = Form("ALL"),
+    min_model_signal_strength: float = Form(0.0),
+    execution_tag_filter: str = Form("ALL"),
+    exclude_execution_tag_filter: str = Form("ALL"),
     sort_by: str = Form("default"),
     sort_order: str = Form("desc"),
     db: Session = Depends(get_db_session),
@@ -1250,6 +1926,12 @@ def save_screener_preset(
         max_debt_to_assets=max_debt_to_assets,
         min_dividend_yield=min_dividend_yield,
         exclude_bottom_market_cap_pct=exclude_bottom_market_cap_pct,
+        recent_snapshot_runs=recent_snapshot_runs,
+        min_snapshot_hits=min_snapshot_hits,
+        model_signal_filter=model_signal_filter,
+        min_model_signal_strength=min_model_signal_strength,
+        execution_tag_filter=execution_tag_filter,
+        exclude_execution_tag_filter=exclude_execution_tag_filter,
         sort_by=sort_by,
         sort_order=sort_order,
     )
@@ -1299,6 +1981,12 @@ def export_screener_csv(
     max_debt_to_assets: float = Query(100.0),
     min_dividend_yield: float = Query(0.0),
     exclude_bottom_market_cap_pct: float = Query(10.0),
+    recent_snapshot_runs: int = Query(0),
+    min_snapshot_hits: int = Query(0),
+    model_signal_filter: str = Query("ALL"),
+    min_model_signal_strength: float = Query(0.0),
+    execution_tag_filter: str = Query("ALL"),
+    exclude_execution_tag_filter: str = Query("ALL"),
     sort_by: str = Query("default"),
     sort_order: str = Query("desc"),
 ) -> Response:
@@ -1321,6 +2009,12 @@ def export_screener_csv(
         max_debt_to_assets=max_debt_to_assets,
         min_dividend_yield=min_dividend_yield,
         exclude_bottom_market_cap_pct=exclude_bottom_market_cap_pct,
+        recent_snapshot_runs=recent_snapshot_runs,
+        min_snapshot_hits=min_snapshot_hits,
+        model_signal_filter=model_signal_filter,
+        min_model_signal_strength=min_model_signal_strength,
+        execution_tag_filter=execution_tag_filter,
+        exclude_execution_tag_filter=exclude_execution_tag_filter,
         sort_by=sort_by,
         sort_order=sort_order,
     )
@@ -1335,6 +2029,16 @@ def export_screener_csv(
             "trend_score",
             "action_label",
             "latest_close",
+            "model_signal_label",
+            "model_signal_strength",
+            "model_conviction_bucket",
+            "model_position_size_hint",
+            "model_entry_style",
+            "model_execution_tags",
+            "model_percentile",
+            "model_horizon_days",
+            "model_reward_risk_ratio",
+            "model_expected_drawdown_20d",
             "momentum_5",
             "momentum_20",
             "volume_ratio",
@@ -1344,12 +2048,15 @@ def export_screener_csv(
             "revenue_yoy",
             "dividend_yield",
             "debt_to_assets",
+            "snapshot_hits",
             "selection_reason",
         ],
     )
     writer.writeheader()
     for item in results:
-        writer.writerow({key: item.get(key) for key in writer.fieldnames})
+        row = {key: item.get(key) for key in writer.fieldnames}
+        row["model_execution_tags"] = ";".join(item.get("model_execution_tags") or [])
+        writer.writerow(row)
     filename = f"{model_template}_screener.csv"
     return Response(
         content=buffer.getvalue(),
@@ -1380,6 +2087,12 @@ def add_screener_result_to_watchlist(
     max_debt_to_assets: float = Form(100.0),
     min_dividend_yield: float = Form(0.0),
     exclude_bottom_market_cap_pct: float = Form(10.0),
+    recent_snapshot_runs: int = Form(0),
+    min_snapshot_hits: int = Form(0),
+    model_signal_filter: str = Form("ALL"),
+    min_model_signal_strength: float = Form(0.0),
+    execution_tag_filter: str = Form("ALL"),
+    exclude_execution_tag_filter: str = Form("ALL"),
     sort_by: str = Form("default"),
     sort_order: str = Form("desc"),
     db: Session = Depends(get_db_session),
@@ -1414,6 +2127,12 @@ def add_screener_result_to_watchlist(
         max_debt_to_assets=max_debt_to_assets,
         min_dividend_yield=min_dividend_yield,
         exclude_bottom_market_cap_pct=exclude_bottom_market_cap_pct,
+        recent_snapshot_runs=recent_snapshot_runs,
+        min_snapshot_hits=min_snapshot_hits,
+        model_signal_filter=model_signal_filter,
+        min_model_signal_strength=min_model_signal_strength,
+        execution_tag_filter=execution_tag_filter,
+        exclude_execution_tag_filter=exclude_execution_tag_filter,
         sort_by=sort_by,
         sort_order=sort_order,
     )
@@ -1442,6 +2161,12 @@ def add_all_screener_results_to_watchlist(
     max_debt_to_assets: float = Form(100.0),
     min_dividend_yield: float = Form(0.0),
     exclude_bottom_market_cap_pct: float = Form(10.0),
+    recent_snapshot_runs: int = Form(0),
+    min_snapshot_hits: int = Form(0),
+    model_signal_filter: str = Form("ALL"),
+    min_model_signal_strength: float = Form(0.0),
+    execution_tag_filter: str = Form("ALL"),
+    exclude_execution_tag_filter: str = Form("ALL"),
     sort_by: str = Form("default"),
     sort_order: str = Form("desc"),
     bulk_top_n: int = Form(0),
@@ -1467,6 +2192,12 @@ def add_all_screener_results_to_watchlist(
         max_debt_to_assets=max_debt_to_assets,
         min_dividend_yield=min_dividend_yield,
         exclude_bottom_market_cap_pct=exclude_bottom_market_cap_pct,
+        recent_snapshot_runs=recent_snapshot_runs,
+        min_snapshot_hits=min_snapshot_hits,
+        model_signal_filter=model_signal_filter,
+        min_model_signal_strength=min_model_signal_strength,
+        execution_tag_filter=execution_tag_filter,
+        exclude_execution_tag_filter=exclude_execution_tag_filter,
         sort_by=sort_by,
         sort_order=sort_order,
     )
@@ -1511,6 +2242,12 @@ def sync_screener_symbol(
     max_debt_to_assets: float = Form(100.0),
     min_dividend_yield: float = Form(0.0),
     exclude_bottom_market_cap_pct: float = Form(10.0),
+    recent_snapshot_runs: int = Form(0),
+    min_snapshot_hits: int = Form(0),
+    model_signal_filter: str = Form("ALL"),
+    min_model_signal_strength: float = Form(0.0),
+    execution_tag_filter: str = Form("ALL"),
+    exclude_execution_tag_filter: str = Form("ALL"),
     sort_by: str = Form("default"),
     sort_order: str = Form("desc"),
     db: Session = Depends(get_db_session),
@@ -1545,6 +2282,12 @@ def sync_screener_symbol(
         max_debt_to_assets=max_debt_to_assets,
         min_dividend_yield=min_dividend_yield,
         exclude_bottom_market_cap_pct=exclude_bottom_market_cap_pct,
+        recent_snapshot_runs=recent_snapshot_runs,
+        min_snapshot_hits=min_snapshot_hits,
+        model_signal_filter=model_signal_filter,
+        min_model_signal_strength=min_model_signal_strength,
+        execution_tag_filter=execution_tag_filter,
+        exclude_execution_tag_filter=exclude_execution_tag_filter,
         sort_by=sort_by,
         sort_order=sort_order,
     )
@@ -1573,6 +2316,12 @@ def sync_top_screener_results(
     max_debt_to_assets: float = Form(100.0),
     min_dividend_yield: float = Form(0.0),
     exclude_bottom_market_cap_pct: float = Form(10.0),
+    recent_snapshot_runs: int = Form(0),
+    min_snapshot_hits: int = Form(0),
+    model_signal_filter: str = Form("ALL"),
+    min_model_signal_strength: float = Form(0.0),
+    execution_tag_filter: str = Form("ALL"),
+    exclude_execution_tag_filter: str = Form("ALL"),
     sort_by: str = Form("default"),
     sort_order: str = Form("desc"),
     sync_top_n: int = Form(5),
@@ -1597,6 +2346,12 @@ def sync_top_screener_results(
         max_debt_to_assets=max_debt_to_assets,
         min_dividend_yield=min_dividend_yield,
         exclude_bottom_market_cap_pct=exclude_bottom_market_cap_pct,
+        recent_snapshot_runs=recent_snapshot_runs,
+        min_snapshot_hits=min_snapshot_hits,
+        model_signal_filter=model_signal_filter,
+        min_model_signal_strength=min_model_signal_strength,
+        execution_tag_filter=execution_tag_filter,
+        exclude_execution_tag_filter=exclude_execution_tag_filter,
         sort_by=sort_by,
         sort_order=sort_order,
     )
@@ -1613,5 +2368,280 @@ def sync_top_screener_results(
     success_count = sum(1 for item in sync_results if item["status"] == "success")
     return RedirectResponse(
         url=f"{_build_screen_query(params)}&message={urlencode({'m': f'Synced {success_count}/{len(sync_results)} screener results'})[2:]}",
+        status_code=303,
+    )
+
+
+@router.post("/add-to-focus")
+def add_all_screener_results_to_focus(
+    request: Request,
+    lang: str = Form("en"),
+    model_template: str = Form("technical_momentum"),
+    universe: str = Form("watchlist"),
+    market: str = Form("ALL"),
+    min_trend_score: int = Form(60),
+    action_filter: str = Form("ALL"),
+    min_volume_ratio: float = Form(0.0),
+    min_listing_days: int = Form(365),
+    pe_min: float = Form(0.0),
+    pe_max: float = Form(30.0),
+    min_roe_avg_3y: float = Form(12.0),
+    min_net_profit_yoy: float = Form(20.0),
+    min_revenue_yoy: float = Form(0.0),
+    max_debt_to_assets: float = Form(100.0),
+    min_dividend_yield: float = Form(0.0),
+    exclude_bottom_market_cap_pct: float = Form(10.0),
+    recent_snapshot_runs: int = Form(0),
+    min_snapshot_hits: int = Form(0),
+    model_signal_filter: str = Form("ALL"),
+    min_model_signal_strength: float = Form(0.0),
+    execution_tag_filter: str = Form("ALL"),
+    exclude_execution_tag_filter: str = Form("ALL"),
+    sort_by: str = Form("default"),
+    sort_order: str = Form("desc"),
+    focus_top_n: int = Form(10),
+) -> RedirectResponse:
+    if not is_authenticated(request):
+        return login_redirect("/screeners")
+    params = _current_params(
+        lang=lang,
+        model_template=model_template,
+        universe=universe,
+        market=market,
+        min_trend_score=min_trend_score,
+        action_filter=action_filter,
+        min_volume_ratio=min_volume_ratio,
+        min_listing_days=min_listing_days,
+        pe_min=pe_min,
+        pe_max=pe_max,
+        min_roe_avg_3y=min_roe_avg_3y,
+        min_net_profit_yoy=min_net_profit_yoy,
+        min_revenue_yoy=min_revenue_yoy,
+        max_debt_to_assets=max_debt_to_assets,
+        min_dividend_yield=min_dividend_yield,
+        exclude_bottom_market_cap_pct=exclude_bottom_market_cap_pct,
+        recent_snapshot_runs=recent_snapshot_runs,
+        min_snapshot_hits=min_snapshot_hits,
+        model_signal_filter=model_signal_filter,
+        min_model_signal_strength=min_model_signal_strength,
+        execution_tag_filter=execution_tag_filter,
+        exclude_execution_tag_filter=exclude_execution_tag_filter,
+        sort_by=sort_by,
+        sort_order=sort_order,
+    )
+    result = add_to_today_focus_pool(_run_screen(ScreenerService(), params), top_n=focus_top_n)
+    message = (
+        f"Added {result['added']} stock(s) to today focus pool"
+        if lang == "en"
+        else f"已将 {result['added']} 只股票加入今日重点盯盘池"
+    )
+    return RedirectResponse(
+        url=f"{_build_screen_query(params)}&message={urlencode({'m': message})[2:]}",
+        status_code=303,
+    )
+
+
+@router.get("/focus/today", response_class=HTMLResponse)
+def today_focus_pool_page(request: Request, lang: str = Query("en"), db: Session = Depends(get_db_session)) -> str:
+    if not is_authenticated(request):
+        return login_redirect("/screeners/focus/today")
+
+    watchlist_repo = WatchlistRepository(db)
+    watchlist = watchlist_repo.get_or_create_default()
+    watchlist_map = watchlist_repo.list_ticker_map(watchlist.id)
+    items = enrich_focus_pool_with_symbols(load_today_focus_pool())
+    item_rows = []
+    for item in items:
+        ticker = str(item.get("ticker") or "").upper()
+        existing = watchlist_map.get(ticker)
+        patterns = " / ".join(item.get("matched_patterns") or []) or "-"
+        item_rows.append(
+            "<tr>"
+            f"<td><a href='/insights/{ticker}?lang={lang}'>{ticker}</a></td>"
+            f"<td>{item.get('name') or ticker}</td>"
+            f"<td>{item.get('market') or '-'}</td>"
+            f"<td>{patterns}</td>"
+            f"<td>{item.get('model_signal_label') or '-'}</td>"
+            f"<td>{item.get('model_signal_strength') or '-'}</td>"
+            f"<td>{_watchlist_summary(existing, lang) if existing else '-'}</td>"
+            f"<td>{_sync_status_badge(existing, lang)}</td>"
+            f"<td><a class='main-open-link' href='/insights/{ticker}?lang={lang}'>{_lang_text(lang, 'open_insight')}</a></td>"
+            "</tr>"
+        )
+    item_rows_html = "".join(item_rows) or f"<tr><td colspan='9'>{_lang_text(lang, 'no_match')}</td></tr>"
+    return f"""
+    <!DOCTYPE html>
+    <html lang="{lang}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{_lang_text(lang, 'today_focus_pool')}</title>
+        <style>
+          body {{ margin: 0; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:#1f2937; background:#f5efe2; }}
+          .wrap {{ max-width:1080px; margin:0 auto; padding:28px 20px 56px; }}
+          .toolbar {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }}
+          .toolbar a {{ color:#0f766e; text-decoration:none; font-weight:700; }}
+          .card {{ background:#fffdf7; border:1px solid #d6cfc2; border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); margin-bottom:16px; }}
+          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:#dff5ef; color:#0f766e; font-size:12px; font-weight:700; text-transform:uppercase; margin-bottom:12px; }}
+          .table-wrap {{ overflow-x:auto; border-radius:14px; border:1px solid #d6cfc2; background:#fff; }}
+          table {{ width:100%; border-collapse:collapse; min-width:980px; }}
+          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid #d6cfc2; white-space:nowrap; }}
+          th {{ color:#6b7280; font-weight:700; }}
+          .main-open-link {{ display:inline-flex; align-items:center; justify-content:center; padding:6px 9px; border-radius:999px; background:#eef8f5; color:#0f766e; text-decoration:none; font-weight:800; font-size:12px; }}
+        </style>
+      </head>
+      <body>
+        <main class="wrap">
+          <div class="toolbar">
+            <a href="/screeners?lang={lang}">← {_lang_text(lang, 'quant_screener')}</a>
+            <a href="/watchlist?lang={lang}">{_lang_text(lang, 'open_watchlist')}</a>
+          </div>
+          <div class="card">
+            <div class="eyebrow">{_lang_text(lang, 'today_focus_pool')}</div>
+            <h1 style="margin:0 0 8px;">{_lang_text(lang, 'today_focus_pool')}</h1>
+            <p style="margin:0;color:#6b7280;">{'A holding area for the names you want to study first today.' if lang == 'en' else '把最值得优先盯盘和复盘的股票，先放进今天的重点池。'}</p>
+          </div>
+          <div class="card">
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>{_lang_text(lang, 'ticker')}</th>
+                    <th>{_lang_text(lang, 'name')}</th>
+                    <th>{_lang_text(lang, 'market')}</th>
+                    <th>{_lang_text(lang, 'pattern_hits')}</th>
+                    <th>{_lang_text(lang, 'model_signal_filter')}</th>
+                    <th>{_lang_text(lang, 'min_model_signal_strength')}</th>
+                    <th>{_lang_text(lang, 'watchlist')}</th>
+                    <th>{_lang_text(lang, 'last_sync')}</th>
+                    <th>{_lang_text(lang, 'insight')}</th>
+                  </tr>
+                </thead>
+                <tbody>{item_rows_html}</tbody>
+              </table>
+            </div>
+          </div>
+        </main>
+      </body>
+    </html>
+    """
+
+
+@router.get("/market-snapshot", response_class=HTMLResponse)
+def market_snapshot_page(
+    request: Request,
+    lang: str = Query("en"),
+    mode: str = Query("monitor"),
+    message: str | None = Query(None),
+    db: Session = Depends(get_db_session),
+) -> str:
+    if not is_authenticated(request):
+        return login_redirect("/screeners/market-snapshot")
+
+    watchlist_repo = WatchlistRepository(db)
+    watchlist = watchlist_repo.get_or_create_default()
+    watchlist_map = watchlist_repo.list_ticker_map(watchlist.id)
+    view_mode = (mode or "monitor").strip().lower()
+    if view_mode not in {"premarket", "monitor", "postmarket"}:
+        view_mode = "monitor"
+    boards = ScreenerService().build_market_snapshot(market="CN", limit_per_board=10, mode=view_mode)
+    sentiment = build_market_sentiment_snapshot(boards=boards)
+    sentiment_chip = _signal_chip("Market", sentiment.get("sentiment") or "neutral")
+    sentiment_summary = (
+        f"Avg score {sentiment.get('average_snapshot_score', '-')} | "
+        f"Bullish boards {sentiment.get('bullish_boards', '-')} | "
+        f"Candidates {sentiment.get('total_candidates', '-')}"
+    )
+    board_html = []
+    for board in boards:
+        title = board["title_zh"] if lang == "zh" else board["title_en"]
+        description = board["description_zh"] if lang == "zh" else board["description_en"]
+        board_html.append(
+            "<section class='card'>"
+            f"<div class='eyebrow'>{_lang_text(lang, 'market_snapshot')}</div>"
+            f"<h2 style='margin:0 0 8px;'>{title}</h2>"
+            f"<p style='margin:0 0 14px;color:#6b7280;'>{description}</p>"
+            f"{_market_snapshot_table(board.get('rows') or [], watchlist_map, lang)}"
+            "</section>"
+        )
+    return f"""
+    <!DOCTYPE html>
+    <html lang="{lang}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{_lang_text(lang, 'market_snapshot')}</title>
+        <style>
+          body {{ margin: 0; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:#1f2937; background:#f5efe2; }}
+          .wrap {{ max-width:1200px; margin:0 auto; padding:28px 20px 56px; }}
+          .toolbar {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }}
+          .toolbar a {{ color:#0f766e; text-decoration:none; font-weight:700; }}
+          .card {{ background:#fffdf7; border:1px solid #d6cfc2; border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); margin-bottom:16px; }}
+          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:#dff5ef; color:#0f766e; font-size:12px; font-weight:700; text-transform:uppercase; margin-bottom:12px; }}
+          .table-wrap {{ overflow-x:auto; border-radius:14px; border:1px solid #d6cfc2; background:#fff; }}
+          table {{ width:100%; border-collapse:collapse; min-width:1080px; }}
+          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid #d6cfc2; vertical-align:top; }}
+          th {{ color:#6b7280; font-weight:700; white-space:nowrap; }}
+          .main-open-link {{ display:inline-flex; align-items:center; justify-content:center; padding:6px 9px; border-radius:999px; background:#eef8f5; color:#0f766e; text-decoration:none; font-weight:800; font-size:12px; white-space:nowrap; }}
+          .muted {{ color:#6b7280; }}
+        </style>
+      </head>
+      <body>
+        <main class="wrap">
+          <div class="toolbar">
+            <a href="/screeners?lang={lang}">← {_lang_text(lang, 'quant_screener')}</a>
+            <a href="/screeners/focus/today?lang={lang}">{_lang_text(lang, 'today_focus_pool')}</a>
+            <a href="/watchlist?lang={lang}">{_lang_text(lang, 'open_watchlist')}</a>
+          </div>
+          <div class="card">
+            <div class="eyebrow">{_lang_text(lang, 'market_snapshot')}</div>
+            <h1 style="margin:0 0 8px;">{_lang_text(lang, 'market_snapshot')}</h1>
+            <p style="margin:0;color:#6b7280;">{'A compact trading board for today’s strongest local setups.' if lang == 'en' else '把今天最值得先看的强势、收口、连阳、放量候选股集中成一个快照页。'}</p>
+            <div style="margin-top:14px;">
+              <div class="muted" style="margin-bottom:8px;">{_lang_text(lang, 'view_mode')}</div>
+              {_mode_switch_html('/screeners/market-snapshot', view_mode, lang)}
+            </div>
+          </div>
+          <div class="card">
+            <div class="eyebrow">{_lang_text(lang, 'market_sentiment')}</div>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">{sentiment_chip}</div>
+            <p style="margin:12px 0 0;color:#6b7280;">{sentiment_summary}</p>
+          </div>
+          {_banner_html(message, lang)}
+          {''.join(board_html)}
+        </main>
+      </body>
+    </html>
+    """
+
+
+@router.post("/market-snapshot/add-to-focus")
+def add_market_snapshot_ticker_to_focus(
+    request: Request,
+    lang: str = Form("en"),
+    ticker: str = Form(...),
+    name: str = Form(""),
+    market: str = Form("CN"),
+    selection_reason: str = Form(""),
+    matched_patterns: str = Form(""),
+) -> RedirectResponse:
+    if not is_authenticated(request):
+        return login_redirect("/screeners/market-snapshot")
+
+    patterns = [item.strip() for item in str(matched_patterns or "").split("/") if item.strip()]
+    add_to_today_focus_pool(
+        [
+            {
+                "ticker": str(ticker).strip().upper(),
+                "name": name or str(ticker).strip().upper(),
+                "market": market or "CN",
+                "selection_reason": selection_reason or "",
+                "matched_patterns": patterns,
+            }
+        ]
+    )
+    message = _lang_text(lang, "added_to_focus_message").format(ticker=str(ticker).strip().upper())
+    return RedirectResponse(
+        url=f"/screeners/market-snapshot?{urlencode({'lang': lang, 'message': message})}",
         status_code=303,
     )

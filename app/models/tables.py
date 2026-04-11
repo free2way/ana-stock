@@ -87,6 +87,78 @@ class PredictionExplanation(Base):
     prediction: Mapped[Prediction] = relationship()
 
 
+class PredictionDetail(Base):
+    __tablename__ = "prediction_details"
+    __table_args__ = (UniqueConstraint("prediction_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    prediction_id: Mapped[int] = mapped_column(ForeignKey("predictions.id"), nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bullish_prob: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bearish_prob: Mapped[float | None] = mapped_column(Float, nullable=True)
+    expected_return_5d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    expected_return_20d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    expected_drawdown_20d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    model_reward_risk_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    risk_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    target_horizon_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    universe_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    percentile: Mapped[float | None] = mapped_column(Float, nullable=True)
+    regime_label: Mapped[str | None] = mapped_column(Text, nullable=True)
+    conviction_bucket: Mapped[str | None] = mapped_column(Text, nullable=True)
+    position_size_hint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    entry_style: Mapped[str | None] = mapped_column(Text, nullable=True)
+    signal_label: Mapped[str | None] = mapped_column(Text, nullable=True)
+    signal_strength: Mapped[float | None] = mapped_column(Float, nullable=True)
+    summary_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+    prediction: Mapped[Prediction] = relationship()
+
+
+class ModelChartSignal(Base):
+    __tablename__ = "model_chart_signals"
+    __table_args__ = (UniqueConstraint("model_run_id", "symbol_id", "trade_date"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    model_run_id: Mapped[int] = mapped_column(ForeignKey("model_runs.id"), nullable=False)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"), nullable=False)
+    trade_date: Mapped[str] = mapped_column(Text, nullable=False)
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rank_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    signal_label: Mapped[str | None] = mapped_column(Text, nullable=True)
+    signal_strength: Mapped[float | None] = mapped_column(Float, nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+    model_run: Mapped[ModelRun] = relationship()
+    symbol: Mapped[Symbol] = relationship()
+
+
+class PredictionTradePlan(Base):
+    __tablename__ = "prediction_trade_plans"
+    __table_args__ = (UniqueConstraint("prediction_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    prediction_id: Mapped[int] = mapped_column(ForeignKey("predictions.id"), nullable=False)
+    entry_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    breakout_level: Mapped[float | None] = mapped_column(Float, nullable=True)
+    take_profit_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    take_profit_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    risk_level: Mapped[float | None] = mapped_column(Float, nullable=True)
+    support_level: Mapped[float | None] = mapped_column(Float, nullable=True)
+    resistance_level: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stop_type: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trailing_stop_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    invalidation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    execution_tags_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+    prediction: Mapped[Prediction] = relationship()
+
+
 class StrategyRun(Base):
     __tablename__ = "strategy_runs"
 
@@ -180,6 +252,44 @@ class FundamentalSnapshot(Base):
     revenue_yoy: Mapped[float | None] = mapped_column(Float, nullable=True)
     debt_to_assets: Mapped[float | None] = mapped_column(Float, nullable=True)
     data_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+    symbol: Mapped[Symbol] = relationship()
+
+
+class ConceptSnapshot(Base):
+    __tablename__ = "concept_snapshots"
+    __table_args__ = (UniqueConstraint("symbol_id", "concept_name", "as_of_date", "source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"), nullable=False)
+    concept_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    concept_name: Mapped[str] = mapped_column(Text, nullable=False)
+    as_of_date: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    strength: Mapped[float | None] = mapped_column(Float, nullable=True)
+    data_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+    symbol: Mapped[Symbol] = relationship()
+
+
+class TechnicalSnapshot(Base):
+    __tablename__ = "technical_snapshots"
+    __table_args__ = (UniqueConstraint("symbol_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"), nullable=False)
+    as_of_date: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    limit_up_yesterday: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    volume_breakout: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    ma_cluster: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    bullish_ma_stack: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    macd_underwater_cross: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    matched_patterns_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[str] = mapped_column(Text, nullable=False)
 

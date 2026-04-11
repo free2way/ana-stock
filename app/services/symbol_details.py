@@ -21,7 +21,7 @@ class SymbolDataService:
 
     def _candidate_paths(self, ticker: str) -> list[Path]:
         upper = ticker.upper()
-        market = "HK" if upper.endswith(".HK") else "CN" if upper.endswith((".SS", ".SZ", ".SH")) else None
+        market = "HK" if upper.endswith(".HK") else "CN" if upper.endswith((".SS", ".SZ", ".SH", ".BJ")) else None
         candidates = market_ticker_candidates(upper, market) if market else [upper]
 
         paths: list[Path] = []

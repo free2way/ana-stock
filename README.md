@@ -75,6 +75,55 @@ python3 -m venv .venv
 http://127.0.0.1:8000/dashboard
 ```
 
+## PostgreSQL Migration Prep
+
+The app still defaults to SQLite, but it now also supports a PostgreSQL-style `PQW_DATABASE_URL`.
+
+1. Install PostgreSQL and create a database/user.
+
+```bash
+brew install postgresql@17
+brew services start postgresql@17
+createuser ana_user --pwprompt
+createdb ana_prod -O ana_user
+```
+
+2. Configure the app to use PostgreSQL.
+
+```env
+PQW_DATABASE_URL=postgresql+psycopg://ana_user:your_password@127.0.0.1:5432/ana_prod
+```
+
+3. Copy the existing SQLite data into PostgreSQL.
+
+```bash
+.venv/bin/python scripts/migrate_database.py \
+  --source-url sqlite:////absolute/path/to/app.db \
+  --target-url postgresql+psycopg://ana_user:your_password@127.0.0.1:5432/ana_prod
+```
+
+Use `--truncate-target` if you want to overwrite an existing PostgreSQL copy.
+
+4. Validate the copy by comparing row counts table-by-table.
+
+```bash
+.venv/bin/python scripts/migrate_database.py \
+  --mode validate \
+  --source-url sqlite:////absolute/path/to/app.db \
+  --target-url postgresql+psycopg://ana_user:your_password@127.0.0.1:5432/ana_prod
+```
+
+5. Restart the app and smoke test:
+
+- `/dashboard`
+- `/watchlist`
+- `/dashboard/ai-daily-report`
+- `/dashboard/ops/jobs`
+
+For a production-style home-lab deployment on an internal Mac mini with external access through Cloudflare Tunnel, see:
+
+- `docs/macmini-cloudflare-tunnel.md`
+
 ## Run With Docker
 
 Start the app with Docker Compose:
@@ -108,6 +157,142 @@ Install Qlib support if you want to build Qlib datasets:
 
 ```bash
 .venv/bin/pip install -r requirements-qlib.txt
+```
+
+If you already have Qlib-style prediction outputs and want to feed them into the app without changing the UI layer, you can import them directly:
+
+```bash
+.venv/bin/python scripts/import_qlib_predictions.py --csv path/to/predictions.csv --run-name qlib_demo
+```
+
+There is also a thin Qlib predictor bridge that validates the local Qlib dataset and can import a Qlib-style predictions CSV into the app:
+
+```bash
+.venv/bin/python scripts/run_qlib_predictor.py --run-name qlib_demo --predictions-csv path/to/predictions.csv
+```
+
+If your trained artifact directory already contains a native-style predictions export named `predictions.csv`, `predictions.json`, or `predictions.jsonl`, you can point the predictor at the artifact directory directly:
+
+```bash
+.venv/bin/python scripts/run_qlib_predictor.py --run-name qlib_demo --artifact-path path/to/qlib_artifact_dir
+```
+
+The artifact directory may also include an optional `manifest.json` with metadata such as:
+
+```json
+{
+  "run_name": "qlib_demo",
+  "market": "US",
+  "universe": "sp500",
+  "model_type": "qlib_native",
+  "target_horizon_days": 10
+}
+```
+
+If present, the manifest metadata will be merged into the imported model run context.
+
+If you prefer a structured payload instead of CSV, `predictions.json` is also accepted. It should contain a list of prediction objects, for example:
+
+```json
+[
+  {
+    "ticker": "AAPL",
+    "trade_date": "2026-04-03",
+    "score": 0.29,
+    "signal_label": "Buy",
+    "signal_strength": 72,
+    "summary_text": "Imported from structured Qlib JSON."
+  }
+]
+```
+
+Line-delimited JSON is also accepted as `predictions.jsonl`, with one prediction object per line.
+
+For a more native artifact contract, you can also provide a single `native_result.json` file that bundles predictions and companion outputs together:
+
+```json
+{
+  "manifest": {
+    "run_name": "qlib_native_bundle",
+    "market": "US",
+    "universe": "sp500"
+  },
+  "predictions": [
+    {
+      "ticker": "AAPL",
+      "trade_date": "2026-04-03",
+      "score": 0.29,
+      "signal_label": "Buy",
+      "signal_strength": 72
+    }
+  ],
+  "explanations": [
+    {
+      "ticker": "AAPL",
+      "trade_date": "2026-04-03",
+      "feature_name": "momentum_20",
+      "contribution": 0.18
+    }
+  ],
+  "chart_signals": [
+    {
+      "ticker": "AAPL",
+      "trade_date": "2026-04-02",
+      "signal_label": "Pullback",
+      "signal_strength": 68
+    }
+  ],
+  "trade_plan": [
+    {
+      "ticker": "AAPL",
+      "trade_date": "2026-04-03",
+      "entry_low": 188.0,
+      "entry_high": 190.0
+    }
+  ]
+}
+```
+
+You can also include an optional `explanations.csv` or `features.csv` in the same artifact directory to import feature contributions into the app's `prediction_explanations` layer. The expected columns are:
+
+```text
+ticker,trade_date,feature_name,feature_value,contribution,direction,display_order
+```
+
+You can also include an optional `chart_signals.csv` to control the historical buy/watch/sell markers drawn on the interactive insight chart. The expected columns are:
+
+```text
+ticker,trade_date,score,rank_value,signal_label,signal_strength,note
+```
+
+You can also include an optional `trade_plan.json` to override the insight page execution levels with model-provided values. The expected fields are:
+
+```json
+[
+  {
+    "ticker": "AAPL",
+    "trade_date": "2026-04-03",
+    "entry_low": 180.0,
+    "entry_high": 183.0,
+    "breakout_level": 188.0,
+    "take_profit_low": 194.0,
+    "take_profit_high": 198.0,
+    "risk_level": 176.5,
+    "support_level": 178.0,
+    "resistance_level": 188.0,
+    "stop_type": "trailing",
+    "trailing_stop_pct": 6.5,
+    "invalidation_reason": "Break below the post-breakout low.",
+    "execution_tags": ["gap-risk", "earnings-soon"],
+    "note": "Model-generated execution plan."
+  }
+]
+```
+
+To inspect the expected native Qlib output schema before wiring a real predictor, run:
+
+```bash
+.venv/bin/python scripts/run_qlib_predictor.py --run-name qlib_demo --print-schema
 ```
 
 Install TuShare Pro support if you want A-share fundamentals for multi-model screeners:
@@ -212,6 +397,7 @@ Job triggers:
 - `POST /jobs/build-dataset`
 - `POST /jobs/sync-cn-fundamentals`
 - `POST /jobs/train`
+- `POST /jobs/import-model-output`
 - `POST /jobs/backtest`
 - `POST /jobs/run-pipeline`
 

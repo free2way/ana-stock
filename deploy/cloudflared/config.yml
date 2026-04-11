@@ -1,0 +1,7 @@
+tunnel: 743d19a3-682c-4f71-b75f-e0f4d8b0086a 
+credentials-file: /Users/jackyhu/.cloudflared/743d19a3-682c-4f71-b75f-e0f4d8b0086a.json 
+
+ingress:
+  - hostname: quant.hujuntong.com
+    service: http://127.0.0.1:8000
+  - service: http_status:404
