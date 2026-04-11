@@ -1,6 +1,6 @@
 import json
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 
@@ -8,6 +8,7 @@ from app.core.db import get_db_session
 from app.models.schema import SymbolCreate, SymbolRead
 from app.services.analysis_fusion import safe_symbol_analysis
 from app.services.ai_analysis import AIAnalysisService
+from app.services.auth import is_authenticated, login_redirect
 from app.services.market_intelligence import build_symbol_decision_brief, build_symbol_news_sentiment_brief
 from app.services.market_news import MarketNewsService
 from app.services.model_signal_summary import build_signal_label, model_confidence
@@ -112,13 +113,17 @@ def _symbol_page_bundle(overview: dict, latest_signal: dict | None, *, headline_
 
 
 @router.get("", response_model=list[SymbolRead])
-def list_symbols(db: Session = Depends(get_db_session)) -> list[SymbolRead]:
+def list_symbols(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
     repo = SymbolRepository(db)
     return repo.list_symbols()
 
 
 @router.post("", response_model=SymbolRead)
-def create_symbol(payload: SymbolCreate, db: Session = Depends(get_db_session)) -> SymbolRead:
+def create_symbol(payload: SymbolCreate, request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
     repo = SymbolRepository(db)
     existing = repo.get_by_ticker(payload.ticker)
     if existing:
@@ -127,7 +132,9 @@ def create_symbol(payload: SymbolCreate, db: Session = Depends(get_db_session)) 
 
 
 @router.get("/{ticker}/overview")
-def symbol_overview(ticker: str, db: Session = Depends(get_db_session)) -> dict:
+def symbol_overview(ticker: str, request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect(f"/symbols/{ticker}")
     symbol_repo = SymbolRepository(db)
     sync_repo = PriceSyncStateRepository(db)
     prediction_repo = PredictionRepository(db)
@@ -148,7 +155,9 @@ def symbol_overview(ticker: str, db: Session = Depends(get_db_session)) -> dict:
 
 
 @router.get("/{ticker}/history")
-def symbol_history(ticker: str, limit: int = 120, db: Session = Depends(get_db_session)) -> list[dict]:
+def symbol_history(ticker: str, request: Request, limit: int = 120, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect(f"/symbols/{ticker}")
     symbol_repo = SymbolRepository(db)
     if symbol_repo.get_by_ticker(ticker) is None:
         raise HTTPException(status_code=404, detail="Ticker not found.")
@@ -160,10 +169,13 @@ def symbol_history(ticker: str, limit: int = 120, db: Session = Depends(get_db_s
 @router.get("/{ticker}/signals")
 def symbol_signals(
     ticker: str,
+    request: Request,
     limit: int = 120,
     latest_run_only: bool = True,
     db: Session = Depends(get_db_session),
-) -> list[dict]:
+) :
+    if not is_authenticated(request):
+        return login_redirect(f"/symbols/{ticker}")
     symbol_repo = SymbolRepository(db)
     if symbol_repo.get_by_ticker(ticker) is None:
         raise HTTPException(status_code=404, detail="Ticker not found.")
@@ -175,9 +187,12 @@ def symbol_signals(
 @router.get("/{ticker}/technical-rating")
 def symbol_technical_rating(
     ticker: str,
+    request: Request,
     interval: str = "1d",
     db: Session = Depends(get_db_session),
-) -> dict:
+):
+    if not is_authenticated(request):
+        return login_redirect(f"/symbols/{ticker}")
     symbol_repo = SymbolRepository(db)
     overview = symbol_repo.get_overview(ticker)
     if overview is None:
@@ -197,8 +212,11 @@ def symbol_technical_rating(
 @router.get("/{ticker}/multi-timeframe-analysis")
 def symbol_multi_timeframe_analysis(
     ticker: str,
+    request: Request,
     db: Session = Depends(get_db_session),
-) -> dict:
+):
+    if not is_authenticated(request):
+        return login_redirect(f"/symbols/{ticker}")
     symbol_repo = SymbolRepository(db)
     overview = symbol_repo.get_overview(ticker)
     if overview is None:
@@ -217,8 +235,11 @@ def symbol_multi_timeframe_analysis(
 @router.get("/{ticker}/bollinger-band-analysis")
 def symbol_bollinger_band_analysis(
     ticker: str,
+    request: Request,
     db: Session = Depends(get_db_session),
-) -> dict:
+):
+    if not is_authenticated(request):
+        return login_redirect(f"/symbols/{ticker}")
     symbol_repo = SymbolRepository(db)
     overview = symbol_repo.get_overview(ticker)
     if overview is None:
@@ -233,8 +254,11 @@ def symbol_bollinger_band_analysis(
 @router.get("/{ticker}/candlestick-patterns")
 def symbol_candlestick_patterns(
     ticker: str,
+    request: Request,
     db: Session = Depends(get_db_session),
-) -> dict:
+):
+    if not is_authenticated(request):
+        return login_redirect(f"/symbols/{ticker}")
     symbol_repo = SymbolRepository(db)
     overview = symbol_repo.get_overview(ticker)
     if overview is None:
@@ -249,8 +273,11 @@ def symbol_candlestick_patterns(
 @router.get("/{ticker}/combined-analysis")
 def symbol_combined_analysis(
     ticker: str,
+    request: Request,
     db: Session = Depends(get_db_session),
-) -> dict:
+):
+    if not is_authenticated(request):
+        return login_redirect(f"/symbols/{ticker}")
     symbol_repo = SymbolRepository(db)
     prediction_repo = PredictionRepository(db)
     overview = symbol_repo.get_overview(ticker)
@@ -267,8 +294,11 @@ def symbol_combined_analysis(
 @router.get("/{ticker}/page-bundle")
 def symbol_page_bundle(
     ticker: str,
+    request: Request,
     db: Session = Depends(get_db_session),
-) -> dict:
+):
+    if not is_authenticated(request):
+        return login_redirect(f"/symbols/{ticker}")
     symbol_repo = SymbolRepository(db)
     prediction_repo = PredictionRepository(db)
     overview = symbol_repo.get_overview(ticker)
@@ -286,9 +316,12 @@ def symbol_page_bundle(
 @router.get("/{ticker}/ai-analysis")
 def symbol_ai_analysis(
     ticker: str,
+    request: Request,
     lang: str = "zh",
     db: Session = Depends(get_db_session),
-) -> dict:
+):
+    if not is_authenticated(request):
+        return login_redirect(f"/symbols/{ticker}")
     symbol_repo = SymbolRepository(db)
     prediction_repo = PredictionRepository(db)
     overview = symbol_repo.get_overview(ticker)
@@ -311,8 +344,11 @@ def symbol_ai_analysis(
 @router.get("/{ticker}/decision-brief")
 def symbol_decision_brief(
     ticker: str,
+    request: Request,
     db: Session = Depends(get_db_session),
-) -> dict:
+):
+    if not is_authenticated(request):
+        return login_redirect(f"/symbols/{ticker}")
     symbol_repo = SymbolRepository(db)
     prediction_repo = PredictionRepository(db)
     overview = symbol_repo.get_overview(ticker)
@@ -334,8 +370,11 @@ def symbol_decision_brief(
 @router.get("/{ticker}/news-sentiment")
 def symbol_news_sentiment(
     ticker: str,
+    request: Request,
     db: Session = Depends(get_db_session),
-) -> dict:
+):
+    if not is_authenticated(request):
+        return login_redirect(f"/symbols/{ticker}")
     symbol_repo = SymbolRepository(db)
     prediction_repo = PredictionRepository(db)
     overview = symbol_repo.get_overview(ticker)
@@ -362,9 +401,12 @@ def symbol_news_sentiment(
 @router.get("/{ticker}/news-feed")
 def symbol_news_feed(
     ticker: str,
+    request: Request,
     limit: int = 5,
     db: Session = Depends(get_db_session),
-) -> dict:
+):
+    if not is_authenticated(request):
+        return login_redirect(f"/symbols/{ticker}")
     symbol_repo = SymbolRepository(db)
     overview = symbol_repo.get_overview(ticker)
     if overview is None:

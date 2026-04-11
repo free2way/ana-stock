@@ -300,6 +300,34 @@ class AppFlowTests(unittest.TestCase):
         finally:
             fresh_client.close()
 
+    def test_json_and_mutation_routes_require_authentication(self) -> None:
+        fresh_client = TestClient(self.client.app)
+        try:
+            protected_gets = [
+                "/symbols",
+                "/symbols/600000.SS/combined-analysis",
+                "/symbols/600000.SS/page-bundle",
+                "/signals/latest",
+                "/backtests",
+                "/backtests/latest/curve",
+                "/jobs/recent",
+                "/jobs/sync-states",
+            ]
+            for path in protected_gets:
+                response = fresh_client.get(path, follow_redirects=False)
+                self.assertEqual(303, response.status_code, path)
+                self.assertIn("/login", response.headers["location"], path)
+
+            create_response = fresh_client.post(
+                "/symbols",
+                json={"ticker": "TEST.SS", "name": "Test", "market": "CN", "exchange": "SSE"},
+                follow_redirects=False,
+            )
+            self.assertEqual(303, create_response.status_code)
+            self.assertIn("/login", create_response.headers["location"])
+        finally:
+            fresh_client.close()
+
     def test_sample_workflow_populates_dashboard_and_symbol_pages(self) -> None:
         from app.services.backtester import BacktestRunner
         from app.services.dataset_build import build_dataset

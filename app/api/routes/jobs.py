@@ -122,13 +122,17 @@ def job_templates() -> list[dict[str, str]]:
 
 
 @router.get("/sync-states")
-def sync_states(db: Session = Depends(get_db_session)) -> list[dict[str, str | int | None]]:
+def sync_states(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
     repo = PriceSyncStateRepository(db)
     return repo.list_states_with_symbols()
 
 
 @router.get("/recent")
-def recent_jobs(limit: int = 20, db: Session = Depends(get_db_session)) -> list[dict]:
+def recent_jobs(request: Request, limit: int = 20, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
     repo = DataJobRepository(db)
     return repo.list_recent_jobs(limit=limit)
 
