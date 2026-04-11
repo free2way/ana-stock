@@ -421,7 +421,9 @@ def symbol_news_feed(
 
 
 @router.get("/{ticker}", response_class=HTMLResponse)
-def symbol_page(ticker: str, db: Session = Depends(get_db_session)) -> str:
+def symbol_page(ticker: str, request: Request, db: Session = Depends(get_db_session)) -> str:
+    if not is_authenticated(request):
+        return login_redirect(f"/symbols/{ticker}")
     symbol_repo = SymbolRepository(db)
     sync_repo = PriceSyncStateRepository(db)
     prediction_repo = PredictionRepository(db)

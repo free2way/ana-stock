@@ -305,6 +305,7 @@ class AppFlowTests(unittest.TestCase):
         try:
             protected_gets = [
                 "/symbols",
+                "/symbols/600000.SS",
                 "/symbols/600000.SS/combined-analysis",
                 "/symbols/600000.SS/page-bundle",
                 "/signals/latest",
