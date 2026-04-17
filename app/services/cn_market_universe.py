@@ -3,6 +3,7 @@ from datetime import date, timedelta
 from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
 from app.models.tables import PriceSyncState
+from app.services.market_lake import write_ohlcv_rows_to_lake
 from app.services.market_sync import sync_market_data
 from app.services.repository import SymbolRepository
 from app.services.technical_snapshot_cache import rebuild_technical_snapshots
@@ -93,7 +94,7 @@ def init_cn_market_data(
     limit: int | None = None,
     pending_only: bool = False,
     retry_failed: bool = False,
-    provider: str = "yfinance",
+    provider: str = "auto",
 ) -> dict:
     days_back = max(30, int(days_back))
     offset = max(0, int(offset))
@@ -204,9 +205,10 @@ def refresh_cn_market_data(
     *,
     days_back: int = 7,
     limit: int | None = None,
-    provider: str = "yfinance",
+    provider: str = "auto",
     incremental: bool = False,
     overlap_days: int = 3,
+    rebuild_snapshots: bool = True,
 ) -> dict:
     days_back = max(2, int(days_back))
     limit = None if limit in (None, 0) else max(1, int(limit))
@@ -278,7 +280,7 @@ def refresh_cn_market_data(
         "failure_count": failure_count,
         "results": results,
     }
-    if success_count:
+    if success_count and rebuild_snapshots:
         technical_snapshot_rebuild = rebuild_technical_snapshots(market="CN", limit=limit)
         payload["technical_snapshot_rebuild"] = technical_snapshot_rebuild
         payload["message"] = f"{payload['message']} {technical_snapshot_rebuild['message']}"
@@ -289,8 +291,9 @@ def refresh_cn_market_data_daily(
     *,
     days_back: int = 7,
     limit: int | None = None,
-    provider: str = "yfinance",
+    provider: str = "auto",
     overlap_days: int = 3,
+    rebuild_snapshots: bool = True,
 ) -> dict:
     return refresh_cn_market_data(
         days_back=days_back,
@@ -298,7 +301,54 @@ def refresh_cn_market_data_daily(
         provider=provider,
         incremental=True,
         overlap_days=overlap_days,
+        rebuild_snapshots=rebuild_snapshots,
     )
+
+
+def refresh_cn_market_data_lake_only(
+    *,
+    start_date: str,
+    end_date: str | None = None,
+    limit: int | None = None,
+) -> dict:
+    with SessionLocal() as db:
+        symbol_repo = SymbolRepository(db)
+        tickers = [
+            symbol.ticker
+            for symbol in symbol_repo.list_symbols()
+            if (symbol.market or "").upper() == "CN"
+            and _is_supported_cn_symbol(ticker=symbol.ticker, exchange=symbol.exchange)
+        ]
+    if limit:
+        tickers = tickers[: max(1, int(limit))]
+    if not tickers:
+        return {
+            "status": "empty",
+            "message": "No CN symbols available. Sync the CN market universe first.",
+            "start_date": start_date,
+            "end_date": end_date,
+            "success_count": 0,
+            "failure_count": 0,
+        }
+    rows_by_ticker = TushareClient().fetch_cn_daily_history_bulk(
+        tickers,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    rows = [row for ticker_rows in rows_by_ticker.values() for row in ticker_rows]
+    parquet_paths = write_ohlcv_rows_to_lake(market="CN", rows=rows) if rows else []
+    touched = {str(row.get("symbol") or "").upper() for row in rows if row.get("symbol")}
+    return {
+        "status": "success" if rows else "empty",
+        "message": f"CN lake-only refresh wrote {len(rows)} row(s) for {len(touched)} stock(s) into {len(parquet_paths)} parquet partition(s).",
+        "start_date": start_date,
+        "end_date": end_date,
+        "total_symbols": len(tickers),
+        "success_count": len(touched),
+        "failure_count": 0,
+        "rows_written": len(rows),
+        "parquet_files": [str(path) for path in parquet_paths[:12]],
+    }
 
 
 def _fetch_cn_symbol_universe_from_akshare() -> list[dict]:

@@ -4,10 +4,13 @@ from pathlib import Path
 from app.core.config import get_settings
 from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
+from app.services.market_lake import write_ohlcv_rows_to_lake
 from app.services.normalizer import MarketDataNormalizer
-from app.services.openbb_client import HistoricalPriceRequest, OpenBBClient
+from app.services.openbb_client import HistoricalPriceRequest
+from app.services.providers import resolve_price_provider
 from app.services.repository import PriceSyncStateRepository, SymbolRepository
-from app.services.ticker_format import normalize_ticker_for_market, provider_ticker_candidates
+from app.services.tushare_client import TushareClient
+from app.services.ticker_format import infer_market_from_ticker, normalize_ticker_for_market, provider_ticker_candidates
 
 
 RAW_FIELDS = [
@@ -67,11 +70,11 @@ def sync_market_data(
     tickers: list[str] | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
-    provider: str = "yfinance",
+    provider: str = "auto",
     start_dates_by_ticker: dict[str, str] | None = None,
+    persist_csv: bool = False,
 ) -> list[dict]:
     settings = get_settings()
-    client = OpenBBClient()
     normalizer = MarketDataNormalizer()
     results: list[dict] = []
 
@@ -82,12 +85,19 @@ def sync_market_data(
         symbols = []
         if tickers:
             for ticker in tickers:
-                normalized_ticker = ticker.strip().upper()
+                inferred_market = infer_market_from_ticker(ticker)
+                normalized_ticker = normalize_ticker_for_market(ticker, inferred_market)
                 if not normalized_ticker:
                     continue
                 symbol = symbol_repo.get_by_ticker(normalized_ticker)
                 if symbol is None:
-                    symbol = symbol_repo.create_symbol(SymbolCreate(ticker=normalized_ticker, name=normalized_ticker, market="US"))
+                    symbol = symbol_repo.create_symbol(
+                        SymbolCreate(
+                            ticker=normalized_ticker,
+                            name=normalized_ticker,
+                            market=inferred_market,
+                        )
+                    )
                 symbols.append(symbol)
         else:
             symbols = symbol_repo.list_symbols()
@@ -95,39 +105,88 @@ def sync_market_data(
         if not symbols:
             raise RuntimeError("No symbols found. Add symbols first or pass tickers to sync.")
 
+        bulk_rows_by_ticker: dict[str, list[dict]] = {}
+        normalized_provider = str(provider or "").strip().lower()
+        use_cn_tushare_bulk = (
+            len(symbols) >= 100
+            and normalized_provider in {"", "auto", "tushare"}
+            and all(str(symbol.market or "").upper() == "CN" for symbol in symbols)
+        )
+        if use_cn_tushare_bulk:
+            bulk_client = TushareClient()
+            earliest_start_date = start_date
+            if start_dates_by_ticker:
+                candidate_dates = [
+                    str(value).strip()
+                    for value in start_dates_by_ticker.values()
+                    if str(value or "").strip()
+                ]
+                if candidate_dates:
+                    earliest_start_date = min(candidate_dates)
+            bulk_rows_by_ticker = bulk_client.fetch_cn_daily_history_bulk(
+                [symbol.ticker for symbol in symbols],
+                start_date=earliest_start_date,
+                end_date=end_date,
+            )
+            lake_rows = [row for ticker_rows in bulk_rows_by_ticker.values() for row in ticker_rows]
+            if lake_rows:
+                write_ohlcv_rows_to_lake(market="CN", rows=lake_rows)
+
         for symbol in symbols:
             try:
-                provider_ticker = normalize_ticker_for_market(symbol.ticker, symbol.market)
-                provider_candidates = provider_ticker_candidates(symbol.ticker, symbol.market)
-                rows: list[dict] = []
-                selected_provider_ticker = provider_ticker
                 symbol_start_date = start_dates_by_ticker.get(symbol.ticker, start_date) if start_dates_by_ticker else start_date
-                for candidate in provider_candidates:
-                    candidate_rows = client.fetch_historical_prices(
-                        HistoricalPriceRequest(
-                            ticker=candidate,
-                            start_date=symbol_start_date,
-                            end_date=end_date,
-                            provider=provider,
+                if bulk_rows_by_ticker:
+                    rows = [
+                        row
+                        for row in (bulk_rows_by_ticker.get(symbol.ticker) or [])
+                        if not symbol_start_date or str(row.get("date") or "") >= str(symbol_start_date)
+                    ]
+                    selected_provider_ticker = symbol.ticker
+                    provider_used = "tushare_bulk"
+                else:
+                    price_provider = resolve_price_provider(provider, market=symbol.market)
+                    provider_ticker = normalize_ticker_for_market(symbol.ticker, symbol.market)
+                    provider_candidates = provider_ticker_candidates(symbol.ticker, symbol.market)
+                    rows = []
+                    selected_provider_ticker = provider_ticker
+                    provider_used = provider
+                    for candidate in provider_candidates:
+                        candidate_rows = price_provider.fetch_historical_prices(
+                            HistoricalPriceRequest(
+                                ticker=candidate,
+                                start_date=symbol_start_date,
+                                end_date=end_date,
+                                provider=provider,
+                            )
                         )
-                    )
-                    if candidate_rows and len(candidate_rows) > len(rows):
-                        rows = candidate_rows
-                        selected_provider_ticker = candidate
+                        if candidate_rows and len(candidate_rows) > len(rows):
+                            rows = candidate_rows
+                            selected_provider_ticker = candidate
+                            provider_used = getattr(price_provider, "last_source_used", provider) or provider
                 if not rows:
-                    raise RuntimeError(f"No market data returned for {provider_ticker}")
+                    raise RuntimeError(f"No market data returned for {selected_provider_ticker}")
+                market_code = str(symbol.market or infer_market_from_ticker(symbol.ticker) or "").upper()
+                lake_paths = []
+                if market_code in {"CN", "US"} and not bulk_rows_by_ticker:
+                    lake_paths = write_ohlcv_rows_to_lake(market=market_code, rows=rows, merge_existing=True)
                 raw_path = settings.raw_data_dir / f"{symbol.ticker}.csv"
-                merged_rows = merge_market_data_rows(read_raw_csv(raw_path), rows)
-                write_raw_csv(raw_path, merged_rows)
                 normalized_path = settings.normalized_data_dir / f"{symbol.ticker}.csv"
-                normalizer.normalize_symbol_file(raw_path, normalized_path)
-                last_synced_date = merged_rows[-1]["date"] if merged_rows else None
+                merged_rows = rows
+                if persist_csv:
+                    merged_rows = merge_market_data_rows(read_raw_csv(raw_path), rows)
+                    write_raw_csv(raw_path, merged_rows)
+                    normalizer.normalize_symbol_file(raw_path, normalized_path)
+                sorted_rows = sorted(rows, key=lambda row: str(row.get("date") or ""))
+                last_synced_date = sorted_rows[-1]["date"] if sorted_rows else None
                 sync_repo.upsert_state(
                     symbol_id=symbol.id,
-                    provider=getattr(client, "last_source_used", provider) or provider,
+                    provider=provider_used,
                     last_synced_date=last_synced_date,
                     status="success",
-                    message=f"Wrote {len(rows)} fetched row(s), {len(merged_rows)} stored row(s) to {raw_path.name} via {selected_provider_ticker}",
+                    message=(
+                        f"Wrote {len(rows)} fetched row(s) to Parquet lake via {selected_provider_ticker}"
+                        + (f" and {len(merged_rows)} stored CSV row(s) to {raw_path.name}" if persist_csv else "")
+                    ),
                 )
                 results.append(
                     {
@@ -137,8 +196,10 @@ def sync_market_data(
                         "stored_rows": len(merged_rows),
                         "provider_ticker": selected_provider_ticker,
                         "last_synced_date": last_synced_date,
-                        "raw_path": str(raw_path),
-                        "normalized_path": str(normalized_path),
+                        "lake_paths": [str(path) for path in lake_paths],
+                        "raw_path": str(raw_path) if persist_csv else None,
+                        "normalized_path": str(normalized_path) if persist_csv else None,
+                        "persist_csv": persist_csv,
                     }
                 )
             except Exception as exc:

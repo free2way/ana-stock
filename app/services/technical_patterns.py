@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import pandas as pd
 
 from app.core.config import get_settings
+from app.services.market_lake import load_lake_price_history
+from app.services.ticker_format import market_ticker_candidates
 
 
 @dataclass(slots=True)
@@ -161,12 +163,20 @@ class TechnicalPatternService:
             self.settings.raw_data_dir / f"{ticker}.csv",
         ]
         path = next((item for item in candidate_paths if item.exists()), None)
-        if path is None:
-            return None
-        try:
-            frame = pd.read_csv(path)
-        except Exception:
-            return None
+        if path is not None:
+            try:
+                frame = pd.read_csv(path)
+            except Exception:
+                return None
+        else:
+            rows = []
+            for market, symbol in self._lake_candidates(ticker):
+                rows = load_lake_price_history(market=market, ticker=symbol, limit=240)
+                if rows:
+                    break
+            if not rows:
+                return None
+            frame = pd.DataFrame(rows)
         if frame.empty or "date" not in frame.columns or "close" not in frame.columns:
             return None
         if "volume" not in frame.columns:
@@ -175,7 +185,19 @@ class TechnicalPatternService:
             frame["high"] = frame["close"]
         if "low" not in frame.columns:
             frame["low"] = frame["close"]
+        if "open" not in frame.columns:
+            frame["open"] = frame["close"]
         return frame.sort_values("date").reset_index(drop=True)
+
+    def _lake_candidates(self, ticker: str) -> list[tuple[str, str]]:
+        upper = ticker.upper().strip()
+        if not upper:
+            return []
+        if upper.endswith((".SS", ".SZ", ".SH", ".BJ")) or (upper.isdigit() and len(upper) == 6):
+            return [("CN", candidate) for candidate in market_ticker_candidates(upper, "CN")]
+        if upper.endswith(".HK"):
+            return []
+        return [("US", upper)]
 
     def _build_indicators(self, frame: pd.DataFrame) -> pd.DataFrame:
         data = frame.copy()

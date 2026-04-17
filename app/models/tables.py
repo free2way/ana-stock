@@ -227,6 +227,19 @@ class DataJob(Base):
     params_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class WorkspaceSnapshot(Base):
+    __tablename__ = "workspace_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_type: Mapped[str] = mapped_column(Text, nullable=False)
+    snapshot_date: Mapped[str] = mapped_column(Text, nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    source_job_id: Mapped[int | None] = mapped_column(ForeignKey("data_jobs.id"), nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+    source_job: Mapped[DataJob | None] = relationship()
+
+
 class AppSetting(Base):
     __tablename__ = "app_settings"
 

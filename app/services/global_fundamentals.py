@@ -2,7 +2,7 @@ from dataclasses import asdict, dataclass
 
 from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
-from app.services.openbb_client import OpenBBClient
+from app.services.providers import resolve_fundamental_provider
 from app.services.repository import FundamentalSnapshotRepository, SymbolRepository
 from app.services.ticker_format import normalize_ticker_for_market
 
@@ -35,11 +35,13 @@ def sync_global_fundamentals(tickers: list[str] | None = None) -> dict:
             "tickers": [],
         }
 
-    client = OpenBBClient()
     rows: list[GlobalFundamentalRow] = []
     failures: list[str] = []
+    provider_sources: set[str] = set()
     for ticker in normalized_tickers:
-        snapshot = client.fetch_fundamental_snapshot(ticker)
+        provider = resolve_fundamental_provider("openbb", market=_infer_market(ticker))
+        snapshot = provider.fetch_snapshot(ticker)
+        provider_sources.add(getattr(provider, "last_source_used", "openbb"))
         if not snapshot:
             failures.append(ticker)
             continue
@@ -88,7 +90,7 @@ def sync_global_fundamentals(tickers: list[str] | None = None) -> dict:
             fundamental_repo.upsert_snapshot(
                 symbol_id=symbol.id,
                 report_date=row.report_date,
-                source="yfinance_fundamentals",
+                source=next(iter(provider_sources), "openbb_fundamentals"),
                 listing_date=row.listing_date,
                 pe_ttm=row.pe_ttm,
                 dividend_yield=row.dividend_yield,
@@ -105,9 +107,10 @@ def sync_global_fundamentals(tickers: list[str] | None = None) -> dict:
 
     status = "success" if not failures else "partial"
     failure_text = f" {len(failures)} failed." if failures else ""
+    provider_text = ", ".join(sorted(provider_sources)) if provider_sources else "unknown"
     return {
         "status": status,
-        "message": f"Synced {written} US/HK fundamental row(s) for {len(touched)} stock(s).{failure_text}",
+        "message": f"Synced {written} US/HK fundamental row(s) for {len(touched)} stock(s) via {provider_text}.{failure_text}",
         "rows_written": written,
         "tickers": touched,
         "failed_tickers": failures,

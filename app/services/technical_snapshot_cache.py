@@ -3,9 +3,17 @@ from app.services.repository import SymbolRepository, TechnicalSnapshotRepositor
 from app.services.technical_patterns import TechnicalPatternService
 
 
-def rebuild_technical_snapshots(*, market: str = "CN", limit: int | None = None) -> dict:
+def rebuild_technical_snapshots(
+    *,
+    market: str = "CN",
+    limit: int | None = None,
+    tickers: list[str] | None = None,
+) -> dict:
     normalized_market = (market or "CN").upper()
     limit = None if limit in (None, 0) else max(1, int(limit))
+    normalized_tickers = {
+        str(ticker).strip().upper() for ticker in (tickers or []) if str(ticker).strip()
+    }
 
     with SessionLocal() as db:
         symbol_repo = SymbolRepository(db)
@@ -13,7 +21,8 @@ def rebuild_technical_snapshots(*, market: str = "CN", limit: int | None = None)
         symbols = [
             symbol
             for symbol in symbol_repo.list_symbols()
-            if normalized_market == "ALL" or (symbol.market or "").upper() == normalized_market
+            if (normalized_market == "ALL" or (symbol.market or "").upper() == normalized_market)
+            and (not normalized_tickers or symbol.ticker.upper() in normalized_tickers)
         ]
         if limit:
             symbols = symbols[:limit]

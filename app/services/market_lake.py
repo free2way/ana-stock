@@ -1,0 +1,389 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import duckdb
+import polars as pl
+
+from app.core.config import get_settings
+
+
+LAKE_OHLCV_COLUMNS = [
+    "date",
+    "symbol",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "adj_close",
+    "dividend",
+    "split_ratio",
+]
+
+
+def market_lake_root() -> Path:
+    return get_settings().data_dir / "lake"
+
+
+def write_daily_ohlcv_parquet(*, market: str, trade_date: str, rows: list[dict], merge_existing: bool = False) -> Path:
+    market_code = str(market or "").strip().lower() or "unknown"
+    path = market_lake_root() / f"{market_code}_daily" / f"date={trade_date}" / "part.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    normalized_rows = [_normalize_ohlcv_row(row, trade_date=trade_date) for row in rows]
+    frame = pl.DataFrame(normalized_rows, schema=LAKE_OHLCV_COLUMNS, orient="row")
+    if merge_existing and path.exists():
+        try:
+            existing = pl.read_parquet(path)
+            frame = pl.concat([existing, frame], how="vertical_relaxed")
+            frame = frame.unique(subset=["date", "symbol"], keep="last").sort(["date", "symbol"])
+        except Exception:
+            pass
+    frame.write_parquet(path, compression="zstd")
+    return path
+
+
+def us_daily_parquet_glob() -> str:
+    return str(market_lake_root() / "us_daily" / "date=*" / "*.parquet")
+
+
+def daily_parquet_glob(market: str) -> str:
+    market_code = str(market or "").strip().lower() or "unknown"
+    return str(market_lake_root() / f"{market_code}_daily" / "date=*" / "*.parquet")
+
+
+def query_us_daily_summary(*, trade_date: str | None = None, limit: int = 10) -> dict:
+    parquet_glob = us_daily_parquet_glob()
+    if not list((market_lake_root() / "us_daily").glob("date=*/*.parquet")):
+        return {"status": "empty", "message": "No U.S. daily Parquet lake files found.", "rows": []}
+    where_clause = "WHERE date = ?" if trade_date else ""
+    params = [trade_date] if trade_date else []
+    sql = f"""
+        SELECT
+            date,
+            symbol,
+            close,
+            volume,
+            close * volume AS dollar_volume
+        FROM read_parquet('{parquet_glob}', hive_partitioning = true)
+        {where_clause}
+        ORDER BY dollar_volume DESC NULLS LAST
+        LIMIT {max(1, int(limit))}
+    """
+    with duckdb.connect(database=":memory:") as connection:
+        rows = connection.execute(sql, params).fetchall()
+        columns = [item[0] for item in connection.description]
+    return {
+        "status": "success",
+        "trade_date": trade_date,
+        "rows": [_json_ready_row(dict(zip(columns, row, strict=False))) for row in rows],
+        "count": len(rows),
+    }
+
+
+def load_lake_price_history(*, market: str, ticker: str, limit: int = 120) -> list[dict]:
+    market_code = str(market or "").strip().upper()
+    symbol = str(ticker or "").strip().upper()
+    market_dir = market_lake_root() / f"{market_code.lower()}_daily"
+    parquet_files = _recent_parquet_files(market_code, limit=max(20, int(limit) * 2))
+    if market_code not in {"CN", "US"} or not symbol or not parquet_files:
+        return []
+    sql = f"""
+        SELECT
+            CAST(date AS VARCHAR) AS date,
+            symbol,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            adj_close
+        FROM read_parquet(?, hive_partitioning = true)
+        WHERE symbol = ?
+        ORDER BY CAST(date AS DATE) DESC
+        LIMIT {max(1, int(limit))}
+    """
+    with duckdb.connect(database=":memory:") as connection:
+        rows = connection.execute(sql, [parquet_files, symbol]).fetchall()
+        columns = [item[0] for item in connection.description]
+    history = [_json_ready_row(dict(zip(columns, row, strict=False))) for row in rows]
+    history.sort(key=lambda item: item.get("date") or "")
+    return history
+
+
+def _recent_parquet_files(market: str, *, limit: int) -> list[str]:
+    market_code = str(market or "").strip().lower()
+    market_dir = market_lake_root() / f"{market_code}_daily"
+    files = sorted(
+        market_dir.glob("date=*/*.parquet"),
+        key=lambda path: path.parent.name,
+        reverse=True,
+    )
+    return [str(path) for path in files[: max(1, int(limit))]]
+
+
+def load_lake_rows(*, markets: list[str] | None = None, tickers: set[str] | None = None, limit_per_symbol: int | None = None) -> list[dict]:
+    market_codes = [
+        str(market or "").strip().upper()
+        for market in (markets or ["CN", "US"])
+        if str(market or "").strip().upper() in {"CN", "US"}
+    ] or ["CN", "US"]
+    normalized_tickers = {str(ticker or "").strip().upper() for ticker in (tickers or set()) if str(ticker or "").strip()}
+    all_rows: list[dict] = []
+    for market_code in market_codes:
+        market_dir = market_lake_root() / f"{market_code.lower()}_daily"
+        if not list(market_dir.glob("date=*/*.parquet")):
+            continue
+        parquet_glob = daily_parquet_glob(market_code)
+        ticker_filter = "WHERE symbol = ANY(?)" if normalized_tickers else ""
+        params = [sorted(normalized_tickers)] if normalized_tickers else []
+        limit_clause = ""
+        if limit_per_symbol is not None and int(limit_per_symbol) > 0:
+            limit_clause = f"WHERE rn <= {int(limit_per_symbol)}"
+        sql = f"""
+            WITH base AS (
+                SELECT
+                    CAST(date AS DATE) AS trade_date,
+                    symbol,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    adj_close,
+                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY CAST(date AS DATE) DESC) AS rn
+                FROM read_parquet('{parquet_glob}', hive_partitioning = true)
+                {ticker_filter}
+            )
+            SELECT
+                CAST(trade_date AS VARCHAR) AS date,
+                symbol,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                adj_close
+            FROM base
+            {limit_clause}
+            ORDER BY symbol, trade_date
+        """
+        with duckdb.connect(database=":memory:") as connection:
+            rows = connection.execute(sql, params).fetchall()
+            columns = [item[0] for item in connection.description]
+        all_rows.extend(_json_ready_row(dict(zip(columns, row, strict=False))) for row in rows)
+    all_rows.sort(key=lambda row: (row.get("symbol") or "", row.get("date") or ""))
+    return all_rows
+
+
+def list_lake_symbols(*, market: str) -> set[str]:
+    market_code = str(market or "").strip().upper()
+    market_dir = market_lake_root() / f"{market_code.lower()}_daily"
+    if market_code not in {"CN", "US"} or not list(market_dir.glob("date=*/*.parquet")):
+        return set()
+    parquet_glob = daily_parquet_glob(market_code)
+    sql = f"""
+        SELECT DISTINCT symbol
+        FROM read_parquet('{parquet_glob}', hive_partitioning = true)
+        WHERE symbol IS NOT NULL
+    """
+    with duckdb.connect(database=":memory:") as connection:
+        rows = connection.execute(sql).fetchall()
+    return {str(row[0] or "").strip().upper() for row in rows if row and row[0]}
+
+
+def write_ohlcv_rows_to_lake(*, market: str, rows: list[dict], merge_existing: bool = False) -> list[Path]:
+    rows_by_date: dict[str, list[dict]] = {}
+    for row in rows:
+        trade_date = str(row.get("date") or "").strip()
+        if not trade_date:
+            continue
+        rows_by_date.setdefault(trade_date, []).append(row)
+    return [
+        write_daily_ohlcv_parquet(market=market, trade_date=trade_date, rows=date_rows, merge_existing=merge_existing)
+        for trade_date, date_rows in sorted(rows_by_date.items())
+    ]
+
+
+def screen_us_lake_momentum(*, trade_date: str | None = None, limit: int = 160, min_dollar_volume: float = 1_000_000.0) -> list[dict]:
+    return screen_lake_momentum(market="US", trade_date=trade_date, limit=limit, min_dollar_volume=min_dollar_volume)
+
+
+def screen_cn_lake_momentum(*, trade_date: str | None = None, limit: int = 160, min_dollar_volume: float = 10_000_000.0) -> list[dict]:
+    return screen_lake_momentum(market="CN", trade_date=trade_date, limit=limit, min_dollar_volume=min_dollar_volume)
+
+
+def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: int = 160, min_dollar_volume: float = 1_000_000.0) -> list[dict]:
+    market_code = str(market or "").strip().upper() or "US"
+    market_dir = market_lake_root() / f"{market_code.lower()}_daily"
+    parquet_glob = daily_parquet_glob(market_code)
+    if not list(market_dir.glob("date=*/*.parquet")):
+        return []
+    date_filter = "WHERE date <= ?" if trade_date else ""
+    params = [trade_date] if trade_date else []
+    sql = f"""
+        WITH base AS (
+            SELECT
+                CAST(date AS DATE) AS trade_date,
+                symbol,
+                close,
+                volume,
+                close * volume AS dollar_volume
+            FROM read_parquet('{parquet_glob}', hive_partitioning = true)
+            {date_filter}
+        ),
+        enriched AS (
+            SELECT
+                trade_date,
+                symbol,
+                close,
+                volume,
+                dollar_volume,
+                close / NULLIF(LAG(close, 5) OVER (PARTITION BY symbol ORDER BY trade_date), 0) - 1 AS momentum_5,
+                close / NULLIF(LAG(close, 20) OVER (PARTITION BY symbol ORDER BY trade_date), 0) - 1 AS momentum_20,
+                AVG(volume) OVER (
+                    PARTITION BY symbol ORDER BY trade_date
+                    ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                ) AS avg_volume_20,
+                AVG(close) OVER (
+                    PARTITION BY symbol ORDER BY trade_date
+                    ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                ) AS ma20,
+                AVG(close) OVER (
+                    PARTITION BY symbol ORDER BY trade_date
+                    ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                ) AS ma60,
+                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY trade_date DESC) AS rn
+            FROM base
+        )
+        SELECT
+            trade_date AS date,
+            symbol,
+            close,
+            volume,
+            dollar_volume,
+            momentum_5,
+            momentum_20,
+            CASE WHEN avg_volume_20 > 0 THEN volume / avg_volume_20 ELSE NULL END AS volume_ratio,
+            ma20,
+            ma60
+        FROM enriched
+        WHERE rn = 1
+          AND close IS NOT NULL
+          AND volume IS NOT NULL
+          AND dollar_volume >= ?
+        ORDER BY
+          COALESCE(momentum_20, 0) DESC,
+          COALESCE(momentum_5, 0) DESC,
+          dollar_volume DESC
+        LIMIT {max(1, int(limit))}
+    """
+    with duckdb.connect(database=":memory:") as connection:
+        rows = connection.execute(sql, [*params, float(min_dollar_volume)]).fetchall()
+        columns = [item[0] for item in connection.description]
+    results: list[dict] = []
+    for index, row in enumerate(rows, start=1):
+        item = _json_ready_row(dict(zip(columns, row, strict=False)))
+        trend_score = _lake_trend_score(item)
+        item.update(
+            {
+                "ticker": item.get("symbol"),
+                "name": item.get("symbol"),
+                "market": market_code,
+                "latest_close": item.get("close"),
+                "trend_score": trend_score,
+                "action_label": _lake_action_label(trend_score),
+                "action_summary": _lake_action_summary(item, trend_score),
+                "selection_reason": _lake_selection_reason(item),
+                "distance_to_breakout_pct": None,
+                "rank_value": index,
+                "snapshot_score": round(
+                    trend_score
+                    + max(0.0, min(25.0, float(item.get("momentum_20") or 0.0) * 100.0))
+                    + max(0.0, min(12.0, float(item.get("volume_ratio") or 1.0) * 2.0)),
+                    2,
+                ),
+            }
+        )
+        results.append(item)
+    return results
+
+
+def _normalize_ohlcv_row(row: dict, *, trade_date: str) -> dict:
+    return {
+        "date": str(row.get("date") or trade_date),
+        "symbol": str(row.get("symbol") or "").strip().upper(),
+        "open": _as_float(row.get("open")),
+        "high": _as_float(row.get("high")),
+        "low": _as_float(row.get("low")),
+        "close": _as_float(row.get("close")),
+        "volume": _as_float(row.get("volume")),
+        "adj_close": _as_float(row.get("adj_close")),
+        "dividend": _as_float(row.get("dividend")),
+        "split_ratio": _as_float(row.get("split_ratio")),
+    }
+
+
+def _as_float(value) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _json_ready_row(row: dict) -> dict:
+    return {key: value.isoformat() if hasattr(value, "isoformat") else value for key, value in row.items()}
+
+
+def _lake_trend_score(row: dict) -> int:
+    score = 50.0
+    momentum_5 = float(row.get("momentum_5") or 0.0)
+    momentum_20 = float(row.get("momentum_20") or 0.0)
+    volume_ratio = float(row.get("volume_ratio") or 1.0)
+    close = row.get("close")
+    ma20 = row.get("ma20")
+    ma60 = row.get("ma60")
+    score += max(-12.0, min(12.0, momentum_5 * 120.0))
+    score += max(-18.0, min(18.0, momentum_20 * 90.0))
+    score += max(-6.0, min(8.0, (volume_ratio - 1.0) * 8.0))
+    if close is not None and ma20 is not None and float(close) > float(ma20):
+        score += 8.0
+    if close is not None and ma60 is not None and float(close) > float(ma60):
+        score += 8.0
+    return int(max(1, min(99, round(score))))
+
+
+def _lake_action_label(score: int) -> str:
+    if score >= 75:
+        return "BUY"
+    if score >= 60:
+        return "WATCH"
+    if score <= 35:
+        return "AVOID"
+    return "HOLD"
+
+
+def _lake_action_summary(row: dict, score: int) -> str:
+    return (
+        f"Lake momentum score {score}; "
+        f"20d momentum {_fmt_pct(row.get('momentum_20'))}, "
+        f"5d momentum {_fmt_pct(row.get('momentum_5'))}, "
+        f"volume ratio {float(row.get('volume_ratio') or 0.0):.2f}."
+    )
+
+
+def _lake_selection_reason(row: dict) -> str:
+    return (
+        f"DuckDB Parquet scan: dollar volume {float(row.get('dollar_volume') or 0.0):.0f}, "
+        f"20d momentum {_fmt_pct(row.get('momentum_20'))}, "
+        f"5d momentum {_fmt_pct(row.get('momentum_5'))}."
+    )
+
+
+def _fmt_pct(value) -> str:
+    try:
+        return f"{float(value) * 100:.2f}%"
+    except (TypeError, ValueError):
+        return "-"

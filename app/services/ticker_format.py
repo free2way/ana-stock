@@ -27,6 +27,21 @@ def normalize_ticker_for_market(ticker: str, market: str | None) -> str:
     return normalized
 
 
+def infer_market_from_ticker(ticker: str, market: str | None = None) -> str:
+    market_value = (market or "").strip().upper()
+    if market_value in {"CN", "HK", "US"}:
+        return market_value
+
+    normalized = str(ticker or "").strip().upper()
+    if normalized.endswith((".SS", ".SH", ".SZ", ".BJ")):
+        return "CN"
+    if normalized.endswith(".HK"):
+        return "HK"
+    if normalized.isdigit() and len(normalized) == 6:
+        return "CN"
+    return "US"
+
+
 def market_ticker_candidates(ticker: str, market: str | None) -> list[str]:
     normalized = normalize_ticker_for_market(ticker, market)
     market_value = (market or "").strip().upper()

@@ -1,8 +1,8 @@
 import json
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 
-from sqlalchemy import case, delete, desc, func, select
+from sqlalchemy import case, delete, desc, func, insert, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -25,11 +25,48 @@ from app.models.tables import (
     TechnicalSnapshot,
     Watchlist,
     WatchlistItem,
+    WorkspaceSnapshot,
 )
+from app.services.tradability_filter import evaluate_candidate_tradability
+from app.services.time_utils import app_now, app_now_iso
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return app_now_iso()
+
+
+def _loads_json_object(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _safe_parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _job_duration_seconds(started_at: str | None, finished_at: str | None) -> int | None:
+    started = _safe_parse_iso(started_at)
+    finished = _safe_parse_iso(finished_at)
+    if started is None or finished is None:
+        return None
+    if started.tzinfo is None and finished.tzinfo is not None:
+        started = started.replace(tzinfo=finished.tzinfo)
+    elif started.tzinfo is not None and finished.tzinfo is None:
+        finished = finished.replace(tzinfo=started.tzinfo)
+    elif started.tzinfo is not None and finished.tzinfo is not None:
+        started = started.astimezone(UTC)
+        finished = finished.astimezone(UTC)
+    return max(0, int((finished - started).total_seconds()))
 
 
 def ticker_query_candidates(ticker: str) -> list[str]:
@@ -47,6 +84,12 @@ def ticker_query_candidates(ticker: str) -> list[str]:
 
 
 def chunked_ids(values: list[int], size: int = 500) -> list[list[int]]:
+    if size < 1:
+        size = 1
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def chunked_rows(values: list[dict], size: int = 100) -> list[list[dict]]:
     if size < 1:
         size = 1
     return [values[index : index + size] for index in range(0, len(values), size)]
@@ -143,6 +186,28 @@ class SymbolRepository:
             "updated_at": symbol.updated_at,
         }
 
+    def list_overviews_for_tickers(self, tickers: list[str]) -> dict[str, dict]:
+        normalized = [ticker.strip().upper() for ticker in tickers if ticker and ticker.strip()]
+        if not normalized:
+            return {}
+        stmt = select(Symbol).where(Symbol.ticker.in_(normalized)).order_by(Symbol.ticker.asc())
+        rows = self.db.scalars(stmt).all()
+        return {
+            symbol.ticker: {
+                "id": symbol.id,
+                "ticker": symbol.ticker,
+                "name": symbol.name,
+                "market": symbol.market,
+                "exchange": symbol.exchange,
+                "sector": symbol.sector,
+                "industry": symbol.industry,
+                "is_active": symbol.is_active,
+                "created_at": symbol.created_at,
+                "updated_at": symbol.updated_at,
+            }
+            for symbol in rows
+        }
+
     def update_symbol_metadata(
         self,
         symbol_id: int,
@@ -179,36 +244,150 @@ class PredictionRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def list_latest_predictions(self, limit: int = 20) -> list[dict]:
-        latest_model_run_id = self.db.scalar(select(func.max(Prediction.model_run_id)))
-        if latest_model_run_id is None:
-            return []
+    @staticmethod
+    def _compute_action_bucket(candidate: dict) -> str:
+        status = str(candidate.get("tradability_status") or "").upper()
+        signal_label = str(candidate.get("signal_label") or "").strip().upper()
+        if status == "BLOCKED":
+            return "blocked"
+        if status in {"REVIEW", "DEFER"} or signal_label in {"SELL", "STRONG_SELL"}:
+            return "risk_reduction"
+        if status == "READY":
+            return "action_queue"
+        return "monitor"
 
-        latest_date = self.db.scalar(
-            select(func.max(Prediction.trade_date)).where(Prediction.model_run_id == latest_model_run_id)
-        )
-        if latest_date is None:
-            return []
+    @staticmethod
+    def _compute_action_label(candidate: dict) -> str:
+        bucket = PredictionRepository._compute_action_bucket(candidate)
+        if bucket == "blocked":
+            return "do_not_trade"
+        if bucket == "risk_reduction":
+            return "review_or_trim"
+        if bucket == "action_queue":
+            return "ready_to_trade"
+        return "monitor_only"
 
-        stmt = (
-            select(Prediction, Symbol)
-            .join(Symbol, Symbol.id == Prediction.symbol_id)
-            .where(Prediction.model_run_id == latest_model_run_id)
-            .where(Prediction.trade_date == latest_date)
-            .order_by(desc(Prediction.score))
-            .limit(limit)
-        )
-        rows = self.db.execute(stmt).all()
-        return [
+    @staticmethod
+    def _compute_target_weight(candidate: dict) -> float | None:
+        status = str(candidate.get("tradability_status") or "").upper()
+        if status == "BLOCKED":
+            return None
+
+        try:
+            score = float(candidate.get("score")) if candidate.get("score") is not None else None
+        except (TypeError, ValueError):
+            score = None
+
+        try:
+            signal_strength = (
+                float(candidate.get("signal_strength")) if candidate.get("signal_strength") is not None else None
+            )
+        except (TypeError, ValueError):
+            signal_strength = None
+
+        weight = 0.02
+        if score is not None:
+            if score >= 0.85:
+                weight = 0.07
+            elif score >= 0.75:
+                weight = 0.05
+            elif score >= 0.6:
+                weight = 0.03
+
+        if signal_strength is not None and signal_strength >= 85:
+            weight += 0.01
+
+        if status == "DEFER":
+            weight = min(weight, 0.02)
+        elif status == "REVIEW":
+            weight = min(weight, 0.03)
+
+        return round(min(weight, 0.1), 4)
+
+    @staticmethod
+    def _compute_priority(candidate: dict) -> int | None:
+        status = str(candidate.get("tradability_status") or "").upper()
+        try:
+            score = float(candidate.get("score")) if candidate.get("score") is not None else None
+        except (TypeError, ValueError):
+            score = None
+
+        if status == "BLOCKED":
+            return 4
+        if score is None:
+            return 3
+        if status == "READY" and score >= 0.8:
+            return 1
+        if status in {"READY", "REVIEW", "DEFER"}:
+            return 2
+        return 3
+
+    def _build_signal_decision(self, candidate: dict) -> dict:
+        decision = evaluate_candidate_tradability(candidate)
+        payload = dict(candidate)
+        payload.update(
             {
-                "trade_date": prediction.trade_date,
-                "ticker": symbol.ticker,
-                "name": symbol.name,
-                "score": prediction.score,
-                "rank_value": prediction.rank_value,
+                "tradability_status": decision.tradability_status,
+                "target_weight": self._compute_target_weight(
+                    {**candidate, "tradability_status": decision.tradability_status}
+                ),
+                "priority": self._compute_priority(
+                    {**candidate, "tradability_status": decision.tradability_status}
+                ),
+                "action_bucket": self._compute_action_bucket(
+                    {
+                        **candidate,
+                        "tradability_status": decision.tradability_status,
+                    }
+                ),
+                "action_label": self._compute_action_label(
+                    {
+                        **candidate,
+                        "tradability_status": decision.tradability_status,
+                    }
+                ),
+                "liquidity_bucket": decision.liquidity_bucket,
+                "risk_flags": decision.risk_flags,
+                "block_reason": decision.block_reason,
+                "entry_trigger": decision.entry_trigger,
+                "invalidation_condition": decision.invalidation_condition,
+                "time_horizon": decision.time_horizon,
+                "max_slippage_bps": decision.max_slippage_bps,
+                "stop_loss_type": decision.stop_loss_type,
+                "execution_note": decision.execution_note,
+                "event_conflict": None,
+                "suggested_participation_rate": decision.suggested_participation_rate,
             }
-            for prediction, symbol in rows
-        ]
+        )
+        return payload
+
+    def list_latest_predictions(self, limit: int = 20) -> list[dict]:
+        return self.list_latest_predictions_for_market(market=None, limit=limit)
+
+    def list_latest_signal_decisions(
+        self,
+        *,
+        limit: int = 20,
+        market: str | None = None,
+        tradability: str | None = None,
+    ) -> list[dict]:
+        raw_candidates = self.list_latest_predictions_for_market(market=market, limit=max(limit * 3, 30))
+        decisions = [self._build_signal_decision(candidate) for candidate in raw_candidates]
+
+        normalized_tradability = str(tradability).upper() if tradability else None
+        if normalized_tradability and normalized_tradability != "ALL":
+            decisions = [
+                item for item in decisions if str(item.get("tradability_status") or "").upper() == normalized_tradability
+            ]
+
+        decisions.sort(
+            key=lambda item: (
+                item.get("priority") if item.get("priority") is not None else 99,
+                -(item.get("score") or 0),
+                item.get("ticker") or "",
+            )
+        )
+        return decisions[:limit]
 
     def list_latest_predictions_for_market(self, market: str | None, limit: int = 50) -> list[dict]:
         latest_model_run_id = self.db.scalar(select(func.max(Prediction.model_run_id)))
@@ -260,6 +439,9 @@ class PredictionRepository:
                 "position_size_hint": (detail.position_size_hint if detail is not None else None),
                 "entry_style": (detail.entry_style if detail is not None else None),
                 "percentile": (detail.percentile if detail is not None else None),
+                "sector": symbol.sector,
+                "industry": symbol.industry,
+                "summary_text": (detail.summary_text if detail is not None else None),
             }
             for prediction, symbol, detail in rows
         ]
@@ -497,6 +679,7 @@ class PredictionRepository:
 class PredictionExplanationRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
+        self._batch_size = 50
 
     def replace_for_model_run(self, model_run_id: int, rows: list[dict]) -> int:
         prediction_stmt = select(Prediction).where(Prediction.model_run_id == model_run_id)
@@ -504,37 +687,40 @@ class PredictionExplanationRepository:
         prediction_ids = [prediction.id for prediction in predictions]
         if prediction_ids:
             for prediction_id_chunk in chunked_ids(prediction_ids):
-                explanation_stmt = select(PredictionExplanation).where(
-                    PredictionExplanation.prediction_id.in_(prediction_id_chunk)
+                self.db.execute(
+                    delete(PredictionExplanation).where(
+                        PredictionExplanation.prediction_id.in_(prediction_id_chunk)
+                    )
                 )
-                for explanation in self.db.scalars(explanation_stmt).all():
-                    self.db.delete(explanation)
-            self.db.flush()
+                self.db.commit()
 
         if not rows:
-            self.db.commit()
             return 0
 
         prediction_map = {(prediction.symbol_id, prediction.trade_date): prediction.id for prediction in predictions}
         now = utc_now_iso()
-        inserted = 0
+        payload_rows: list[dict] = []
         for row in rows:
             prediction_id = prediction_map.get((row["symbol_id"], row["trade_date"]))
             if prediction_id is None:
                 continue
-            explanation = PredictionExplanation(
-                prediction_id=prediction_id,
-                feature_name=row["feature_name"],
-                feature_value=row.get("feature_value"),
-                contribution=row.get("contribution"),
-                direction=row.get("direction"),
-                display_order=row.get("display_order"),
-                created_at=now,
+            payload_rows.append(
+                {
+                    "prediction_id": prediction_id,
+                    "feature_name": row["feature_name"],
+                    "feature_value": row.get("feature_value"),
+                    "contribution": row.get("contribution"),
+                    "direction": row.get("direction"),
+                    "display_order": row.get("display_order"),
+                    "created_at": now,
+                }
             )
-            self.db.add(explanation)
-            inserted += 1
 
-        self.db.commit()
+        inserted = len(payload_rows)
+        for row_chunk in chunked_rows(payload_rows, self._batch_size):
+            self.db.execute(insert(PredictionExplanation), row_chunk)
+            self.db.commit()
+
         return inserted
 
     def get_for_prediction(self, prediction_id: int) -> list[dict]:
@@ -572,6 +758,7 @@ class PredictionExplanationRepository:
 class PredictionDetailRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
+        self._batch_size = 50
 
     def replace_for_model_run(self, model_run_id: int, rows: list[dict]) -> int:
         prediction_stmt = select(Prediction).where(Prediction.model_run_id == model_run_id)
@@ -579,48 +766,51 @@ class PredictionDetailRepository:
         prediction_ids = [prediction.id for prediction in predictions]
         if prediction_ids:
             for prediction_id_chunk in chunked_ids(prediction_ids):
-                detail_stmt = select(PredictionDetail).where(PredictionDetail.prediction_id.in_(prediction_id_chunk))
-                for detail in self.db.scalars(detail_stmt).all():
-                    self.db.delete(detail)
-            self.db.flush()
+                self.db.execute(
+                    delete(PredictionDetail).where(PredictionDetail.prediction_id.in_(prediction_id_chunk))
+                )
+                self.db.commit()
 
         if not rows:
-            self.db.commit()
             return 0
 
         prediction_map = {(prediction.symbol_id, prediction.trade_date): prediction.id for prediction in predictions}
         now = utc_now_iso()
-        inserted = 0
+        payload_rows: list[dict] = []
         for row in rows:
             prediction_id = prediction_map.get((row["symbol_id"], row["trade_date"]))
             if prediction_id is None:
                 continue
-            detail = PredictionDetail(
-                prediction_id=prediction_id,
-                confidence=row.get("confidence"),
-                bullish_prob=row.get("bullish_prob"),
-                bearish_prob=row.get("bearish_prob"),
-                expected_return_5d=row.get("expected_return_5d"),
-                expected_return_20d=row.get("expected_return_20d"),
-                expected_drawdown_20d=row.get("expected_drawdown_20d"),
-                model_reward_risk_ratio=row.get("model_reward_risk_ratio"),
-                risk_score=row.get("risk_score"),
-                target_horizon_days=row.get("target_horizon_days"),
-                universe_size=row.get("universe_size"),
-                percentile=row.get("percentile"),
-                regime_label=row.get("regime_label"),
-                conviction_bucket=row.get("conviction_bucket"),
-                position_size_hint=row.get("position_size_hint"),
-                entry_style=row.get("entry_style"),
-                signal_label=row.get("signal_label"),
-                signal_strength=row.get("signal_strength"),
-                summary_text=row.get("summary_text"),
-                created_at=now,
+            payload_rows.append(
+                {
+                    "prediction_id": prediction_id,
+                    "confidence": row.get("confidence"),
+                    "bullish_prob": row.get("bullish_prob"),
+                    "bearish_prob": row.get("bearish_prob"),
+                    "expected_return_5d": row.get("expected_return_5d"),
+                    "expected_return_20d": row.get("expected_return_20d"),
+                    "expected_drawdown_20d": row.get("expected_drawdown_20d"),
+                    "model_reward_risk_ratio": row.get("model_reward_risk_ratio"),
+                    "risk_score": row.get("risk_score"),
+                    "target_horizon_days": row.get("target_horizon_days"),
+                    "universe_size": row.get("universe_size"),
+                    "percentile": row.get("percentile"),
+                    "regime_label": row.get("regime_label"),
+                    "conviction_bucket": row.get("conviction_bucket"),
+                    "position_size_hint": row.get("position_size_hint"),
+                    "entry_style": row.get("entry_style"),
+                    "signal_label": row.get("signal_label"),
+                    "signal_strength": row.get("signal_strength"),
+                    "summary_text": row.get("summary_text"),
+                    "created_at": now,
+                }
             )
-            self.db.add(detail)
-            inserted += 1
 
-        self.db.commit()
+        inserted = len(payload_rows)
+        for row_chunk in chunked_rows(payload_rows, self._batch_size):
+            self.db.execute(insert(PredictionDetail), row_chunk)
+            self.db.commit()
+
         return inserted
 
 
@@ -803,23 +993,45 @@ class BacktestRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
 
+    def _build_backtest_payload(self, row: StrategyRun) -> dict:
+        summary = _loads_json_object(row.summary_json)
+        validation = None
+        if summary is not None:
+            validation = {
+                "annualized_return": summary.get("annualized_return"),
+                "annualized_volatility": summary.get("annualized_volatility"),
+                "sharpe_like": summary.get("sharpe_like"),
+                "information_ratio": summary.get("information_ratio"),
+                "calmar_like": summary.get("calmar_like"),
+                "max_drawdown": summary.get("max_drawdown"),
+                "hit_ratio": summary.get("hit_ratio"),
+                "excess_hit_ratio": summary.get("excess_hit_ratio"),
+                "avg_turnover": summary.get("avg_turnover"),
+                "candidate_pass_rate": summary.get("candidate_pass_rate"),
+                "selection_rate": summary.get("selection_rate"),
+                "avg_selected_names": summary.get("avg_selected_names"),
+                "cost_assumption_bps": summary.get("cost_assumption_bps"),
+                "gate_stats": summary.get("gate_stats") or {},
+                "capacity_flags": summary.get("capacity_flags") or {},
+            }
+        return {
+            "id": row.id,
+            "name": row.name,
+            "strategy_type": row.strategy_type,
+            "start_date": row.start_date,
+            "end_date": row.end_date,
+            "status": row.status,
+            "summary_json": row.summary_json,
+            "summary": summary,
+            "validation_summary": validation,
+            "created_at": row.created_at,
+            "finished_at": row.finished_at,
+        }
+
     def list_backtests(self) -> list[dict]:
         stmt = select(StrategyRun).order_by(StrategyRun.created_at.desc())
         rows = self.db.scalars(stmt).all()
-        return [
-            {
-                "id": row.id,
-                "name": row.name,
-                "strategy_type": row.strategy_type,
-                "start_date": row.start_date,
-                "end_date": row.end_date,
-                "status": row.status,
-                "summary_json": row.summary_json,
-                "created_at": row.created_at,
-                "finished_at": row.finished_at,
-            }
-            for row in rows
-        ]
+        return [self._build_backtest_payload(row) for row in rows]
 
     def get_latest_backtest(self) -> StrategyRun | None:
         stmt = select(StrategyRun).order_by(StrategyRun.id.desc()).limit(1)
@@ -829,17 +1041,7 @@ class BacktestRepository:
         backtest = self.get_latest_backtest()
         if backtest is None:
             return None
-        return {
-            "id": backtest.id,
-            "name": backtest.name,
-            "strategy_type": backtest.strategy_type,
-            "start_date": backtest.start_date,
-            "end_date": backtest.end_date,
-            "status": backtest.status,
-            "summary_json": backtest.summary_json,
-            "created_at": backtest.created_at,
-            "finished_at": backtest.finished_at,
-        }
+        return self._build_backtest_payload(backtest)
 
     def get_daily_metrics(self, strategy_run_id: int) -> list[dict]:
         stmt = (
@@ -899,6 +1101,59 @@ class PriceSyncStateRepository:
             }
             for state, symbol in rows
         ]
+
+    def list_recent_states_with_symbols(self, limit: int = 5) -> list[dict]:
+        stmt = (
+            select(PriceSyncState, Symbol)
+            .join(Symbol, Symbol.id == PriceSyncState.symbol_id)
+            .order_by(desc(PriceSyncState.updated_at), market_sort_case(Symbol.market), Symbol.ticker.asc())
+            .limit(max(1, limit))
+        )
+        rows = self.db.execute(stmt).all()
+        return [
+            {
+                "symbol_id": state.symbol_id,
+                "ticker": symbol.ticker,
+                "name": symbol.name,
+                "provider": state.provider,
+                "last_synced_date": state.last_synced_date,
+                "status": state.status,
+                "message": state.message,
+                "updated_at": state.updated_at,
+            }
+            for state, symbol in rows
+        ]
+
+    def get_status_overview(self) -> dict:
+        rows = self.db.execute(
+            select(
+                PriceSyncState.status,
+                PriceSyncState.provider,
+                func.count().label("count"),
+                func.max(PriceSyncState.updated_at).label("latest_updated_at"),
+            ).group_by(PriceSyncState.status, PriceSyncState.provider)
+        ).all()
+        status_counts: dict[str, int] = {}
+        provider_counts: dict[str, int] = {}
+        latest_updated_at = None
+        total = 0
+        for row in rows:
+            count = int(row.count or 0)
+            total += count
+            status = str(row.status or "unknown")
+            provider = str(row.provider or "unknown")
+            status_counts[status] = status_counts.get(status, 0) + count
+            provider_counts[provider] = provider_counts.get(provider, 0) + count
+            updated_at = row.latest_updated_at
+            if updated_at and (latest_updated_at is None or str(updated_at) > str(latest_updated_at)):
+                latest_updated_at = updated_at
+        return {
+            "total": total,
+            "success": status_counts.get("success", 0),
+            "status_counts": status_counts,
+            "provider_counts": provider_counts,
+            "latest_updated_at": latest_updated_at,
+        }
 
     def get_state_for_ticker(self, ticker: str) -> dict | None:
         stmt = (
@@ -978,7 +1233,7 @@ class DataJobRepository:
                 started_at=utc_now_iso(),
                 finished_at=None,
                 message=message,
-                params_json=json.dumps(params) if params is not None else None,
+                params_json=json.dumps(params, ensure_ascii=False) if params is not None else None,
             )
             self.db.add(job)
             try:
@@ -992,7 +1247,14 @@ class DataJobRepository:
                 _sleep_for_lock_retry(attempt)
         raise RuntimeError("Data job creation exhausted retries.")
 
-    def complete_job(self, job_id: int, *, status: str, message: str | None = None) -> DataJob | None:
+    def complete_job(
+        self,
+        job_id: int,
+        *,
+        status: str,
+        message: str | None = None,
+        result: dict | None = None,
+    ) -> DataJob | None:
         attempts = 4
         for attempt in range(1, attempts + 1):
             stmt = select(DataJob).where(DataJob.id == job_id)
@@ -1002,6 +1264,14 @@ class DataJobRepository:
             job.status = status
             job.finished_at = utc_now_iso()
             job.message = message
+            if result is not None:
+                params = _loads_json_object(job.params_json) or {}
+                params["result"] = result
+                params["job_runtime"] = {
+                    "duration_seconds": _job_duration_seconds(job.started_at, job.finished_at),
+                    "completed_at": job.finished_at,
+                }
+                job.params_json = json.dumps(params, ensure_ascii=False)
             try:
                 self.db.commit()
                 self.db.refresh(job)
@@ -1016,19 +1286,36 @@ class DataJobRepository:
     def list_recent_jobs(self, limit: int = 20) -> list[dict]:
         stmt = select(DataJob).order_by(DataJob.id.desc()).limit(limit)
         rows = self.db.scalars(stmt).all()
-        return [
-            {
-                "id": row.id,
-                "job_type": row.job_type,
-                "status": row.status,
-                "started_at": row.started_at,
-                "finished_at": row.finished_at,
-                "message": row.message,
-                "params_json": row.params_json,
-                "params": json.loads(row.params_json) if row.params_json else None,
-            }
-            for row in rows
-        ]
+        results: list[dict] = []
+        for row in rows:
+            params = _loads_json_object(row.params_json)
+            result = (params or {}).get("result") if isinstance(params, dict) else None
+            runtime = (params or {}).get("job_runtime") if isinstance(params, dict) else None
+            results.append(
+                {
+                    "id": row.id,
+                    "job_type": row.job_type,
+                    "status": row.status,
+                    "started_at": row.started_at,
+                    "finished_at": row.finished_at,
+                    "message": row.message,
+                    "params_json": row.params_json,
+                    "params": params,
+                    "result": result,
+                    "pipeline_step": (params or {}).get("pipeline_step"),
+                    "depends_on": (params or {}).get("depends_on") or [],
+                    "input_summary": (params or {}).get("input_summary"),
+                    "output_summary": (result or {}).get("output_summary") if isinstance(result, dict) else None,
+                    "quality_summary": (result or {}).get("quality_summary") if isinstance(result, dict) else None,
+                    "retry_count": (result or {}).get("retry_count", 0) if isinstance(result, dict) else 0,
+                    "duration_seconds": (
+                        (runtime or {}).get("duration_seconds")
+                        if isinstance(runtime, dict)
+                        else _job_duration_seconds(row.started_at, row.finished_at)
+                    ),
+                }
+            )
+        return results
 
     def has_running_job(self, job_type: str) -> bool:
         stmt = (
@@ -1046,7 +1333,7 @@ class DataJobRepository:
         stale_after_hours: int = 6,
         message_prefix: str = "Marked stale running job as failed.",
     ) -> int:
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, stale_after_hours))
+        cutoff = app_now() - timedelta(hours=max(1, stale_after_hours))
         stmt = select(DataJob).where(DataJob.status == "running")
         if job_types:
             stmt = stmt.where(DataJob.job_type.in_(job_types))
@@ -1074,6 +1361,109 @@ class DataJobRepository:
         return updated
 
 
+class WorkspaceSnapshotRepository:
+    def __init__(self, db: Session) -> None:
+        self.db = db
+
+    def create_snapshot(
+        self,
+        *,
+        snapshot_type: str,
+        snapshot_date: str,
+        payload: dict,
+        source_job_id: int | None = None,
+    ) -> WorkspaceSnapshot:
+        attempts = 4
+        for attempt in range(1, attempts + 1):
+            snapshot = WorkspaceSnapshot(
+                snapshot_type=snapshot_type,
+                snapshot_date=snapshot_date,
+                payload_json=json.dumps(payload, ensure_ascii=False),
+                source_job_id=source_job_id,
+                created_at=utc_now_iso(),
+            )
+            self.db.add(snapshot)
+            try:
+                self.db.commit()
+                self.db.refresh(snapshot)
+                return snapshot
+            except OperationalError as exc:
+                self.db.rollback()
+                if attempt >= attempts or not _is_sqlite_locked_error(exc):
+                    raise
+                _sleep_for_lock_retry(attempt)
+        raise RuntimeError("Workspace snapshot creation exhausted retries.")
+
+    def get_latest_snapshot(self, snapshot_type: str) -> dict | None:
+        stmt = (
+            select(WorkspaceSnapshot)
+            .where(WorkspaceSnapshot.snapshot_type == snapshot_type)
+            .order_by(WorkspaceSnapshot.id.desc())
+            .limit(1)
+        )
+        row = self.db.scalar(stmt)
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row.payload_json)
+        except json.JSONDecodeError:
+            payload = None
+        return {
+            "id": row.id,
+            "snapshot_type": row.snapshot_type,
+            "snapshot_date": row.snapshot_date,
+            "payload": payload,
+            "source_job_id": row.source_job_id,
+            "created_at": row.created_at,
+        }
+
+    def list_snapshots(self, snapshot_type: str, *, limit: int = 20) -> list[dict]:
+        stmt = (
+            select(WorkspaceSnapshot)
+            .where(WorkspaceSnapshot.snapshot_type == snapshot_type)
+            .order_by(WorkspaceSnapshot.id.desc())
+            .limit(limit)
+        )
+        rows = self.db.scalars(stmt).all()
+        results: list[dict] = []
+        for row in rows:
+            try:
+                payload = json.loads(row.payload_json)
+            except json.JSONDecodeError:
+                payload = None
+            results.append(
+                {
+                    "id": row.id,
+                    "snapshot_type": row.snapshot_type,
+                    "snapshot_date": row.snapshot_date,
+                    "payload": payload,
+                    "source_job_id": row.source_job_id,
+                    "created_at": row.created_at,
+                }
+            )
+        return results
+
+    def get_snapshot(self, snapshot_id: int, *, snapshot_type: str | None = None) -> dict | None:
+        stmt = select(WorkspaceSnapshot).where(WorkspaceSnapshot.id == snapshot_id)
+        if snapshot_type:
+            stmt = stmt.where(WorkspaceSnapshot.snapshot_type == snapshot_type)
+        row = self.db.scalar(stmt.limit(1))
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row.payload_json)
+        except json.JSONDecodeError:
+            payload = None
+        return {
+            "id": row.id,
+            "snapshot_type": row.snapshot_type,
+            "snapshot_date": row.snapshot_date,
+            "payload": payload,
+            "source_job_id": row.source_job_id,
+            "created_at": row.created_at,
+        }
+
+
 class DashboardReadRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -1085,7 +1475,7 @@ class DashboardReadRepository:
         sync_repo = PriceSyncStateRepository(self.db)
         job_repo = DataJobRepository(self.db)
         concept_repo = ConceptSnapshotRepository(self.db)
-        latest_signals = signal_repo.list_latest_predictions(limit=10)
+        latest_signals = signal_repo.list_latest_signal_decisions(limit=10)
         return {
             "latest_signals": latest_signals,
             "sync_states": sync_repo.list_states_with_symbols(),
@@ -1656,6 +2046,37 @@ class ModelRunRepository:
         self.db.commit()
         self.db.refresh(run)
         return run
+
+    def complete_stale_running_runs(
+        self,
+        *,
+        stale_after_hours: int = 6,
+        message_prefix: str = "Marked stale running model run as failed.",
+    ) -> int:
+        cutoff = app_now() - timedelta(hours=max(1, stale_after_hours))
+        rows = self.db.scalars(select(ModelRun).where(ModelRun.status == "running")).all()
+        updated = 0
+        for row in rows:
+            try:
+                started_at = datetime.fromisoformat(row.created_at)
+            except (TypeError, ValueError):
+                started_at = None
+            if started_at is None or started_at > cutoff:
+                continue
+            row.status = "failed"
+            row.finished_at = utc_now_iso()
+            config = {}
+            if row.config_json:
+                try:
+                    config = json.loads(row.config_json)
+                except json.JSONDecodeError:
+                    config = {}
+            config["stale_cleanup_note"] = f"{message_prefix} Original run started at {row.created_at}."
+            row.config_json = json.dumps(config, ensure_ascii=False)
+            updated += 1
+        if updated:
+            self.db.commit()
+        return updated
 
     def get_latest_run(self) -> ModelRun | None:
         stmt = select(ModelRun).order_by(ModelRun.id.desc()).limit(1)

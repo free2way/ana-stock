@@ -1,17 +1,20 @@
 import json
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from app.core.db import SessionLocal
-from app.services.ai_daily_report import build_ai_daily_report, save_ai_daily_report
+from app.services.ai_daily_report import build_ai_daily_report, render_ai_daily_report_push_messages, save_ai_daily_report
 from app.services.backtester import BacktestRunner
 from app.services.cn_concepts import sync_cn_concepts
 from app.services.dataset_build import build_dataset
+from app.services.market_lake import load_lake_rows
 from app.services.market_sync import sync_market_data
 from app.services.push_notifications import PushNotificationService
 from app.services.repository import AppSettingRepository, DataJobRepository, WatchlistRepository
+from app.services.time_utils import app_now, app_now_iso
 from app.services.trainer import SignalTrainer
+from app.services.workspace_snapshots import refresh_workspace_snapshots
 
 
 AUTO_ANALYSIS_KEY = "auto_analysis_config"
@@ -20,7 +23,7 @@ AUTO_ANALYSIS_JOB_TYPE = "watchlist_auto_analysis"
 DEFAULT_AUTO_ANALYSIS_CONFIG = {
     "enabled": False,
     "interval_hours": 24,
-    "provider": "tushare",
+    "provider": "auto",
     "start_date": "2025-01-01",
     "signal_type": "momentum",
     "lookback_days": 3,
@@ -32,11 +35,11 @@ DEFAULT_AUTO_ANALYSIS_CONFIG = {
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc).replace(microsecond=0)
+    return app_now()
 
 
 def utc_now_iso() -> str:
-    return utc_now().isoformat()
+    return app_now_iso()
 
 
 def _safe_int(value, default: int) -> int:
@@ -69,7 +72,7 @@ class AutoAnalysisService:
         config["interval_hours"] = max(1, _safe_int(config.get("interval_hours"), 24))
         config["lookback_days"] = max(1, _safe_int(config.get("lookback_days"), 3))
         config["top_n"] = max(1, _safe_int(config.get("top_n"), 1))
-        config["provider"] = str(config.get("provider") or "tushare").strip() or "tushare"
+        config["provider"] = str(config.get("provider") or "auto").strip() or "auto"
         config["signal_type"] = str(config.get("signal_type") or "momentum").strip() or "momentum"
         config["start_date"] = str(config.get("start_date") or "2025-01-01").strip() or "2025-01-01"
         config["sync_cn_concepts"] = bool(config.get("sync_cn_concepts", True))
@@ -154,11 +157,30 @@ class AutoAnalysisService:
 
         run_name = f"watchlist_auto_{utc_now().strftime('%Y%m%d_%H%M%S')}"
         try:
-            sync_results = sync_market_data(
-                tickers=tickers,
-                start_date=config["start_date"],
-                provider=config["provider"],
-            )
+            use_lake = self._should_use_market_lake(tickers=tickers, markets=normalized_markets)
+            if use_lake:
+                sync_results = [
+                    {
+                        "ticker": ticker,
+                        "status": "skipped",
+                        "provider": "parquet_lake",
+                        "message": "Using pre-refreshed Parquet market lake; no per-symbol CSV sync needed.",
+                    }
+                    for ticker in tickers
+                ]
+                build_result = {
+                    "normalized_files": [],
+                    "qlib_built": False,
+                    "source": "parquet_lake",
+                    "message": "Skipped CSV normalization; trainer and backtester read from Parquet lake.",
+                }
+            else:
+                sync_results = sync_market_data(
+                    tickers=tickers,
+                    start_date=config["start_date"],
+                    provider=config["provider"],
+                )
+                build_result = build_dataset(normalize_only=True)
             cn_concept_result = None
             if config.get("sync_cn_concepts"):
                 cn_tickers = [ticker for ticker in tickers if ticker.upper().endswith((".SS", ".SZ"))]
@@ -171,11 +193,17 @@ class AutoAnalysisService:
                             "message": str(exc),
                             "rows_written": 0,
                         }
-            build_result = build_dataset(normalize_only=True)
             predictions_written = SignalTrainer().train(
                 run_name=run_name,
                 signal_type=config["signal_type"],
                 lookback_days=config["lookback_days"],
+                tickers=tickers,
+                market=(
+                    sorted(normalized_markets)[0]
+                    if len(normalized_markets) == 1
+                    else ("MIXED" if normalized_markets else None)
+                ),
+                universe="local_watchlist",
             )
             daily_rows_written = BacktestRunner().run(top_n=config["top_n"])
             ai_daily_report = build_ai_daily_report(
@@ -187,12 +215,24 @@ class AutoAnalysisService:
             push_result = None
             notifier = PushNotificationService()
             if notifier.available_channels():
-                from app.services.ai_daily_report import render_ai_daily_report_message
-
-                push_result = notifier.send_text(
-                    title="AI 每日决策面板",
-                    body=render_ai_daily_report_message(ai_daily_report),
-                )
+                push_messages = render_ai_daily_report_push_messages(ai_daily_report)
+                push_results = []
+                sent: list[str] = []
+                failed: list[dict] = []
+                for message_item in push_messages:
+                    result = notifier.send_text(
+                        title=message_item["title"],
+                        body=message_item["body"],
+                    )
+                    push_results.append({"title": message_item["title"], **result})
+                    sent.extend(item for item in (result.get("sent") or []) if item not in sent)
+                    failed.extend(result.get("failed") or [])
+                push_result = {
+                    "status": "success" if sent and not failed else "partial" if sent else "failed",
+                    "sent": sent,
+                    "failed": failed,
+                    "messages": push_results,
+                }
             message = (
                 f"Auto analysis finished for {len(tickers)} watchlist stock(s): "
                 f"{predictions_written} predictions, {daily_rows_written} backtest day(s)"
@@ -206,6 +246,7 @@ class AutoAnalysisService:
             with SessionLocal() as db:
                 DataJobRepository(db).complete_job(job_id, status="success", message=message)
                 self._persist_last_run(db)
+                refresh_workspace_snapshots(db, source_job_id=job_id)
             return {
                 "status": "success",
                 "job_id": job_id,
@@ -224,6 +265,14 @@ class AutoAnalysisService:
             with SessionLocal() as db:
                 DataJobRepository(db).complete_job(job_id, status="failed", message=str(exc))
             raise
+
+    def _should_use_market_lake(self, *, tickers: list[str], markets: set[str]) -> bool:
+        if not tickers:
+            return False
+        if markets and not markets.issubset({"CN", "US"}):
+            return False
+        rows = load_lake_rows(tickers={ticker.upper() for ticker in tickers}, limit_per_symbol=2)
+        return bool(rows)
 
     def _persist_last_run(self, db) -> None:
         repo = AppSettingRepository(db)
@@ -252,6 +301,11 @@ class AutoAnalysisService:
             else:
                 tickers = watchlist_repo.list_enabled_tickers(watchlist.id)
             job_repo = DataJobRepository(db)
+            job_repo.complete_stale_running_jobs(
+                job_types=[AUTO_ANALYSIS_JOB_TYPE],
+                stale_after_hours=max(1, int(config.get("stale_job_hours") or 6)),
+                message_prefix="Auto analysis cleanup closed a stale running job.",
+            )
             if job_repo.has_running_job(AUTO_ANALYSIS_JOB_TYPE):
                 raise RuntimeError("Auto analysis is already running.")
             job = job_repo.create_job(

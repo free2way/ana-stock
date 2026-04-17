@@ -10,8 +10,14 @@ router = APIRouter(prefix="/signals", tags=["signals"])
 
 
 @router.get("/latest")
-def latest_signals(request: Request, limit: int = 20, db: Session = Depends(get_db_session)):
+def latest_signals(
+    request: Request,
+    limit: int = 20,
+    market: str | None = None,
+    tradability: str | None = None,
+    db: Session = Depends(get_db_session),
+):
     if not is_authenticated(request):
         return login_redirect("/dashboard")
     repo = PredictionRepository(db)
-    return repo.list_latest_predictions(limit=limit)
+    return repo.list_latest_signal_decisions(limit=limit, market=market, tradability=tradability)

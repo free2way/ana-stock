@@ -5,6 +5,7 @@ from pathlib import Path
 from app.services.model_signal_summary import enrich_model_output, summarize_model_output
 from app.core.config import get_settings
 from app.core.db import SessionLocal
+from app.services.market_lake import load_lake_rows
 from app.services.repository import (
     ModelRunRepository,
     PredictionDetailRepository,
@@ -20,12 +21,25 @@ class SignalTrainer:
     def __init__(self) -> None:
         self.settings = get_settings()
 
-    def _load_rows(self) -> list[dict]:
+    def _load_rows(self, *, tickers: set[str] | None = None) -> list[dict]:
         rows: list[dict] = []
-        for csv_path in sorted(self.settings.normalized_data_dir.glob("*.csv")):
+        csv_paths = sorted(self.settings.normalized_data_dir.glob("*.csv"))
+        selected_paths = csv_paths
+        if tickers:
+            matched_paths = [csv_path for csv_path in csv_paths if csv_path.stem.upper() in tickers]
+            if matched_paths:
+                selected_paths = matched_paths
+        for csv_path in selected_paths:
             with csv_path.open("r", newline="", encoding="utf-8") as input_file:
                 reader = csv.DictReader(input_file)
-                rows.extend(reader)
+                if tickers:
+                    rows.extend(
+                        row for row in reader if str(row.get("symbol") or "").strip().upper() in tickers
+                    )
+                else:
+                    rows.extend(reader)
+        if not rows:
+            rows = load_lake_rows(tickers=tickers)
         rows.sort(key=lambda row: (row.get("symbol") or "", row.get("date") or ""))
         return rows
 
@@ -66,10 +80,16 @@ class SignalTrainer:
         run_name: str = "baseline_momentum",
         signal_type: str = "momentum",
         lookback_days: int = 3,
+        tickers: list[str] | None = None,
+        market: str | None = None,
+        universe: str | None = None,
     ) -> int:
-        rows = self._load_rows()
+        normalized_tickers = {
+            str(ticker).strip().upper() for ticker in (tickers or []) if str(ticker).strip()
+        } or None
+        rows = self._load_rows(tickers=normalized_tickers)
         if not rows:
-            raise RuntimeError("No normalized CSV files found. Run `scripts/build_dataset.py --normalize-only` first.")
+            raise RuntimeError("No local market data found. Refresh the Parquet market lake or rebuild normalized CSVs first.")
         if lookback_days < 1:
             raise RuntimeError("lookback_days must be at least 1.")
         if signal_type not in {"momentum", "reversal"}:
@@ -88,18 +108,28 @@ class SignalTrainer:
             prediction_repo = PredictionWriteRepository(db)
             detail_repo = PredictionDetailRepository(db)
             explanation_repo = PredictionExplanationRepository(db)
+            model_repo.complete_stale_running_runs(
+                stale_after_hours=6,
+                message_prefix="Trainer cleanup closed a stale running model run.",
+            )
 
             dates = sorted({row["date"] for row in rows if row.get("date")})
+            latest_prediction_date = dates[-1] if dates else None
             run = model_repo.create_run(
                 name=run_name,
                 model_type="local_baseline",
-                market="US",
-                universe="local_watchlist",
+                market=market or "US",
+                universe=universe or ("local_watchlist" if normalized_tickers else "full_dataset"),
                 train_start=dates[0] if dates else None,
                 train_end=dates[-1] if dates else None,
                 test_start=dates[0] if dates else None,
                 test_end=dates[-1] if dates else None,
-                config={"signal_type": signal_type, "lookback_days": lookback_days},
+                config={
+                    "signal_type": signal_type,
+                    "lookback_days": lookback_days,
+                    "ticker_count": len(normalized_tickers or []),
+                    "tickers": sorted(normalized_tickers) if normalized_tickers else None,
+                },
                 artifact_path=None,
                 status="running",
             )
@@ -181,16 +211,6 @@ class SignalTrainer:
                                 "contribution": volume_component * polarity,
                             },
                         ]
-                        historical_returns = trailing_returns[:-1]
-                        latest_first = list(reversed(historical_returns))
-                        for index, value in enumerate(latest_first, start=1):
-                            components.append(
-                                {
-                                    "feature_name": f"lag_return_{index}d",
-                                    "feature_value": value,
-                                    "contribution": (value / len(trailing_returns)) * polarity,
-                                }
-                            )
 
                 closes.append(close)
                 if volume:
@@ -227,31 +247,35 @@ class SignalTrainer:
                         },
                         lang="en",
                     ) or {}
-                    detail_rows.append(
-                        {
-                            "symbol_id": record["symbol_id"],
-                            "trade_date": record["trade_date"],
-                            "confidence": enriched.get("confidence"),
-                            "bullish_prob": enriched.get("bullish_prob"),
-                            "bearish_prob": enriched.get("bearish_prob"),
-                            "expected_return_5d": enriched.get("expected_return_5d"),
-                            "expected_return_20d": enriched.get("expected_return_20d"),
-                            "expected_drawdown_20d": enriched.get("expected_drawdown_20d"),
-                            "model_reward_risk_ratio": enriched.get("model_reward_risk_ratio"),
-                            "risk_score": enriched.get("risk_score"),
-                            "target_horizon_days": enriched.get("target_horizon_days"),
-                            "universe_size": enriched.get("universe_size"),
-                            "percentile": enriched.get("percentile"),
-                            "regime_label": enriched.get("regime_label"),
-                            "conviction_bucket": enriched.get("conviction_bucket"),
-                            "position_size_hint": enriched.get("position_size_hint"),
-                            "entry_style": enriched.get("entry_style"),
-                            "signal_label": enriched.get("signal_label"),
-                            "signal_strength": enriched.get("signal_strength"),
-                            "summary_text": enriched.get("summary_text") or summarize_model_output(enriched, lang="en"),
-                        }
-                    )
-                    explanation_rows.extend(record.pop("_explanations", []))
+                    if latest_prediction_date and record["trade_date"] == latest_prediction_date:
+                        detail_rows.append(
+                            {
+                                "symbol_id": record["symbol_id"],
+                                "trade_date": record["trade_date"],
+                                "confidence": enriched.get("confidence"),
+                                "bullish_prob": enriched.get("bullish_prob"),
+                                "bearish_prob": enriched.get("bearish_prob"),
+                                "expected_return_5d": enriched.get("expected_return_5d"),
+                                "expected_return_20d": enriched.get("expected_return_20d"),
+                                "expected_drawdown_20d": enriched.get("expected_drawdown_20d"),
+                                "model_reward_risk_ratio": enriched.get("model_reward_risk_ratio"),
+                                "risk_score": enriched.get("risk_score"),
+                                "target_horizon_days": enriched.get("target_horizon_days"),
+                                "universe_size": enriched.get("universe_size"),
+                                "percentile": enriched.get("percentile"),
+                                "regime_label": enriched.get("regime_label"),
+                                "conviction_bucket": enriched.get("conviction_bucket"),
+                                "position_size_hint": enriched.get("position_size_hint"),
+                                "entry_style": enriched.get("entry_style"),
+                                "signal_label": enriched.get("signal_label"),
+                                "signal_strength": enriched.get("signal_strength"),
+                                "summary_text": enriched.get("summary_text") or summarize_model_output(enriched, lang="en"),
+                            }
+                        )
+                    if latest_prediction_date and record["trade_date"] == latest_prediction_date:
+                        explanation_rows.extend(record.pop("_explanations", []))
+                    else:
+                        record.pop("_explanations", None)
                     signal_rows.append(record)
 
             if not signal_rows:

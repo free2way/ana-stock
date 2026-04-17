@@ -1,5 +1,7 @@
 import csv
+import html
 import json
+import re
 from io import StringIO
 from urllib.parse import urlencode
 from datetime import datetime, timezone
@@ -11,29 +13,88 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.db import get_db_session
 from app.models.schema import SymbolCreate
-from app.services.ai_daily_report import build_ai_daily_report, load_ai_daily_report, render_ai_daily_report_message, save_ai_daily_report
+from app.services.ai_daily_report import (
+    build_ai_daily_report,
+    build_close_review_action_feed,
+    list_ai_daily_report_history,
+    load_ai_daily_report,
+    load_ai_daily_report_history_item,
+    render_ai_daily_report_message,
+    save_ai_daily_report,
+)
 from app.services.auth import is_authenticated, login_redirect
+from app.services.auto_analysis import auto_analysis_service
 from app.services.close_review_scheduler import close_review_scheduler_service
 from app.services.focus_pool import enrich_focus_pool_with_symbols, load_today_focus_pool
 from app.services.dashboard_summary import load_dashboard_summary, load_recent_jobs_summary
 from app.services.market_intelligence import build_market_narrative_brief
+from app.services.market_lake import load_lake_price_history
 from app.services.market_news import MarketNewsService
 from app.services.market_sync import sync_market_data
 from app.services.model_signal_summary import build_model_state, build_signal_label, enrich_model_output, model_confidence
+from app.services.portfolio_book import load_portfolio_positions
+from app.services.price_snapshot import load_latest_close
+from app.services.push_notifications import PushNotificationService
 from app.services.repository import (
+    BacktestRepository,
     ConceptSnapshotRepository,
+    DataJobRepository,
+    ModelRunRepository,
     PredictionRepository,
     PredictionTradePlanRepository,
+    PriceSyncStateRepository,
     SymbolRepository,
     TechnicalSnapshotRepository,
     WatchlistRepository,
 )
 from app.services.runtime_cache import get_or_set
 from app.services.screener import ScreenerService
+from app.services.social_signals import social_signal_summary
 from app.services.symbol_details import SymbolDataService
+from app.services.time_utils import format_app_datetime
+from app.services.ui_lang import resolve_request_lang
+from app.services.workspace_nav import WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
+from app.services.workspace_snapshots import (
+    SNAPSHOT_CONTINUOUS_LEADERS,
+    SNAPSHOT_DASHBOARD_NLP,
+    SNAPSHOT_HOME_PORTFOLIO,
+    SNAPSHOT_HOME_WATCHLIST,
+    SNAPSHOT_MARKET_HEATMAP_WORKSPACE,
+    SNAPSHOT_MARKET_WORKSPACE,
+    SNAPSHOT_MARKET_WORKSPACE_MONITOR,
+    SNAPSHOT_MODEL_CANDIDATES,
+    SNAPSHOT_PIPELINE_STATUS,
+    load_latest_workspace_snapshot,
+)
 
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+
+
+def _provider_strategy_view(lang: str) -> dict:
+    if lang == "zh":
+        return {
+            "title": "Provider 策略",
+            "copy": "先看系统如何自动选源，再看最近一次实际上用了哪个数据源。",
+            "price_auto": "价格数据 `auto`：A 股优先 TuShare，其他市场优先 yfinance。",
+            "price_openbb": "价格数据 `openbb`：走 OpenBB 包装层，并保留现有 fallback 能力。",
+            "fund_auto": "基本面 `auto`：A 股走 TuShare，美股/港股走 OpenBB 或 yfinance fundamentals。",
+            "concept_auto": "概念数据 `auto`：当前 A 股概念映射统一走 TuShare。",
+            "execution": "执行与实时：后续会放到 `execution / realtime` 层，而不是混进研究数据层。",
+            "ops_title": "当前 provider 口径",
+            "ops_copy": "任务配置里现在推荐优先用 `auto` 或按市场选择默认 provider。",
+        }
+    return {
+        "title": "Provider Strategy",
+        "copy": "Check how the app chooses providers automatically first, then compare that with the provider actually used most recently.",
+        "price_auto": "Price `auto`: CN prefers TuShare, while other markets default to yfinance.",
+        "price_openbb": "Price `openbb`: goes through the OpenBB wrapper and keeps the existing fallback behavior.",
+        "fund_auto": "Fundamentals `auto`: CN uses TuShare, while US/HK uses OpenBB or yfinance fundamentals.",
+        "concept_auto": "Concept `auto`: current CN concept mapping is standardized on TuShare.",
+        "execution": "Execution and realtime are reserved for the future `execution / realtime` layer instead of the research data layer.",
+        "ops_title": "Current provider policy",
+        "ops_copy": "Job configuration now prefers `auto` or a market-aware default provider.",
+    }
 
 
 def _dashboard_home_panels(
@@ -99,6 +160,81 @@ def _dashboard_home_panels(
         }
 
     return get_or_set("dashboard_home_panels", cache_key, ttl_seconds=90.0, loader=_load)
+
+
+def _signal_status_tone(status: str | None) -> str:
+    normalized = str(status or "").upper()
+    if normalized == "READY":
+        return "sig-buy"
+    if normalized in {"REVIEW", "DEFER"}:
+        return "sig-watch"
+    if normalized == "BLOCKED":
+        return "sig-sell"
+    return "sig-hold"
+
+
+def _dashboard_signal_action_sets(latest_signals: list[dict]) -> dict[str, list[dict]]:
+    actionable: list[dict] = []
+    blocked: list[dict] = []
+    trim_review: list[dict] = []
+    for item in latest_signals:
+        status = str(item.get("tradability_status") or "").upper()
+        score = float(item.get("score") or 0.0)
+        priority = item.get("priority") if item.get("priority") is not None else 99
+        enriched = {
+            **item,
+            "status_tone": _signal_status_tone(status),
+            "status_label": status or "UNKNOWN",
+            "target_weight_pct": round(float(item.get("target_weight") or 0.0) * 100.0, 1) if item.get("target_weight") is not None else None,
+            "risk_flags_text": "/".join((item.get("risk_flags") or [])[:2]) or "-",
+            "sort_key": (priority, -score, item.get("ticker") or ""),
+        }
+        if status == "READY":
+            actionable.append(enriched)
+        elif status == "BLOCKED":
+            blocked.append(enriched)
+        elif status in {"REVIEW", "DEFER"}:
+            trim_review.append(enriched)
+    actionable.sort(key=lambda item: item["sort_key"])
+    blocked.sort(key=lambda item: item["sort_key"])
+    trim_review.sort(key=lambda item: item["sort_key"])
+    return {"actionable": actionable[:5], "blocked": blocked[:5], "trim_review": trim_review[:5]}
+
+
+def _dashboard_trading_regime(
+    *,
+    latest_signals: list[dict],
+    risk_overview: dict,
+    lang: str,
+) -> dict[str, str]:
+    signal_sets = _dashboard_signal_action_sets(latest_signals)
+    actionable = len(signal_sets["actionable"])
+    blocked = len(signal_sets["blocked"])
+    review = len(signal_sets["trim_review"])
+    top_tags = [str(tag).lower() for tag in (risk_overview.get("top_tags") or [])]
+
+    if actionable >= max(3, blocked + 1) and review <= actionable:
+        label = "进攻" if lang == "zh" else "Offense"
+        detail = (
+            "可执行候选多于受阻与复核，今天可以先配风险。"
+            if lang == "zh"
+            else "More names are actionable than blocked or under review, so risk can be added selectively."
+        )
+    elif blocked >= max(2, actionable) or any("drawdown" in tag or "gap" in tag for tag in top_tags):
+        label = "防守" if lang == "zh" else "Defense"
+        detail = (
+            "受阻候选和风险标记偏多，今天先控制风险再谈加仓。"
+            if lang == "zh"
+            else "Blocked candidates and risk tags dominate, so risk control should come before adding exposure."
+        )
+    else:
+        label = "平衡" if lang == "zh" else "Balanced"
+        detail = (
+            "可执行与复核信号并存，适合边做边核。"
+            if lang == "zh"
+            else "Actionable and review names are mixed, so proceed selectively and verify as you go."
+        )
+    return {"label": label, "detail": detail}
 
 
 def _dashboard_watchlist_map(db: Session) -> dict[str, dict]:
@@ -210,7 +346,8 @@ def _render_dashboard_home_panels_fragment(
         focus_items=focus_items,
         risk_overview=risk_overview,
     )
-    ai_daily_report = load_ai_daily_report(db=db)
+    signal_sets = _dashboard_signal_action_sets(latest_signals)
+    ai_daily_report = _load_cached_ai_daily_report(db)
     snapshot_top_lines = list(home_panels.get("snapshot_top_lines") or [])
     market_narrative = home_panels["market_narrative"]
     market_headlines = home_panels["market_headlines"]
@@ -238,6 +375,27 @@ def _render_dashboard_home_panels_fragment(
             "</div>"
             "</div>"
         )
+    actionable_rows = "".join(
+        "<div style='display:flex;justify-content:space-between;gap:8px;padding:10px 0;border-top:1px solid var(--line);'>"
+        f"<div><div style='font-weight:800'>{item.get('ticker')}</div><div class='muted'>{item.get('name') or item.get('ticker')}</div><div class='muted'>{item.get('execution_note') or item.get('entry_trigger') or '-'}</div></div>"
+        f"<div style='text-align:right;'><span class='signal {item.get('status_tone')}'>{item.get('status_label')}</span><div class='muted'>{(str(item.get('target_weight_pct')) + '%') if item.get('target_weight_pct') is not None else '-'}</div></div>"
+        "</div>"
+        for item in signal_sets["actionable"]
+    ) or f"<div class='muted'>{'暂无可执行候选' if lang == 'zh' else 'No actionable candidates yet'}</div>"
+    blocked_rows = "".join(
+        "<div style='display:flex;justify-content:space-between;gap:8px;padding:10px 0;border-top:1px solid var(--line);'>"
+        f"<div><div style='font-weight:800'>{item.get('ticker')}</div><div class='muted'>{item.get('name') or item.get('ticker')}</div><div class='muted'>{item.get('block_reason') or item.get('execution_note') or '-'}</div></div>"
+        f"<div style='text-align:right;'><span class='signal {item.get('status_tone')}'>{item.get('status_label')}</span><div class='muted'>{item.get('risk_flags_text')}</div></div>"
+        "</div>"
+        for item in signal_sets["blocked"]
+    ) or f"<div class='muted'>{'暂无受阻候选' if lang == 'zh' else 'No blocked candidates'}</div>"
+    review_rows = "".join(
+        "<div style='display:flex;justify-content:space-between;gap:8px;padding:10px 0;border-top:1px solid var(--line);'>"
+        f"<div><div style='font-weight:800'>{item.get('ticker')}</div><div class='muted'>{item.get('name') or item.get('ticker')}</div><div class='muted'>{item.get('execution_note') or item.get('invalidation_condition') or '-'}</div></div>"
+        f"<div style='text-align:right;'><span class='signal {item.get('status_tone')}'>{item.get('status_label')}</span><div class='muted'>{item.get('risk_flags_text')}</div></div>"
+        "</div>"
+        for item in signal_sets["trim_review"]
+    ) or f"<div class='muted'>{'暂无复核队列' if lang == 'zh' else 'No review queue yet'}</div>"
     return f"""
       <article class="card">
         <div class="eyebrow">{'今日行动板' if lang == 'zh' else 'Today Action Board'}</div>
@@ -249,7 +407,7 @@ def _render_dashboard_home_panels_fragment(
           </div>
           <div>
             <div class="muted" style="font-weight:700;margin-bottom:6px;">{'连续强势股' if lang == 'zh' else 'Continuous Leaders'}</div>
-            <div class="muted">{' / '.join(item.get('ticker') for item in continuous_rows_source[:3]) or '-'}</div>
+            <div class="muted">{" / ".join(f"{item.get('ticker')} · {item.get('name') or item.get('ticker')}" for item in continuous_rows_source[:3]) or '-'}</div>
           </div>
           <div>
             <div class="muted" style="font-weight:700;margin-bottom:6px;">{'今日重点盯盘池' if lang == 'zh' else 'Today Focus Pool'}</div>
@@ -259,6 +417,24 @@ def _render_dashboard_home_panels_fragment(
             <a class="action-link" href="/screeners/market-snapshot?lang={lang}&mode={session_mode}">{'打开市场快照榜单' if lang == 'zh' else 'Open Market Snapshot'}</a>
             <a class="action-link" href="/screeners/focus/today?lang={lang}">{'打开今日重点盯盘池' if lang == 'zh' else 'Open Today Focus Pool'}</a>
             <a class="action-link" href="/watchlist?lang={lang}&mode={session_mode}">{_dt(lang, 'open_watchlist')}</a>
+          </div>
+        </div>
+      </article>
+      <article class="card">
+        <div class="eyebrow">{'交易候选' if lang == 'zh' else 'Actionable Candidates'}</div>
+        <div class="muted">{'先看今天能做、要复核、以及不能做的票。' if lang == 'zh' else 'Start with what is actionable, what needs review, and what is blocked.'}</div>
+        <div class="stack" style="margin-top:12px;">
+          <div>
+            <div class="muted" style="font-weight:700;margin-bottom:6px;">{'可执行' if lang == 'zh' else 'Ready'}</div>
+            {actionable_rows}
+          </div>
+          <div>
+            <div class="muted" style="font-weight:700;margin-bottom:6px;">{'待复核 / 减仓' if lang == 'zh' else 'Review / Trim'}</div>
+            {review_rows}
+          </div>
+          <div>
+            <div class="muted" style="font-weight:700;margin-bottom:6px;">{'受阻候选' if lang == 'zh' else 'Blocked'}</div>
+            {blocked_rows}
           </div>
         </div>
       </article>
@@ -300,11 +476,12 @@ def _render_dashboard_top_fragment(
     signal_items = "".join(
         "<article class='signal-card'>"
         f"<div class='signal-top'><a class='signal-ticker' href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a><span class='signal-rank'>#{int(item['rank_value'])}</span></div>"
+        f"<div class='signal-date'>{item.get('name') or item['ticker']}</div>"
         f"<div class='signal-date'>{item['trade_date']}</div>"
         f"<div style='margin-bottom:8px;'><span style='display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;background:{build_model_state(item.get('score'), lang=lang)['bg']};color:{build_model_state(item.get('score'), lang=lang)['fg']};font-weight:800;font-size:12px;'>{build_model_state(item.get('score'), lang=lang)['label']}</span></div>"
         f"<div class='signal-score'>{item['score']:.6f}</div>"
         f"<div style='margin-top:6px;'>{_signal_pill(item.get('score'), lang=lang, compact=True)}</div>"
-        f"<div class='signal-foot'>{latest_model['name'] if latest_model else ('最新模型' if lang == 'zh' else 'Latest model')}"
+        f"<div class='signal-foot' title='{latest_model['name'] if latest_model else ('最新模型' if lang == 'zh' else 'Latest model')}'>{_compact_run_name(latest_model['name'], 24) if latest_model else ('最新模型' if lang == 'zh' else 'Latest model')}"
         f"{' · ' + str(model_confidence(item.get('score'))) + '%' if model_confidence(item.get('score')) is not None else ''}</div>"
         "</article>"
         for item in latest_signals[:3]
@@ -346,7 +523,11 @@ def _render_ai_daily_report_card(report: dict | None) -> str:
     rows = payload.get("rows") or []
     strategy = payload.get("strategy") or {}
     preview = "".join(
-        f"<div class='muted' style='margin-top:8px;'><strong>{item.get('ticker')}</strong> · {item.get('verdict') or '-'} · {item.get('headline') or '-'}</div>"
+        (
+            f"<div class='muted' style='margin-top:8px;'><strong>{item.get('ticker')}</strong> · {item.get('name') or item.get('ticker')} · {item.get('verdict') or '-'} · 仓位 {item.get('target_weight') or '-'} · {item.get('tradability_status') or '-'}"
+            f"<br/>触发 {item.get('entry_trigger') or '-'} · 失效 {item.get('invalidation_condition') or '-'}"
+            f"<br/>周期 {item.get('time_horizon') or '-'} · 滑点 {item.get('max_slippage_bps') or '-'}bps · {item.get('liquidity_bucket') or '-'} 桶</div>"
+        )
         for item in rows[:3]
     ) or "<div class='muted' style='margin-top:8px;'>No AI daily report yet.</div>"
     return (
@@ -815,15 +996,845 @@ def _lookback_pills(base_path: str, *, selected: int, extra_params: dict[str, st
 
 def _load_summary(db: Session, *, lookback_runs: int = 5) -> dict:
     lookback_runs = _clamp_lookback_runs(lookback_runs)
-    return load_dashboard_summary(
-        db,
-        lookback_runs=lookback_runs,
-        market_context_loader=lambda latest_signals: _build_market_context(
+    cache_key = json.dumps({"lookback_runs": lookback_runs}, sort_keys=True, ensure_ascii=False)
+
+    def _load() -> dict:
+        return load_dashboard_summary(
             db,
-            latest_signals,
             lookback_runs=lookback_runs,
-        ),
+            market_context_loader=lambda latest_signals: _build_market_context(
+                db,
+                latest_signals,
+                lookback_runs=lookback_runs,
+            ),
+        )
+
+    return get_or_set("dashboard_summary_bundle", cache_key, ttl_seconds=60.0, loader=_load)
+
+
+def _lightweight_market_context(latest_signals: list[dict]) -> dict:
+    risk_counts: dict[str, int] = {}
+    tagged_examples: list[dict] = []
+    for item in latest_signals:
+        tags = [str(tag).strip() for tag in (item.get("risk_flags") or item.get("execution_tags") or []) if str(tag).strip()]
+        if not tags:
+            continue
+        for tag in tags:
+            risk_counts[tag] = risk_counts.get(tag, 0) + 1
+        tagged_examples.append(
+            {
+                "ticker": item.get("ticker"),
+                "tags": tags[:2],
+                "signal_strength": int(item.get("signal_strength") or 0),
+            }
+        )
+    tagged_examples.sort(key=lambda entry: (-entry["signal_strength"], str(entry.get("ticker") or "")))
+    return {
+        "market_distribution": [],
+        "top_concepts": [],
+        "sector_heatmap": [],
+        "concept_tracker": [],
+        "continuous_leaders": [],
+        "risk_overview": {
+            "tagged_names": len(tagged_examples),
+            "top_tags": [
+                {"tag": tag, "count": count}
+                for tag, count in sorted(risk_counts.items(), key=lambda pair: (-pair[1], pair[0]))[:3]
+            ],
+            "examples": tagged_examples[:3],
+        },
+        "resonance_score": 0.0,
+        "tracked_signal_count": len(latest_signals),
+    }
+
+
+def _load_home_summary(db: Session, *, lookback_runs: int = 5) -> dict:
+    lookback_runs = _clamp_lookback_runs(lookback_runs)
+    cache_key = json.dumps({"lookback_runs": lookback_runs, "kind": "home"}, sort_keys=True, ensure_ascii=False)
+
+    def _load() -> dict:
+        return load_dashboard_summary(
+            db,
+            lookback_runs=lookback_runs,
+            market_context_loader=_lightweight_market_context,
+        )
+
+    return get_or_set("dashboard_home_summary_bundle", cache_key, ttl_seconds=60.0, loader=_load)
+
+
+def _load_ops_summary(db: Session) -> dict:
+    def _load() -> dict:
+        sync_repo = PriceSyncStateRepository(db)
+        model_repo = ModelRunRepository(db)
+        backtest_repo = BacktestRepository(db)
+        job_repo = DataJobRepository(db)
+        return {
+            "generated_at": datetime.now(timezone.utc).astimezone().replace(microsecond=0).isoformat(),
+            "auto_analysis": auto_analysis_service.get_status(db=db),
+            "latest_model": model_repo.get_latest_run_summary() or {},
+            "recent_model_runs": model_repo.list_recent_runs(limit=8),
+            "latest_backtest": backtest_repo.get_latest_backtest_summary() or {},
+            "recent_jobs": job_repo.list_recent_jobs(limit=8),
+            "sync_overview": sync_repo.get_status_overview(),
+            "recent_sync_states": sync_repo.list_recent_states_with_symbols(limit=5),
+        }
+
+    return get_or_set("dashboard_ops_summary_bundle", "latest", ttl_seconds=30.0, loader=_load)
+
+
+def _load_cached_ai_daily_report(db: Session) -> dict:
+    return get_or_set(
+        "dashboard_ai_daily_report",
+        "latest",
+        ttl_seconds=45.0,
+        loader=lambda: load_ai_daily_report(db=db) or {},
     )
+
+
+def _display_time(value: str | None, *, with_tz: bool = False) -> str:
+    return format_app_datetime(value, with_tz=with_tz)
+
+
+def _report_outcome_rows(report: dict, *, report_date: str | None) -> list[dict]:
+    rows = report.get("market_recommendations") or report.get("rows") or []
+    outcome_rows: list[dict] = []
+    for item in rows[:5]:
+        ticker = str(item.get("ticker") or "").strip().upper()
+        market = str(item.get("market") or "").strip().upper() or ("CN" if ticker.endswith((".SS", ".SZ", ".SH", ".BJ")) else "US")
+        history = load_lake_price_history(market=market, ticker=ticker, limit=260)
+        baseline = None
+        if report_date:
+            prior_or_same = [row for row in history if str(row.get("date") or "") <= str(report_date)]
+            if prior_or_same:
+                baseline = prior_or_same[-1]
+        if baseline is None and history:
+            baseline = history[0]
+        latest = history[-1] if history else None
+        try:
+            baseline_close = float((baseline or {}).get("close"))
+        except (TypeError, ValueError):
+            baseline_close = None
+        try:
+            latest_close = float((latest or {}).get("close"))
+        except (TypeError, ValueError):
+            latest_close = None
+        baseline_date = str((baseline or {}).get("date") or "-")
+        latest_date = str((latest or {}).get("date") or "-")
+        return_pct = None
+        status = "pending"
+        if baseline_close and latest_close and latest_date > baseline_date:
+            return_pct = (latest_close / baseline_close - 1.0) * 100.0
+            if return_pct >= 3:
+                status = "hit"
+            elif return_pct <= -3:
+                status = "miss"
+            else:
+                status = "watch"
+        outcome_rows.append(
+            {
+                "ticker": ticker,
+                "name": item.get("name") or ticker,
+                "market": market,
+                "baseline_date": baseline_date,
+                "baseline_close": baseline_close,
+                "latest_date": latest_date,
+                "latest_close": latest_close,
+                "return_pct": return_pct,
+                "status": status,
+            }
+        )
+    return outcome_rows
+
+
+def _report_outcome_summary(outcome_rows: list[dict], *, lang: str) -> str:
+    measured = [row for row in outcome_rows if row.get("return_pct") is not None]
+    if not measured:
+        return "暂无后续交易日价格，先保留待观察。" if lang == "zh" else "No later trading-day prices yet; keep this report pending."
+    avg_return = sum(float(row.get("return_pct") or 0.0) for row in measured) / len(measured)
+    hit_count = sum(1 for row in measured if float(row.get("return_pct") or 0.0) > 0)
+    if lang == "zh":
+        return f"已可验证 {len(measured)} 只，平均收益 {avg_return:.2f}%，上涨命中 {hit_count}/{len(measured)}。"
+    return f"{len(measured)} names are measurable, average return {avg_return:.2f}%, positive hits {hit_count}/{len(measured)}."
+
+
+def _fmt_optional_float(value: object, *, suffix: str = "", digits: int = 2) -> str:
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):.{digits}f}{suffix}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _outcome_status_label(status: str | None, *, lang: str) -> str:
+    normalized = str(status or "").lower()
+    if lang == "zh":
+        return {
+            "pending": "待观察",
+            "hit": "命中",
+            "miss": "失效",
+            "watch": "观察",
+        }.get(normalized, "-")
+    return {
+        "pending": "Pending",
+        "hit": "Hit",
+        "miss": "Miss",
+        "watch": "Watch",
+    }.get(normalized, "-")
+
+
+def _dashboard_home_signal(score: float | None, lang: str) -> tuple[str, str]:
+    label = build_signal_label(score, lang=lang) or ("观察" if lang == "zh" else "Watch")
+    normalized = str(label).strip().lower()
+    if normalized in {"buy", "买入"}:
+        return label, "sig-buy"
+    if normalized in {"sell", "卖出"}:
+        return label, "sig-sell"
+    if normalized in {"watch", "观察"}:
+        return label, "sig-watch"
+    return label, "sig-hold"
+
+
+def _dashboard_home_watchlist_rows(db: Session, *, lang: str, session_mode: str) -> list[dict]:
+    watchlist_repo = WatchlistRepository(db)
+    prediction_repo = PredictionRepository(db)
+    watchlist = watchlist_repo.get_or_create_default()
+    items = watchlist_repo.list_items(watchlist.id)
+    tickers = [item["ticker"] for item in items]
+    outputs = prediction_repo.get_latest_model_outputs_for_tickers(tickers)
+    ranked: list[dict] = []
+    for item in items:
+        model_output = outputs.get(item["ticker"]) or {}
+        score = model_output.get("score")
+        confidence = int(model_output.get("confidence") or model_confidence(score) or 0)
+        label, tone = _dashboard_home_signal(score, lang)
+        decision = str(label).upper()
+        mode_rank = confidence * 2 + int(round(float(score or 0.0) * 100))
+        if session_mode == "postmarket":
+            mode_rank += int(round(float(score or 0.0) * 100))
+        ranked.append(
+            {
+                "ticker": item["ticker"],
+                "name": item.get("name") or item["ticker"],
+                "market": item.get("market") or "-",
+                "score": float(score or 0.0),
+                "confidence": confidence,
+                "decision": decision,
+                "signal_label": label,
+                "signal_tone": tone,
+                "mode_rank": mode_rank,
+            }
+        )
+    ranked.sort(key=lambda item: (-item["mode_rank"], item["ticker"]))
+    return ranked[:8]
+
+
+def _dashboard_home_portfolio_rows(db: Session, *, lang: str) -> tuple[list[dict], dict]:
+    symbol_repo = SymbolRepository(db)
+    prediction_repo = PredictionRepository(db)
+    rows: list[dict] = []
+    total_market_value = 0.0
+    total_cost = 0.0
+    for item in load_portfolio_positions():
+        overview = symbol_repo.get_overview(item["ticker"]) or {
+            "ticker": item["ticker"],
+            "name": item.get("name"),
+            "market": item.get("market"),
+        }
+        latest_signal = None
+        predictions = prediction_repo.list_symbol_predictions(item["ticker"], limit=1, latest_run_only=True)
+        if predictions:
+            latest_signal = predictions[0]
+        latest_price = float(load_latest_close(item["ticker"]) or 0.0)
+        quantity = float(item.get("quantity") or 0.0)
+        cost_basis = float(item.get("cost_basis") or 0.0)
+        market_value = latest_price * quantity
+        cost_value = cost_basis * quantity
+        pnl = market_value - cost_value
+        pnl_pct = ((latest_price / cost_basis) - 1.0) * 100 if cost_basis else 0.0
+        total_market_value += market_value
+        total_cost += cost_value
+        signal_label, signal_tone = _dashboard_home_signal((latest_signal or {}).get("score"), lang)
+        rows.append(
+            {
+                "ticker": item["ticker"],
+                "name": overview.get("name") or item["ticker"],
+                "market": overview.get("market") or item.get("market") or "-",
+                "latest_price": latest_price,
+                "market_value": market_value,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "signal_label": signal_label,
+                "signal_tone": signal_tone,
+            }
+        )
+    rows.sort(key=lambda item: (-abs(item["market_value"]), item["ticker"]))
+    totals = {
+        "market_value": total_market_value,
+        "cost": total_cost,
+        "pnl": total_market_value - total_cost,
+        "pnl_pct": ((total_market_value / total_cost) - 1.0) * 100 if total_cost else 0.0,
+    }
+    return rows[:8], totals
+
+
+def _compact_label(value: str | None, limit: int = 28) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 1]}…"
+
+
+def _compact_run_name(value: str | None, limit: int = 24) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    if "_" not in text:
+        return _compact_label(text, limit=limit)
+    parts = [part for part in text.split("_") if part]
+    if len(parts) >= 3:
+        prefix = "_".join(parts[:2])
+        suffix = parts[-1]
+        compact = f"{prefix}…{suffix}"
+        if len(compact) <= limit:
+            return compact
+    return _compact_label(text, limit=limit)
+
+
+def _compact_job_type(value: str | None, limit: int = 22) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    aliases = {
+        "watchlist_auto_analysis": "watchlist_analysis",
+        "cn_close_review": "close_review",
+        "sync_cn_symbol_universe": "cn_universe_sync",
+        "init_cn_market_data": "cn_market_init",
+        "refresh_cn_market_data": "cn_market_refresh",
+        "rebuild_technical_snapshots": "tech_snapshots",
+    }
+    text = aliases.get(text, text)
+    return _compact_run_name(text, limit=limit)
+
+
+def _compact_json_summary(value: object, limit: int = 56) -> str:
+    if value in (None, "", {}):
+        return "-"
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        text = str(value)
+    return _compact_label(text, limit=limit)
+
+
+def _latest_cn_refresh_summary(db: Session, recent_jobs: list[dict] | None = None, *, lang: str = "zh") -> dict:
+    jobs = recent_jobs or DataJobRepository(db).list_recent_jobs(limit=10)
+    refresh_job = next(
+        (
+            item
+            for item in jobs
+            if str(item.get("job_type") or "").lower() == "cn_close_review"
+            and str(item.get("status") or "").lower() == "success"
+        ),
+        None,
+    )
+    cn_total = len([symbol for symbol in SymbolRepository(db).list_symbols() if (symbol.market or "").upper() == "CN"])
+    message = str((refresh_job or {}).get("message") or "")
+    match = re.search(r"light CN refresh\s+(\d+)\s+symbol", message, re.IGNORECASE)
+    refreshed = int(match.group(1)) if match else None
+    summary = f"{refreshed}/{cn_total}" if refreshed is not None and cn_total else (str(refreshed) if refreshed is not None else "-")
+    if refreshed is not None:
+        label = f"本轮刷新 {refreshed}/{cn_total} 只 A 股" if lang == "zh" else f"Refreshed {refreshed}/{cn_total} CN symbols"
+    else:
+        label = "暂无全市场刷新结果" if lang == "zh" else "No CN refresh result yet"
+    return {
+        "job": refresh_job,
+        "refreshed": refreshed,
+        "total": cn_total,
+        "summary": summary,
+        "label": label,
+    }
+
+
+def _payload_rows(snapshot: dict | None) -> list[dict]:
+    payload = (snapshot or {}).get("payload")
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get("rows")
+    return rows if isinstance(rows, list) else []
+
+
+def _render_dashboard_workspace(
+    *,
+    lang: str,
+    session_mode: str,
+    lookback_runs: int,
+    summary: dict,
+    watchlist_rows: list[dict],
+    portfolio_rows: list[dict],
+    model_candidate_rows: list[dict],
+    portfolio_totals: dict,
+    portfolio_meta: dict,
+    pipeline_payload: dict,
+    recent_jobs: list[dict],
+    banner_html: str,
+    nlp_payload: dict,
+) -> str:
+    generated_at = summary["generated_at"]
+    auto_analysis = summary["auto_analysis"]
+    market_context = summary["market_context"]
+    latest_model = summary["latest_model"] or {}
+    top_signals = model_candidate_rows or (summary["latest_signals"] or [])[:5]
+    risk_overview = market_context.get("risk_overview", {})
+    risk_tags = risk_overview.get("top_tags") or []
+    lead_text = (
+        "把自选、持仓、模型结果和自动任务放回同一个主工作台。"
+        if lang == "zh"
+        else "Bring watchlist, portfolio, model output, and automated jobs into one workspace."
+    )
+    nav_html = render_workspace_nav_html(lang=lang, active_key="home", lookback_runs=lookback_runs)
+    watchlist_html = "".join(
+        "<article class='list-row'>"
+        f"<div><a class='ticker' href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a><div class='subtle'>{item['name']} · {item['market']}</div></div>"
+        f"<div class='row-right'><span class='signal {item['signal_tone']}'>{item['signal_label']}</span><div class='mini-metric'>{item['confidence']}%</div></div>"
+        "</article>"
+        for item in watchlist_rows
+    ) or f"<div class='empty'>{'还没有自选股' if lang == 'zh' else 'No watchlist names yet'}</div>"
+    portfolio_html = "".join(
+        "<article class='list-row'>"
+        f"<div><a class='ticker' href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a><div class='subtle'>{item['name']} · {item['market']}</div></div>"
+        f"<div class='row-right'><div class='mini-metric {'neg' if item['pnl'] < 0 else 'pos'}'>{item['pnl_pct']:.1f}%</div><span class='signal {item['signal_tone']}'>{item['signal_label']}</span></div>"
+        "</article>"
+        for item in portfolio_rows
+    ) or f"<div class='empty'>{'还没有持仓' if lang == 'zh' else 'No positions yet'}</div>"
+    top_signal_html = "".join(
+        "<article class='signal-row'>"
+        f"<div><a class='ticker' href='/insights/{item.get('ticker')}?lang={lang}'>{item.get('ticker')}</a><div class='subtle'>{item.get('trade_date') or '-'}</div><div class='subtle'>{_compact_label(item.get('reason_summary'), 72) if item.get('reason_summary') else (item.get('name') or '-')}</div></div>"
+        f"<div class='row-right'><span class='signal {item.get('signal_tone') or _dashboard_home_signal(item.get('score'), lang)[1]}'>{item.get('signal_label') or _dashboard_home_signal(item.get('score'), lang)[0]}</span></div>"
+        "</article>"
+        for item in top_signals
+    ) or f"<div class='empty'>{'暂无模型结果' if lang == 'zh' else 'No model output yet'}</div>"
+    recent_jobs_html = "".join(
+        "<article class='job-row'>"
+        f"<div><div class='job-type' title='{item.get('job_type') or '-'}'>{_compact_job_type(item.get('job_type'), 20) or '-'}</div><div class='subtle'>{_display_time(item.get('started_at') or item.get('created_at'))}</div></div>"
+        f"<div class='job-status {str(item.get('status') or '').lower()}'>{item.get('status') or '-'}</div>"
+        "</article>"
+        for item in recent_jobs[:5]
+    ) or f"<div class='empty'>{'暂无任务记录' if lang == 'zh' else 'No jobs yet'}</div>"
+    action_focus_rows = (portfolio_meta or {}).get("watch_items") or []
+    signal_sets = _dashboard_signal_action_sets(summary.get("latest_signals") or [])
+    regime_view = _dashboard_trading_regime(
+        latest_signals=summary.get("latest_signals") or [],
+        risk_overview=risk_overview,
+        lang=lang,
+    )
+    close_review_action_feed = (pipeline_payload or {}).get("close_review_action_feed") if isinstance(pipeline_payload, dict) else None
+    if not isinstance(close_review_action_feed, dict):
+        close_review_action_feed = build_close_review_action_feed(_load_cached_ai_daily_report(db), lang=lang)
+    action_queue_count = len(signal_sets["actionable"])
+    risk_reduction_count = len(signal_sets["trim_review"]) + len(action_focus_rows[:3])
+    blocked_count = len(signal_sets["blocked"])
+    action_focus_html = "".join(
+        "<article class='signal-row'>"
+        f"<div><a class='ticker' href='/insights/{item.get('ticker')}?lang={lang}'>{item.get('ticker')}</a><div class='subtle'>{item.get('name') or item.get('ticker')}</div><div class='subtle'>{item.get('action_reason') or '-'}</div></div>"
+        f"<div class='row-right'><span class='signal sig-watch'>{item.get('action_priority') or '-'}</span><div class='mini-metric'>{item.get('action_hint') or '-'}</div></div>"
+        "</article>"
+        for item in action_focus_rows[:3]
+    ) or f"<div class='empty'>{'暂无动作焦点' if lang == 'zh' else 'No action focus yet'}</div>"
+    actionable_html = "".join(
+        "<article class='signal-row'>"
+        f"<div><a class='ticker' href='/insights/{item.get('ticker')}?lang={lang}'>{item.get('ticker')}</a><div class='subtle'>{item.get('name') or item.get('ticker')}</div><div class='subtle'>{item.get('execution_note') or item.get('entry_trigger') or '-'}</div></div>"
+        f"<div class='row-right'><span class='signal {item.get('status_tone')}'>{item.get('status_label')}</span><div class='mini-metric'>{(str(item.get('target_weight_pct')) + '%') if item.get('target_weight_pct') is not None else '-'}</div></div>"
+        "</article>"
+        for item in signal_sets["actionable"][:3]
+    ) or f"<div class='empty'>{'暂无可执行候选' if lang == 'zh' else 'No actionable candidates yet'}</div>"
+    blocked_html = "".join(
+        "<article class='signal-row'>"
+        f"<div><a class='ticker' href='/insights/{item.get('ticker')}?lang={lang}'>{item.get('ticker')}</a><div class='subtle'>{item.get('name') or item.get('ticker')}</div><div class='subtle'>{item.get('block_reason') or '-'}</div></div>"
+        f"<div class='row-right'><span class='signal {item.get('status_tone')}'>{item.get('status_label')}</span><div class='mini-metric'>{item.get('risk_flags_text')}</div></div>"
+        "</article>"
+        for item in signal_sets["blocked"][:3]
+    ) or f"<div class='empty'>{'暂无受阻候选' if lang == 'zh' else 'No blocked candidates'}</div>"
+    news_opportunities_html = "".join(
+        "<article class='signal-row'>"
+        f"<div><a class='ticker' href='/insights/{item.get('ticker')}?lang={lang}'>{item.get('ticker')}</a><div class='subtle'>{item.get('name') or item.get('ticker')}</div><div class='subtle'>{item.get('summary_text') or '-'}</div></div>"
+        f"<div class='row-right'><span class='signal sig-buy'>{item.get('sentiment_label') or '-'}</span><div class='mini-metric'>{item.get('headline_count') or 0}</div></div>"
+        "</article>"
+        for item in (nlp_payload.get("opportunities") or [])[:3]
+    ) or f"<div class='empty'>{'暂无新闻驱动机会' if lang == 'zh' else 'No news opportunities yet'}</div>"
+    news_risks_html = "".join(
+        "<article class='signal-row'>"
+        f"<div><a class='ticker' href='/insights/{item.get('ticker')}?lang={lang}'>{item.get('ticker')}</a><div class='subtle'>{item.get('name') or item.get('ticker')}</div><div class='subtle'>{item.get('summary_text') or '-'}</div></div>"
+        f"<div class='row-right'><span class='signal sig-sell'>{item.get('sentiment_label') or '-'}</span><div class='mini-metric'>{' / '.join(item.get('risk_tags') or []) or '-'}</div></div>"
+        "</article>"
+        for item in (nlp_payload.get("risks") or [])[:3]
+    ) or f"<div class='empty'>{'暂无新闻风险提醒' if lang == 'zh' else 'No news risks yet'}</div>"
+    close_review_action_html = "".join(
+        "<article class='signal-row'>"
+        f"<div><a class='ticker' href='/insights/{item.get('ticker')}?lang={lang}'>{item.get('ticker')}</a><div class='subtle'>{item.get('name') or item.get('ticker')}</div><div class='subtle'>{item.get('execution_note') or item.get('entry_trigger') or '-'}</div></div>"
+        f"<div class='row-right'><span class='signal sig-buy'>{item.get('tradability_status') or '-'}</span><div class='mini-metric'>{item.get('target_weight') or '-'}</div></div>"
+        "</article>"
+        for item in (close_review_action_feed.get("actionable") or [])[:3]
+    ) or f"<div class='empty'>{'暂无盘后可执行动作' if lang == 'zh' else 'No close-review actions yet'}</div>"
+    pipeline_job_map = {
+        "refresh": next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "cn_close_review"), None),
+        "analysis": next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "watchlist_auto_analysis"), None),
+    }
+    pipeline_rows_html = "".join(
+        "<article class='job-row'>"
+        f"<div><div class='job-type'>{label}</div><div class='subtle'>{_display_time((job or {}).get('finished_at') or (job or {}).get('started_at'))}</div></div>"
+        f"<div class='job-status {str((job or {}).get('status') or 'unknown').lower()}'>{(job or {}).get('status') or ('unknown' if lang == 'en' else '未知')}</div>"
+        "</article>"
+        for label, job in (
+            (("收盘刷新与快照" if lang == "zh" else "Close Review Refresh"), pipeline_job_map["refresh"]),
+            (("自动分析与训练" if lang == "zh" else "Auto Analysis and Train"), pipeline_job_map["analysis"]),
+        )
+    )
+    risk_tags_html = "".join(f"<span class='chip'>{tag}</span>" for tag in risk_tags[:4]) or f"<span class='chip'>{'风险平稳' if lang == 'zh' else 'Risk stable'}</span>"
+    latest_model_full_label = latest_model.get("name") or latest_model.get("model_type") or ("尚未训练" if lang == "zh" else "Not trained")
+    latest_model_label = _compact_run_name(latest_model_full_label, limit=26)
+    latest_model_time = _display_time(latest_model.get("finished_at") or latest_model.get("created_at"))
+    latest_model_status = latest_model.get("status") or ("unknown" if lang == "en" else "未知")
+    trust_score = int((pipeline_payload or {}).get("trust_score") or 0)
+    if lang == "zh":
+        trust_label = "可信度较高" if trust_score >= 75 else ("需要人工复核" if trust_score < 55 else "可用但建议复核")
+        action_mix_text = f"高 {((portfolio_meta or {}).get('action_mix') or {}).get('high', 0)} / 中 {((portfolio_meta or {}).get('action_mix') or {}).get('medium', 0)} / 低 {((portfolio_meta or {}).get('action_mix') or {}).get('low', 0)}"
+    else:
+        trust_label = "Higher trust" if trust_score >= 75 else ("Needs review" if trust_score < 55 else "Usable with review")
+        action_mix_text = f"H {((portfolio_meta or {}).get('action_mix') or {}).get('high', 0)} / M {((portfolio_meta or {}).get('action_mix') or {}).get('medium', 0)} / L {((portfolio_meta or {}).get('action_mix') or {}).get('low', 0)}"
+    exposure_text = f"{(portfolio_meta or {}).get('top_sector') or '-'} · {(portfolio_meta or {}).get('concentration_pct') or 0}%"
+    auto_status_label = auto_analysis.get("status") or ("running" if auto_analysis.get("enabled") else "idle")
+    auto_status_text = (
+        "自动任务会把结果直接回流到这里。"
+        if lang == "zh"
+        else "Automated jobs should flow their output back here."
+    )
+    lang_toggle = (
+        f"<a class='top-pill' href='/dashboard?lang=en&mode={session_mode}&lookback_runs={lookback_runs}'>EN</a>"
+        f"<a class='top-pill' href='/dashboard?lang=zh&mode={session_mode}&lookback_runs={lookback_runs}'>中文</a>"
+    )
+    mode_toggle = "".join(
+        f"<a class='top-pill{' active' if value == session_mode else ''}' href='/dashboard?lang={lang}&mode={value}&lookback_runs={lookback_runs}'>{label}</a>"
+        for value, label in (
+            ("premarket", "盘前" if lang == "zh" else "Premarket"),
+            ("monitor", "盘中" if lang == "zh" else "Monitor"),
+            ("postmarket", "盘后" if lang == "zh" else "Postmarket"),
+        )
+    )
+    return f"""
+    <!DOCTYPE html>
+    <html lang="{lang}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{'PQW 工作台' if lang == 'zh' else 'PQW Workspace'}</title>
+        <style>
+          :root {{
+            --bg:#071018;
+            --bg-soft:#0d1722;
+            --panel:#111c28;
+            --panel-2:#152231;
+            --panel-3:#1a2a3c;
+            --ink:#e6edf3;
+            --muted:#90a3b8;
+            --line:#223246;
+            --accent:#3dd9b6;
+            --accent-2:#52a8ff;
+            --danger:#ff6b81;
+            --warn:#f6c85f;
+            --good:#4ade80;
+          }}
+          * {{ box-sizing:border-box; }}
+          body {{
+            margin:0;
+            font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color:var(--ink);
+            background:
+              radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),
+              radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),
+              linear-gradient(180deg, #08111a 0%, #071018 100%);
+          }}
+          a {{ color:inherit; text-decoration:none; }}
+          .app {{ display:grid; grid-template-columns: 280px minmax(0, 1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .brand {{ margin-bottom:28px; }}
+          .content {{ padding:28px; }}
+          .topbar {{ display:flex; justify-content:space-between; gap:16px; align-items:flex-start; flex-wrap:wrap; margin-bottom:20px; }}
+          .hero h2 {{ margin:0 0 10px; font-size:38px; line-height:1.02; max-width:760px; }}
+          .hero p {{ margin:0; color:var(--muted); font-size:15px; max-width:720px; }}
+          .top-actions {{ display:flex; gap:10px; flex-wrap:wrap; }}
+          .top-pill {{
+            display:inline-flex; align-items:center; justify-content:center;
+            min-height:38px; padding:0 14px; border-radius:999px; border:1px solid var(--line);
+            background:rgba(17,28,40,0.72); color:var(--muted); font-weight:700; font-size:13px;
+          }}
+          .top-pill.active {{ color:var(--ink); border-color:rgba(82,168,255,0.35); background:rgba(82,168,255,0.16); }}
+          .banner {{ margin-bottom:18px; padding:14px 16px; border-radius:16px; background:#172534; border:1px solid var(--line); }}
+          .summary-grid {{ display:grid; gap:14px; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); margin-bottom:18px; }}
+          .card {{
+            background:linear-gradient(180deg, rgba(21,34,49,0.98), rgba(17,28,40,0.98));
+            border:1px solid var(--line);
+            border-radius:22px;
+            padding:18px;
+            box-shadow:0 24px 48px rgba(0,0,0,0.18);
+          }}
+          .eyebrow {{ display:inline-flex; margin-bottom:10px; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.10); color:var(--accent); font-size:11px; font-weight:800; letter-spacing:0.05em; text-transform:uppercase; }}
+          .metric {{ font-size:30px; font-weight:800; line-height:1; margin:0 0 8px; }}
+          .metric.metric-compact {{ font-size:18px; line-height:1.25; word-break:break-word; overflow-wrap:anywhere; }}
+          .muted {{ color:var(--muted); font-size:13px; line-height:1.5; }}
+          .workspace {{ display:grid; gap:18px; grid-template-columns:minmax(0, 1.35fr) minmax(340px, 0.8fr); }}
+          .stack {{ display:grid; gap:18px; }}
+          .panel-head {{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:14px; }}
+          .panel-head h3 {{ margin:0; font-size:22px; }}
+          .panel-head p {{ margin:6px 0 0; color:var(--muted); font-size:13px; }}
+          .list-stack {{ display:grid; gap:10px; }}
+          .list-row, .signal-row, .job-row {{
+            display:flex; justify-content:space-between; gap:12px; align-items:center;
+            padding:14px; border-radius:16px; background:rgba(11,19,29,0.82); border:1px solid rgba(34,50,70,0.92);
+          }}
+          .row-right {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }}
+          .ticker {{ font-weight:800; font-size:15px; }}
+          .subtle {{ color:var(--muted); font-size:12px; margin-top:4px; }}
+          .signal {{ display:inline-flex; align-items:center; padding:6px 10px; border-radius:999px; font-size:12px; font-weight:800; }}
+          .sig-buy {{ background:rgba(74,222,128,0.14); color:#8af0a6; }}
+          .sig-sell {{ background:rgba(255,107,129,0.14); color:#ff93a4; }}
+          .sig-watch {{ background:rgba(82,168,255,0.14); color:#89c2ff; }}
+          .sig-hold {{ background:rgba(246,200,95,0.14); color:#ffd982; }}
+          .mini-metric {{ font-weight:800; font-size:13px; color:var(--ink); }}
+          .mini-metric.pos {{ color:#8af0a6; }}
+          .mini-metric.neg {{ color:#ff93a4; }}
+          .chip-row {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }}
+          .chip {{ display:inline-flex; align-items:center; padding:7px 10px; border-radius:999px; background:rgba(82,168,255,0.10); border:1px solid rgba(82,168,255,0.18); color:#9acbff; font-size:12px; font-weight:700; }}
+          .cta-row {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }}
+          .cta {{
+            display:inline-flex; align-items:center; justify-content:center;
+            min-height:40px; padding:0 14px; border-radius:14px; font-weight:800; font-size:13px;
+            border:1px solid var(--line); background:rgba(17,28,40,0.8);
+          }}
+          .cta.primary {{ background:linear-gradient(180deg, rgba(61,217,182,0.26), rgba(61,217,182,0.14)); border-color:rgba(61,217,182,0.28); }}
+          .job-status {{ padding:6px 10px; border-radius:999px; font-size:12px; font-weight:800; text-transform:uppercase; }}
+          .job-status.success {{ background:rgba(74,222,128,0.14); color:#8af0a6; }}
+          .job-status.failed {{ background:rgba(255,107,129,0.14); color:#ff93a4; }}
+          .job-status.partial {{ background:rgba(246,200,95,0.14); color:#ffd982; }}
+          .job-status.running {{ background:rgba(82,168,255,0.14); color:#89c2ff; }}
+          .job-status.unknown {{ background:rgba(144,163,184,0.14); color:#c0cfde; }}
+          .job-type {{ font-weight:700; font-size:13px; }}
+          .empty {{ padding:18px; border-radius:16px; background:rgba(11,19,29,0.65); border:1px dashed var(--line); color:var(--muted); font-size:13px; }}
+          @media (max-width: 1120px) {{
+            .app {{ grid-template-columns:1fr; }}
+            .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }}
+            .workspace, .summary-grid {{ grid-template-columns:1fr; }}
+          }}
+        </style>
+      </head>
+      <body>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{'量化工作台' if lang == 'zh' else 'Trading Workspace'}</h1>
+              <p>{lead_text}</p>
+            </div>
+            <nav class="side-nav">{nav_html}</nav>
+            <div class="sidebar-foot">
+              <div class="eyebrow">{'自动化' if lang == 'zh' else 'Automation'}</div>
+              <div class="metric" style="font-size:20px;margin-bottom:6px;">{auto_status_label}</div>
+              <div class="muted">{auto_status_text}</div>
+              <div class="chip-row">
+                <span class="chip">{'模式' if lang == 'zh' else 'Mode'}: {session_mode}</span>
+                <span class="chip">{'更新' if lang == 'zh' else 'Updated'}: {generated_at}</span>
+              </div>
+            </div>
+          </aside>
+          <main class="content">
+            {banner_html}
+            <section class="topbar">
+              <div class="hero">
+                <h2>{'先看自选和持仓，再进入模型选股与任务中心。' if lang == 'zh' else 'Start with watchlist and positions, then move into model picks and jobs.'}</h2>
+                <p>{lead_text}</p>
+              </div>
+              <div class="top-actions">
+                {mode_toggle}
+                {lang_toggle}
+              </div>
+            </section>
+
+            <section class="summary-grid">
+              <article class="card">
+                <div class="eyebrow">{'Trading Regime' if lang == 'en' else '交易节奏'}</div>
+                <div class="metric">{regime_view['label']}</div>
+                <div class="muted">{regime_view['detail']}</div>
+                <div class="chip-row"><span class="chip">{'模型可信度' if lang == 'zh' else 'Model trust'}: {trust_score}</span></div>
+              </article>
+              <article class="card">
+                <div class="eyebrow">{'Action Queue' if lang == 'en' else '行动队列'}</div>
+                <div class="metric">{action_queue_count}</div>
+                <div class="muted">{'今天优先看的可执行候选。' if lang == 'zh' else 'Ready-to-trade names that deserve attention first.'}</div>
+              </article>
+              <article class="card">
+                <div class="eyebrow">{'Risk Reduction' if lang == 'en' else '减风险队列'}</div>
+                <div class="metric">{risk_reduction_count}</div>
+                <div class="muted">{'先减谁、先复核谁，应该在这里看。' if lang == 'zh' else 'This is the queue for trims and review-first names.'}</div>
+              </article>
+              <article class="card">
+                <div class="eyebrow">{'Blocked Candidates' if lang == 'en' else '受阻候选'}</div>
+                <div class="metric">{blocked_count}</div>
+                <div class="muted">{'这些名字今天不适合直接做。' if lang == 'zh' else 'These names should not be traded directly today.'}</div>
+                <div class="chip-row"><span class="chip">{'暴露' if lang == 'zh' else 'Exposure'}: {exposure_text}</span></div>
+              </article>
+              <article class="card">
+                <div class="eyebrow">{'Latest Model' if lang == 'en' else '最新模型'}</div>
+                <div class="metric metric-compact" title="{latest_model_full_label}">{latest_model_label}</div>
+                <div class="muted">{latest_model_time}</div>
+                <div class="chip-row"><span class="chip">{'状态' if lang == 'zh' else 'Status'}: {latest_model_status}</span><span class="chip">{trust_label}</span></div>
+              </article>
+            </section>
+
+            <section class="workspace">
+              <div class="stack">
+                <article class="card">
+                  <div class="panel-head">
+                    <div>
+                      <div class="eyebrow">{'今日首页' if lang == 'zh' else 'Home Board'}</div>
+                      <h3>{'自选股票' if lang == 'zh' else 'Watchlist'}</h3>
+                      <p>{'把最该看的股票直接放在第一屏。' if lang == 'zh' else 'Keep the most relevant names in the first screenful.'}</p>
+                    </div>
+                    <a class="cta" href="/watchlist?lang={lang}&mode={session_mode}">{'打开完整自选' if lang == 'zh' else 'Open watchlist'}</a>
+                  </div>
+                  <div class="list-stack">{watchlist_html}</div>
+                </article>
+
+                <article class="card">
+                  <div class="panel-head">
+                    <div>
+                      <div class="eyebrow">{'持仓总览' if lang == 'zh' else 'Portfolio'}</div>
+                      <h3>{'持仓股票' if lang == 'zh' else 'Positions'}</h3>
+                      <p>{'把盈亏、风险态度和关注顺序放在一起。' if lang == 'zh' else 'Show PnL, posture, and review priority together.'}</p>
+                    </div>
+                    <a class="cta" href="/portfolio">{'打开持仓页' if lang == 'zh' else 'Open portfolio'}</a>
+                  </div>
+                  <div class="muted" style="margin-bottom:12px;">{(portfolio_meta or {}).get('risk_summary') or ('先看组合暴露，再看单票盈亏。' if lang == 'zh' else 'Check portfolio exposure before single-name PnL.')}</div>
+                  <div class="list-stack">{portfolio_html}</div>
+                </article>
+              </div>
+
+              <div class="stack">
+                <article class="card">
+                  <div class="panel-head">
+                    <div>
+                      <div class="eyebrow">{'组合暴露' if lang == 'zh' else 'Exposure'}</div>
+                      <h3>{'组合层先看什么' if lang == 'zh' else 'Portfolio-level first look'}</h3>
+                      <p>{'先确认行业集中度和动作优先级，再看单票明细。' if lang == 'zh' else 'Confirm concentration and action priority before drilling into single names.'}</p>
+                    </div>
+                  </div>
+                  <div class="list-stack">
+                    <article class="signal-row">
+                      <div><div class="ticker">{'最大行业暴露' if lang == 'zh' else 'Top sector exposure'}</div><div class="subtle">{exposure_text}</div></div>
+                      <div class="row-right"><div class="mini-metric">{(portfolio_meta or {}).get('top_market') or '-'}</div></div>
+                    </article>
+                    <article class="signal-row">
+                      <div><div class="ticker">{'动作优先级分布' if lang == 'zh' else 'Action priority mix'}</div><div class="subtle">{'高优先级仓位越多，越需要人工复核。' if lang == 'zh' else 'More high-priority names means more manual review is needed.'}</div></div>
+                      <div class="row-right"><div class="mini-metric">{action_mix_text}</div></div>
+                    </article>
+                  </div>
+                </article>
+                <article class="card">
+                  <div class="panel-head">
+                    <div>
+                      <div class="eyebrow">{'模型机会' if lang == 'zh' else 'Model Opportunities'}</div>
+                      <h3>{'模型选股入口' if lang == 'zh' else 'Model Picks'}</h3>
+                      <p>{'下一步不再先看一堆参数，而是先从模板进入。' if lang == 'zh' else 'Lead with templates first instead of a wall of parameters.'}</p>
+                    </div>
+                  </div>
+                  <div class="list-stack">{top_signal_html}</div>
+                  <div class="cta-row">
+                    <a class="cta primary" href="/screeners?lang={lang}">{'进入模型选股' if lang == 'zh' else 'Open screeners'}</a>
+                    <a class="cta" href="/dashboard/continuous-leaders?lang={lang}&lookback_runs={lookback_runs}">{'连续强势' if lang == 'zh' else 'Continuous leaders'}</a>
+                  </div>
+                </article>
+                <article class="card">
+                  <div class="panel-head">
+                    <div>
+                      <div class="eyebrow">{'新闻驱动机会' if lang == 'zh' else 'News Opportunities'}</div>
+                      <h3>{'新闻层面今天先看什么' if lang == 'zh' else 'What news suggests today'}</h3>
+                      <p>{'这里读取收盘后新闻增强 job 的预存结果，不在首页做实时 NLP。' if lang == 'zh' else 'This reads precomputed post-close news results instead of running NLP live.'}</p>
+                    </div>
+                  </div>
+                  <div class="list-stack">{news_opportunities_html}</div>
+                </article>
+                <article class="card">
+                  <div class="panel-head">
+                    <div>
+                      <div class="eyebrow">{'新闻风险提醒' if lang == 'zh' else 'News Risks'}</div>
+                      <h3>{'先避开什么' if lang == 'zh' else 'What to avoid first'}</h3>
+                      <p>{'这里汇总负面情绪和文本风险标签。' if lang == 'zh' else 'This summarizes negative tone and text risk tags.'}</p>
+                    </div>
+                  </div>
+                  <div class="list-stack">{news_risks_html}</div>
+                </article>
+
+                <article class="card">
+                  <div class="panel-head">
+                    <div>
+                      <div class="eyebrow">{'盘后动作' if lang == 'zh' else 'Close Review Actions'}</div>
+                      <h3>{'收盘复盘后先做什么' if lang == 'zh' else 'What to do after close review'}</h3>
+                      <p>{close_review_action_feed.get('summary') or ('把复盘结果直接翻译成动作。' if lang == 'zh' else 'Translate the close review directly into actions.')}</p>
+                    </div>
+                    <a class="cta" href="/dashboard/ai-daily-report">{'打开 AI 日报' if lang == 'zh' else 'Open AI report'}</a>
+                  </div>
+                  <div class="list-stack">{close_review_action_html}</div>
+                </article>
+
+                <article class="card">
+                  <div class="panel-head">
+                    <div>
+                      <div class="eyebrow">{'减风险队列' if lang == 'zh' else 'Risk Reduction Queue'}</div>
+                      <h3>{'优先处理哪些仓位' if lang == 'zh' else 'Which positions need action first'}</h3>
+                      <p>{'先看该减、该复核、以及偏离目标仓位的仓位。' if lang == 'zh' else 'Start with trims, review names, and holdings that are far from target weight.'}</p>
+                    </div>
+                    <a class="cta" href="/portfolio">{'打开持仓页' if lang == 'zh' else 'Open portfolio'}</a>
+                  </div>
+                  <div class="list-stack">{action_focus_html}</div>
+                </article>
+
+                <article class="card">
+                  <div class="panel-head">
+                    <div>
+                      <div class="eyebrow">{'任务中心' if lang == 'zh' else 'Jobs'}</div>
+                      <h3>{'自动任务结果' if lang == 'zh' else 'Automated Results'}</h3>
+                      <p>{'让 job 的结果自然回到首页，而不是让你自己去找。' if lang == 'zh' else 'Bring job outcomes back to the home screen.'}</p>
+                    </div>
+                    <a class="cta" href="/dashboard/ops?lang={lang}&lookback_runs={lookback_runs}">{'打开任务中心' if lang == 'zh' else 'Open jobs'}</a>
+                  </div>
+                  <div class="list-stack" style="margin-bottom:12px;">{pipeline_rows_html}</div>
+                  <div class="list-stack">{recent_jobs_html}</div>
+                </article>
+
+                <article class="card">
+                  <div class="panel-head">
+                    <div>
+                      <div class="eyebrow">{'导航建议' if lang == 'zh' else 'Suggested Flow'}</div>
+                      <h3>{'推荐使用路径' if lang == 'zh' else 'Suggested Path'}</h3>
+                    </div>
+                  </div>
+                  <div class="cta-row">
+                    <a class="cta primary" href="/watchlist?lang={lang}&mode={session_mode}">{'先看自选' if lang == 'zh' else 'Review watchlist'}</a>
+                    <a class="cta" href="/portfolio">{'再看持仓' if lang == 'zh' else 'Review portfolio'}</a>
+                    <a class="cta" href="/screeners?lang={lang}">{'再做模型选股' if lang == 'zh' else 'Run screeners'}</a>
+                    <a class="cta" href="/dashboard/ops?lang={lang}&lookback_runs={lookback_runs}">{'最后看自动任务' if lang == 'zh' else 'Check jobs last'}</a>
+                  </div>
+                </article>
+              </div>
+            </section>
+          </main>
+        </div>
+      </body>
+    </html>
+    """
 
 
 def _sparkline_svg(values: list[int]) -> str:
@@ -1027,281 +2038,447 @@ def _concept_price_strength(symbol_data_service: SymbolDataService, tickers: lis
 
 
 def _build_market_context(db: Session, latest_signals: list[dict], *, lookback_runs: int = 5) -> dict:
-    tickers = [item["ticker"] for item in latest_signals if item.get("ticker")]
-    symbol_repo = SymbolRepository(db)
-    concept_repo = ConceptSnapshotRepository(db)
-    signal_repo = PredictionRepository(db)
-    trade_plan_repo = PredictionTradePlanRepository(db)
-    symbol_data_service = SymbolDataService()
-
-    market_counts: dict[str, int] = {}
-    for ticker in tickers:
-        symbol = symbol_repo.get_by_ticker(ticker)
-        market = (symbol.market if symbol and symbol.market else "OTHER").upper()
-        market_counts[market] = market_counts.get(market, 0) + 1
-
-    market_distribution = [
-        {"market": market, "count": count}
-        for market, count in sorted(market_counts.items(), key=lambda pair: (-pair[1], pair[0]))
-    ]
-
-    concept_rows = concept_repo.list_latest_for_tickers(tickers)
-    model_meta_cache: dict[str, dict] = {}
-
-    def model_meta_for_ticker(ticker: str, *, score: float | None = None) -> dict:
-        cache_key = ticker.upper()
-        if cache_key in model_meta_cache:
-            return model_meta_cache[cache_key]
-        detail = signal_repo.get_latest_model_output_for_ticker(ticker)
-        if detail is None:
-            detail = {"ticker": ticker, "score": score}
-        elif detail.get("score") is None and score is not None:
-            detail["score"] = score
-        enriched = enrich_model_output(detail, lang="en") or {"score": score, "state": build_model_state(score, lang="en")}
-        trade_plan = trade_plan_repo.get_latest_for_ticker(ticker) or {}
-        model_meta_cache[cache_key] = {
-            "state": enriched.get("state") or build_model_state(score, lang="en"),
-            "confidence": enriched.get("confidence"),
-            "summary_text": enriched.get("summary_text"),
-            "bullish_prob": enriched.get("bullish_prob"),
-            "bearish_prob": enriched.get("bearish_prob"),
-            "risk_score": enriched.get("risk_score"),
-            "regime_label": enriched.get("regime_label"),
-            "conviction_bucket": enriched.get("conviction_bucket"),
-            "position_size_hint": enriched.get("position_size_hint"),
-            "entry_style": enriched.get("entry_style"),
-            "signal_label": enriched.get("signal_label"),
-            "signal_strength": enriched.get("signal_strength"),
-            "percentile": enriched.get("percentile"),
-            "target_horizon_days": enriched.get("target_horizon_days"),
-            "expected_drawdown_20d": enriched.get("expected_drawdown_20d"),
-            "model_reward_risk_ratio": enriched.get("model_reward_risk_ratio"),
-            "execution_tags": list(trade_plan.get("execution_tags") or []),
+    signature = [
+        {
+            "ticker": item.get("ticker"),
+            "trade_date": item.get("trade_date"),
+            "score": item.get("score"),
         }
-        return model_meta_cache[cache_key]
+        for item in latest_signals[:20]
+    ]
+    cache_key = json.dumps({"lookback_runs": lookback_runs, "signals": signature}, sort_keys=True, ensure_ascii=False)
 
-    def _top_execution_tags(ticker_details: list[dict]) -> list[str]:
-        counts: dict[str, int] = {}
-        for detail in ticker_details:
-            for tag in detail.get("execution_tags") or []:
-                normalized = str(tag).strip()
-                if not normalized:
-                    continue
-                counts[normalized] = counts.get(normalized, 0) + 1
-        return [
-            tag
-            for tag, _count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-        ][:2]
+    def _load() -> dict:
+        tickers = [item["ticker"] for item in latest_signals if item.get("ticker")]
+        symbol_repo = SymbolRepository(db)
+        concept_repo = ConceptSnapshotRepository(db)
+        signal_repo = PredictionRepository(db)
+        trade_plan_repo = PredictionTradePlanRepository(db)
+        symbol_data_service = SymbolDataService()
 
-    concept_map: dict[str, dict] = {}
-    score_lookup = {item["ticker"]: float(item.get("score") or 0.0) for item in latest_signals}
-    for row in concept_rows:
-        name = row["concept_name"]
-        item = concept_map.setdefault(
-            name,
-            {
-                "concept_name": name,
-                "concept_code": row.get("concept_code"),
-                "hits": 0,
-                "score_total": 0.0,
-                "tickers": [],
-                "ticker_details": [],
-                "as_of_date": row.get("as_of_date"),
-            },
-        )
-        item["hits"] += 1
-        item["score_total"] += score_lookup.get(row["ticker"], 0.0)
-        if row["ticker"] not in item["tickers"]:
-            item["tickers"].append(row["ticker"])
-            item["ticker_details"].append(
+        market_counts: dict[str, int] = {}
+        for ticker in tickers:
+            symbol = symbol_repo.get_by_ticker(ticker)
+            market = (symbol.market if symbol and symbol.market else "OTHER").upper()
+            market_counts[market] = market_counts.get(market, 0) + 1
+
+        market_distribution = [
+            {"market": market, "count": count}
+            for market, count in sorted(market_counts.items(), key=lambda pair: (-pair[1], pair[0]))
+        ]
+
+        concept_rows = concept_repo.list_latest_for_tickers(tickers)
+        model_meta_cache: dict[str, dict] = {}
+
+        def model_meta_for_ticker(ticker: str, *, score: float | None = None) -> dict:
+            inner_key = ticker.upper()
+            if inner_key in model_meta_cache:
+                return model_meta_cache[inner_key]
+            detail = signal_repo.get_latest_model_output_for_ticker(ticker)
+            if detail is None:
+                detail = {"ticker": ticker, "score": score}
+            elif detail.get("score") is None and score is not None:
+                detail["score"] = score
+            enriched = enrich_model_output(detail, lang="en") or {"score": score, "state": build_model_state(score, lang="en")}
+            trade_plan = trade_plan_repo.get_latest_for_ticker(ticker) or {}
+            model_meta_cache[inner_key] = {
+                "state": enriched.get("state") or build_model_state(score, lang="en"),
+                "confidence": enriched.get("confidence"),
+                "summary_text": enriched.get("summary_text"),
+                "bullish_prob": enriched.get("bullish_prob"),
+                "bearish_prob": enriched.get("bearish_prob"),
+                "risk_score": enriched.get("risk_score"),
+                "regime_label": enriched.get("regime_label"),
+                "conviction_bucket": enriched.get("conviction_bucket"),
+                "position_size_hint": enriched.get("position_size_hint"),
+                "entry_style": enriched.get("entry_style"),
+                "signal_label": enriched.get("signal_label"),
+                "signal_strength": enriched.get("signal_strength"),
+                "percentile": enriched.get("percentile"),
+                "target_horizon_days": enriched.get("target_horizon_days"),
+                "expected_drawdown_20d": enriched.get("expected_drawdown_20d"),
+                "model_reward_risk_ratio": enriched.get("model_reward_risk_ratio"),
+                "execution_tags": list(trade_plan.get("execution_tags") or []),
+            }
+            return model_meta_cache[inner_key]
+
+        def _top_execution_tags(ticker_details: list[dict]) -> list[str]:
+            counts: dict[str, int] = {}
+            for detail in ticker_details:
+                for tag in detail.get("execution_tags") or []:
+                    normalized = str(tag).strip()
+                    if not normalized:
+                        continue
+                    counts[normalized] = counts.get(normalized, 0) + 1
+            return [tag for tag, _count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))][:2]
+
+        concept_map: dict[str, dict] = {}
+        score_lookup = {item["ticker"]: float(item.get("score") or 0.0) for item in latest_signals}
+        for row in concept_rows:
+            name = row["concept_name"]
+            item = concept_map.setdefault(
+                name,
                 {
-                    "ticker": row["ticker"],
-                    "name": row.get("name"),
-                    "score": score_lookup.get(row["ticker"], 0.0),
-                    **model_meta_for_ticker(row["ticker"], score=score_lookup.get(row["ticker"], 0.0)),
+                    "concept_name": name,
+                    "concept_code": row.get("concept_code"),
+                    "hits": 0,
+                    "score_total": 0.0,
+                    "tickers": [],
+                    "ticker_details": [],
+                    "as_of_date": row.get("as_of_date"),
+                },
+            )
+            item["hits"] += 1
+            item["score_total"] += score_lookup.get(row["ticker"], 0.0)
+            if row["ticker"] not in item["tickers"]:
+                item["tickers"].append(row["ticker"])
+                item["ticker_details"].append(
+                    {
+                        "ticker": row["ticker"],
+                        "name": row.get("name"),
+                        "score": score_lookup.get(row["ticker"], 0.0),
+                        **model_meta_for_ticker(row["ticker"], score=score_lookup.get(row["ticker"], 0.0)),
+                    }
+                )
+
+        top_concepts = sorted(
+            (
+                {
+                    "concept_name": value["concept_name"],
+                    "concept_code": value["concept_code"],
+                    "hits": value["hits"],
+                    "avg_score": round(value["score_total"] / max(value["hits"], 1), 4),
+                    "tickers": value["tickers"],
+                    "ticker_details": sorted(value["ticker_details"], key=lambda detail: detail["score"], reverse=True),
+                    "as_of_date": value["as_of_date"],
+                    "max_signal_strength": max((int(detail.get("signal_strength") or 0) for detail in value["ticker_details"]), default=0),
+                    "buy_signal_count": sum(
+                        1 for detail in value["ticker_details"]
+                        if str(detail.get("signal_label") or "").strip().upper() == "BUY"
+                    ),
+                    "execution_tags": _top_execution_tags(value["ticker_details"]),
+                    **_concept_price_strength(symbol_data_service, value["tickers"]),
+                }
+                for value in concept_map.values()
+            ),
+            key=lambda item: (-item["hits"], -item["avg_score"], item["concept_name"]),
+        )[:12]
+        top_hits = top_concepts[0]["hits"] if top_concepts else 0
+        resonance_score = round(top_hits / max(len(latest_signals), 1) * 100, 1) if latest_signals else 0.0
+
+        sector_heatmap = []
+        for item in top_concepts[:8]:
+            move_boost = int(max(item.get("avg_move_5d") or 0.0, 0.0) * 3)
+            breadth_boost = int(((item.get("breadth_pct") or 0.0) / 100.0) * 16)
+            intensity = min(100, 20 + item["hits"] * 18 + int(max(item["avg_score"], 0) * 120) + move_boost + breadth_boost)
+            sector_heatmap.append(
+                {
+                    "label": item["concept_name"],
+                    "slug": _concept_slug(item["concept_name"]),
+                    "hits": item["hits"],
+                    "avg_score": item["avg_score"],
+                    "avg_move_5d": item.get("avg_move_5d"),
+                    "avg_move_20d": item.get("avg_move_20d"),
+                    "breadth_pct": item.get("breadth_pct"),
+                    "max_signal_strength": item.get("max_signal_strength"),
+                    "buy_signal_count": item.get("buy_signal_count"),
+                    "execution_tags": item.get("execution_tags", []),
+                    "intensity": intensity,
                 }
             )
 
-    top_concepts = sorted(
-        (
-            {
-                "concept_name": value["concept_name"],
-                "concept_code": value["concept_code"],
-                "hits": value["hits"],
-                "avg_score": round(value["score_total"] / max(value["hits"], 1), 4),
-                "tickers": value["tickers"],
-                "ticker_details": sorted(value["ticker_details"], key=lambda detail: detail["score"], reverse=True),
-                "as_of_date": value["as_of_date"],
-                "max_signal_strength": max((int(detail.get("signal_strength") or 0) for detail in value["ticker_details"]), default=0),
-                "buy_signal_count": sum(
-                    1 for detail in value["ticker_details"]
-                    if str(detail.get("signal_label") or "").strip().upper() == "BUY"
-                ),
-                "execution_tags": _top_execution_tags(value["ticker_details"]),
-                **_concept_price_strength(symbol_data_service, value["tickers"]),
-            }
-            for value in concept_map.values()
-        ),
-        key=lambda item: (-item["hits"], -item["avg_score"], item["concept_name"]),
-    )[:12]
-    top_hits = top_concepts[0]["hits"] if top_concepts else 0
-    resonance_score = round(top_hits / max(len(latest_signals), 1) * 100, 1) if latest_signals else 0.0
+        snapshots = signal_repo.list_recent_prediction_snapshots(top_n=10, limit_runs=max(lookback_runs, 2))
+        concept_snapshots: list[dict] = []
+        for snapshot in snapshots:
+            snapshot_tickers = [item["ticker"] for item in snapshot["items"]]
+            snapshot_rows = concept_repo.list_latest_for_tickers(snapshot_tickers)
+            counts: dict[str, int] = {}
+            for row in snapshot_rows:
+                counts[row["concept_name"]] = counts.get(row["concept_name"], 0) + 1
+            concept_snapshots.append({"trade_date": snapshot["trade_date"], "counts": counts})
 
-    sector_heatmap = []
-    for item in top_concepts[:8]:
-        move_boost = int(max(item.get("avg_move_5d") or 0.0, 0.0) * 3)
-        breadth_boost = int(((item.get("breadth_pct") or 0.0) / 100.0) * 16)
-        intensity = min(100, 20 + item["hits"] * 18 + int(max(item["avg_score"], 0) * 120) + move_boost + breadth_boost)
-        sector_heatmap.append(
-            {
-                "label": item["concept_name"],
-                "slug": _concept_slug(item["concept_name"]),
-                "hits": item["hits"],
-                "avg_score": item["avg_score"],
-                "avg_move_5d": item.get("avg_move_5d"),
-                "avg_move_20d": item.get("avg_move_20d"),
-                "breadth_pct": item.get("breadth_pct"),
-                "max_signal_strength": item.get("max_signal_strength"),
-                "buy_signal_count": item.get("buy_signal_count"),
-                "execution_tags": item.get("execution_tags", []),
-                "intensity": intensity,
-            }
-        )
+        tracker_rows: list[dict] = []
+        for item in top_concepts:
+            current_hits = item["hits"]
+            previous_hits = 0
+            streak = 0
+            history: list[int] = []
+            for snapshot in concept_snapshots:
+                count = snapshot["counts"].get(item["concept_name"], 0)
+                history.append(count)
+            if len(history) > 1:
+                previous_hits = history[1]
+            for count in history:
+                if count > 0:
+                    streak += 1
+                else:
+                    break
+            tracker_rows.append(
+                {
+                    "concept_name": item["concept_name"],
+                    "hits": current_hits,
+                    "previous_hits": previous_hits,
+                    "delta_hits": current_hits - previous_hits,
+                    "streak": streak,
+                    "avg_score": item["avg_score"],
+                    "avg_move_5d": item.get("avg_move_5d"),
+                    "avg_move_20d": item.get("avg_move_20d"),
+                    "breadth_pct": item.get("breadth_pct"),
+                    "max_signal_strength": item.get("max_signal_strength"),
+                    "buy_signal_count": item.get("buy_signal_count"),
+                    "execution_tags": item.get("execution_tags", []),
+                    "tickers": item["tickers"],
+                    "ticker_details": item["ticker_details"],
+                    "history": history,
+                    "slug": _concept_slug(item["concept_name"]),
+                }
+            )
+        tracker_rows.sort(key=lambda row: (-row["delta_hits"], -row["hits"], row["concept_name"]))
 
-    snapshots = signal_repo.list_recent_prediction_snapshots(top_n=10, limit_runs=max(lookback_runs, 2))
-    concept_snapshots: list[dict] = []
-    for snapshot in snapshots:
-        snapshot_tickers = [item["ticker"] for item in snapshot["items"]]
-        snapshot_rows = concept_repo.list_latest_for_tickers(snapshot_tickers)
-        counts: dict[str, int] = {}
-        for row in snapshot_rows:
-            counts[row["concept_name"]] = counts.get(row["concept_name"], 0) + 1
-        concept_snapshots.append(
-            {
-                "trade_date": snapshot["trade_date"],
-                "counts": counts,
-            }
-        )
+        latest_signal_map = {item["ticker"]: item for item in latest_signals}
+        continuous_leaders: list[dict] = []
+        ticker_hit_counts: dict[str, int] = {}
+        ticker_score_history: dict[str, list[float]] = {}
+        for snapshot in snapshots:
+            for item in snapshot["items"]:
+                ticker = item["ticker"]
+                ticker_hit_counts[ticker] = ticker_hit_counts.get(ticker, 0) + 1
+                ticker_score_history.setdefault(ticker, []).append(float(item.get("score") or 0.0))
 
-    tracker_rows: list[dict] = []
-    for item in top_concepts:
-        current_hits = item["hits"]
-        previous_hits = 0
-        streak = 0
-        history: list[int] = []
-        for snapshot in concept_snapshots:
-            count = snapshot["counts"].get(item["concept_name"], 0)
-            history.append(count)
-        if len(history) > 1:
-            previous_hits = history[1]
-        for count in history:
-            if count > 0:
-                streak += 1
-            else:
-                break
-        tracker_rows.append(
-            {
-                "concept_name": item["concept_name"],
-                "hits": current_hits,
-                "previous_hits": previous_hits,
-                "delta_hits": current_hits - previous_hits,
-                "streak": streak,
-                "avg_score": item["avg_score"],
-                "avg_move_5d": item.get("avg_move_5d"),
-                "avg_move_20d": item.get("avg_move_20d"),
-                "breadth_pct": item.get("breadth_pct"),
-                "max_signal_strength": item.get("max_signal_strength"),
-                "buy_signal_count": item.get("buy_signal_count"),
-                "execution_tags": item.get("execution_tags", []),
-                "tickers": item["tickers"],
-                "ticker_details": item["ticker_details"],
-                "history": history,
-                "slug": _concept_slug(item["concept_name"]),
-            }
-        )
-    tracker_rows.sort(key=lambda row: (-row["delta_hits"], -row["hits"], row["concept_name"]))
+        for ticker, hits in ticker_hit_counts.items():
+            if hits <= 0:
+                continue
+            symbol = symbol_repo.get_by_ticker(ticker)
+            latest_signal = latest_signal_map.get(ticker, {})
+            continuous_leaders.append(
+                {
+                    "ticker": ticker,
+                    "name": (symbol.name if symbol and symbol.name else ticker),
+                    "market": (symbol.market if symbol and symbol.market else "OTHER").upper(),
+                    "hits": hits,
+                    "runs": lookback_runs,
+                    "score": round(float(latest_signal.get("score") or 0.0), 4),
+                    "score_history": ticker_score_history.get(ticker, []),
+                    "trade_date": latest_signal.get("trade_date"),
+                    **model_meta_for_ticker(ticker, score=float(latest_signal.get("score") or 0.0)),
+                }
+            )
+        continuous_leaders.sort(key=lambda item: (-item["hits"], -item["score"], item["ticker"]))
 
-    latest_signal_map = {item["ticker"]: item for item in latest_signals}
-    continuous_leaders: list[dict] = []
-    ticker_hit_counts: dict[str, int] = {}
-    ticker_score_history: dict[str, list[float]] = {}
-    for snapshot in snapshots:
-        for item in snapshot["items"]:
-            ticker = item["ticker"]
-            ticker_hit_counts[ticker] = ticker_hit_counts.get(ticker, 0) + 1
-            ticker_score_history.setdefault(ticker, []).append(float(item.get("score") or 0.0))
+        risk_counts: dict[str, int] = {}
+        tagged_examples: list[dict] = []
+        seen_tickers: set[str] = set()
+        combined_details: list[dict] = []
+        for concept in top_concepts:
+            combined_details.extend(concept.get("ticker_details") or [])
+        combined_details.extend(continuous_leaders)
+        for detail in combined_details:
+            ticker = str(detail.get("ticker") or "").upper()
+            if not ticker or ticker in seen_tickers:
+                continue
+            seen_tickers.add(ticker)
+            tags = [str(tag).strip() for tag in (detail.get("execution_tags") or []) if str(tag).strip()]
+            if not tags:
+                continue
+            for tag in tags:
+                risk_counts[tag] = risk_counts.get(tag, 0) + 1
+            tagged_examples.append(
+                {
+                    "ticker": detail.get("ticker"),
+                    "tags": tags[:2],
+                    "signal_strength": int(detail.get("signal_strength") or 0),
+                }
+            )
+        tagged_examples.sort(key=lambda item: (-item["signal_strength"], item["ticker"] or ""))
+        risk_overview = {
+            "tagged_names": len(tagged_examples),
+            "top_tags": [
+                {"tag": tag, "count": count}
+                for tag, count in sorted(risk_counts.items(), key=lambda item: (-item[1], item[0]))[:3]
+            ],
+            "examples": tagged_examples[:3],
+        }
 
-    for ticker, hits in ticker_hit_counts.items():
-        if hits <= 0:
-            continue
-        symbol = symbol_repo.get_by_ticker(ticker)
-        latest_signal = latest_signal_map.get(ticker, {})
-        continuous_leaders.append(
-            {
-                "ticker": ticker,
-                "name": (symbol.name if symbol and symbol.name else ticker),
-                "market": (symbol.market if symbol and symbol.market else "OTHER").upper(),
-                "hits": hits,
-                "runs": lookback_runs,
-                "score": round(float(latest_signal.get("score") or 0.0), 4),
-                "score_history": ticker_score_history.get(ticker, []),
-                "trade_date": latest_signal.get("trade_date"),
-                **model_meta_for_ticker(ticker, score=float(latest_signal.get("score") or 0.0)),
-            }
-        )
-    continuous_leaders.sort(key=lambda item: (-item["hits"], -item["score"], item["ticker"]))
+        return {
+            "market_distribution": market_distribution,
+            "top_concepts": top_concepts,
+            "sector_heatmap": sector_heatmap,
+            "concept_tracker": tracker_rows[:12],
+            "continuous_leaders": continuous_leaders[:10],
+            "risk_overview": risk_overview,
+            "resonance_score": resonance_score,
+            "tracked_signal_count": len(latest_signals),
+        }
 
-    risk_counts: dict[str, int] = {}
-    tagged_examples: list[dict] = []
-    seen_tickers: set[str] = set()
-    combined_details: list[dict] = []
-    for concept in top_concepts:
-        combined_details.extend(concept.get("ticker_details") or [])
-    combined_details.extend(continuous_leaders)
-    for detail in combined_details:
-        ticker = str(detail.get("ticker") or "").upper()
-        if not ticker or ticker in seen_tickers:
-            continue
-        seen_tickers.add(ticker)
-        tags = [str(tag).strip() for tag in (detail.get("execution_tags") or []) if str(tag).strip()]
-        if not tags:
-            continue
-        for tag in tags:
-            risk_counts[tag] = risk_counts.get(tag, 0) + 1
-        tagged_examples.append(
-            {
-                "ticker": detail.get("ticker"),
-                "tags": tags[:2],
-                "signal_strength": int(detail.get("signal_strength") or 0),
-            }
-        )
-    tagged_examples.sort(key=lambda item: (-item["signal_strength"], item["ticker"] or ""))
-    risk_overview = {
-        "tagged_names": len(tagged_examples),
-        "top_tags": [
-            {"tag": tag, "count": count}
-            for tag, count in sorted(risk_counts.items(), key=lambda item: (-item[1], item[0]))[:3]
-        ],
-        "examples": tagged_examples[:3],
-    }
-
-    return {
-        "market_distribution": market_distribution,
-        "top_concepts": top_concepts,
-        "sector_heatmap": sector_heatmap,
-        "concept_tracker": tracker_rows[:12],
-        "continuous_leaders": continuous_leaders[:10],
-        "risk_overview": risk_overview,
-        "resonance_score": resonance_score,
-        "tracked_signal_count": len(latest_signals),
-    }
+    return get_or_set("dashboard_market_context", cache_key, ttl_seconds=60.0, loader=_load)
 
 
 def _get_concept_from_summary(summary: dict, concept_slug: str) -> dict | None:
     return next(
-        (item for item in summary["market_context"]["concept_tracker"] if item["slug"] == concept_slug),
+        (item for item in (summary.get("market_context") or {}).get("concept_tracker", []) if item.get("slug") == concept_slug),
         None,
     )
+
+
+def _ticker_links_html(tickers: list[str], *, lang: str, limit: int = 18) -> str:
+    normalized = [str(ticker).strip().upper() for ticker in tickers if str(ticker).strip()]
+    if not normalized:
+        return "-"
+    links = [
+        f"<a href='/insights/{ticker}?lang={lang}'>{ticker}</a>"
+        for ticker in normalized[:limit]
+    ]
+    if len(normalized) > limit:
+        links.append(f"<span class='muted'>+{len(normalized) - limit}</span>")
+    return ", ".join(links)
+
+
+def _enrich_heatmap_ticker_details(db: Session, ticker_details: list[dict], *, lang: str) -> list[dict]:
+    tickers = [str(detail.get("ticker") or "").strip().upper() for detail in ticker_details if detail.get("ticker")]
+    if not tickers:
+        return []
+    needs_lookup = [
+        ticker
+        for ticker, detail in zip(tickers, ticker_details)
+        if detail.get("name") is None or detail.get("score") is None
+    ]
+    overviews = SymbolRepository(db).list_overviews_for_tickers(needs_lookup) if needs_lookup else {}
+    latest_outputs = PredictionRepository(db).get_latest_model_outputs_for_tickers(needs_lookup) if needs_lookup else {}
+    enriched_rows: list[dict] = []
+    for raw_detail in ticker_details:
+        ticker = str(raw_detail.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        latest = latest_outputs.get(ticker) or {}
+        overview = overviews.get(ticker) or {}
+        score = raw_detail.get("score")
+        if score is None:
+            score = latest.get("score")
+        if score is None:
+            score = raw_detail.get("trend_score")
+        if score is None:
+            score = 0.0
+        enriched = enrich_model_output({**latest, "ticker": ticker, "score": score}, lang="en") if latest else {}
+        signal_label = (
+            raw_detail.get("signal_label")
+            or latest.get("signal_label")
+            or enriched.get("signal_label")
+        )
+        signal_strength = (
+            raw_detail.get("signal_strength")
+            if raw_detail.get("signal_strength") is not None
+            else latest.get("signal_strength")
+        )
+        enriched_rows.append(
+            {
+                "ticker": ticker,
+                "name": raw_detail.get("name") or overview.get("name") or latest.get("name") or ticker,
+                "score": float(score or 0.0),
+                "state": raw_detail.get("state") or enriched.get("state") or build_model_state(float(score or 0.0), lang="en"),
+                "confidence": raw_detail.get("confidence") or latest.get("confidence") or enriched.get("confidence"),
+                "percentile": raw_detail.get("percentile") or latest.get("percentile") or enriched.get("percentile"),
+                "target_horizon_days": raw_detail.get("target_horizon_days") or latest.get("target_horizon_days") or enriched.get("target_horizon_days"),
+                "model_reward_risk_ratio": raw_detail.get("model_reward_risk_ratio") or latest.get("model_reward_risk_ratio") or enriched.get("model_reward_risk_ratio"),
+                "conviction_bucket": raw_detail.get("conviction_bucket") or latest.get("conviction_bucket") or enriched.get("conviction_bucket"),
+                "position_size_hint": raw_detail.get("position_size_hint") or latest.get("position_size_hint") or enriched.get("position_size_hint"),
+                "entry_style": raw_detail.get("entry_style") or latest.get("entry_style") or enriched.get("entry_style"),
+                "signal_label": signal_label,
+                "signal_strength": int(signal_strength or 0),
+                "execution_tags": raw_detail.get("execution_tags") or latest.get("execution_tags") or enriched.get("execution_tags") or [],
+            }
+        )
+    return sorted(enriched_rows, key=lambda detail: float(detail.get("score") or 0.0), reverse=True)
+
+
+def _get_heatmap_concept_from_snapshot(db: Session, concept_slug: str, *, lang: str) -> dict | None:
+    snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_MARKET_HEATMAP_WORKSPACE)
+    payload = (snapshot or {}).get("payload") or {}
+    heatmap_rows = payload.get("sector_heatmap") or []
+    matched = next(
+        (
+            item
+            for item in heatmap_rows
+            if str(item.get("slug") or "") == concept_slug
+            or _concept_slug(str(item.get("label") or "")) == concept_slug
+            or str(item.get("label") or "") == concept_slug
+        ),
+        None,
+    )
+    if matched is None:
+        return None
+    ticker_details = _enrich_heatmap_ticker_details(db, matched.get("ticker_details") or [], lang=lang)
+    tickers = [detail["ticker"] for detail in ticker_details]
+    hits = int(matched.get("hits") or len(ticker_details) or 0)
+    return {
+        "concept_name": matched.get("label") or concept_slug,
+        "concept_code": None,
+        "slug": matched.get("slug") or concept_slug,
+        "hits": hits,
+        "previous_hits": 0,
+        "delta_hits": 0,
+        "streak": 1 if hits else 0,
+        "history": [hits],
+        "tickers": tickers,
+        "ticker_details": ticker_details,
+        "avg_score": float(matched.get("avg_score") or 0.0),
+        "avg_move_5d": matched.get("avg_move_5d"),
+        "avg_move_20d": matched.get("avg_move_20d"),
+        "breadth_pct": matched.get("breadth_pct"),
+        "buy_signal_count": int(matched.get("buy_signal_count") or 0),
+        "max_signal_strength": int(matched.get("max_signal_strength") or 0),
+        "execution_tags": matched.get("execution_tags") or [],
+        "as_of_date": (snapshot or {}).get("created_at"),
+        "source": "heatmap_snapshot",
+    }
+
+
+def _get_concept_for_detail(db: Session, summary: dict, concept_slug: str, *, lang: str) -> dict | None:
+    concept = _get_concept_from_summary(summary, concept_slug)
+    if concept is not None:
+        return concept
+    return _get_heatmap_concept_from_snapshot(db, concept_slug, lang=lang)
+
+
+def _concept_tracker_rows_from_heatmap_snapshot(db: Session) -> list[dict]:
+    snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_MARKET_HEATMAP_WORKSPACE)
+    payload = (snapshot or {}).get("payload") or {}
+    rows: list[dict] = []
+    for item in payload.get("sector_heatmap") or []:
+        label = str(item.get("label") or "").strip()
+        if not label:
+            continue
+        ticker_details = item.get("ticker_details") or []
+        tickers = [str(detail.get("ticker") or "").strip().upper() for detail in ticker_details if detail.get("ticker")]
+        hits = int(item.get("hits") or len(tickers) or 0)
+        rows.append(
+            {
+                "concept_name": label,
+                "concept_code": None,
+                "slug": item.get("slug") or _concept_slug(label),
+                "hits": hits,
+                "previous_hits": 0,
+                "delta_hits": 0,
+                "streak": 1 if hits else 0,
+                "history": [hits],
+                "avg_move_5d": item.get("avg_move_5d"),
+                "breadth_pct": item.get("breadth_pct"),
+                "buy_signal_count": int(item.get("buy_signal_count") or 0),
+                "max_signal_strength": int(item.get("max_signal_strength") or 0),
+                "execution_tags": item.get("execution_tags") or [],
+                "avg_score": float(item.get("avg_score") or 0.0),
+                "tickers": tickers,
+                "ticker_details": ticker_details,
+            }
+        )
+    return rows
+
+
+def _load_concept_tracker_rows(db: Session, *, lookback_runs: int) -> list[dict]:
+    rows = _concept_tracker_rows_from_heatmap_snapshot(db)
+    if rows:
+        return rows
+    summary = _load_summary(db, lookback_runs=lookback_runs)
+    return list((summary.get("market_context") or {}).get("concept_tracker") or [])
 
 
 def _dashboard_model_badge(state: dict | None, *, confidence: int | None = None, compact: bool = False) -> str:
@@ -1573,6 +2750,219 @@ def dashboard_summary(request: Request, lookback_runs: int = 5, db: Session = De
 def dashboard_data_sources(request: Request, lang: str = "en", db: Session = Depends(get_db_session)):
     if not is_authenticated(request):
         return login_redirect("/dashboard/data-sources")
+    lang = resolve_request_lang(request)
+    lookback_runs = _clamp_lookback_runs(request.query_params.get("lookback_runs", 5))
+    summary = _load_home_summary(db, lookback_runs=lookback_runs)
+    data_sources = summary["data_sources"]
+    sync_states = summary["sync_states"]
+    concept_data = data_sources["concept_data"] or {}
+    synced_count = len(sync_states)
+    provider_count = len(data_sources["current_provider_breakdown"])
+    primary_provider = data_sources["primary_provider"] or "-"
+    concept_freshness = concept_data.get("freshness") or "-"
+    provider_strategy = _provider_strategy_view(lang)
+    ds_text = {
+        "en": {
+            "title": "Data Sources",
+            "hero": "Where This App Gets Data",
+            "lead": "Use this page to understand the live provider mix, sync freshness, and the fallback strategy behind market, profile, and concept data.",
+            "workspace": "Workspace",
+            "model_picks": "Model Picks",
+            "market": "Market",
+            "jobs": "Jobs",
+            "data": "Data",
+            "settings": "Settings",
+            "status_title": "Data Status",
+            "status_copy": "Provider freshness and actual sync sources",
+            "updated": "Updated",
+            "primary_provider": "Primary Provider",
+            "primary_provider_help": "The most common provider across the latest sync history.",
+            "primary_provider_label": "Primary provider",
+            "tracked_providers": "Tracked Providers",
+            "tracked_providers_help": "How many different providers appear in current sync records.",
+            "tracked_symbols": "Tracked Symbols",
+            "tracked_symbols_help": "Symbols with sync metadata stored locally.",
+            "synced_symbols": "Synced symbols",
+            "concept_freshness": "Concept freshness",
+            "freshness": "Freshness",
+            "cn_concepts": "CN Concepts",
+            "latest_as_of": "Latest as-of date",
+            "concepts_across_symbols": "{concepts} concepts across {symbols} symbols",
+            "focus": "What To Check First",
+            "focus_copy": "Start with provider concentration, concept freshness, and the latest per-symbol sync rows before drilling into details.",
+            "top_summary": "Data Strategy and Current Sources",
+            "top_summary_copy": "This page should answer two questions quickly: where data is supposed to come from, and what provider the app actually used most recently.",
+            "strategy": "Fallback Strategy",
+            "strategy_copy": "These are the intended source cascades the app follows when fetching and enriching data.",
+            "strategy_prices": "Price History Path",
+            "strategy_profiles": "Profile Path",
+            "strategy_concepts": "Concept Path",
+            "open_jobs": "Open Task Center",
+            "open_workspace": "Back to workspace",
+            "provider_rows": "Latest provider mix",
+            "current_mix": "Current provider mix",
+            "recent_sync": "Latest sync rows",
+            "per_symbol_sync_source": "Recent Per-Symbol Sync State",
+            "stocks": "Stocks",
+            "no_provider_usage": "No provider usage yet",
+            "no_sync_history": "No sync history yet",
+        },
+        "zh": {
+            "title": "数据来源",
+            "hero": "这个应用的数据来自哪里",
+            "lead": "这个页面用来解释当前数据源分布、同步新鲜度，以及行情、资料、概念数据背后的回退策略。",
+            "workspace": "工作台",
+            "model_picks": "模型选股",
+            "market": "市场概览",
+            "jobs": "任务中心",
+            "data": "数据状态",
+            "settings": "设置",
+            "status_title": "数据状态",
+            "status_copy": "数据源新鲜度与实际同步来源",
+            "updated": "最近更新",
+            "primary_provider": "主要数据源",
+            "primary_provider_help": "最近同步记录里占比最高的数据源。",
+            "primary_provider_label": "主要数据源",
+            "tracked_providers": "已跟踪数据源",
+            "tracked_providers_help": "当前同步记录里出现过的不同数据源数量。",
+            "tracked_symbols": "已跟踪股票",
+            "tracked_symbols_help": "本地数据库中保存了同步元数据的股票数量。",
+            "synced_symbols": "已同步股票数",
+            "concept_freshness": "概念数据新鲜度",
+            "freshness": "新鲜度",
+            "cn_concepts": "A股概念",
+            "latest_as_of": "最新日期",
+            "concepts_across_symbols": "{concepts} 个概念，覆盖 {symbols} 只股票",
+            "focus": "先看什么",
+            "focus_copy": "先看数据源集中度、概念数据日期，再看最近几条逐股同步状态，确认整体是否健康。",
+            "top_summary": "数据策略与当前来源",
+            "top_summary_copy": "这页应该先回答两个问题：系统理论上该从哪里取数，以及最近一次实际上用了哪个数据源。",
+            "strategy": "回退策略",
+            "strategy_copy": "这里展示应用在拉取和补全数据时预期遵循的数据源路径。",
+            "strategy_prices": "行情路径",
+            "strategy_profiles": "资料路径",
+            "strategy_concepts": "概念路径",
+            "open_jobs": "打开任务中心",
+            "open_workspace": "返回工作台",
+            "provider_rows": "最近数据源分布",
+            "current_mix": "当前数据源分布",
+            "recent_sync": "最近同步记录",
+            "per_symbol_sync_source": "逐股最新同步状态",
+            "stocks": "股票数",
+            "no_provider_usage": "暂无数据源使用记录",
+            "no_sync_history": "暂无同步记录",
+        },
+    }["zh" if lang == "zh" else "en"]
+    history_steps = "".join(f"<li>{step}</li>" for step in data_sources["historical_price_strategy"])
+    profile_steps = "".join(f"<li>{step}</li>" for step in data_sources["symbol_profile_strategy"])
+    concept_steps = "".join(f"<li>{step}</li>" for step in data_sources["concept_strategy"])
+    provider_rows = "".join(
+        "<article class='list-row'>"
+        f"<div><div class='ticker'>{item['provider']}</div><div class='subtle'>{ds_text['stocks']}</div></div>"
+        f"<div class='row-right'><div class='mini-metric'>{item['count']}</div></div>"
+        "</article>"
+        for item in data_sources["current_provider_breakdown"][:6]
+    ) or f"<div class='empty'>{ds_text['no_provider_usage']}</div>"
+    symbol_rows = "".join(
+        "<article class='sync-row'>"
+        f"<div><a class='ticker' href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a><div class='subtle'>{item['name'] or item['ticker']} · {item['provider'] or '-'}</div><div class='subtle'>{item['message'] or '-'}</div></div>"
+        f"<div class='row-right'><div class='mini-metric'>{item['last_synced_date'] or '-'}</div><span class='status-pill {str(item['status'] or 'idle').lower()}'>{item['status'] or '-'}</span></div>"
+        "</article>"
+        for item in sync_states[:8]
+    ) or f"<div class='empty'>{ds_text['no_sync_history']}</div>"
+    nav_html = render_workspace_nav_html(lang=lang, active_key="data", lookback_runs=lookback_runs)
+    metrics_html = "".join(
+        "<article class='metric-card'>"
+        f"<div class='metric-label'>{label}</div>"
+        f"<div class='metric-value'>{value}</div>"
+        f"<div class='metric-meta'>{meta}</div>"
+        "</article>"
+        for label, value, meta in [
+            (ds_text["primary_provider"], primary_provider, ds_text["primary_provider_help"]),
+            (ds_text["tracked_providers"], provider_count, ds_text["tracked_providers_help"]),
+            (ds_text["tracked_symbols"], synced_count, ds_text["tracked_symbols_help"]),
+            (ds_text["concept_freshness"], concept_freshness, f"{ds_text['latest_as_of']}: {concept_data.get('latest_as_of_date') or '-'}"),
+        ]
+    )
+    return f"""
+    <!DOCTYPE html>
+    <html lang="{lang}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{ds_text['title']}</title>
+        <style>
+          :root {{ --bg:#071018; --panel:#111c28; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; }}
+          * {{ box-sizing:border-box; }}
+          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
+          a {{ color:inherit; text-decoration:none; }}
+          .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .main {{ padding:28px 30px 48px; }}
+          .topbar,.chip-row,.action-row,.row-right {{ display:flex; flex-wrap:wrap; gap:10px; }}
+          .topbar {{ justify-content:space-between; align-items:center; margin-bottom:24px; }}
+          .top-pill,.cta,.mini-metric,.status-pill {{ display:inline-flex; align-items:center; justify-content:center; }}
+          .top-pill,.cta {{ padding:8px 12px; border-radius:999px; border:1px solid var(--line); background:rgba(17,28,40,0.7); color:var(--muted); font-size:13px; font-weight:700; }}
+          .cta.primary {{ background:linear-gradient(135deg, rgba(61,217,182,0.28), rgba(82,168,255,0.24)); color:var(--ink); }}
+          .hero {{ display:grid; grid-template-columns:minmax(0,1.4fr) minmax(280px,0.9fr); gap:16px; margin-bottom:16px; }}
+          .card {{ background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 40px rgba(0,0,0,0.22); }}
+          .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.12); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.06em; text-transform:uppercase; }}
+          h1 {{ margin:14px 0 10px; font-size:40px; line-height:1.02; letter-spacing:-0.03em; }}
+          .section-title {{ margin:0 0 6px; font-size:22px; }}
+          .lead,.section-copy,.subtle,.metric-meta,li,.empty {{ color:var(--muted); }}
+          .lead,.section-copy {{ font-size:15px; line-height:1.6; }}
+          .metrics-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px; margin:16px 0; }}
+          .metric-card {{ padding:18px; border-radius:20px; background:rgba(21,34,49,0.82); border:1px solid var(--line); }}
+          .metric-label {{ color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; }}
+          .metric-value {{ margin-top:12px; font-size:26px; font-weight:800; letter-spacing:-0.03em; word-break:break-word; }}
+          .workspace-grid {{ display:grid; grid-template-columns:minmax(0,1.05fr) minmax(320px,0.95fr); gap:16px; align-items:start; }}
+          .stack,.list-stack {{ display:grid; gap:16px; }}
+          .list-row,.sync-row {{ display:flex; justify-content:space-between; align-items:flex-start; gap:14px; padding:14px 0; border-top:1px solid rgba(144,163,184,0.12); }}
+          .list-row:first-child,.sync-row:first-child {{ border-top:none; padding-top:0; }}
+          .ticker {{ font-weight:800; font-size:15px; color:var(--ink); }}
+          .subtle {{ margin-top:4px; font-size:12px; line-height:1.45; }}
+          .mini-metric {{ padding:7px 10px; border-radius:999px; background:rgba(82,168,255,0.12); color:#b9dcff; font-size:12px; font-weight:700; }}
+          .status-pill {{ padding:7px 10px; border-radius:999px; font-size:12px; font-weight:800; text-transform:uppercase; letter-spacing:0.04em; background:rgba(144,163,184,0.14); color:#b4c5d8; }}
+          .status-pill.success {{ background:rgba(74,222,128,0.14); color:#8df0aa; }} .status-pill.failed {{ background:rgba(255,107,129,0.16); color:#ff9aaa; }} .status-pill.partial {{ background:rgba(246,200,95,0.16); color:#ffd98a; }} .status-pill.running {{ background:rgba(82,168,255,0.16); color:#9bd0ff; }}
+          ul {{ margin:10px 0 0 18px; padding:0; }} li {{ margin:8px 0; line-height:1.55; }}
+          @media (max-width:1180px) {{ .metrics-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .workspace-grid, .hero {{ grid-template-columns:1fr; }} }}
+          @media (max-width:900px) {{ .app {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }} }}
+          @media (max-width:640px) {{ .main {{ padding:20px 16px 36px; }} h1 {{ font-size:30px; }} .metrics-grid {{ grid-template-columns:1fr; }} }}
+        </style>
+      </head>
+      <body>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand"><span class="brand-tag">PQW</span><h1>{ds_text['status_title']}</h1><p>{ds_text['status_copy']}</p></div>
+            <nav class="side-nav">{nav_html}</nav>
+            <div class="sidebar-foot">{ds_text['top_summary_copy']}</div>
+          </aside>
+          <main class="main">
+            <div class="topbar">
+              <div class="chip-row"><span class="top-pill">{ds_text['updated']}: {_display_time(summary.get('generated_at'), with_tz=True)}</span><span class="top-pill">{ds_text['primary_provider_label']}: {primary_provider}</span><span class="top-pill">{ds_text['synced_symbols']}: {synced_count}</span></div>
+              <div class="chip-row"><a class="top-pill" href="/dashboard/data-sources?lang=en&lookback_runs={lookback_runs}">EN</a><a class="top-pill" href="/dashboard/data-sources?lang=zh&lookback_runs={lookback_runs}">中文</a></div>
+            </div>
+            <section class="hero">
+              <article class="card"><span class="eyebrow">{ds_text['top_summary']}</span><h1>{ds_text['hero']}</h1><p class="lead">{ds_text['lead']}</p><div class="action-row"><a class="cta primary" href="/dashboard?lang={lang}&lookback_runs={lookback_runs}">{ds_text['open_workspace']}</a><a class="cta" href="/dashboard/ops?lang={lang}&lookback_runs={lookback_runs}">{ds_text['open_jobs']}</a></div></article>
+              <article class="card"><span class="eyebrow">{ds_text['focus']}</span><h2 class="section-title">{ds_text['status_title']}</h2><p class="section-copy">{ds_text['focus_copy']}</p><div class="list-stack"><div><div class="subtle">{ds_text['primary_provider']}</div><div class="ticker">{primary_provider}</div></div><div><div class="subtle">{ds_text['concept_freshness']}</div><div class="ticker">{concept_freshness}</div></div><div><div class="subtle">{ds_text['latest_as_of']}</div><div class="ticker">{concept_data.get('latest_as_of_date') or '-'}</div></div><div><div class="subtle">{ds_text['tracked_providers']}</div><div class="ticker">{provider_count}</div></div></div></article>
+            </section>
+            <section class="metrics-grid">{metrics_html}</section>
+            <section class="workspace-grid">
+              <div class="stack">
+                <article class="card"><span class="eyebrow">{ds_text['strategy']}</span><h2 class="section-title">{ds_text['strategy_copy']}</h2><div class="workspace-grid" style="grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px;"><article class="metric-card"><div class="metric-label">{ds_text['strategy_prices']}</div><ul>{history_steps}</ul></article><article class="metric-card"><div class="metric-label">{ds_text['strategy_profiles']}</div><ul>{profile_steps}</ul></article><article class="metric-card"><div class="metric-label">{ds_text['strategy_concepts']}</div><ul>{concept_steps}</ul></article></div></article>
+                <article class="card"><span class="eyebrow">{provider_strategy['title']}</span><h2 class="section-title">{provider_strategy['copy']}</h2><div class="list-stack"><article class="list-row"><div><div class="ticker">Price / Auto</div><div class="subtle">{provider_strategy['price_auto']}</div></div></article><article class="list-row"><div><div class="ticker">Price / OpenBB</div><div class="subtle">{provider_strategy['price_openbb']}</div></div></article><article class="list-row"><div><div class="ticker">Fundamental / Auto</div><div class="subtle">{provider_strategy['fund_auto']}</div></div></article><article class="list-row"><div><div class="ticker">Concept / Auto</div><div class="subtle">{provider_strategy['concept_auto']}</div></div></article><article class="list-row"><div><div class="ticker">Execution / Realtime</div><div class="subtle">{provider_strategy['execution']}</div></div></article></div></article>
+                <article class="card"><span class="eyebrow">{ds_text['recent_sync']}</span><h2 class="section-title">{ds_text['per_symbol_sync_source']}</h2><div class="list-stack">{symbol_rows}</div></article>
+              </div>
+              <div class="stack">
+                <article class="card"><span class="eyebrow">{ds_text['current_mix']}</span><h2 class="section-title">{ds_text['provider_rows']}</h2><div class="list-stack">{provider_rows}</div></article>
+                <article class="card"><span class="eyebrow">{ds_text['cn_concepts']}</span><h2 class="section-title">{ds_text['concept_freshness']}</h2><p class="section-copy">{ds_text['concepts_across_symbols'].format(concepts=concept_data.get('concept_count'), symbols=concept_data.get('symbol_count'))}</p><div class="list-stack"><div><div class="subtle">{ds_text['latest_as_of']}</div><div class="ticker">{concept_data.get('latest_as_of_date') or '-'}</div></div><div><div class="subtle">{ds_text.get('freshness', 'Freshness' if lang == 'en' else '新鲜度')}</div><div class="ticker">{concept_freshness}</div></div></div></article>
+              </div>
+            </section>
+          </main>
+        </div>
+      </body>
+    </html>
+    """
     lang = "zh" if lang == "zh" else "en"
     summary = _load_summary(db)
     data_sources = summary["data_sources"]
@@ -1649,9 +3039,10 @@ def dashboard_data_sources(request: Request, lang: str = "en", db: Session = Dep
         f"<tr><td>{item['provider']}</td><td>{item['count']}</td></tr>"
         for item in data_sources["current_provider_breakdown"]
     ) or f"<tr><td colspan='2'>{ds_text['no_provider_usage']}</td></tr>"
+    visible_sync_states = sync_states[:200]
     symbol_rows = "".join(
-        f"<tr><td><a href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a></td><td>{item['name'] or item['ticker']}</td><td>{item['provider'] or '-'}</td><td>{item['status'] or '-'}</td><td>{item['last_synced_date'] or '-'}</td><td class='message-cell'>{item['message'] or '-'}</td></tr>"
-        for item in sync_states
+        f"<tr><td><a href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a></td><td title='{item['name'] or item['ticker']}'>{_compact_label(item['name'] or item['ticker'], 20)}</td><td>{item['provider'] or '-'}</td><td>{item['status'] or '-'}</td><td>{item['last_synced_date'] or '-'}</td><td class='message-cell' title='{item['message'] or '-'}'>{_compact_label(item['message'] or '-', 56)}</td></tr>"
+        for item in visible_sync_states
     ) or f"<tr><td colspan='6'>{ds_text['no_sync_history']}</td></tr>"
     history_steps = "".join(f"<li>{step}</li>" for step in data_sources["historical_price_strategy"])
     profile_steps = "".join(f"<li>{step}</li>" for step in data_sources["symbol_profile_strategy"])
@@ -1702,7 +3093,7 @@ def dashboard_data_sources(request: Request, lang: str = "en", db: Session = Dep
           a {{ color:#0f766e; text-decoration:none; font-weight:700; }}
           .table-wrap {{ width:100%; overflow-x:auto; border-radius:14px; }}
           table {{ width:100%; border-collapse:collapse; font-size:14px; min-width:760px; }}
-          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
+          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; white-space:nowrap; }}
           th {{ color:var(--muted); font-weight:600; }}
           .message-cell {{
             max-width: 340px;
@@ -1779,6 +3170,7 @@ def dashboard_data_sources(request: Request, lang: str = "en", db: Session = Dep
           </section>
           <section class="card">
             <div class="eyebrow">{ds_text['per_symbol_sync_source']}</div>
+            <div class="muted" style="margin-bottom:10px;">{('仅展示最近 200 条同步记录。' if lang == 'zh' else 'Showing the latest 200 per-symbol sync rows.')}</div>
             <div class="table-wrap">
               <table>
                 <thead><tr><th>{ds_text['ticker']}</th><th>{ds_text['name']}</th><th>{ds_text['provider']}</th><th>{ds_text['status']}</th><th>{ds_text['last_sync']}</th><th>{ds_text['message']}</th></tr></thead>
@@ -1812,8 +3204,8 @@ def dashboard_concept_detail(
     if not is_authenticated(request):
         return login_redirect(f"/dashboard/concepts/{concept_slug}")
     lookback_runs = _clamp_lookback_runs(lookback_runs)
-    summary = _load_summary(db, lookback_runs=lookback_runs)
-    concept = _get_concept_from_summary(summary, concept_slug)
+    summary = _load_home_summary(db, lookback_runs=lookback_runs)
+    concept = _get_concept_for_detail(db, summary, concept_slug, lang=lang)
     if concept is None:
         return HTMLResponse("<h1>Concept not found</h1>", status_code=404)
 
@@ -1829,23 +3221,24 @@ def dashboard_concept_detail(
         else ""
     )
     ticker_detail_rows: list[dict] = []
+    compute_price_moves = concept.get("source") != "heatmap_snapshot" or len(concept["ticker_details"]) <= 60
     for detail in concept["ticker_details"]:
         state_label, state_bg, state_fg = _concept_ticker_watch_state(watchlist_map, detail["ticker"], lang)
         existing = watchlist_map.get(detail["ticker"])
-        history = symbol_data_service.get_history(detail["ticker"], limit=10)
         five_day_move = None
-        if len(history) >= 6:
-            start_close = history[-6].get("close")
-            end_close = history[-1].get("close")
-            if start_close not in (None, 0) and end_close is not None:
-                five_day_move = ((float(end_close) / float(start_close)) - 1) * 100
-        twenty_day_history = symbol_data_service.get_history(detail["ticker"], limit=20)
         twenty_day_move = None
-        if len(twenty_day_history) >= 2:
-            start_close = twenty_day_history[0].get("close")
-            end_close = twenty_day_history[-1].get("close")
-            if start_close not in (None, 0) and end_close is not None:
-                twenty_day_move = ((float(end_close) / float(start_close)) - 1) * 100
+        if compute_price_moves:
+            history = symbol_data_service.get_history(detail["ticker"], limit=21)
+            if len(history) >= 6:
+                start_close = history[-6].get("close")
+                end_close = history[-1].get("close")
+                if start_close not in (None, 0) and end_close is not None:
+                    five_day_move = ((float(end_close) / float(start_close)) - 1) * 100
+            if len(history) >= 20:
+                start_close = history[-20].get("close")
+                end_close = history[-1].get("close")
+                if start_close not in (None, 0) and end_close is not None:
+                    twenty_day_move = ((float(end_close) / float(start_close)) - 1) * 100
         ticker_detail_rows.append(
             {
                 **detail,
@@ -1919,7 +3312,7 @@ def dashboard_concept_detail(
             "<tr>"
             f"<td><a href='/insights/{detail['ticker']}?lang={lang}'>{detail['ticker']}</a></td>"
             f"<td>{detail.get('name') or detail['ticker']}</td>"
-            f"<td><div>{detail['score']:.4f}</div><div style='margin-top:6px;'>{_dashboard_model_badge(detail.get('state'), confidence=detail.get('confidence'), compact=True)}</div><div style='margin-top:6px;'>{_signal_pill(detail.get('score'), lang=lang, strength=int(detail.get('signal_strength') or 0), compact=True)}</div><div style='margin-top:6px;font-size:12px;color:#6b7280;'>{('Pct ' + format(float(detail.get('percentile')), '.1f') + '%') if detail.get('percentile') is not None else ''}{(' · ' if detail.get('percentile') is not None and detail.get('target_horizon_days') is not None else '')}{('H ' + str(int(detail.get('target_horizon_days'))) + 'd') if detail.get('target_horizon_days') is not None else ''}{(' · ' if (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None) and detail.get('model_reward_risk_ratio') is not None else '')}{('R/R ' + format(float(detail.get('model_reward_risk_ratio')), '.2f')) if detail.get('model_reward_risk_ratio') is not None else ''}{(' · ' if (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None) and detail.get('conviction_bucket') else '')}{detail.get('conviction_bucket') or ''}{(' · ' if detail.get('position_size_hint') and (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None or detail.get('conviction_bucket')) else '')}{detail.get('position_size_hint') or ''}{(' · ' if detail.get('entry_style') and (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None or detail.get('conviction_bucket') or detail.get('position_size_hint')) else '')}{detail.get('entry_style') or ''}{(' · ' if detail.get('execution_tags') and (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None or detail.get('conviction_bucket') or detail.get('position_size_hint') or detail.get('entry_style')) else '')}{' / '.join((detail.get('execution_tags') or [])[:2])}</div></td>"
+            f"<td><div>{float(detail.get('score') or 0.0):.4f}</div><div style='margin-top:6px;'>{_dashboard_model_badge(detail.get('state'), confidence=detail.get('confidence'), compact=True)}</div><div style='margin-top:6px;'>{_signal_pill(detail.get('score'), lang=lang, strength=int(detail.get('signal_strength') or 0), compact=True)}</div><div style='margin-top:6px;font-size:12px;color:#6b7280;'>{('Pct ' + format(float(detail.get('percentile')), '.1f') + '%') if detail.get('percentile') is not None else ''}{(' · ' if detail.get('percentile') is not None and detail.get('target_horizon_days') is not None else '')}{('H ' + str(int(detail.get('target_horizon_days'))) + 'd') if detail.get('target_horizon_days') is not None else ''}{(' · ' if (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None) and detail.get('model_reward_risk_ratio') is not None else '')}{('R/R ' + format(float(detail.get('model_reward_risk_ratio')), '.2f')) if detail.get('model_reward_risk_ratio') is not None else ''}{(' · ' if (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None) and detail.get('conviction_bucket') else '')}{detail.get('conviction_bucket') or ''}{(' · ' if detail.get('position_size_hint') and (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None or detail.get('conviction_bucket')) else '')}{detail.get('position_size_hint') or ''}{(' · ' if detail.get('entry_style') and (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None or detail.get('conviction_bucket') or detail.get('position_size_hint')) else '')}{detail.get('entry_style') or ''}{(' · ' if detail.get('execution_tags') and (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None or detail.get('conviction_bucket') or detail.get('position_size_hint') or detail.get('entry_style')) else '')}{' / '.join((detail.get('execution_tags') or [])[:2])}</div></td>"
             f"<td>{_percent_chip(detail['five_day_move'])}</td>"
             f"<td><span style='display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;background:{detail['watch_state_bg']};color:{detail['watch_state_fg']};font-size:12px;font-weight:800;white-space:nowrap;'>{detail['watch_state_label']}</span></td>"
             f"<td>{detail.get('last_synced_date') or '-'}</td>"
@@ -2001,6 +3394,7 @@ def dashboard_concept_detail(
     if concept.get("avg_move_20d") is not None:
         avg_move_20d_display = f"{'+' if concept.get('avg_move_20d', 0) > 0 else ''}{float(concept['avg_move_20d']):.1f}%"
     breadth_display = f"{float(concept['breadth_pct']):.0f}%" if concept.get("breadth_pct") is not None else "-"
+    nav_html = render_workspace_nav_html(lang=lang, active_key="market", lookback_runs=lookback_runs)
     return f"""
     <!DOCTYPE html>
     <html lang="{lang}">
@@ -2009,58 +3403,63 @@ def dashboard_concept_detail(
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{concept['concept_name']}</title>
         <style>
-          :root {{
-            --bg: #f5efe2;
-            --panel: #fffdf7;
-            --ink: #1f2937;
-            --muted: #6b7280;
-            --line: #d6cfc2;
-            --accent: #0f766e;
-            --accent-soft: #dff5ef;
-          }}
+          :root {{ --bg:#071018; --panel:#111c28; --panel-2:#152231; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; --accent-soft:rgba(61,217,182,0.12); }}
           * {{ box-sizing: border-box; }}
-          body {{
-            margin: 0;
-            font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            color: var(--ink);
-            background:
-              radial-gradient(circle at top left, #fff6d8 0, transparent 30%),
-              radial-gradient(circle at top right, #d9f3ee 0, transparent 35%),
-              var(--bg);
-          }}
-          .wrap {{ max-width: 980px; margin: 0 auto; padding: 28px 20px 56px; }}
-          .card {{ background: var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); margin-bottom:16px; }}
-          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
+          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
+          a {{ color:inherit; text-decoration:none; }}
+          .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .main {{ padding:28px 30px 48px; min-width:0; }}
+          .wrap {{ max-width:1180px; margin:0 auto; }}
+          .card {{ background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 40px rgba(0,0,0,0.22); margin-bottom:16px; }}
+          .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
           .metric {{ font-size: 30px; font-weight: 800; margin: 8px 0; }}
           .muted {{ color: var(--muted); font-size: 14px; }}
           .grid {{ display:grid; gap:16px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-bottom:16px; }}
           .action-grid {{ display:grid; gap:16px; grid-template-columns: minmax(260px, 1fr) minmax(280px, 1.2fr); margin-bottom:16px; }}
           .mini-grid {{ display:grid; gap:16px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); }}
-          .mini-card {{ background:#f9f7f0; border:1px solid var(--line); border-radius:16px; padding:14px; }}
+          .mini-card {{ background:rgba(21,34,49,0.82); border:1px solid var(--line); border-radius:18px; padding:14px; }}
           .mini-top {{ display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:6px; }}
-          .mini-score {{ font-size:12px; font-weight:800; color:#0f766e; background:#dff5ef; padding:4px 8px; border-radius:999px; }}
+          .mini-score {{ font-size:12px; font-weight:800; color:var(--accent); background:var(--accent-soft); padding:4px 8px; border-radius:999px; }}
           .mini-name {{ color:var(--muted); font-size:13px; margin-bottom:10px; min-height:34px; }}
-          .mini-metrics {{ display:flex; justify-content:space-between; gap:10px; color:#374151; font-size:12px; font-weight:700; margin-top:8px; }}
+          .mini-metrics {{ display:flex; justify-content:space-between; gap:10px; color:var(--ink); font-size:12px; font-weight:700; margin-top:8px; }}
           .compare-row {{ display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }}
-          .compare-pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; background:#f3f4f6; color:#374151; text-decoration:none; font-size:12px; font-weight:800; }}
-          .compare-pill.active {{ background:#dff5ef; color:#0f766e; }}
-          table {{ width:100%; border-collapse:collapse; }}
-          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); }}
+          .compare-pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; background:rgba(17,28,40,0.75); border:1px solid var(--line); color:var(--muted); text-decoration:none; font-size:12px; font-weight:800; }}
+          .compare-pill.active {{ background:rgba(61,217,182,0.16); border-color:rgba(61,217,182,0.24); color:var(--ink); }}
+          .table-wrap {{ width:100%; overflow-x:auto; border-radius:16px; border:1px solid var(--line); background:rgba(11,19,29,0.82); }}
+          table {{ width:100%; min-width:980px; border-collapse:collapse; }}
+          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
           th {{ color: var(--muted); font-weight: 600; }}
-          a {{ color: var(--accent); text-decoration: none; font-weight: 700; }}
-          .banner {{ margin-bottom:16px; padding:14px 16px; border-radius:16px; background:#dff5ef; color:#0f766e; font-weight:700; }}
+          .banner {{ margin-bottom:16px; padding:14px 16px; border-radius:16px; background:rgba(61,217,182,0.12); color:var(--accent); font-weight:700; border:1px solid rgba(61,217,182,0.24); }}
           .stack {{ display:grid; gap:12px; }}
-          input, button {{ border-radius:12px; border:1px solid var(--line); padding:10px 12px; font:inherit; }}
-          button {{ background:var(--accent); color:#fff; border-color:var(--accent); font-weight:700; }}
+          input, button {{ border-radius:12px; border:1px solid var(--line); padding:10px 12px; font:inherit; background:#0f1823; color:var(--ink); }}
+          button {{ background:linear-gradient(135deg, rgba(61,217,182,0.88), rgba(82,168,255,0.82)); color:#03131f; border-color:transparent; font-weight:800; cursor:pointer; }}
           .checkline {{ display:inline-flex; align-items:center; gap:8px; color:var(--muted); font-size:14px; }}
-          .action-link {{ display:inline-flex; align-items:center; padding:10px 12px; border-radius:12px; background:#eef8f5; color:#0f766e; text-decoration:none; font-weight:700; }}
+          .action-link {{ display:inline-flex; align-items:center; padding:10px 12px; border-radius:12px; background:rgba(61,217,182,0.12); color:var(--accent); border:1px solid rgba(61,217,182,0.2); text-decoration:none; font-weight:800; }}
+          .sidebar-foot {{ margin-top:24px; padding:16px; border:1px solid var(--line); border-radius:18px; background:rgba(17,28,40,0.68); color:var(--muted); font-size:13px; line-height:1.55; }}
+          @media (max-width:1100px) {{ .app {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }} .main {{ padding:20px 16px 36px; }} .action-grid {{ grid-template-columns:1fr; }} }}
         </style>
       </head>
       <body>
-        <main class="wrap">
-          {banner_html}
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{'概念详情' if lang == 'zh' else 'Concept Detail'}</h1>
+              <p>{'从板块热力图进入后，查看命中股票、模型信号和加入自选动作。' if lang == 'zh' else 'Drill from market heat into member names, model signals, and watchlist actions.'}</p>
+            </div>
+            <nav class="side-nav">{nav_html}</nav>
+            <div class="sidebar-foot">{'这页回答“这个概念里哪些股票被模型命中，以及哪些值得加入自选”。' if lang == 'zh' else 'This page answers which names inside a concept were hit by the model and which deserve watchlist attention.'}</div>
+          </aside>
+          <main class="main">
+            <div class="wrap">
+              {banner_html}
           <div class="card">
-            <a href="/dashboard">← {_concept_tr(lang, 'back_to_dashboard')}</a>
+            <div class="compare-row">
+              <a class="compare-pill" href="/dashboard/market?lang={lang}&lookback_runs={lookback_runs}">← {'返回市场概况' if lang == 'zh' else 'Back to Market'}</a>
+              <a class="compare-pill" href="/dashboard/market/heatmap?lang={lang}&lookback_runs={lookback_runs}">{'板块热力图' if lang == 'zh' else 'Sector Heatmap'}</a>
+              <a class="compare-pill" href="/dashboard/market/concepts?lang={lang}&lookback_runs={lookback_runs}">{'概念追踪' if lang == 'zh' else 'Concept Tracker'}</a>
+            </div>
             {lang_switch}
             <div class="eyebrow" style="margin-top:12px;">{_concept_tr(lang, 'concept_detail')}</div>
             <div class="metric">{concept['concept_name']}</div>
@@ -2092,27 +3491,27 @@ def dashboard_concept_detail(
             <div class="eyebrow">{_concept_tr(lang, 'concept_strength')}</div>
             <div class="muted" style="margin-bottom:14px;">{_concept_tr(lang, 'concept_strength_subtitle')}</div>
             <div class="grid" style="margin-bottom:0;">
-              <article class="card" style="margin-bottom:0;background:#f9f7f0;">
+              <article class="card" style="margin-bottom:0;background:rgba(21,34,49,0.82);">
                 <div class="eyebrow">{_concept_tr(lang, 'five_day')}</div>
                 <div class="metric">{avg_move_5d_display}</div>
                 <div class="muted">Average 5-day move across tickers inside this concept.</div>
               </article>
-              <article class="card" style="margin-bottom:0;background:#f9f7f0;">
+              <article class="card" style="margin-bottom:0;background:rgba(21,34,49,0.82);">
                 <div class="eyebrow">{_concept_tr(lang, 'twenty_day')}</div>
                 <div class="metric">{avg_move_20d_display}</div>
                 <div class="muted">Average 20-day move across tickers inside this concept.</div>
               </article>
-              <article class="card" style="margin-bottom:0;background:#f9f7f0;">
+              <article class="card" style="margin-bottom:0;background:rgba(21,34,49,0.82);">
                 <div class="eyebrow">{_concept_tr(lang, 'breadth')}</div>
                 <div class="metric">{breadth_display}</div>
                 <div class="muted">{_concept_tr(lang, 'breadth_help')}</div>
               </article>
-              <article class="card" style="margin-bottom:0;background:#f9f7f0;">
+              <article class="card" style="margin-bottom:0;background:rgba(21,34,49,0.82);">
                 <div class="eyebrow">{_concept_tr(lang, 'buy_signal_count')}</div>
                 <div class="metric">{int(concept.get('buy_signal_count') or 0)}</div>
                 <div class="muted">{_concept_tr(lang, 'buy_signal_count_help')}</div>
               </article>
-              <article class="card" style="margin-bottom:0;background:#f9f7f0;">
+              <article class="card" style="margin-bottom:0;background:rgba(21,34,49,0.82);">
                 <div class="eyebrow">{_concept_tr(lang, 'max_signal_strength')}</div>
                 <div class="metric">{int(concept.get('max_signal_strength') or 0)}</div>
                 <div class="muted">{_concept_tr(lang, 'max_signal_strength_help')}</div>
@@ -2209,7 +3608,7 @@ def dashboard_concept_detail(
           </section>
           <section class="card">
             <div class="eyebrow">{_concept_tr(lang, 'ticker_breakdown')}</div>
-            <table>
+            <div class="table-wrap"><table>
               <thead>
                 <tr>
                   <th><a href="{_concept_sort_link(concept_slug, sort_by, sort_order, 'ticker', lang, comparison_sort)}&lookback_runs={lookback_runs}">{_concept_tr(lang, 'ticker')}{' ↓' if sort_by == 'ticker' and sort_order == 'desc' else ' ↑' if sort_by == 'ticker' else ''}</a></th>
@@ -2222,9 +3621,11 @@ def dashboard_concept_detail(
                 </tr>
               </thead>
               <tbody>{ticker_rows}</tbody>
-            </table>
+            </table></div>
           </section>
-        </main>
+            </div>
+          </main>
+        </div>
         <script>
           function appendExecutionTag(formAction, inputName, tag) {{
             const form = document.querySelector(`form[action="${{formAction}}"]`);
@@ -2282,7 +3683,7 @@ def dashboard_concept_add_to_watchlist(
     sync_message = ""
     if sync_now and tickers_csv.strip():
         tickers = [ticker.strip() for ticker in tickers_csv.split(",") if ticker.strip()]
-        results = sync_market_data(tickers=tickers, start_date="2025-01-01", provider="yfinance")
+        results = sync_market_data(tickers=tickers, start_date="2025-01-01", provider="auto")
         success_count = sum(1 for item in results if item.get("status") == "success")
         sync_message = f" · Synced {success_count}/{len(tickers)}"
 
@@ -2328,7 +3729,7 @@ def dashboard_concept_add_top_to_watchlist(
     )
     sync_message = ""
     if sync_now and tickers:
-        results = sync_market_data(tickers=tickers, start_date="2025-01-01", provider="yfinance")
+        results = sync_market_data(tickers=tickers, start_date="2025-01-01", provider="auto")
         success_count = sum(1 for item in results if item.get("status") == "success")
         sync_message = f" · Synced {success_count}/{len(tickers)}"
 
@@ -2383,7 +3784,7 @@ def dashboard_concept_ticker_action(
 
     if action == "sync":
         watchlist_repo.set_sync_enabled(existing["item_id"], True)
-        results = sync_market_data(tickers=[ticker], start_date="2025-01-01", provider="yfinance")
+        results = sync_market_data(tickers=[ticker], start_date="2025-01-01", provider="auto")
         result = results[0] if results else None
         if result and result.get("status") == "success":
             message = f"Synced {ticker} with {result['rows']} rows"
@@ -2437,7 +3838,7 @@ def dashboard_continuous_leader_action(
 
     if action == "sync":
         watchlist_repo.set_sync_enabled(existing["item_id"], True)
-        results = sync_market_data(tickers=[ticker], start_date="2025-01-01", provider="yfinance")
+        results = sync_market_data(tickers=[ticker], start_date="2025-01-01", provider="auto")
         result = results[0] if results else None
         if result and result.get("status") == "success":
             message = f"Synced {ticker} with {result['rows']} rows"
@@ -2481,7 +3882,7 @@ def dashboard_continuous_leaders_add_top(
     )
     sync_message = ""
     if sync_now and tickers:
-        results = sync_market_data(tickers=tickers, start_date="2025-01-01", provider="yfinance")
+        results = sync_market_data(tickers=tickers, start_date="2025-01-01", provider="auto")
         success_count = sum(1 for item in results if item.get("status") == "success")
         sync_message = f" · Synced {success_count}/{len(tickers)}"
 
@@ -2523,13 +3924,14 @@ def dashboard_continuous_leaders_page(
     continuous_signal = continuous_signal.upper()
     execution_tag_filter = execution_tag_filter.strip()
     exclude_execution_tag_filter = exclude_execution_tag_filter.strip()
-    summary = _load_summary(db, lookback_runs=lookback_runs)
-    market_context = summary["market_context"]
+    summary = _load_home_summary(db, lookback_runs=lookback_runs)
+    continuous_snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_CONTINUOUS_LEADERS)
+    continuous_rows_snapshot = ((continuous_snapshot or {}).get("payload") or {}).get("rows") if isinstance(continuous_snapshot, dict) else None
     watchlist_repo = WatchlistRepository(db)
     watchlist = watchlist_repo.get_or_create_default()
     watchlist_map = watchlist_repo.list_ticker_map(watchlist.id)
 
-    rows_source = list(market_context.get("continuous_leaders", []))
+    rows_source = list(continuous_rows_snapshot or summary["market_context"].get("continuous_leaders", []))
     for item in rows_source:
         existing = watchlist_map.get(item["ticker"])
         if existing is None:
@@ -2691,6 +4093,7 @@ def dashboard_continuous_leaders_page(
     risk_examples_html = " · ".join(
         f"{item['ticker']} ({' / '.join(item['tags'])})" for item in risk_examples
     ) or "-"
+    nav_html = render_workspace_nav_html(lang=lang, active_key="market", lookback_runs=lookback_runs)
     return f"""
     <!DOCTYPE html>
     <html lang="{lang}">
@@ -2699,52 +4102,58 @@ def dashboard_continuous_leaders_page(
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{_concept_tr(lang, 'continuous_detail')}</title>
         <style>
-          :root {{
-            --bg: #f5efe2;
-            --panel: #fffdf7;
-            --ink: #1f2937;
-            --muted: #6b7280;
-            --line: #d6cfc2;
-            --accent: #0f766e;
-            --accent-soft: #dff5ef;
-          }}
+          :root {{ --bg:#071018; --panel:#111c28; --panel-2:#152231; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; --accent-soft:rgba(61,217,182,0.12); }}
           * {{ box-sizing: border-box; }}
-          body {{
-            margin: 0;
-            font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            color: var(--ink);
-            background:
-              radial-gradient(circle at top left, #fff6d8 0, transparent 30%),
-              radial-gradient(circle at top right, #d9f3ee 0, transparent 35%),
-              var(--bg);
-          }}
-          .wrap {{ max-width: 1080px; margin: 0 auto; padding: 28px 20px 56px; }}
-          .card {{ background: var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); margin-bottom:16px; }}
+          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at top right, rgba(61,217,182,0.12), transparent 24%),linear-gradient(180deg,#08111a 0%,#071018 100%); }}
+          a {{ color:inherit; text-decoration:none; }}
+          .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .content {{ padding:28px 30px 48px; }}
+          .wrap {{ max-width:1120px; margin:0 auto; }}
+          .card {{ background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 40px rgba(0,0,0,0.22); margin-bottom:16px; }}
           .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
-          .metric {{ font-size: 30px; font-weight: 800; margin: 8px 0; }}
+          .metric {{ font-size: 30px; font-weight: 800; margin: 8px 0; color:var(--ink); }}
           .muted {{ color: var(--muted); font-size: 14px; }}
           .grid {{ display:grid; gap:16px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-bottom:16px; }}
-          .compare-row {{ display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }}
-          .compare-pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; background:#f3f4f6; color:#374151; text-decoration:none; font-size:12px; font-weight:800; }}
-          .compare-pill.active {{ background:#dff5ef; color:#0f766e; }}
-          table {{ width:100%; border-collapse:collapse; }}
-          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); }}
+          .compare-row,.toolbar {{ display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; align-items:center; }}
+          .compare-pill,.pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; background:rgba(17,28,40,0.75); border:1px solid var(--line); color:var(--muted); text-decoration:none; font-size:12px; font-weight:800; }}
+          .compare-pill.active,.pill.active {{ background:rgba(61,217,182,0.14); color:var(--ink); border-color:rgba(61,217,182,0.28); }}
+          .table-wrap {{ width:100%; overflow-x:auto; border-radius:14px; border:1px solid var(--line); background:rgba(11,19,29,0.82); }}
+          table {{ width:100%; min-width:980px; border-collapse:collapse; }}
+          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); white-space:nowrap; vertical-align:top; }}
           th {{ color: var(--muted); font-weight: 600; }}
-          a {{ color: var(--accent); text-decoration: none; font-weight: 700; }}
           .stack {{ display:grid; gap:12px; }}
-          input, button, select {{ border-radius:12px; border:1px solid var(--line); padding:10px 12px; font:inherit; }}
-          button {{ background:var(--accent); color:#fff; border-color:var(--accent); font-weight:700; }}
+          input, button, select {{ border-radius:12px; border:1px solid var(--line); padding:10px 12px; font:inherit; background:#0f1823; color:var(--ink); }}
+          button {{ background:var(--accent); color:#041119; border-color:var(--accent); font-weight:800; }}
           .checkbox-row {{ display:inline-flex; align-items:center; gap:8px; color:var(--muted); font-size:14px; }}
-          .action-link {{ display:inline-flex; align-items:center; padding:10px 12px; border-radius:12px; background:#eef8f5; color:#0f766e; text-decoration:none; font-weight:700; }}
+          .action-link {{ display:inline-flex; align-items:center; padding:10px 12px; border-radius:12px; background:rgba(61,217,182,0.10); color:var(--accent); font-weight:700; }}
+          h1 {{ margin:0 0 8px; font-size:38px; line-height:1.05; letter-spacing:-0.03em; }}
+          .sidebar-foot {{ margin-top:24px; padding:16px; border:1px solid var(--line); border-radius:18px; background:rgba(17,28,40,0.68); color:var(--muted); font-size:13px; line-height:1.55; }}
+          @media (max-width: 1120px) {{ .app {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }} .content {{ padding:20px 16px 36px; }} }}
         </style>
       </head>
       <body>
-        <main class="wrap">
-          <div class="card">
-            <a href="/dashboard">← {_concept_tr(lang, 'back_to_dashboard')}</a>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{_concept_tr(lang, 'continuous_leaders')}</h1>
+              <p>{'查看最近几次模型快照里持续入选、持续走强的股票，并快速加入自选。' if lang == 'zh' else 'Review names that keep recurring across recent model snapshots and move them into the watchlist quickly.'}</p>
+            </div>
+            <nav class="side-nav">{nav_html}</nav>
+            <div class="sidebar-foot">{'这页聚焦连续入选和持续走强的股票，适合做盘前优先级排序。' if lang == 'zh' else 'This page focuses on names that keep recurring and staying strong, useful for pre-market prioritization.'}</div>
+          </aside>
+          <main class="content">
+        <div class="wrap">
+          <div class="toolbar">
+            <a href="/dashboard?lang={lang}" class="pill">← {_concept_tr(lang, 'back_to_dashboard')}</a>
+            <a href="/watchlist?lang={lang}" class="pill">{'观察池' if lang == 'zh' else 'Watchlist'}</a>
+            <a href="/dashboard/market?lang={lang}&lookback_runs={lookback_runs}" class="pill">{'市场概览' if lang == 'zh' else 'Market Overview'}</a>
             {lang_switch}
-            <div class="eyebrow" style="margin-top:12px;">{_concept_tr(lang, 'continuous_leaders')}</div>
-            <div class="metric">{_concept_tr(lang, 'continuous_detail')}</div>
+          </div>
+          <div class="card">
+            <div class="eyebrow">{_concept_tr(lang, 'continuous_leaders')}</div>
+            <h1>{_concept_tr(lang, 'continuous_detail')}</h1>
             <div class="muted">{_concept_tr(lang, 'continuous_subtitle')}</div>
           </div>
           <section class="card">
@@ -2857,6 +4266,7 @@ def dashboard_continuous_leaders_page(
               </label>
               <button type="submit">{_concept_tr(lang, 'add_top_n')}</button>
             </form>
+            <div class="table-wrap">
             <table>
               <thead>
                 <tr>
@@ -2874,8 +4284,11 @@ def dashboard_continuous_leaders_page(
               </thead>
               <tbody>{rows_html}</tbody>
             </table>
+            </div>
           </section>
-        </main>
+        </div>
+          </main>
+        </div>
         <script>
           function appendExecutionTag(formAction, inputName, tag) {{
             const form = document.querySelector(`form[action="${{formAction}}"]`);
@@ -2928,11 +4341,13 @@ def dashboard_continuous_leaders_export(
     continuous_signal = continuous_signal.upper()
     execution_tag_filter = execution_tag_filter.strip()
     exclude_execution_tag_filter = exclude_execution_tag_filter.strip()
-    summary = _load_summary(db, lookback_runs=lookback_runs)
+    summary = _load_home_summary(db, lookback_runs=lookback_runs)
+    continuous_snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_CONTINUOUS_LEADERS)
+    continuous_rows_snapshot = ((continuous_snapshot or {}).get("payload") or {}).get("rows") if isinstance(continuous_snapshot, dict) else None
     watchlist_repo = WatchlistRepository(db)
     watchlist = watchlist_repo.get_or_create_default()
     watchlist_map = watchlist_repo.list_ticker_map(watchlist.id)
-    rows_source = list(summary["market_context"].get("continuous_leaders", []))
+    rows_source = list(continuous_rows_snapshot or summary["market_context"].get("continuous_leaders", []))
     for item in rows_source:
         existing = watchlist_map.get(item["ticker"])
         if existing is None:
@@ -3059,110 +4474,68 @@ def dashboard_market_page(
     signal_filter = signal_filter.upper()
     execution_tag_filter = execution_tag_filter.strip()
     exclude_execution_tag_filter = exclude_execution_tag_filter.strip()
-    summary = _load_summary(db, lookback_runs=lookback_runs)
-    market_context = summary["market_context"]
+    summary = _load_home_summary(db, lookback_runs=lookback_runs)
+    latest_signals = list(summary.get("latest_signals") or [])
+    filtered_signals = []
+    for item in latest_signals:
+        label = str(item.get("signal_label") or build_signal_label(item.get("score"), lang=lang) or "").strip().upper()
+        if signal_filter != "ALL" and label != signal_filter:
+            continue
+        if min_signal_strength > 0 and int(item.get("signal_strength") or 0) < min_signal_strength:
+            continue
+        tags = item.get("risk_flags") or item.get("execution_tags") or []
+        if execution_tag_filter and execution_tag_filter.upper() != "ALL" and not _matches_execution_tag_filter(tags, execution_tag_filter):
+            continue
+        if exclude_execution_tag_filter and exclude_execution_tag_filter.upper() != "ALL" and not _excludes_execution_tag_filter(tags, exclude_execution_tag_filter):
+            continue
+        filtered_signals.append(item)
 
-    heatmap_rows = list(market_context["sector_heatmap"])
-    if signal_filter == "BUY":
-        heatmap_rows = [item for item in heatmap_rows if int(item.get("buy_signal_count") or 0) > 0]
-    elif signal_filter != "ALL":
-        heatmap_rows = [
-            item for item in heatmap_rows
-            if any(str(detail.get("signal_label") or "").strip().upper() == signal_filter for detail in item.get("ticker_details", []))
-        ]
-    if min_signal_strength > 0:
-        heatmap_rows = [item for item in heatmap_rows if int(item.get("max_signal_strength") or 0) >= min_signal_strength]
-    if min_buy_signal_count > 0:
-        heatmap_rows = [item for item in heatmap_rows if int(item.get("buy_signal_count") or 0) >= min_buy_signal_count]
-    if execution_tag_filter and execution_tag_filter.upper() != "ALL":
-        heatmap_rows = [item for item in heatmap_rows if _matches_execution_tag_filter(item.get("execution_tags"), execution_tag_filter)]
-    if exclude_execution_tag_filter and exclude_execution_tag_filter.upper() != "ALL":
-        heatmap_rows = [item for item in heatmap_rows if _excludes_execution_tag_filter(item.get("execution_tags"), exclude_execution_tag_filter)]
+    market_counts: dict[str, int] = {}
+    tagged_names = 0
     risk_counts: dict[str, int] = {}
     risk_examples: list[dict[str, object]] = []
-    tagged_names = 0
-    for item in heatmap_rows:
-        tags = [str(tag).strip() for tag in (item.get("execution_tags") or []) if str(tag).strip()]
-        if not tags:
-            continue
-        tagged_names += 1
-        for tag in tags:
-            risk_counts[tag] = risk_counts.get(tag, 0) + 1
-        risk_examples.append({"label": item.get("label"), "tags": tags[:2]})
+    for item in filtered_signals:
+        market = str(item.get("market") or "OTHER").upper()
+        market_counts[market] = market_counts.get(market, 0) + 1
+        tags = [str(tag).strip() for tag in (item.get("risk_flags") or item.get("execution_tags") or []) if str(tag).strip()]
+        if tags:
+            tagged_names += 1
+            for tag in tags:
+                risk_counts[tag] = risk_counts.get(tag, 0) + 1
+            risk_examples.append({"label": item.get("ticker") or "-", "tags": tags[:2]})
     risk_examples = risk_examples[:3]
     risk_top_tags = sorted(risk_counts.items(), key=lambda pair: (-pair[1], pair[0]))[:3]
-    if heatmap_sort == "five_day":
-        heatmap_rows.sort(key=lambda item: (float(item.get("avg_move_5d") or -9999.0), float(item.get("avg_score") or 0.0)), reverse=True)
-    elif heatmap_sort == "breadth":
-        heatmap_rows.sort(key=lambda item: (float(item.get("breadth_pct") or -1.0), float(item.get("avg_score") or 0.0)), reverse=True)
-    elif heatmap_sort == "score":
-        heatmap_rows.sort(key=lambda item: (float(item.get("avg_score") or 0.0), int(item.get("hits") or 0)), reverse=True)
-    else:
-        heatmap_rows.sort(key=lambda item: (int(item.get("hits") or 0), float(item.get("avg_score") or 0.0)), reverse=True)
-    for item in heatmap_rows:
-        avg_move = item.get("avg_move_5d")
-        breadth = item.get("breadth_pct")
-        item["avg_move_5d_display"] = "-" if avg_move is None else f"{'+' if float(avg_move) > 0 else ''}{float(avg_move):.1f}%"
-        item["breadth_display"] = "-" if breadth is None else f"{float(breadth):.0f}% {'涨' if lang == 'zh' else 'up'}"
-        item["execution_tags_display"] = " · ".join(item.get("execution_tags") or [])
-    heatmap_tiles = "".join(
-        f"<a href='/dashboard/concepts/{item['slug']}?{urlencode({'lookback_runs': lookback_runs, 'lang': lang, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}' class='heat-tile' style='background:rgba(15,118,110,{min(0.92, item['intensity']/115):.2f});'>"
-        f"<div class='heat-label'>{item['label']}</div>"
-        f"<div class='heat-metric'>{item['hits']} {'次命中' if lang == 'zh' else 'hit(s)'}</div>"
-        f"<div class='heat-meta'>{'平均分' if lang == 'zh' else 'avg'} {item['avg_score']:.3f}</div>"
-        f"<div class='heat-meta'>{item['avg_move_5d_display']} · {item['breadth_display']}</div>"
-        f"<div class='heat-meta'>{'买点' if lang == 'zh' else 'Buy'} {int(item.get('buy_signal_count') or 0)} · {'最强' if lang == 'zh' else 'Max'} {int(item.get('max_signal_strength') or 0)}</div>"
-        f"<div class='heat-meta'>{item['execution_tags_display'] or ('执行提醒 -' if lang == 'zh' else 'Execution tags -')}</div>"
-        "</a>"
-        for item in heatmap_rows
-    ) or f"<div class='muted'>{'暂无概念热力图，请先同步 A 股概念。' if lang == 'zh' else 'No concept heatmap yet. Sync CN concepts first.'}</div>"
     market_rows = "".join(
-        f"<tr><td>{item['market']}</td><td>{item['count']}</td></tr>"
-        for item in market_context["market_distribution"]
+        f"<tr><td>{market}</td><td>{count}</td></tr>"
+        for market, count in sorted(market_counts.items(), key=lambda pair: (-pair[1], pair[0]))
     ) or f"<tr><td colspan='2'>{'暂无信号分布' if lang == 'zh' else 'No signal distribution yet'}</td></tr>"
-    concept_rows_source = list(market_context["concept_tracker"])
-    if signal_filter != "ALL":
-        concept_rows_source = [
-            item for item in concept_rows_source
-            if any(str(detail.get("signal_label") or "").strip().upper() == signal_filter for detail in item.get("ticker_details", []))
-        ]
-    if min_signal_strength > 0:
-        concept_rows_source = [
-            item for item in concept_rows_source
-            if int(item.get("max_signal_strength") or 0) >= min_signal_strength
-        ]
-    if min_buy_signal_count > 0:
-        concept_rows_source = [
-            item for item in concept_rows_source
-            if int(item.get("buy_signal_count") or 0) >= min_buy_signal_count
-        ]
-    if execution_tag_filter and execution_tag_filter.upper() != "ALL":
-        concept_rows_source = [
-            item for item in concept_rows_source
-            if _matches_execution_tag_filter(item.get("execution_tags"), execution_tag_filter)
-        ]
-    if exclude_execution_tag_filter and exclude_execution_tag_filter.upper() != "ALL":
-        concept_rows_source = [
-            item for item in concept_rows_source
-            if _excludes_execution_tag_filter(item.get("execution_tags"), exclude_execution_tag_filter)
-        ]
-    concept_rows = "".join(
-        "<tr>"
-        f"<td id='concept-{item['slug']}'><a href='/dashboard/concepts/{item['slug']}?{urlencode({'lookback_runs': lookback_runs, 'lang': lang, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}'>{item['concept_name']}</a></td>"
-        f"<td>{item['hits']}</td><td>{item['previous_hits']}</td><td>{'+' if item['delta_hits'] > 0 else ''}{item['delta_hits']}</td><td>{item['streak']}</td><td>{_sparkline_svg(item['history'])}</td><td>{_percent_chip(item.get('avg_move_5d'))}</td><td>{_breadth_chip(item.get('breadth_pct'))}</td><td>{int(item.get('buy_signal_count') or 0)}</td><td>{int(item.get('max_signal_strength') or 0)}</td><td>{' · '.join(item.get('execution_tags') or []) or '-'}</td><td>{item['avg_score']:.4f}</td><td>{', '.join(item['tickers'])}</td>"
-        "</tr>"
-        for item in concept_rows_source
-    ) or f"<tr><td colspan='13'>{'暂无概念数据' if lang == 'zh' else 'No concept data yet'}</td></tr>"
+
+    market_snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_MARKET_WORKSPACE)
+    market_snapshot_payload = (market_snapshot or {}).get("payload") if isinstance(market_snapshot, dict) else None
+    snapshot_boards = (market_snapshot_payload or {}).get("rows") if isinstance(market_snapshot_payload, dict) else None
+    market_monitor_snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_MARKET_WORKSPACE_MONITOR)
+    snapshot_ready = isinstance(market_monitor_snapshot, dict) and isinstance(snapshot_boards, list) and bool(snapshot_boards)
+    if not snapshot_ready:
+        snapshot_boards = []
+    board_preview_html = "".join(
+        "<article class='card'>"
+        f"<div class='eyebrow'>{board.get('title_zh') if lang == 'zh' else board.get('title_en')}</div>"
+        f"<div class='muted'>{board.get('description_zh') if lang == 'zh' else board.get('description_en')}</div>"
+        f"<div style='margin-top:12px;font-size:28px;font-weight:800;'>{len(board.get('rows') or [])}</div>"
+        f"<div class='muted'>{'当前候选数' if lang == 'zh' else 'Current candidates'}</div>"
+        "</article>"
+        for board in snapshot_boards[:4]
+    ) or f"<div class='muted'>{'市场快照仍在后台预计算，稍后刷新即可。' if lang == 'zh' else 'Market snapshot boards are still being precomputed in the background. Refresh shortly.'}</div>"
+
+    top_signal_rows = "".join(
+        "<article class='signal-row'>"
+        f"<div><a class='ticker' href='/insights/{item.get('ticker')}?lang={lang}'>{item.get('ticker')}</a><div class='subtle'>{item.get('trade_date') or '-'}</div><div class='subtle'>{_compact_label(item.get('reason_summary') or item.get('name') or '-', 72)}</div></div>"
+        f"<div class='row-right'><span class='signal {_dashboard_home_signal(item.get('score'), lang)[1]}'>{item.get('signal_label') or _dashboard_home_signal(item.get('score'), lang)[0]}</span><div class='mini-metric'>{int(item.get('signal_strength') or 0)}</div></div>"
+        "</article>"
+        for item in filtered_signals[:5]
+    ) or f"<div class='empty'>{'暂无符合条件的候选' if lang == 'zh' else 'No candidates match the current focus'}</div>"
+
     lookback_pills = _lookback_pills("/dashboard/market", selected=lookback_runs, extra_params={"lang": lang, "heatmap_sort": heatmap_sort, "signal_filter": signal_filter, "min_signal_strength": min_signal_strength, "min_buy_signal_count": min_buy_signal_count, "execution_tag_filter": execution_tag_filter, "exclude_execution_tag_filter": exclude_execution_tag_filter})
-    heatmap_sort_pills = "".join(
-        f"<a href='/dashboard/market?{urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'heatmap_sort': mode, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}' class='compare-pill{' active' if heatmap_sort == mode else ''}'>{label}</a>"
-        for mode, label in (
-            ("hits", _dt(lang, "sort_by_hits")),
-            ("five_day", _dt(lang, "sort_by_5d")),
-            ("breadth", _dt(lang, "sort_by_breadth")),
-            ("score", _dt(lang, "sort_by_score")),
-        )
-    )
     signal_pills = "".join(
         f"<a href='/dashboard/market?{urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'heatmap_sort': heatmap_sort, 'signal_filter': mode, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}' class='compare-pill{' active' if signal_filter == mode else ''}'>{label}</a>"
         for mode, label in (
@@ -3179,6 +4552,8 @@ def dashboard_market_page(
     risk_examples_html = " · ".join(
         f"{item['label']} ({' / '.join(item['tags'])})" for item in risk_examples
     ) or "-"
+    nav_html = render_workspace_nav_html(lang=lang, active_key="market", lookback_runs=lookback_runs)
+    board_count = sum(len(board.get("rows") or []) for board in snapshot_boards)
     return f"""
     <!DOCTYPE html>
     <html lang="{lang}">
@@ -3187,30 +4562,59 @@ def dashboard_market_page(
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{'市场脉冲' if lang == 'zh' else 'Market Pulse'}</title>
         <style>
-          :root {{ --bg:#f5efe2; --panel:#fffdf7; --ink:#1f2937; --muted:#6b7280; --line:#d6cfc2; --accent:#0f766e; --accent-soft:#dff5ef; }}
+          :root {{ --bg:#071018; --panel:#111c28; --panel-2:#152231; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; --accent-soft:rgba(61,217,182,0.12); }}
           * {{ box-sizing:border-box; }}
-          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left,#fff6d8 0,transparent 30%),radial-gradient(circle at top right,#d9f3ee 0,transparent 35%),var(--bg); }}
-          .wrap {{ max-width:1080px; margin:0 auto; padding:32px 20px 56px; }}
-          .card {{ background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); margin-bottom:16px; }}
-          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
+          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
+          a {{ color:inherit; text-decoration:none; }}
+          .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .main {{ padding:28px 30px 48px; }}
+          .wrap {{ max-width:1120px; margin:0 auto; }}
           .toolbar,.compare-row {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }}
+          .card {{ background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 40px rgba(0,0,0,0.22); margin-bottom:16px; }}
+          .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.05em; text-transform:uppercase; margin-bottom:12px; }}
           .muted {{ color:var(--muted); font-size:14px; }}
-          .pill,.compare-pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; background:#eef8f5; color:#0f766e; font-size:13px; font-weight:700; text-decoration:none; }}
-          .compare-pill.active {{ background:#0f766e; color:#fff; }}
+          .pill,.compare-pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; background:rgba(17,28,40,0.75); border:1px solid var(--line); color:var(--muted); font-size:13px; font-weight:700; text-decoration:none; }}
+          .compare-pill.active, .pill.active {{ background:rgba(61,217,182,0.16); border-color:rgba(61,217,182,0.24); color:var(--ink); }}
           .grid {{ display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); margin-bottom:16px; }}
-          .heat-grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); margin-top:12px; }}
-          .heat-tile {{ color:#fff; border-radius:16px; padding:14px; min-height:110px; display:flex; flex-direction:column; justify-content:space-between; text-decoration:none; box-shadow:0 8px 24px rgba(15,118,110,0.12); }}
-          .heat-label {{ font-weight:800; line-height:1.3; }}
-          .heat-metric {{ font-size:22px; font-weight:800; }}
-          .heat-meta {{ font-size:12px; opacity:0.92; }}
-          table {{ width:100%; border-collapse:collapse; font-size:14px; }}
-          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
+          .signal-row {{
+            display:flex; justify-content:space-between; gap:12px; align-items:center;
+            padding:14px; border-radius:16px; background:rgba(11,19,29,0.82); border:1px solid rgba(34,50,70,0.92);
+          }}
+          .row-right {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }}
+          .ticker {{ font-weight:800; font-size:15px; }}
+          .subtle {{ color:var(--muted); font-size:12px; margin-top:4px; }}
+          .signal {{ display:inline-flex; align-items:center; padding:6px 10px; border-radius:999px; font-size:12px; font-weight:800; }}
+          .sig-buy {{ background:rgba(74,222,128,0.14); color:#8af0a6; }}
+          .sig-sell {{ background:rgba(255,107,129,0.14); color:#ff93a4; }}
+          .sig-watch {{ background:rgba(82,168,255,0.14); color:#89c2ff; }}
+          .sig-hold {{ background:rgba(246,200,95,0.14); color:#ffd982; }}
+          .mini-metric {{ font-weight:800; font-size:13px; color:var(--ink); }}
+          .empty {{ padding:18px; border-radius:16px; background:rgba(11,19,29,0.65); border:1px dashed var(--line); color:var(--muted); font-size:13px; }}
+          .table-wrap {{ width:100%; overflow-x:auto; border-radius:14px; border:1px solid var(--line); background:rgba(11,19,29,0.82); }}
+          table {{ width:100%; min-width:640px; border-collapse:collapse; font-size:14px; }}
+          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; white-space:nowrap; }}
           th {{ color:var(--muted); font-weight:600; }}
-          a {{ color:#0f766e; text-decoration:none; font-weight:700; }}
+          h1 {{ margin:0 0 8px; font-size:38px; line-height:1.04; letter-spacing:-0.03em; }}
+          input, button {{ width:100%; padding:10px 12px; border-radius:12px; border:1px solid var(--line); background:#0f1823; color:var(--ink); font:inherit; }}
+          button {{ width:auto; background:var(--accent); color:#041119; font-weight:800; cursor:pointer; }}
+          .sidebar-foot {{ margin-top:24px; padding:16px; border:1px solid var(--line); border-radius:18px; background:rgba(17,28,40,0.68); color:var(--muted); font-size:13px; line-height:1.55; }}
+          @media (max-width: 1100px) {{ .app {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }} .main {{ padding:20px 16px 36px; }} }}
         </style>
       </head>
       <body>
-        <main class="wrap">
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{'市场概览' if lang == 'zh' else 'Market Overview'}</h1>
+              <p>{'先看市场节奏、板块热力和概念共振，再决定是否进入更细的热力图或概念追踪页。' if lang == 'zh' else 'Review market tone, sector heat, and concept resonance before drilling into deeper heatmap or concept views.'}</p>
+            </div>
+            <nav class="side-nav">{nav_html}</nav>
+            <div class="sidebar-foot">{'这页只保留市场工作流入口与摘要，详细板块和概念页继续往下看。' if lang == 'zh' else 'This page keeps the market workflow summary and entry points while deeper pages handle the detail.'}</div>
+          </aside>
+          <main class="main">
+        <div class="wrap">
           <div class="toolbar">
             <a href="/dashboard?lang={lang}" class="pill">← {'返回总览' if lang == 'zh' else 'Back to dashboard'}</a>
             <a href="/dashboard/ops?lang={lang}&lookback_runs={lookback_runs}" class="pill">{'运维操作台' if lang == 'zh' else 'Operations'}</a>
@@ -3225,12 +4629,14 @@ def dashboard_market_page(
           <section class="grid">
             <article class="card">
               <div class="eyebrow">{_dt(lang, 'sector_heatmap')}</div>
-              <div class="muted">{'查看板块热力、热力排序和信号分布。' if lang == 'zh' else 'Open sector heat, sorting controls, and signal distribution.'}</div>
+              <div style="font-size:28px;font-weight:800;margin:6px 0;">{board_count}</div>
+              <div class="muted">{'市场快照候选总数，适合先粗看盘面。' if lang == 'zh' else 'Total snapshot candidates for a quick market scan.'}</div>
               <div style="margin-top:12px;"><a class="pill" href="/dashboard/market/heatmap?lang={lang}&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}">{'打开板块热力图' if lang == 'zh' else 'Open Sector Heatmap'}</a></div>
             </article>
             <article class="card">
               <div class="eyebrow">{_dt(lang, 'concept_activity_tracker')}</div>
-              <div class="muted">{'查看概念共振、异动追踪和概念 drill-down。' if lang == 'zh' else 'Open concept resonance, activity tracking, and drill-down views.'}</div>
+              <div style="font-size:28px;font-weight:800;margin:6px 0;">{len(filtered_signals)}</div>
+              <div class="muted">{'当前焦点筛选下的候选数量。' if lang == 'zh' else 'Candidate count under the current focus filters.'}</div>
               <div style="margin-top:12px;"><a class="pill" href="/dashboard/market/concepts?lang={lang}&lookback_runs={lookback_runs}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}">{'打开概念追踪' if lang == 'zh' else 'Open Concept Tracker'}</a></div>
             </article>
           </section>
@@ -3295,9 +4701,9 @@ def dashboard_market_page(
           </section>
           <section class="card">
             <div class="eyebrow">{_dt(lang, 'concept_resonance')}</div>
-            <div style="font-size:32px;font-weight:800;margin:6px 0;">{market_context['resonance_score']:.1f}%</div>
-            <div class="muted">{_dt(lang, 'concept_resonance_help')}</div>
-            <div class="muted" style="margin-top:8px;">{_dt(lang, 'tracked_signals')}: {market_context['tracked_signal_count']}</div>
+            <div style="font-size:32px;font-weight:800;margin:6px 0;">{len(risk_top_tags)}</div>
+            <div class="muted">{'这里先看执行风险是否集中，详细概念共振留给概念追踪页。' if lang == 'zh' else 'Use this page to spot execution-risk concentration first; leave full concept resonance for the concept tracker.'}</div>
+            <div class="muted" style="margin-top:8px;">{_dt(lang, 'tracked_signals')}: {len(filtered_signals)}</div>
           </section>
           <section class="card">
             <div class="eyebrow">{'市场入口' if lang == 'zh' else 'Market Shortcuts'}</div>
@@ -3307,14 +4713,9 @@ def dashboard_market_page(
             </div>
           </section>
           <section class="card">
-            <div class="eyebrow">{_dt(lang, 'sector_heatmap')}</div>
-            <div class="muted">{_dt(lang, 'sector_heatmap_help')}</div>
-            <div class="compare-row" style="margin-top:10px;">
-              <span class="muted">{_dt(lang, 'heatmap_sort')}:</span>
-              {heatmap_sort_pills}
-            </div>
-            <div class="heat-grid">{''.join(heatmap_tiles.split('</a>')[:4]) + ('</a>' if heatmap_tiles and '</a>' in heatmap_tiles else '') if heatmap_tiles.startswith('<a ') else heatmap_tiles}</div>
-            <div class="muted" style="margin-top:10px;"><a href="/dashboard/market/heatmap?lang={lang}&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}">{'查看完整板块热力图 →' if lang == 'zh' else 'Open full heatmap →'}</a></div>
+            <div class="eyebrow">{'市场快照预览' if lang == 'zh' else 'Snapshot Preview'}</div>
+            <div class="grid">{board_preview_html}</div>
+            <div class="muted" style="margin-top:10px;"><a href="/screeners/market-snapshot?lang={lang}">{'打开市场快照榜单 →' if lang == 'zh' else 'Open market snapshot boards →'}</a></div>
           </section>
           <section class="grid">
             <article class="card">
@@ -3325,21 +4726,34 @@ def dashboard_market_page(
               </table>
             </article>
             <article class="card">
-              <div class="eyebrow">{_dt(lang, 'concept_resonance')}</div>
-              <div style="font-size:32px;font-weight:800;margin:6px 0;">{market_context['resonance_score']:.1f}%</div>
-              <div class="muted">{_dt(lang, 'concept_resonance_help')}</div>
-              <div class="muted" style="margin-top:8px;">{_dt(lang, 'tracked_signals')}: {market_context['tracked_signal_count']}</div>
+              <div class="eyebrow">{'轻量候选预览' if lang == 'zh' else 'Candidate Preview'}</div>
+              <div class="muted">{'先看最强的几只票，完整榜单留给热力图和概念页。' if lang == 'zh' else 'Review a few strongest names here and leave the full list to the heatmap and concept pages.'}</div>
+              <div style="margin-top:12px;display:grid;gap:10px;">{top_signal_rows}</div>
             </article>
           </section>
           <section class="card">
-            <div class="eyebrow">{_dt(lang, 'concept_activity_tracker')}</div>
-            <table>
-              <thead><tr><th>{_dt(lang, 'concept')}</th><th>{_dt(lang, 'hits')}</th><th>{_dt(lang, 'prev')}</th><th>{_dt(lang, 'delta_hits')}</th><th>{_dt(lang, 'streak')}</th><th>{_dt(lang, 'trend')}</th><th>{_dt(lang, 'five_day')}</th><th>{_dt(lang, 'breadth')}</th><th>{_concept_tr(lang, 'buy_signal_count')}</th><th>{_concept_tr(lang, 'max_signal_strength')}</th><th>{'执行提醒' if lang == 'zh' else 'Execution Tags'}</th><th>{_dt(lang, 'avg_score')}</th><th>{_dt(lang, 'tickers')}</th></tr></thead>
-              <tbody>{''.join(concept_rows.split('</tr>')[:4]) + ('</tr>' if concept_rows and '</tr>' in concept_rows else '') if concept_rows.startswith('<tr>') else concept_rows}</tbody>
-            </table>
-            <div class="muted" style="margin-top:10px;"><a href="/dashboard/market/concepts?lang={lang}&lookback_runs={lookback_runs}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}">{'查看完整概念追踪 →' if lang == 'zh' else 'Open full concept tracker →'}</a></div>
+            <div class="eyebrow">{'下一步怎么走' if lang == 'zh' else 'Suggested Next Steps'}</div>
+            <div class="grid">
+              <article class="card">
+                <div class="eyebrow">{'看热力' if lang == 'zh' else 'Heatmap'}</div>
+                <div class="muted">{'想看板块/概念分布，就去热力图。' if lang == 'zh' else 'Open the heatmap when you want sector and concept distribution.'}</div>
+                <div style="margin-top:12px;"><a class="pill" href="/dashboard/market/heatmap?lang={lang}&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}">{'进入热力图' if lang == 'zh' else 'Open heatmap'}</a></div>
+              </article>
+              <article class="card">
+                <div class="eyebrow">{'看概念' if lang == 'zh' else 'Concepts'}</div>
+                <div class="muted">{'想看概念追踪、共振和明细，就去概念页。' if lang == 'zh' else 'Open the concept page for resonance, activity tracking, and ticker detail.'}</div>
+                <div style="margin-top:12px;"><a class="pill" href="/dashboard/market/concepts?lang={lang}&lookback_runs={lookback_runs}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}">{'进入概念追踪' if lang == 'zh' else 'Open concept tracker'}</a></div>
+              </article>
+              <article class="card">
+                <div class="eyebrow">{'看连续强势' if lang == 'zh' else 'Persistence'}</div>
+                <div class="muted">{'想看连续入选、持续走强的票，就去连续强势股。' if lang == 'zh' else 'Open continuous leaders to review names that keep showing up.'}</div>
+                <div style="margin-top:12px;"><a class="pill" href="/dashboard/continuous-leaders?lang={lang}&lookback_runs={lookback_runs}">{'进入连续强势股' if lang == 'zh' else 'Open continuous leaders'}</a></div>
+              </article>
+            </div>
           </section>
-        </main>
+        </div>
+          </main>
+        </div>
         <script>
           function appendExecutionTag(formAction, inputName, tag) {{
             const form = document.querySelector(`form[action="${{formAction}}"]`);
@@ -3389,10 +4803,10 @@ def dashboard_market_heatmap_page(
     signal_filter = signal_filter.upper()
     execution_tag_filter = execution_tag_filter.strip()
     exclude_execution_tag_filter = exclude_execution_tag_filter.strip()
-    summary = _load_summary(db, lookback_runs=lookback_runs)
-    market_context = summary["market_context"]
-
-    heatmap_rows = list(market_context["sector_heatmap"])
+    heatmap_snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_MARKET_HEATMAP_WORKSPACE)
+    heatmap_payload = (heatmap_snapshot or {}).get("payload") if isinstance(heatmap_snapshot, dict) else None
+    heatmap_ready = isinstance(heatmap_payload, dict) and isinstance(heatmap_payload.get("sector_heatmap"), list)
+    heatmap_rows = list((heatmap_payload or {}).get("sector_heatmap") or [])
     if signal_filter == "BUY":
         heatmap_rows = [item for item in heatmap_rows if int(item.get("buy_signal_count") or 0) > 0]
     elif signal_filter != "ALL":
@@ -3448,8 +4862,8 @@ def dashboard_market_heatmap_page(
     ) or f"<div class='muted'>{'暂无概念热力图，请先同步 A 股概念。' if lang == 'zh' else 'No concept heatmap yet. Sync CN concepts first.'}</div>"
     market_rows = "".join(
         f"<tr><td>{item['market']}</td><td>{item['count']}</td></tr>"
-        for item in market_context["market_distribution"]
-    ) or f"<tr><td colspan='2'>{'暂无信号分布' if lang == 'zh' else 'No signal distribution yet'}</td></tr>"
+        for item in ((heatmap_payload or {}).get("market_distribution") or [])
+    ) or f"<tr><td colspan='2'>{'热力图仍在后台预计算' if lang == 'zh' else 'Heatmap is still being precomputed'}</td></tr>"
     lookback_pills = _lookback_pills("/dashboard/market/heatmap", selected=lookback_runs, extra_params={"lang": lang, "heatmap_sort": heatmap_sort, "signal_filter": signal_filter, "min_signal_strength": min_signal_strength, "min_buy_signal_count": min_buy_signal_count, "execution_tag_filter": execution_tag_filter, "exclude_execution_tag_filter": exclude_execution_tag_filter})
     heatmap_sort_pills = "".join(
         f"<a href='/dashboard/market/heatmap?{urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'heatmap_sort': mode, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}' class='compare-pill{' active' if heatmap_sort == mode else ''}'>{label}</a>"
@@ -3476,6 +4890,12 @@ def dashboard_market_heatmap_page(
     risk_examples_html = " · ".join(
         f"{item['label']} ({' / '.join(item['tags'])})" for item in risk_examples
     ) or "-"
+    nav_html = render_workspace_nav_html(lang=lang, active_key="market", lookback_runs=lookback_runs)
+    loading_hint = (
+        f"<div class='card'><div class='eyebrow'>{'后台预计算' if lang == 'zh' else 'Background Precompute'}</div><p class='muted'>{'板块热力图仍在后台生成，稍后刷新即可。' if lang == 'zh' else 'Sector heatmap is still being generated in the background. Refresh shortly.'}</p></div>"
+        if not heatmap_ready
+        else ""
+    )
     return f"""
     <!DOCTYPE html>
     <html lang="{lang}">
@@ -3484,30 +4904,51 @@ def dashboard_market_heatmap_page(
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{'板块热力图' if lang == 'zh' else 'Sector Heatmap'}</title>
         <style>
-          :root {{ --bg:#f5efe2; --panel:#fffdf7; --ink:#1f2937; --muted:#6b7280; --line:#d6cfc2; --accent:#0f766e; --accent-soft:#dff5ef; }}
+          :root {{ --bg:#071018; --panel:#111c28; --panel-2:#152231; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; --accent-soft:rgba(61,217,182,0.12); }}
           * {{ box-sizing:border-box; }}
-          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left,#fff6d8 0,transparent 30%),radial-gradient(circle at top right,#d9f3ee 0,transparent 35%),var(--bg); }}
-          .wrap {{ max-width:1080px; margin:0 auto; padding:32px 20px 56px; }}
-          .card {{ background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); margin-bottom:16px; }}
-          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
+          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
+          a {{ color:inherit; text-decoration:none; }}
+          .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .main {{ padding:28px 30px 48px; }}
+          .wrap {{ max-width:1120px; margin:0 auto; }}
+          .card {{ background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 40px rgba(0,0,0,0.22); margin-bottom:16px; }}
+          .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
           .toolbar,.compare-row {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }}
           .muted {{ color:var(--muted); font-size:14px; }}
-          .pill,.compare-pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; background:#eef8f5; color:#0f766e; font-size:13px; font-weight:700; text-decoration:none; }}
-          .compare-pill.active {{ background:#0f766e; color:#fff; }}
+          .pill,.compare-pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; background:rgba(17,28,40,0.75); border:1px solid var(--line); color:var(--muted); font-size:13px; font-weight:700; text-decoration:none; }}
+          .compare-pill.active {{ background:rgba(61,217,182,0.16); border-color:rgba(61,217,182,0.24); color:var(--ink); }}
           .grid {{ display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); margin-bottom:16px; }}
           .heat-grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); margin-top:12px; }}
-          .heat-tile {{ color:#fff; border-radius:16px; padding:14px; min-height:110px; display:flex; flex-direction:column; justify-content:space-between; text-decoration:none; box-shadow:0 8px 24px rgba(15,118,110,0.12); }}
+          .heat-tile {{ color:#fff; border-radius:18px; padding:14px; min-height:110px; display:flex; flex-direction:column; justify-content:space-between; text-decoration:none; box-shadow:0 12px 26px rgba(0,0,0,0.18); }}
           .heat-label {{ font-weight:800; line-height:1.3; }}
           .heat-metric {{ font-size:22px; font-weight:800; }}
           .heat-meta {{ font-size:12px; opacity:0.92; }}
           table {{ width:100%; border-collapse:collapse; font-size:14px; }}
           th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
           th {{ color:var(--muted); font-weight:600; }}
-          a {{ color:#0f766e; text-decoration:none; font-weight:700; }}
+          .ticker-links {{ max-width:280px; line-height:1.8; }}
+          .ticker-links a {{ display:inline-flex; padding:2px 7px; margin:1px 2px 1px 0; border:1px solid rgba(61,217,182,0.22); border-radius:999px; background:rgba(61,217,182,0.08); color:#bff7eb; font-size:12px; font-weight:800; }}
+          input, button {{ width:100%; padding:10px 12px; border-radius:12px; border:1px solid var(--line); background:#0f1823; color:var(--ink); font:inherit; }}
+          button {{ width:auto; background:var(--accent); color:#041119; font-weight:800; cursor:pointer; }}
+          .sidebar-foot {{ margin-top:24px; padding:16px; border:1px solid var(--line); border-radius:18px; background:rgba(17,28,40,0.68); color:var(--muted); font-size:13px; line-height:1.55; }}
+          h1 {{ margin:0 0 8px; font-size:38px; line-height:1.04; letter-spacing:-0.03em; }}
+          @media (max-width:1100px) {{ .app {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }} .main {{ padding:20px 16px 36px; }} }}
         </style>
       </head>
       <body>
-        <main class="wrap">
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{'板块热力图' if lang == 'zh' else 'Sector Heatmap'}</h1>
+              <p>{'这里专门看板块热度、信号分布和筛选后的热力排序。' if lang == 'zh' else 'Use this page for sector heat, signal distribution, and filtered ranking.'}</p>
+            </div>
+            <nav class="side-nav">{nav_html}</nav>
+            <div class="sidebar-foot">{'板块页聚焦在“哪里最热、哪里最强、哪里带风险标签”。' if lang == 'zh' else 'The heatmap focuses on where the market is hottest, strongest, and carrying execution tags.'}</div>
+          </aside>
+          <main class="main">
+        <div class="wrap">
           <div class="toolbar">
             <a href="/dashboard/market?lang={lang}&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}" class="pill">← {'返回市场脉冲' if lang == 'zh' else 'Back to Market Pulse'}</a>
             <a href="/dashboard/market/concepts?lang={lang}&lookback_runs={lookback_runs}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}" class="pill">{_dt(lang, 'concept_activity_tracker')}</a>
@@ -3519,6 +4960,7 @@ def dashboard_market_heatmap_page(
             <h1 style="margin:0 0 8px;">{'板块热力图' if lang == 'zh' else 'Sector Heatmap'}</h1>
             <p class="muted">{_dt(lang, 'sector_heatmap_help')}</p>
           </div>
+          {loading_hint}
           <section class="card">
             <div class="eyebrow">{_dt(lang, 'snapshot_window')}</div>
             <div class="compare-row">{lookback_pills}</div>
@@ -3595,12 +5037,14 @@ def dashboard_market_heatmap_page(
             </article>
             <article class="card">
               <div class="eyebrow">{_dt(lang, 'concept_resonance')}</div>
-              <div style="font-size:32px;font-weight:800;margin:6px 0;">{market_context['resonance_score']:.1f}%</div>
+              <div style="font-size:32px;font-weight:800;margin:6px 0;">{float((heatmap_payload or {}).get('resonance_score') or 0.0):.1f}%</div>
               <div class="muted">{_dt(lang, 'concept_resonance_help')}</div>
-              <div class="muted" style="margin-top:8px;">{_dt(lang, 'tracked_signals')}: {market_context['tracked_signal_count']}</div>
+              <div class="muted" style="margin-top:8px;">{_dt(lang, 'tracked_signals')}: {int((heatmap_payload or {}).get('tracked_signal_count') or 0)}</div>
             </article>
           </section>
-        </main>
+        </div>
+          </main>
+        </div>
         <script>
           function appendExecutionTag(formAction, inputName, tag) {{
             const form = document.querySelector(`form[action="${{formAction}}"]`);
@@ -3651,9 +5095,7 @@ def dashboard_market_concepts_page(
     signal_filter = signal_filter.upper()
     execution_tag_filter = execution_tag_filter.strip()
     exclude_execution_tag_filter = exclude_execution_tag_filter.strip()
-    summary = _load_summary(db, lookback_runs=lookback_runs)
-    market_context = summary["market_context"]
-    concept_rows_source = list(market_context["concept_tracker"])
+    concept_rows_source = _load_concept_tracker_rows(db, lookback_runs=lookback_runs)
     if signal_filter != "ALL":
         concept_rows_source = [
             item
@@ -3714,7 +5156,7 @@ def dashboard_market_concepts_page(
     concept_rows = "".join(
         "<tr>"
         f"<td id='concept-{item['slug']}'><a href='/dashboard/concepts/{item['slug']}?{urlencode({'lookback_runs': lookback_runs, 'lang': lang, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}'>{item['concept_name']}</a></td>"
-        f"<td>{item['hits']}</td><td>{item['previous_hits']}</td><td>{'+' if item['delta_hits'] > 0 else ''}{item['delta_hits']}</td><td>{item['streak']}</td><td>{_sparkline_svg(item['history'])}</td><td>{_percent_chip(item.get('avg_move_5d'))}</td><td>{_breadth_chip(item.get('breadth_pct'))}</td><td>{int(item.get('buy_signal_count') or 0)}</td><td>{int(item.get('max_signal_strength') or 0)}</td><td>{' · '.join(item.get('execution_tags') or []) or '-'}</td><td>{item['avg_score']:.4f}</td><td>{', '.join(item['tickers'])}</td>"
+        f"<td>{item['hits']}</td><td>{item['previous_hits']}</td><td>{'+' if item['delta_hits'] > 0 else ''}{item['delta_hits']}</td><td>{item['streak']}</td><td>{_sparkline_svg(item['history'])}</td><td>{_percent_chip(item.get('avg_move_5d'))}</td><td>{_breadth_chip(item.get('breadth_pct'))}</td><td>{int(item.get('buy_signal_count') or 0)}</td><td>{int(item.get('max_signal_strength') or 0)}</td><td>{' · '.join(item.get('execution_tags') or []) or '-'}</td><td>{item['avg_score']:.4f}</td><td class='ticker-links'>{_ticker_links_html(item.get('tickers') or [], lang=lang)}</td>"
         "</tr>"
         for item in concept_rows_source
     ) or f"<tr><td colspan='13'>{'暂无概念数据' if lang == 'zh' else 'No concept data yet'}</td></tr>"
@@ -3735,6 +5177,7 @@ def dashboard_market_concepts_page(
     risk_examples_html = " · ".join(
         f"{item['concept_name']} ({' / '.join(item['tags'])})" for item in risk_examples
     ) or "-"
+    nav_html = render_workspace_nav_html(lang=lang, active_key="market", lookback_runs=lookback_runs)
     return f"""
     <!DOCTYPE html>
     <html lang="{lang}">
@@ -3743,24 +5186,45 @@ def dashboard_market_concepts_page(
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{'概念异动追踪' if lang == 'zh' else 'Concept Activity Tracker'}</title>
         <style>
-          :root {{ --bg:#f5efe2; --panel:#fffdf7; --ink:#1f2937; --muted:#6b7280; --line:#d6cfc2; --accent:#0f766e; --accent-soft:#dff5ef; }}
+          :root {{ --bg:#071018; --panel:#111c28; --panel-2:#152231; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; --accent-soft:rgba(61,217,182,0.12); }}
           * {{ box-sizing:border-box; }}
-          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left,#fff6d8 0,transparent 30%),radial-gradient(circle at top right,#d9f3ee 0,transparent 35%),var(--bg); }}
-          .wrap {{ max-width:1080px; margin:0 auto; padding:32px 20px 56px; }}
-          .card {{ background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); margin-bottom:16px; }}
-          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
+          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
+          a {{ color:inherit; text-decoration:none; }}
+          .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .main {{ padding:28px 30px 48px; }}
+          .wrap {{ max-width:1120px; margin:0 auto; }}
+          .card {{ background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 40px rgba(0,0,0,0.22); margin-bottom:16px; }}
+          .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
           .toolbar,.compare-row {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }}
           .muted {{ color:var(--muted); font-size:14px; }}
-          .pill, .compare-pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; background:#eef8f5; color:#0f766e; font-size:13px; font-weight:700; text-decoration:none; }}
-          .compare-pill.active {{ background:#0f766e; color:#fff; }}
+          .pill,.compare-pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; background:rgba(17,28,40,0.75); border:1px solid var(--line); color:var(--muted); font-size:13px; font-weight:700; text-decoration:none; }}
+          .compare-pill.active {{ background:rgba(61,217,182,0.16); border-color:rgba(61,217,182,0.24); color:var(--ink); }}
           table {{ width:100%; border-collapse:collapse; font-size:14px; }}
           th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
           th {{ color:var(--muted); font-weight:600; }}
-          a {{ color:#0f766e; text-decoration:none; font-weight:700; }}
+          .ticker-links {{ max-width:280px; line-height:1.8; }}
+          .ticker-links a {{ display:inline-flex; padding:2px 7px; margin:1px 2px 1px 0; border:1px solid rgba(61,217,182,0.22); border-radius:999px; background:rgba(61,217,182,0.08); color:#bff7eb; font-size:12px; font-weight:800; }}
+          input, button {{ width:100%; padding:10px 12px; border-radius:12px; border:1px solid var(--line); background:#0f1823; color:var(--ink); font:inherit; }}
+          button {{ width:auto; background:var(--accent); color:#041119; font-weight:800; cursor:pointer; }}
+          .sidebar-foot {{ margin-top:24px; padding:16px; border:1px solid var(--line); border-radius:18px; background:rgba(17,28,40,0.68); color:var(--muted); font-size:13px; line-height:1.55; }}
+          h1 {{ margin:0 0 8px; font-size:38px; line-height:1.04; letter-spacing:-0.03em; }}
+          @media (max-width:1100px) {{ .app {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }} .main {{ padding:20px 16px 36px; }} }}
         </style>
       </head>
       <body>
-        <main class="wrap">
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{'概念追踪' if lang == 'zh' else 'Concept Tracker'}</h1>
+              <p>{'这里聚焦概念命中、连续性、强弱变化和概念内股票构成。' if lang == 'zh' else 'Use this page to track concept hits, persistence, strength shifts, and member tickers.'}</p>
+            </div>
+            <nav class="side-nav">{nav_html}</nav>
+            <div class="sidebar-foot">{'概念页更适合回答“哪些主题在持续强化，哪些只是短期异动”。' if lang == 'zh' else 'This page helps answer which themes are strengthening versus only flashing briefly.'}</div>
+          </aside>
+          <main class="main">
+        <div class="wrap">
           <div class="toolbar">
             <a href="/dashboard/market?lang={lang}&lookback_runs={lookback_runs}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}" class="pill">← {'返回市场脉冲' if lang == 'zh' else 'Back to Market Pulse'}</a>
             <a href="/dashboard/market/heatmap?lang={lang}&lookback_runs={lookback_runs}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}" class="pill">{_dt(lang, 'sector_heatmap')}</a>
@@ -3820,12 +5284,12 @@ def dashboard_market_concepts_page(
           <section class="card">
             <div class="eyebrow">{_dt(lang, 'risk_overview')}</div>
             <div style="display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));">
-              <article class="card" style="margin:0;background:#f9f7f0;">
+              <article class="card" style="margin:0;background:rgba(21,34,49,0.82);">
                 <div class="eyebrow">{_dt(lang, 'tagged_names')}</div>
                 <div style="font-size:28px;font-weight:800;margin:6px 0;">{tagged_names}</div>
                 <div class="muted">{_dt(lang, 'risk_examples')}</div>
               </article>
-              <article class="card" style="margin:0;background:#f9f7f0;">
+              <article class="card" style="margin:0;background:rgba(21,34,49,0.82);">
                 <div class="eyebrow">{_dt(lang, 'common_risks')}</div>
                 <div class="compare-row" style="margin-bottom:8px;">{risk_top_tags_html}</div>
                 <div class="muted">{_dt(lang, 'risk_examples')}: {risk_examples_html}</div>
@@ -3842,7 +5306,9 @@ def dashboard_market_concepts_page(
               <tbody>{concept_rows}</tbody>
             </table>
           </section>
-        </main>
+        </div>
+          </main>
+        </div>
         <script>
           function appendExecutionTag(formAction, inputName, tag) {{
             const form = document.querySelector(`form[action="${{formAction}}"]`);
@@ -3892,8 +5358,7 @@ def dashboard_market_concepts_export(
     signal_filter = signal_filter.upper()
     execution_tag_filter = execution_tag_filter.strip()
     exclude_execution_tag_filter = exclude_execution_tag_filter.strip()
-    summary = _load_summary(db, lookback_runs=lookback_runs)
-    concept_rows_source = list(summary["market_context"]["concept_tracker"])
+    concept_rows_source = _load_concept_tracker_rows(db, lookback_runs=lookback_runs)
     if signal_filter != "ALL":
         concept_rows_source = [
             item
@@ -3976,106 +5441,504 @@ def dashboard_market_concepts_export(
 def dashboard_ops_page(request: Request, lang: str = "en", lookback_runs: int = 5, db: Session = Depends(get_db_session)) -> str:
     if not is_authenticated(request):
         return login_redirect("/dashboard/ops")
-    lang = "zh" if lang == "zh" else "en"
+    lang = resolve_request_lang(request)
     lookback_runs = _clamp_lookback_runs(lookback_runs)
-    summary = _load_summary(db, lookback_runs=lookback_runs)
+    summary = _load_ops_summary(db)
     auto_analysis = summary["auto_analysis"]
     latest_backtest = summary["latest_backtest"]
     recent_model_runs = summary["recent_model_runs"]
-    sync_states = summary["sync_states"]
+    sync_states = summary["recent_sync_states"]
     recent_jobs = summary["recent_jobs"]
+    latest_model = summary["latest_model"] or {}
+    sync_overview = summary["sync_overview"] or {}
+    pipeline_snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_PIPELINE_STATUS)
+    pipeline_payload = (pipeline_snapshot or {}).get("payload") if isinstance(pipeline_snapshot, dict) else None
+    if isinstance(pipeline_payload, dict):
+        recent_jobs = pipeline_payload.get("recent_jobs") or recent_jobs
+    model_health_rows = pipeline_payload.get("model_health") if isinstance(pipeline_payload, dict) else None
+    anomaly_rows = pipeline_payload.get("anomalies") if isinstance(pipeline_payload, dict) else None
+    close_review_status = close_review_scheduler_service.get_status()
+    provider_strategy = _provider_strategy_view(lang)
+    notifier = PushNotificationService()
+    notification_channels = notifier.available_channels()
     dashboard_redirect = "/dashboard/ops?" + urlencode({"lang": lang, "lookback_runs": lookback_runs})
 
-    def status_badge(status: str) -> str:
-        tone = {
-            "success": ("#dcfce7", "#166534"),
-            "failed": ("#fee2e2", "#991b1b"),
-            "partial": ("#fef3c7", "#92400e"),
-            "running": ("#dbeafe", "#1d4ed8"),
-        }.get(status, ("#e5e7eb", "#374151"))
-        return f"<span style='display:inline-block;padding:4px 8px;border-radius:999px;background:{tone[0]};color:{tone[1]};font-size:12px;font-weight:700;'>{status}</span>"
+    nav_html = render_workspace_nav_html(lang=lang, active_key="ops", lookback_runs=lookback_runs)
 
-    recent_job_rows = "".join(
-        "<tr>"
-        f"<td>{item['id']}</td><td>{item['job_type']}</td><td>{status_badge(item['status'])}</td><td>{item['started_at']}</td><td>{item['finished_at'] or '-'}</td><td><code>{json.dumps(item['params']) if item['params'] else '-'}</code></td><td>{item['message'] or '-'}</td>"
-        "</tr>"
-        for item in recent_jobs
-    ) or f"<tr><td colspan='7'>{'暂无任务' if lang == 'zh' else 'No jobs yet'}</td></tr>"
-    sync_rows = "".join(
-        f"<tr><td><a href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a></td><td>{item['provider']}</td><td>{item['last_synced_date'] or '-'}</td><td>{item['status'] or '-'}</td></tr>"
-        for item in sync_states
-    ) or f"<tr><td colspan='4'>{'暂无同步记录' if lang == 'zh' else 'No sync history yet'}</td></tr>"
-    model_rows = "".join(
-        f"<tr><td>{item['id']}</td><td>{item['name']}</td><td>{item['status']}</td><td><code>{item['config_json'] or '-'}</code></td><td>{item['created_at']}</td></tr>"
-        for item in recent_model_runs
-    ) or f"<tr><td colspan='5'>{'暂无模型运行' if lang == 'zh' else 'No model runs yet'}</td></tr>"
-    backtest_pre = json.dumps(latest_backtest, indent=2) if latest_backtest else ("暂无回测" if lang == "zh" else "No backtest yet")
+    synced_count = int(sync_overview.get("total") or len(sync_states))
+    sync_success_count = int(sync_overview.get("success") or sum(1 for item in sync_states if str(item.get("status") or "").lower() == "success"))
+    primary_provider_counts: dict[str, int] = {}
+    for provider, count in (sync_overview.get("provider_counts") or {}).items():
+        primary_provider_counts[str(provider)] = int(count or 0)
+    if not primary_provider_counts:
+        for item in sync_states:
+            provider = str(item.get("provider") or "unknown")
+            primary_provider_counts[provider] = primary_provider_counts.get(provider, 0) + 1
+    primary_provider = next(iter(sorted(primary_provider_counts.items(), key=lambda pair: (-pair[1], pair[0]))), None)
+
+    refresh_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "cn_close_review"), None)
+    analysis_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "watchlist_auto_analysis"), None)
+    screener_precompute_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "screener_precompute"), None)
+    latest_cn_refresh = _latest_cn_refresh_summary(db, recent_jobs, lang=lang)
+
+    def _step_status_label(job: dict | None, fallback_status: str | None = None) -> tuple[str, str]:
+        status = str((job or {}).get("status") or fallback_status or "").strip().lower()
+        if not status:
+            status = "idle"
+        if lang == "zh":
+            labels = {
+                "success": "成功",
+                "failed": "失败",
+                "partial": "部分完成",
+                "running": "运行中",
+                "enabled": "已开启",
+                "disabled": "已关闭",
+                "idle": "待运行",
+            }
+        else:
+            labels = {
+                "success": "Success",
+                "failed": "Failed",
+                "partial": "Partial",
+                "running": "Running",
+                "enabled": "Enabled",
+                "disabled": "Disabled",
+                "idle": "Idle",
+            }
+        return labels.get(status, status), status
+
+    snapshot_rows = pipeline_payload.get("rows") if isinstance(pipeline_payload, dict) else None
+    if isinstance(snapshot_rows, list) and snapshot_rows:
+        pipeline_steps = [
+            {
+                "label": item.get("label") or item.get("step") or "-",
+                "detail": _display_time(item.get("timestamp")),
+                "message": item.get("message") or "-",
+                "status": _step_status_label(None, str(item.get("status") or "idle")),
+            }
+            for item in snapshot_rows
+        ]
+    else:
+        pipeline_steps = [
+            {
+                "label": "行情刷新" if lang == "zh" else "Market Refresh",
+                "detail": _display_time((refresh_job or {}).get("finished_at") or (refresh_job or {}).get("started_at") or close_review_status.get("last_run_at")),
+                "message": (refresh_job or {}).get("message") or (
+                    "收盘后刷新行情并重建技术快照。" if lang == "zh" else "Refreshes prices and rebuilds technical snapshots after close."
+                ) + (f" · {latest_cn_refresh['label']}" if latest_cn_refresh.get("refreshed") is not None else ""),
+                "status": _step_status_label(refresh_job, "enabled" if close_review_status.get("enabled") else "disabled"),
+            },
+            {
+                "label": "技术快照" if lang == "zh" else "Technical Snapshots",
+                "detail": str(sync_success_count) + (f" / {synced_count}" if synced_count else ""),
+                "message": (
+                    f"{sync_success_count}/{synced_count} {'只股票已完成同步' if lang == 'zh' else 'symbols synced successfully'}"
+                    if synced_count
+                    else ("暂无同步记录" if lang == "zh" else "No sync history yet")
+                ),
+                "status": _step_status_label(None, "success" if sync_success_count else "idle"),
+            },
+            {
+                "label": "模型训练" if lang == "zh" else "Model Training",
+                "detail": _display_time(latest_model.get("finished_at") or latest_model.get("created_at")),
+                "message": latest_model.get("name") or ("尚未训练" if lang == "zh" else "No model run yet"),
+                "status": _step_status_label(None, str(latest_model.get("status") or "idle")),
+            },
+            {
+                "label": "回测结果" if lang == "zh" else "Backtest",
+                "detail": (latest_backtest.get("end_date") or _display_time(latest_backtest.get("created_at"))),
+                "message": latest_backtest.get("name") or ("暂无回测" if lang == "zh" else "No backtest yet"),
+                "status": _step_status_label(None, str(latest_backtest.get("status") or "idle")),
+            },
+            {
+                "label": "AI 日报" if lang == "zh" else "AI Report",
+                "detail": _display_time((analysis_job or {}).get("finished_at") or auto_analysis.get("last_run_at")),
+                "message": (analysis_job or {}).get("message") or (
+                    "自动分析完成后会生成日报与推送。" if lang == "zh" else "A daily report is generated after automated analysis."
+                ),
+                "status": _step_status_label(analysis_job, "idle"),
+            },
+            {
+                "label": "模型预计算" if lang == "zh" else "Model Precompute",
+                "detail": _display_time((screener_precompute_job or {}).get("finished_at") or (screener_precompute_job or {}).get("started_at")),
+                "message": (screener_precompute_job or {}).get("message") or (
+                    "收盘后会把常用模型先跑一遍并缓存结果。" if lang == "zh" else "Common screener models are precomputed and cached after the close."
+                ),
+                "status": _step_status_label(screener_precompute_job, "idle"),
+            },
+        ]
+    pipeline_html = "".join(
+        "<article class='pipeline-step'>"
+        f"<div class='step-head'><span class='step-title'>{item['label']}</span><span class='status-pill {item['status'][1]}'>{item['status'][0]}</span></div>"
+        f"<div class='step-detail'>{item['detail']}</div>"
+        f"<div class='step-message'>{item['message']}</div>"
+        "</article>"
+        for item in pipeline_steps
+    )
+
+    recent_jobs_html = "".join(
+        "<article class='list-row'>"
+        f"<div><div class='ticker'>{item.get('job_type') or '-'}</div><div class='subtle'>{_display_time(item.get('started_at') or item.get('created_at'))}</div></div>"
+        f"<div class='row-right'><span class='status-pill {str(item.get('status') or 'idle').lower()}'>{_step_status_label(item)[0]}</span></div>"
+        "</article>"
+        f"<div class='row-message'>{item.get('message') or '-'}</div>"
+        for item in recent_jobs[:6]
+    ) or f"<div class='empty'>{'暂无任务记录' if lang == 'zh' else 'No jobs yet'}</div>"
+
+    recent_models_html = "".join(
+        "<article class='list-row'>"
+        f"<div><div class='ticker' title='{item.get('name') or '-'}'>{_compact_run_name(item.get('name'), 28) or '-'}</div><div class='subtle'>{_display_time(item.get('created_at'))}</div></div>"
+        f"<div class='row-right'><span class='status-pill {str(item.get('status') or 'idle').lower()}'>{_step_status_label(None, str(item.get('status') or 'idle'))[0]}</span></div>"
+        "</article>"
+        for item in recent_model_runs[:4]
+    ) or f"<div class='empty'>{'暂无模型运行' if lang == 'zh' else 'No model runs yet'}</div>"
+
+    sync_rows_html = "".join(
+        "<article class='sync-row'>"
+        f"<div><a class='ticker' href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a><div class='subtle'>{item.get('provider') or '-'}</div></div>"
+        f"<div class='row-right'><div class='mini-metric'>{item.get('last_synced_date') or '-'}</div><span class='status-pill {str(item.get('status') or 'idle').lower()}'>{_step_status_label(None, str(item.get('status') or 'idle'))[0]}</span></div>"
+        "</article>"
+        for item in sync_states[:5]
+    ) or f"<div class='empty'>{'暂无同步记录' if lang == 'zh' else 'No sync history yet'}</div>"
+
+    top_metrics = [
+        {
+            "label": "自动分析" if lang == "zh" else "Auto Analysis",
+            "value": "开启" if (lang == "zh" and auto_analysis.get("enabled")) else ("关闭" if lang == "zh" else ("On" if auto_analysis.get("enabled") else "Off")),
+            "meta": f"{'下次运行' if lang == 'zh' else 'Next'}: {_display_time(auto_analysis.get('next_run_at'))}",
+        },
+        {
+            "label": "最近训练" if lang == "zh" else "Latest Model",
+            "value": _compact_run_name(latest_model.get("name") or ("尚未训练" if lang == "zh" else "Not trained"), 24),
+            "meta": _display_time(latest_model.get("finished_at") or latest_model.get("created_at")),
+        },
+        {
+            "label": "数据同步" if lang == "zh" else "Data Sync",
+            "value": latest_cn_refresh.get("summary") or f"{sync_success_count}/{synced_count}",
+            "meta": latest_cn_refresh.get("label") or (primary_provider[0] if primary_provider else ("暂无来源" if lang == "zh" else "No provider")),
+        },
+        {
+            "label": "最近回测" if lang == "zh" else "Backtest",
+            "value": _compact_run_name(latest_backtest.get("name") or ("暂无回测" if lang == "zh" else "No backtest"), 24),
+            "meta": latest_backtest.get("status") or "-",
+        },
+        {
+            "label": "模型预计算" if lang == "zh" else "Precompute",
+            "value": (
+                f"{len((screener_precompute_job or {}).get('result', {}).get('snapshots_created') or [])}/"
+                f"{len((screener_precompute_job or {}).get('result', {}).get('snapshots_created') or []) + int((screener_precompute_job or {}).get('result', {}).get('failed_count') or 0)}"
+                if (screener_precompute_job or {}).get("result")
+                else ("待运行" if lang == "zh" else "Pending")
+            ),
+            "meta": (
+                (screener_precompute_job or {}).get("message")
+                or ("收盘后预跑常用模型" if lang == "zh" else "Precompute common screener models after the close")
+            ),
+        },
+    ]
+    metrics_html = "".join(
+        "<article class='metric-card'>"
+        f"<div class='metric-label'>{item['label']}</div>"
+        f"<div class='metric-value' title='{item['value']}'>{item['value']}</div>"
+        f"<div class='metric-meta'>{item['meta']}</div>"
+        "</article>"
+        for item in top_metrics
+    )
+    close_review_action_feed = (pipeline_payload or {}).get("close_review_action_feed") if isinstance(pipeline_payload, dict) else None
+    if not isinstance(close_review_action_feed, dict):
+        close_review_action_feed = build_close_review_action_feed(_load_cached_ai_daily_report(db), lang=lang)
+    if isinstance(model_health_rows, list) and model_health_rows:
+        model_health_html = "".join(
+            "<article class='metric-card'>"
+            f"<div class='metric-label'>{item.get('label') or '-'}</div>"
+            f"<div class='metric-value' title='{item.get('value') or '-'}'>{_compact_label(str(item.get('value') or '-'), 28)}</div>"
+            f"<div class='metric-meta'>{item.get('meta') or '-'}</div>"
+            "</article>"
+            for item in model_health_rows[:4]
+        )
+    else:
+        model_health_html = "".join(
+            "<article class='metric-card'>"
+            f"<div class='metric-label'>{label}</div>"
+            f"<div class='metric-value'>{value}</div>"
+            f"<div class='metric-meta'>{meta}</div>"
+            "</article>"
+            for label, value, meta in (
+                (("训练状态" if lang == "zh" else "Training Status"), latest_model.get("status") or "-", latest_model.get("name") or "-"),
+                (("最近训练时间" if lang == "zh" else "Latest Training"), _display_time(latest_model.get("finished_at") or latest_model.get("created_at")), ("模型越近越可信" if lang == "zh" else "Fresher is usually better")),
+                (("最近回测" if lang == "zh" else "Latest Backtest"), latest_backtest.get("status") or "-", _compact_run_name(latest_backtest.get("name") or "-", 28)),
+                (("数据完整度" if lang == "zh" else "Data Coverage"), f"{sync_success_count}/{synced_count}", ("同步成功股票数" if lang == "zh" else "Synced symbols")),
+            )
+        )
+    anomalies_html = "".join(
+        "<article class='list-row'>"
+        f"<div><div class='ticker'>{item.get('title') or '-'}</div><div class='subtle'>{item.get('detail') or '-'}</div></div>"
+        "</article>"
+        for item in (anomaly_rows or [])
+    ) or f"<div class='empty'>{'当前没有明显异常' if lang == 'zh' else 'No obvious anomalies right now'}</div>"
+    if not notification_channels:
+        anomalies_html = (
+            "<article class='list-row'>"
+            f"<div><div class='ticker'>{'通知渠道未配置' if lang == 'zh' else 'No notification channel configured'}</div>"
+            f"<div class='subtle'>{'AI 日报可以生成，但当前不会自动发送；请先在设置页配置 Telegram / WeChat / Feishu。' if lang == 'zh' else 'AI reports may generate, but they will not auto-send until Telegram / WeChat / Feishu is configured in Settings.'}</div></div>"
+            "</article>"
+        ) + anomalies_html
+    notification_status_html = "".join(
+        f"<span class='chip'>{channel}</span>"
+        for channel in notification_channels
+    ) or f"<span class='chip'>{'未配置' if lang == 'zh' else 'Not configured'}</span>"
+    close_review_action_html = "".join(
+        "<article class='list-row'>"
+        f"<div><div class='ticker'>{item.get('ticker') or '-'}</div><div class='subtle'>{item.get('name') or item.get('ticker') or '-'}</div><div class='subtle'>{item.get('execution_note') or item.get('entry_trigger') or '-'}</div></div>"
+        f"<div class='row-right'><span class='mini-metric'>{item.get('tradability_status') or '-'}</span><span class='mini-metric'>{item.get('target_weight') or '-'}</span></div>"
+        "</article>"
+        for item in (close_review_action_feed.get("actionable") or [])[:4]
+    ) or f"<div class='empty'>{'暂无盘后动作建议' if lang == 'zh' else 'No close-review actions yet'}</div>"
     return f"""
     <!DOCTYPE html>
     <html lang="{lang}">
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>{'运维操作台' if lang == 'zh' else 'Operations'}</title>
+        <title>{'任务中心' if lang == 'zh' else 'Task Center'}</title>
         <style>
-          :root {{ --bg:#f5efe2; --panel:#fffdf7; --ink:#1f2937; --muted:#6b7280; --line:#d6cfc2; --accent:#0f766e; --accent-soft:#dff5ef; }}
+          :root {{
+            --bg:#071018;
+            --bg-soft:#0d1722;
+            --panel:#111c28;
+            --panel-2:#152231;
+            --panel-3:#1a2a3c;
+            --ink:#e6edf3;
+            --muted:#90a3b8;
+            --line:#223246;
+            --accent:#3dd9b6;
+            --accent-2:#52a8ff;
+            --danger:#ff6b81;
+            --warn:#f6c85f;
+            --good:#4ade80;
+          }}
           * {{ box-sizing:border-box; }}
-          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left,#fff6d8 0,transparent 30%),radial-gradient(circle at top right,#d9f3ee 0,transparent 35%),var(--bg); }}
-          .wrap {{ max-width:1080px; margin:0 auto; padding:32px 20px 56px; }}
-          .card {{ background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); margin-bottom:16px; }}
-          .grid {{ display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); margin-bottom:16px; }}
-          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
-          .toolbar {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }}
-          .pill, .action-link {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; background:#eef8f5; color:#0f766e; font-size:13px; font-weight:700; text-decoration:none; }}
-          .muted {{ color:var(--muted); font-size:14px; }}
-          table {{ width:100%; border-collapse:collapse; font-size:14px; }}
-          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
-          th {{ color:var(--muted); font-weight:600; }}
-          form {{ display:grid; gap:10px; }}
-          input, select, button {{ border-radius:12px; border:1px solid var(--line); padding:10px 12px; font:inherit; }}
-          button {{ background:var(--accent); color:#fff; border-color:var(--accent); font-weight:700; }}
-          code, pre {{ white-space:pre-wrap; word-break:break-word; }}
-          pre {{ margin:0; font-size:13px; }}
+          body {{
+            margin:0;
+            font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+            color:var(--ink);
+            background:
+              radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),
+              radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),
+              linear-gradient(180deg, #08111a 0%, #071018 100%);
+          }}
+          a {{ color:inherit; text-decoration:none; }}
+          .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .content {{ padding:28px; }}
+          .topbar {{ display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:20px; flex-wrap:wrap; }}
+          .chip-row {{ display:flex; flex-wrap:wrap; gap:10px; }}
+          .top-pill {{ display:inline-flex; align-items:center; justify-content:center; min-height:38px; padding:0 14px; border-radius:999px; border:1px solid var(--line); background:rgba(17,28,40,0.72); color:var(--muted); font-size:13px; font-weight:700; }}
+          .top-pill.active {{ color:var(--ink); border-color:rgba(82,168,255,0.35); background:rgba(82,168,255,0.16); }}
+          .hero {{ display:grid; grid-template-columns:minmax(0,1.4fr) minmax(280px,0.9fr); gap:16px; margin-bottom:16px; }}
+          .card {{ background:linear-gradient(180deg, rgba(21,34,49,0.98), rgba(17,28,40,0.98)); border:1px solid var(--line); border-radius:22px; padding:18px; box-shadow:0 24px 48px rgba(0,0,0,0.18); }}
+          .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.12); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.06em; text-transform:uppercase; }}
+          h1 {{ margin:14px 0 10px; font-size:40px; line-height:1.02; letter-spacing:-0.03em; }}
+          .lead {{ margin:0; color:var(--muted); font-size:15px; line-height:1.6; max-width:720px; }}
+          .metrics-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px; margin:16px 0; }}
+          .metric-card {{ padding:18px; border-radius:20px; background:rgba(21,34,49,0.82); border:1px solid var(--line); }}
+          .metric-label {{ color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; }}
+          .metric-value {{ margin-top:12px; font-size:26px; font-weight:800; letter-spacing:-0.03em; word-break:break-word; }}
+          .metric-meta {{ margin-top:8px; color:var(--muted); font-size:13px; }}
+          .workspace-grid {{ display:grid; grid-template-columns:minmax(0,1.2fr) minmax(320px,0.8fr); gap:16px; align-items:start; }}
+          .stack {{ display:grid; gap:16px; }}
+          .section-title {{ margin:0 0 6px; font-size:22px; }}
+          .section-copy {{ margin:0 0 16px; color:var(--muted); font-size:14px; line-height:1.6; }}
+          .pipeline-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }}
+          .pipeline-step {{ padding:16px; border-radius:20px; background:rgba(21,34,49,0.72); border:1px solid var(--line); min-height:142px; }}
+          .step-head {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }}
+          .step-title {{ font-weight:800; font-size:16px; }}
+          .step-detail {{ margin-top:16px; font-size:14px; color:var(--ink); }}
+          .step-message {{ margin-top:10px; color:var(--muted); font-size:13px; line-height:1.55; }}
+          .list-stack {{ display:grid; gap:12px; }}
+          .list-row, .sync-row {{ display:flex; justify-content:space-between; align-items:flex-start; gap:14px; padding:14px 0; border-top:1px solid rgba(144,163,184,0.12); }}
+          .list-row:first-child, .sync-row:first-child {{ border-top:none; padding-top:0; }}
+          .row-right {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }}
+          .ticker {{ font-weight:800; font-size:15px; color:var(--ink); }}
+          .subtle {{ margin-top:4px; color:var(--muted); font-size:12px; line-height:1.45; }}
+          .row-message {{ margin-top:-6px; padding:0 0 12px; color:var(--muted); font-size:13px; line-height:1.55; border-bottom:1px solid rgba(144,163,184,0.12); }}
+          .row-message:last-child {{ border-bottom:none; padding-bottom:0; }}
+          .mini-metric {{ padding:7px 10px; border-radius:999px; background:rgba(82,168,255,0.12); color:#b9dcff; font-size:12px; font-weight:700; }}
+          .chip {{ display:inline-flex; align-items:center; padding:7px 10px; border-radius:999px; background:rgba(82,168,255,0.10); border:1px solid rgba(82,168,255,0.18); color:#9acbff; font-size:12px; font-weight:700; }}
+          .status-pill {{ display:inline-flex; padding:7px 10px; border-radius:999px; font-size:12px; font-weight:800; text-transform:uppercase; letter-spacing:0.04em; }}
+          .status-pill.success {{ background:rgba(74,222,128,0.14); color:#8df0aa; }}
+          .status-pill.failed {{ background:rgba(255,107,129,0.16); color:#ff9aaa; }}
+          .status-pill.partial {{ background:rgba(246,200,95,0.16); color:#ffd98a; }}
+          .status-pill.running {{ background:rgba(82,168,255,0.16); color:#9bd0ff; }}
+          .status-pill.enabled {{ background:rgba(61,217,182,0.16); color:#7ff0d2; }}
+          .status-pill.disabled, .status-pill.idle {{ background:rgba(144,163,184,0.14); color:#b4c5d8; }}
+          .action-row {{ display:flex; flex-wrap:wrap; gap:10px; margin-top:16px; }}
+          .cta {{ display:inline-flex; align-items:center; justify-content:center; padding:10px 14px; border-radius:999px; border:1px solid var(--line); background:rgba(21,34,49,0.92); color:var(--ink); font-size:13px; font-weight:800; }}
+          .cta.primary {{ background:linear-gradient(135deg, rgba(61,217,182,0.28), rgba(82,168,255,0.24)); border-color:rgba(61,217,182,0.3); }}
+          .empty {{ color:var(--muted); font-size:14px; }}
+          @media (max-width: 1180px) {{
+            .metrics-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
+            .workspace-grid, .hero {{ grid-template-columns:1fr; }}
+          }}
+          @media (max-width: 900px) {{
+            .app {{ grid-template-columns:1fr; }}
+            .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }}
+            .pipeline-grid {{ grid-template-columns:1fr; }}
+          }}
+          @media (max-width: 640px) {{
+            .content {{ padding:20px 16px 36px; }}
+            h1 {{ font-size:30px; }}
+            .metrics-grid {{ grid-template-columns:1fr; }}
+          }}
         </style>
       </head>
       <body>
-        <main class="wrap">
-          <div class="toolbar">
-            <a href="/dashboard?lang={lang}&lookback_runs={lookback_runs}" class="pill">← {'返回总览' if lang == 'zh' else 'Back to dashboard'}</a>
-            <a href="/dashboard/market?lang={lang}&lookback_runs={lookback_runs}" class="pill">{'市场脉冲' if lang == 'zh' else 'Market Pulse'}</a>
-            <a href="/dashboard/ops?lang=en&lookback_runs={lookback_runs}" class="pill">English</a>
-            <a href="/dashboard/ops?lang=zh&lookback_runs={lookback_runs}" class="pill">中文</a>
-          </div>
-          <div class="card">
-            <div class="eyebrow">{'运维操作台' if lang == 'zh' else 'Operations'}</div>
-            <h1 style="margin:0 0 8px;">{'同步、训练与回测' if lang == 'zh' else 'Sync, Training, and Backtests'}</h1>
-            <p class="muted">{'把重操作和任务历史从首页拆出来，方便专注执行。' if lang == 'zh' else 'A dedicated page for heavy actions and recent job history.'}</p>
-          </div>
-          <section class="grid">
-            <article class="card">
-              <div class="eyebrow">{'同步中心' if lang == 'zh' else 'Sync Center'}</div>
-              <div class="muted">{'处理行情、概念和基本面同步。' if lang == 'zh' else 'Handle market, concept, and fundamental sync.'}</div>
-              <div style="margin-top:12px;"><a class="action-link" href="/dashboard/ops/sync?lang={lang}&lookback_runs={lookback_runs}">{'打开同步中心' if lang == 'zh' else 'Open Sync Center'}</a></div>
-            </article>
-            <article class="card">
-              <div class="eyebrow">{'模型运行' if lang == 'zh' else 'Model Runs'}</div>
-              <div class="muted">{'查看最近训练结果并从这里直接回测。' if lang == 'zh' else 'Review recent runs and trigger backtests directly.'}</div>
-              <div style="margin-top:12px;"><a class="action-link" href="/dashboard/ops/models?lang={lang}&lookback_runs={lookback_runs}">{'打开模型运行' if lang == 'zh' else 'Open Model Runs'}</a></div>
-            </article>
-            <article class="card">
-              <div class="eyebrow">{'任务记录' if lang == 'zh' else 'Job History'}</div>
-              <div class="muted">{'专门查看任务状态、参数和消息。' if lang == 'zh' else 'Inspect task statuses, params, and messages.'}</div>
-              <div style="margin-top:12px;"><a class="action-link" href="/dashboard/ops/jobs?lang={lang}&lookback_runs={lookback_runs}">{'打开任务记录' if lang == 'zh' else 'Open Job History'}</a></div>
-            </article>
-            <article class="card">
-              <div class="eyebrow">{_dt(lang, 'json_shortcuts')}</div>
-              <div><a href="/dashboard/summary?lang={lang}&lookback_runs={lookback_runs}">{_dt(lang, 'dashboard_summary_json')}</a></div>
-              <div><a href="/signals/latest">{_dt(lang, 'latest_signals_json')}</a></div>
-              <div><a href="/backtests/latest/curve">{_dt(lang, 'latest_backtest_curve_json')}</a></div>
-              <div><a href="/jobs/sync-states">{_dt(lang, 'sync_states_json')}</a></div>
-            </article>
-          </section>
-        </main>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{'任务中心' if lang == 'zh' else 'Task Center'}</h1>
+              <p>{'把自动任务、训练状态和最近结果放到一个固定入口，不再让用户去日志里找结论。' if lang == 'zh' else 'Keep automation, training state, and recent results in one fixed place instead of burying them in logs.'}</p>
+            </div>
+            <nav class="side-nav">{nav_html}</nav>
+            <div class="sidebar-foot">
+              {'收盘刷新、自动分析、训练和回测，现在都应该从这里看整体状态。' if lang == 'zh' else 'Close review, auto analysis, training, and backtests should all be tracked from here.'}
+            </div>
+          </aside>
+          <main class="content">
+            <div class="topbar">
+              <div class="chip-row">
+                <span class="top-pill">{'最近更新' if lang == 'zh' else 'Updated'}: {_display_time(summary.get('generated_at'), with_tz=True)}</span>
+                <span class="top-pill">{'计划时间' if lang == 'zh' else 'Close Review'}: {close_review_status.get('run_hour', 0):02d}:{close_review_status.get('run_minute', 0):02d}</span>
+              </div>
+              <div class="chip-row">
+                <a class="top-pill{' active' if lang == 'en' else ''}" href="/dashboard/ops?lang=en&lookback_runs={lookback_runs}">EN</a>
+                <a class="top-pill{' active' if lang == 'zh' else ''}" href="/dashboard/ops?lang=zh&lookback_runs={lookback_runs}">中文</a>
+              </div>
+            </div>
+
+            <section class="hero">
+              <article class="card">
+                <span class="eyebrow">{'自动流程总览' if lang == 'zh' else 'Automation Overview'}</span>
+                <h1>{'今天的自动任务是否跑对了' if lang == 'zh' else 'Did today’s automation run correctly?'}</h1>
+                <p class="lead">{'任务中心现在按流程展示：行情刷新、技术快照、模型训练、回测、AI 日报。你进来后先看状态和结果，再决定要不要进入同步中心或模型页做手动操作。' if lang == 'zh' else 'The page now follows the actual pipeline: market refresh, technical snapshots, model training, backtest, and AI report. Check the status and results first, then decide whether you need the sync or model pages.'}</p>
+                <div class="action-row">
+                  <a class="cta primary" href="/dashboard/ops/sync?lang={lang}&lookback_runs={lookback_runs}">{'打开同步中心' if lang == 'zh' else 'Open Sync Center'}</a>
+                  <a class="cta" href="/dashboard/ops/models?lang={lang}&lookback_runs={lookback_runs}">{'打开模型运行' if lang == 'zh' else 'Open Model Runs'}</a>
+                  <a class="cta" href="/dashboard/ops/jobs?lang={lang}&lookback_runs={lookback_runs}">{'查看任务明细' if lang == 'zh' else 'View Job History'}</a>
+                </div>
+              </article>
+              <article class="card">
+                <span class="eyebrow">{'当前安排' if lang == 'zh' else 'Current Schedule'}</span>
+                <div class="list-stack" style="margin-top:14px;">
+                  <div>
+                    <div class="subtle">{'收盘自动复盘' if lang == 'zh' else 'Close Review'}</div>
+                    <div class="ticker">{'已开启' if close_review_status.get('enabled') and lang == 'zh' else ('已关闭' if lang == 'zh' else ('Enabled' if close_review_status.get('enabled') else 'Disabled'))}</div>
+                  </div>
+                  <div>
+                    <div class="subtle">{'下次计划运行' if lang == 'zh' else 'Next Scheduled Run'}</div>
+                    <div class="ticker">{_display_time(close_review_status.get('next_run_at') or auto_analysis.get('next_run_at'))}</div>
+                  </div>
+                  <div>
+                    <div class="subtle">{'自动分析模板' if lang == 'zh' else 'Auto Analysis Template'}</div>
+                    <div class="ticker">{auto_analysis.get('signal_type') or '-'}</div>
+                  </div>
+                  <div>
+                    <div class="subtle">{'回看窗口' if lang == 'zh' else 'Lookback Window'}</div>
+                    <div class="ticker">{auto_analysis.get('lookback_days') or '-'} {'天' if lang == 'zh' else 'day(s)'}</div>
+                  </div>
+                  <div>
+                    <div class="subtle">{'日报推送渠道' if lang == 'zh' else 'Report delivery channels'}</div>
+                    <div class="chip-row" style="margin-top:8px;">{notification_status_html}</div>
+                  </div>
+                </div>
+                <div class="action-row">
+                  <form action="/jobs/send-ai-daily-report" method="post">
+                    <input type="hidden" name="redirect_to" value="{dashboard_redirect}" />
+                    <button class="cta primary" type="submit">{'立即发送 AI 日报' if lang == 'zh' else 'Send AI Daily Report Now'}</button>
+                  </form>
+                  <a class="cta" href="/dashboard/ai-daily-report?lang={lang}">{'打开 AI 日报' if lang == 'zh' else 'Open AI Report'}</a>
+                </div>
+              </article>
+            </section>
+
+            <section class="metrics-grid">{metrics_html}</section>
+
+            <section class="workspace-grid">
+              <div class="stack">
+                <article class="card">
+                  <span class="eyebrow">{'流程状态板' if lang == 'zh' else 'Pipeline Board'}</span>
+                  <h2 class="section-title">{'从数据到结论的五个步骤' if lang == 'zh' else 'Five steps from data to conclusion'}</h2>
+                  <p class="section-copy">{'这里不再先给原始任务列表，而是先回答用户最关心的问题：今天刷数了吗、训练了吗、回测了吗、AI 日报出来了吗。' if lang == 'zh' else 'Instead of starting with raw logs, this view answers the key questions first: was data refreshed, did training run, did backtest finish, and was the AI report produced?'}</p>
+                  <div class="pipeline-grid">{pipeline_html}</div>
+                </article>
+
+                <article class="card">
+                  <span class="eyebrow">{'模型健康度' if lang == 'zh' else 'Model Health'}</span>
+                  <h2 class="section-title">{'先确认模型今天是否可信' if lang == 'zh' else 'Check if today’s model is trustworthy'}</h2>
+                  <p class="section-copy">{'专业用户通常先确认训练是否成功、回测是否正常、同步覆盖是否足够，再决定是否采纳模型结论。' if lang == 'zh' else 'Professional users usually verify training, backtest, and data coverage before trusting model conclusions.'}</p>
+                  <div class="metrics-grid">{model_health_html}</div>
+                </article>
+
+                <article class="card">
+                  <span class="eyebrow">{'异常提示' if lang == 'zh' else 'Alerts'}</span>
+                  <h2 class="section-title">{'优先处理这些问题' if lang == 'zh' else 'Handle these issues first'}</h2>
+                  <p class="section-copy">{'如果这里出现异常，交易员通常会先暂停扩大风险，再回头核对数据、训练和回测链路。' if lang == 'zh' else 'If alerts appear here, a trader would usually avoid adding risk until data, training, and backtest checks are verified.'}</p>
+                  <div class="list-stack">{anomalies_html}</div>
+                </article>
+
+                <article class="card">
+                  <span class="eyebrow">{'最近任务结果' if lang == 'zh' else 'Recent Jobs'}</span>
+                  <h2 class="section-title">{'自动任务的最新回执' if lang == 'zh' else 'Latest automation receipts'}</h2>
+                  <div class="list-stack">{recent_jobs_html}</div>
+                </article>
+
+                <article class="card">
+                  <span class="eyebrow">{'盘后动作 Feed' if lang == 'zh' else 'Close Review Feed'}</span>
+                  <h2 class="section-title">{'复盘后优先执行什么' if lang == 'zh' else 'What to execute after the close review'}</h2>
+                  <p class="section-copy">{close_review_action_feed.get('summary') or ('把复盘结果整理成动作列表。' if lang == 'zh' else 'Turn the close review into an action list.')}</p>
+                  <div class="list-stack">{close_review_action_html}</div>
+                </article>
+              </div>
+
+              <div class="stack">
+                <article class="card">
+                  <span class="eyebrow">{'最近模型运行' if lang == 'zh' else 'Recent Model Runs'}</span>
+                  <h2 class="section-title">{'训练产出' if lang == 'zh' else 'Training output'}</h2>
+                  <div class="list-stack">{recent_models_html}</div>
+                </article>
+
+                <article class="card">
+                  <span class="eyebrow">{'同步状态摘要' if lang == 'zh' else 'Sync Snapshot'}</span>
+                  <h2 class="section-title">{'最近同步到哪里' if lang == 'zh' else 'What was synced recently'}</h2>
+                  <p class="section-copy">{'用最近几条同步状态快速确认数据新鲜度，详细操作再进入同步中心。' if lang == 'zh' else 'Use the latest sync rows to confirm freshness quickly, then open Sync Center for detailed operations.'}</p>
+                  <div class="list-stack">{sync_rows_html}</div>
+                </article>
+
+                <article class="card">
+                  <span class="eyebrow">{provider_strategy['ops_title']}</span>
+                  <h2 class="section-title">{'任务配置与 provider 策略' if lang == 'zh' else 'Job configuration and provider policy'}</h2>
+                  <p class="section-copy">{provider_strategy['ops_copy']}</p>
+                  <div class="list-stack">
+                    <article class="list-row"><div><div class="ticker">Price / Auto</div><div class="subtle">{provider_strategy['price_auto']}</div></div></article>
+                    <article class="list-row"><div><div class="ticker">Fundamental / Auto</div><div class="subtle">{provider_strategy['fund_auto']}</div></div></article>
+                    <article class="list-row"><div><div class="ticker">Concept / Auto</div><div class="subtle">{provider_strategy['concept_auto']}</div></div></article>
+                  </div>
+                </article>
+
+                <article class="card">
+                  <span class="eyebrow">{'快捷入口' if lang == 'zh' else 'Quick Links'}</span>
+                  <div class="action-row">
+                    <a class="cta" href="/dashboard/summary?lang={lang}&lookback_runs={lookback_runs}">{_dt(lang, 'dashboard_summary_json')}</a>
+                    <a class="cta" href="/signals/latest">{_dt(lang, 'latest_signals_json')}</a>
+                    <a class="cta" href="/backtests/latest/curve">{_dt(lang, 'latest_backtest_curve_json')}</a>
+                    <a class="cta" href="/jobs/sync-states">{_dt(lang, 'sync_states_json')}</a>
+                  </div>
+                </article>
+              </div>
+            </section>
+          </main>
+        </div>
       </body>
     </html>
     """
@@ -4088,29 +5951,65 @@ def dashboard_ops_sync_page(request: Request, lang: str = "en", lookback_runs: i
     lang = "zh" if lang == "zh" else "en"
     lookback_runs = _clamp_lookback_runs(lookback_runs)
     tushare_ready = bool(get_settings().tushare_token)
-    summary = _load_summary(db, lookback_runs=lookback_runs)
+    summary = _load_home_summary(db, lookback_runs=lookback_runs)
     sync_states = summary["sync_states"]
     recent_jobs = summary["recent_jobs"]
     dashboard_redirect = "/dashboard/ops/sync?" + urlencode({"lang": lang, "lookback_runs": lookback_runs})
     close_review_status = close_review_scheduler_service.get_status()
+    refresh_limit = int(close_review_status.get("refresh_limit") or 0)
+    refresh_scope_label = (
+        ("全市场" if refresh_limit == 0 else f"前 {refresh_limit} 只")
+        if lang == "zh"
+        else ("All CN" if refresh_limit == 0 else f"Top {refresh_limit}")
+    )
+    latest_cn_refresh = _latest_cn_refresh_summary(db, recent_jobs, lang=lang)
     cn_universe_job = next((item for item in recent_jobs if item["job_type"] == "sync_cn_symbol_universe"), None)
     cn_init_job = next((item for item in recent_jobs if item["job_type"] == "init_cn_market_data"), None)
-    symbol_repo = SymbolRepository(db)
-    technical_snapshot_repo = TechnicalSnapshotRepository(db)
-    cn_symbols = [symbol for symbol in symbol_repo.list_symbols() if (symbol.market or "").upper() == "CN"]
-    cn_ticker_set = {symbol.ticker for symbol in cn_symbols}
-    cn_symbol_count = len(cn_symbols)
-    cn_sync_success_count = sum(
-        1 for item in sync_states if item["ticker"] in cn_ticker_set and item["status"] == "success"
+    def _load_cn_sync_stats() -> dict:
+        symbol_repo = SymbolRepository(db)
+        technical_snapshot_repo = TechnicalSnapshotRepository(db)
+        cn_symbols = [symbol for symbol in symbol_repo.list_symbols() if (symbol.market or "").upper() == "CN"]
+        cn_ticker_set = {symbol.ticker for symbol in cn_symbols}
+        cn_symbol_count = len(cn_symbols)
+        cn_sync_success_count = sum(
+            1 for item in sync_states if item["ticker"] in cn_ticker_set and item["status"] == "success"
+        )
+        cn_technical_snapshot_count = len(technical_snapshot_repo.list_latest_for_market("CN"))
+        cn_progress_pct = round((cn_sync_success_count / cn_symbol_count) * 100, 1) if cn_symbol_count else 0.0
+        next_cn_offset = cn_sync_success_count
+        default_cn_batch_size = min(500, max(100, cn_symbol_count - cn_sync_success_count)) if cn_symbol_count > cn_sync_success_count else 0
+        return {
+            "cn_symbol_count": cn_symbol_count,
+            "cn_sync_success_count": cn_sync_success_count,
+            "cn_technical_snapshot_count": cn_technical_snapshot_count,
+            "cn_progress_pct": cn_progress_pct,
+            "next_cn_offset": next_cn_offset,
+            "default_cn_batch_size": default_cn_batch_size,
+        }
+
+    cn_stats = get_or_set(
+        "dashboard_ops_cn_sync_stats",
+        json.dumps({"sync_rows": len(sync_states)}, sort_keys=True),
+        ttl_seconds=60.0,
+        loader=_load_cn_sync_stats,
     )
-    cn_technical_snapshot_count = len(technical_snapshot_repo.list_latest_for_market("CN"))
-    cn_progress_pct = round((cn_sync_success_count / cn_symbol_count) * 100, 1) if cn_symbol_count else 0.0
-    next_cn_offset = cn_sync_success_count
-    default_cn_batch_size = min(500, max(100, cn_symbol_count - cn_sync_success_count)) if cn_symbol_count > cn_sync_success_count else 0
+    cn_symbol_count = int(cn_stats.get("cn_symbol_count") or 0)
+    cn_sync_success_count = int(cn_stats.get("cn_sync_success_count") or 0)
+    cn_technical_snapshot_count = int(cn_stats.get("cn_technical_snapshot_count") or 0)
+    cn_progress_pct = float(cn_stats.get("cn_progress_pct") or 0.0)
+    next_cn_offset = int(cn_stats.get("next_cn_offset") or 0)
+    default_cn_batch_size = int(cn_stats.get("default_cn_batch_size") or 0)
+    nav_html = render_workspace_nav_html(lang=lang, active_key="ops", lookback_runs=lookback_runs)
+    visible_sync_states = sync_states[:200]
     sync_rows = "".join(
         f"<tr><td><a href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a></td><td>{item['provider']}</td><td>{item['last_synced_date'] or '-'}</td><td>{item['status'] or '-'}</td></tr>"
-        for item in sync_states
+        for item in visible_sync_states
     ) or f"<tr><td colspan='4'>{'暂无同步记录' if lang == 'zh' else 'No sync history yet'}</td></tr>"
+    sync_state_note = (
+        f"仅展示最近 {len(visible_sync_states)} 条，同步总数 {len(sync_states)}。"
+        if lang == "zh"
+        else f"Showing the latest {len(visible_sync_states)} rows out of {len(sync_states)} sync states."
+    )
     return f"""
     <!DOCTYPE html>
     <html lang="{lang}">
@@ -4119,26 +6018,52 @@ def dashboard_ops_sync_page(request: Request, lang: str = "en", lookback_runs: i
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{'同步中心' if lang == 'zh' else 'Sync Center'}</title>
         <style>
-          :root {{ --bg:#f5efe2; --panel:#fffdf7; --ink:#1f2937; --muted:#6b7280; --line:#d6cfc2; --accent:#0f766e; --accent-soft:#dff5ef; }}
+          :root {{
+            --bg:#071018;
+            --bg-soft:#0d1722;
+            --panel:#111c28;
+            --panel-2:#152231;
+            --ink:#e6edf3;
+            --muted:#90a3b8;
+            --line:#223246;
+            --accent:#3dd9b6;
+            --accent-2:#52a8ff;
+            --warn:#f6c85f;
+          }}
           * {{ box-sizing:border-box; }}
-          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left,#fff6d8 0,transparent 30%),radial-gradient(circle at top right,#d9f3ee 0,transparent 35%),var(--bg); }}
-          .wrap {{ max-width:1080px; margin:0 auto; padding:32px 20px 56px; }}
-          .card {{ background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); margin-bottom:16px; }}
+          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
+          .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .main {{ padding:28px 30px 48px; }}
+          .wrap {{ max-width:1180px; margin:0 auto; }}
+          .card {{ background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 40px rgba(0,0,0,0.22); margin-bottom:16px; }}
           .toolbar,.grid {{ display:flex; flex-wrap:wrap; gap:10px; margin-bottom:16px; align-items:center; }}
           .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:16px; }}
-          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
-          .pill, .action-link {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; background:#eef8f5; color:#0f766e; text-decoration:none; font-size:13px; font-weight:700; }}
+          .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.12); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
+          .pill, .action-link {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; background:rgba(17,28,40,0.7); border:1px solid var(--line); color:var(--ink); text-decoration:none; font-size:13px; font-weight:700; }}
           .muted {{ color:var(--muted); font-size:14px; }}
           table {{ width:100%; border-collapse:collapse; font-size:14px; }}
           th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
           th {{ color:var(--muted); font-weight:600; }}
           form {{ display:grid; gap:10px; }}
-          input, select, button {{ border-radius:12px; border:1px solid var(--line); padding:10px 12px; font:inherit; }}
-          button {{ background:var(--accent); color:#fff; border-color:var(--accent); font-weight:700; }}
+          input, select, button {{ border-radius:14px; border:1px solid var(--line); padding:10px 12px; font:inherit; background:rgba(21,34,49,0.82); color:var(--ink); }}
+          button {{ background:linear-gradient(135deg, rgba(61,217,182,0.88), rgba(82,168,255,0.82)); color:#03131f; border-color:transparent; font-weight:800; }}
+          h1 {{ margin:0 0 8px; font-size:36px; line-height:1.05; letter-spacing:-0.03em; }}
         </style>
       </head>
       <body>
-        <main class="wrap">
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{'任务中心' if lang == 'zh' else 'Ops Center'}</h1>
+              <p>{'同步、训练、回测和自动任务都从这里收口。' if lang == 'zh' else 'Sync, training, backtests, and automation all flow through this workspace.'}</p>
+            </div>
+            <nav class="side-nav">{nav_html}</nav>
+            <div class="sidebar-foot">{'同步页负责把市场数据、A 股全市场初始化、技术快照和收盘复盘入口集中起来。' if lang == 'zh' else 'The sync page centralizes market data, CN universe initialization, technical snapshots, and close-review entry points.'}</div>
+          </aside>
+          <main class="main">
+          <div class="wrap">
           <div class="toolbar">
             <a href="/dashboard/ops?lang={lang}&lookback_runs={lookback_runs}" class="pill">← {'返回运维操作台' if lang == 'zh' else 'Back to Operations'}</a>
             <a href="/dashboard/ops/sync?lang=en&lookback_runs={lookback_runs}" class="pill">English</a>
@@ -4146,7 +6071,7 @@ def dashboard_ops_sync_page(request: Request, lang: str = "en", lookback_runs: i
           </div>
           <div class="card">
             <div class="eyebrow">{'同步中心' if lang == 'zh' else 'Sync Center'}</div>
-            <h1 style="margin:0 0 8px;">{'行情与基本面同步' if lang == 'zh' else 'Market and Fundamental Sync'}</h1>
+            <h1>{'行情与基本面同步' if lang == 'zh' else 'Market and Fundamental Sync'}</h1>
             <p class="muted">{'专门处理市场数据、概念和基本面同步。' if lang == 'zh' else 'A focused page for market, concept, and fundamental sync workflows.'}</p>
           </div>
           {
@@ -4178,11 +6103,13 @@ def dashboard_ops_sync_page(request: Request, lang: str = "en", lookback_runs: i
             <div class="muted">{'股票池总数' if lang == 'zh' else 'Universe'}: <strong>{cn_symbol_count}</strong></div>
             <div class="muted">{'已同步行情' if lang == 'zh' else 'Price Synced'}: <strong>{cn_sync_success_count}</strong></div>
             <div class="muted">{'技术缓存' if lang == 'zh' else 'Technical Snapshots'}: <strong>{cn_technical_snapshot_count}</strong></div>
+            <div class="muted">{'最近全市场轻刷新' if lang == 'zh' else 'Latest Light Refresh'}: <strong>{latest_cn_refresh.get('summary') or '-'}</strong></div>
             <div class="muted" style="margin-top:8px;">{'最近初始化任务' if lang == 'zh' else 'Latest Init Job'}: <strong>{(cn_init_job or {}).get('status', 'idle')}</strong></div>
             <div style="margin-top:10px;height:12px;border-radius:999px;background:#efe7d7;overflow:hidden;">
               <div style="height:100%;width:{cn_progress_pct}%;background:linear-gradient(90deg,#0f766e,#34d399);"></div>
             </div>
             <div class="muted" style="margin-top:8px;">{cn_progress_pct}% ({cn_sync_success_count}/{cn_symbol_count})</div>
+            <div class="muted" style="margin-top:8px;">{latest_cn_refresh.get('label') or ''}</div>
             <div style="margin-top:12px;">
               <a class="action-link" href="/screeners?lang={lang}&market=CN&universe=full_market&model_template=cn_bullish_ma_stack">{'去全市场技术选股' if lang == 'zh' else 'Open Full-Market Technical Screener'}</a>
             </div>
@@ -4190,8 +6117,9 @@ def dashboard_ops_sync_page(request: Request, lang: str = "en", lookback_runs: i
           <section class="card">
             <div class="eyebrow">{'收盘自动复盘' if lang == 'zh' else 'Post-Close Review'}</div>
             <div class="muted">{'当前状态' if lang == 'zh' else 'Status'}: <strong>{('开启' if close_review_status['enabled'] else '关闭') if lang == 'zh' else ('Enabled' if close_review_status['enabled'] else 'Disabled')}</strong></div>
-            <div class="muted">{'计划时间' if lang == 'zh' else 'Scheduled Time'}: <strong>{close_review_status['run_hour']:02d}:{close_review_status['run_minute']:02d}</strong> CST</div>
-            <div class="muted">{'下次运行' if lang == 'zh' else 'Next Run'}: <strong>{close_review_status.get('next_run_at') or '-'}</strong></div>
+            <div class="muted">{'计划时间' if lang == 'zh' else 'Scheduled Time'}: <strong>{close_review_status['run_hour']:02d}:{close_review_status['run_minute']:02d}</strong> Asia/Shanghai</div>
+            <div class="muted">{'全市场轻刷新范围' if lang == 'zh' else 'Market Light Refresh Scope'}: <strong>{refresh_scope_label}</strong></div>
+            <div class="muted">{'下次运行' if lang == 'zh' else 'Next Run'}: <strong>{_display_time(close_review_status.get('next_run_at'))}</strong></div>
             <div class="muted">{'上次运行日期' if lang == 'zh' else 'Last Run Date'}: <strong>{close_review_status.get('last_run_date') or '-'}</strong></div>
             <div class="muted">{'失败后重试冷却' if lang == 'zh' else 'Retry Cooldown'}: <strong>{close_review_status.get('retry_cooldown_minutes', 60)}</strong> {'分钟' if lang == 'zh' else 'minute(s)'}</div>
             <div class="muted">{'当日最多尝试' if lang == 'zh' else 'Max Daily Attempts'}: <strong>{close_review_status.get('max_attempts_per_day', 4)}</strong></div>
@@ -4229,10 +6157,38 @@ def dashboard_ops_sync_page(request: Request, lang: str = "en", lookback_runs: i
                 <input type="hidden" name="redirect_to" value="{dashboard_redirect}" />
                 <input type="hidden" name="lang" value="{lang}" />
                 <input type="text" name="tickers" placeholder="AAPL,MSFT" />
-                <select name="provider"><option value="yfinance">yfinance</option></select>
+                <select name="provider"><option value="auto">auto</option><option value="alpaca">Alpaca</option><option value="tushare">TuShare</option><option value="yfinance">yfinance</option><option value="openbb">OpenBB</option></select>
                 <input type="text" name="start_date" placeholder="YYYY-MM-DD" />
                 <input type="text" name="end_date" placeholder="YYYY-MM-DD" />
                 <button type="submit">{_dt(lang, 'sync_market_data')}</button>
+              </form>
+              <div style="height:14px;"></div>
+              <div class="eyebrow">{'美股收盘批量刷新' if lang == 'zh' else 'US Grouped Daily Refresh'}</div>
+              <form action="/jobs/refresh-us-grouped-daily" method="post">
+                <input type="hidden" name="redirect_to" value="{dashboard_redirect}" />
+                <div class="muted">{'通过 Polygon grouped daily 刷新美股全市场 EOD，默认只写 Parquet，不再生成 CSV。未配置 PQW_POLYGON_API_KEY 时会返回 not_configured。' if lang == 'zh' else 'Refresh U.S. full-market EOD via Polygon grouped daily. By default it writes only Parquet and no CSV. Returns not_configured until PQW_POLYGON_API_KEY is set.'}</div>
+                <input type="text" name="trade_date" placeholder="YYYY-MM-DD ({'留空自动取最近美股交易日' if lang == 'zh' else 'blank for latest US trading day'})" />
+                <input type="number" name="limit" min="0" step="1" value="0" placeholder="{ '调试限制，0 代表全部' if lang == 'zh' else 'Debug limit, 0 for all' }" />
+                <label class="muted" style="display:flex;gap:8px;align-items:center;"><input type="checkbox" name="write_lake" value="true" checked style="width:auto;" /> {'写入 Parquet Market Lake（推荐）' if lang == 'zh' else 'Write Parquet Market Lake (recommended)'}</label>
+                <label class="muted" style="display:flex;gap:8px;align-items:center;"><input type="checkbox" name="persist_per_symbol" value="true" style="width:auto;" /> {'写入逐票 CSV（较慢；一般不建议）' if lang == 'zh' else 'Write per-symbol CSVs (slower; usually not recommended)'}</label>
+                <label class="muted" style="display:flex;gap:8px;align-items:center;"><input type="checkbox" name="normalize" value="true" style="width:auto;" /> {'同时重建 normalized CSV（需勾选逐票 CSV，较慢）' if lang == 'zh' else 'Also rebuild normalized CSVs (requires per-symbol CSVs, slower)'}</label>
+                <button type="submit">{'刷新美股收盘行情' if lang == 'zh' else 'Refresh US EOD'}</button>
+              </form>
+              <div style="height:14px;"></div>
+              <div class="eyebrow">{'预计算美股模型' if lang == 'zh' else 'Precompute US Screeners'}</div>
+              <form action="/jobs/precompute-us-screeners" method="post">
+                <input type="hidden" name="redirect_to" value="{dashboard_redirect}" />
+                <div class="muted">{'先基于本地已有美股池生成模型候选快照；接入 Polygon 全市场后会自动扩大覆盖。' if lang == 'zh' else 'Precompute model snapshots from the local U.S. symbol pool; coverage expands after Polygon full-market refresh.'}</div>
+                <button type="submit">{'预计算美股候选' if lang == 'zh' else 'Precompute US Candidates'}</button>
+              </form>
+              <div style="height:14px;"></div>
+              <div class="eyebrow">{'CSV 清理检查' if lang == 'zh' else 'CSV Cleanup Check'}</div>
+              <form action="/jobs/cleanup-market-csv" method="post">
+                <input type="hidden" name="redirect_to" value="{dashboard_redirect}" />
+                <input type="hidden" name="dry_run" value="true" />
+                <input type="hidden" name="markets" value="CN,US" />
+                <div class="muted">{'只检查已被 Parquet lake 覆盖、可清理的 CSV；不会删除文件。真正删除需要单独确认。' if lang == 'zh' else 'Only checks CSV files already covered by the Parquet lake; no files are deleted. Actual deletion requires separate confirmation.'}</div>
+                <button type="submit">{'检查可清理 CSV' if lang == 'zh' else 'Check Cleanup Candidates'}</button>
               </form>
             </article>
             <article class="card">
@@ -4250,7 +6206,7 @@ def dashboard_ops_sync_page(request: Request, lang: str = "en", lookback_runs: i
                 <input type="number" name="offset" min="0" step="1" value="{next_cn_offset}" placeholder="{ '起始偏移（默认接着当前进度）' if lang == 'zh' else 'Offset (resume from current progress)' }" />
                 <input type="number" name="batch_size" min="0" step="1" value="{default_cn_batch_size}" placeholder="{ '本批数量（0 代表直到结束）' if lang == 'zh' else 'Batch Size (0 for remaining)' }" />
                 <input type="number" name="limit" min="0" step="1" value="0" placeholder="{ '兼容限制（可留 0）' if lang == 'zh' else 'Compatibility limit (optional)' }" />
-                <select name="provider"><option value="yfinance">yfinance</option></select>
+                <select name="provider"><option value="auto">auto</option><option value="tushare">TuShare</option></select>
                 <button type="submit">{'初始化 A 股全市场数据' if lang == 'zh' else 'Init CN Market Data'}</button>
               </form>
               <div style="height:10px;"></div>
@@ -4259,7 +6215,7 @@ def dashboard_ops_sync_page(request: Request, lang: str = "en", lookback_runs: i
                 <input type="hidden" name="redirect_to" value="{dashboard_redirect}" />
                 <input type="number" name="days_back" min="2" step="1" value="7" placeholder="{ '刷新最近天数' if lang == 'zh' else 'Refresh Recent Days' }" />
                 <input type="number" name="limit" min="0" step="1" value="0" placeholder="{ '股票数量限制（0 代表全部）' if lang == 'zh' else 'Limit (0 for all)' }" />
-                <select name="provider"><option value="yfinance">yfinance</option></select>
+                <select name="provider"><option value="auto">auto</option><option value="tushare">TuShare</option></select>
                 <button type="submit">{'刷新 A 股最近行情' if lang == 'zh' else 'Refresh Recent CN Market Data'}</button>
               </form>
               <div style="height:10px;"></div>
@@ -4299,9 +6255,12 @@ def dashboard_ops_sync_page(request: Request, lang: str = "en", lookback_runs: i
           </section>
           <section class="card">
             <div class="eyebrow">{_dt(lang, 'sync_states')}</div>
-            <table><thead><tr><th>{_dt(lang, 'ticker')}</th><th>{_dt(lang, 'provider')}</th><th>{_dt(lang, 'last_sync')}</th><th>{_dt(lang, 'status')}</th></tr></thead><tbody>{sync_rows}</tbody></table>
+            <div class="muted" style="margin-bottom:10px;">{sync_state_note}</div>
+            <div class="table-wrap"><table><thead><tr><th>{_dt(lang, 'ticker')}</th><th>{_dt(lang, 'provider')}</th><th>{_dt(lang, 'last_sync')}</th><th>{_dt(lang, 'status')}</th></tr></thead><tbody>{sync_rows}</tbody></table></div>
           </section>
-        </main>
+          </div>
+          </main>
+        </div>
       </body>
     </html>
     """
@@ -4316,35 +6275,91 @@ def dashboard_ops_models_page(request: Request, lang: str = "en", lookback_runs:
     summary = _load_summary(db, lookback_runs=lookback_runs)
     recent_model_runs = summary["recent_model_runs"]
     latest_backtest = summary["latest_backtest"]
+    latest_backtest_summary = (latest_backtest or {}).get("summary") or {}
+    tradability_summary = latest_backtest_summary.get("tradability_summary") or {}
+    capacity_summary = latest_backtest_summary.get("capacity_summary") or {}
+    attribution_summary = latest_backtest_summary.get("attribution_summary") or {}
+    portfolio_construction_summary = latest_backtest_summary.get("portfolio_construction_summary") or {}
     dashboard_redirect = "/dashboard/ops/models?" + urlencode({"lang": lang, "lookback_runs": lookback_runs})
+    nav_html = render_workspace_nav_html(lang=lang, active_key="ops", lookback_runs=lookback_runs)
     model_rows = "".join(
         "<tr>"
-        f"<td>{item['id']}</td><td>{item['name']}</td><td>{item['status']}</td><td><code>{item['config_json'] or '-'}</code></td><td>{item['created_at']}</td>"
+        f"<td>{item['id']}</td><td title='{item['name']}'>{_compact_run_name(item['name'], 28)}</td><td>{item['status']}</td><td title='{item['config_json'] or '-'}'><code>{_compact_json_summary(item['config_json'], 64)}</code></td><td>{_display_time(item['created_at'])}</td>"
         f"<td><form action='/jobs/backtest' method='post' style='margin:0;'><input type='hidden' name='redirect_to' value='{dashboard_redirect}' /><input type='hidden' name='top_n' value='1' /><input type='hidden' name='model_run_id' value='{item['id']}' /><button type='submit' style='padding:8px 10px;font-size:12px;'>{_dt(lang, 'backtest_this_run')}</button></form></td>"
         "</tr>"
         for item in recent_model_runs
     ) or f"<tr><td colspan='6'>{'暂无模型运行' if lang == 'zh' else 'No model runs yet'}</td></tr>"
     backtest_pre = json.dumps(latest_backtest, indent=2) if latest_backtest else ("暂无回测" if lang == "zh" else "No backtest yet")
+    tradeability_rows = "".join(
+        f"<div class='mini-row'><span>{label}</span><strong>{value}</strong></div>"
+        for label, value in (
+            (("候选数" if lang == "zh" else "Candidates"), int(tradability_summary.get("total_candidates") or 0)),
+            (("可成交" if lang == "zh" else "Eligible"), int(tradability_summary.get("eligible_candidates") or 0)),
+            (("最终入选" if lang == "zh" else "Selected"), int(tradability_summary.get("selected_candidates") or 0)),
+            (("阻塞数" if lang == "zh" else "Blocked"), int(tradability_summary.get("blocked_candidates") or 0)),
+            (("通过率" if lang == "zh" else "Pass Rate"), f"{float(tradability_summary.get('pass_rate') or 0.0) * 100:.1f}%"),
+            (("选中率" if lang == "zh" else "Selection Rate"), f"{float(tradability_summary.get('selection_rate') or 0.0) * 100:.1f}%"),
+        )
+    ) or f"<div class='muted'>{'暂无可成交摘要' if lang == 'zh' else 'No tradability summary yet'}</div>"
+    top_block_reasons = tradability_summary.get("top_block_reasons") or []
+    top_block_html = "".join(
+        f"<div class='tag'>{reason}: {count}</div>"
+        for reason, count in top_block_reasons[:5]
+    ) or f"<div class='muted'>{'暂无阻塞原因' if lang == 'zh' else 'No block reasons yet'}</div>"
+    capacity_rows = "".join(
+        f"<div class='mini-row'><span>{label}</span><strong>{value}</strong></div>"
+        for label, value in (
+            (("最小 ADV" if lang == "zh" else "Min ADV"), f"{float(capacity_summary.get('min_adv') or 0.0):,.0f}"),
+            (("最大跳空" if lang == "zh" else "Max Gap"), f"{float(capacity_summary.get('max_gap_pct') or 0.0) * 100:.1f}%"),
+            (("单票上限" if lang == "zh" else "Max Position"), f"{float(capacity_summary.get('max_position_weight') or 0.0) * 100:.1f}%"),
+            (("行业上限" if lang == "zh" else "Max Sector"), f"{float(capacity_summary.get('max_sector_weight') or 0.0) * 100:.1f}%"),
+            (("平均持股数" if lang == "zh" else "Avg Names"), f"{float(capacity_summary.get('avg_selected_names') or 0.0):.1f}"),
+            (("预估总暴露" if lang == "zh" else "Estimated Gross"), f"{float(capacity_summary.get('estimated_gross_exposure') or 0.0) * 100:.1f}%"),
+        )
+    ) or f"<div class='muted'>{'暂无容量摘要' if lang == 'zh' else 'No capacity summary yet'}</div>"
+    attribution_rows = "".join(
+        f"<div class='mini-row'><span>{label}</span><strong>{value}</strong></div>"
+        for label, value in (
+            (("组合总收益" if lang == "zh" else "Portfolio Return"), f"{float(attribution_summary.get('portfolio_total_return') or 0.0) * 100:.2f}%"),
+            (("基准收益" if lang == "zh" else "Benchmark Return"), f"{float(attribution_summary.get('benchmark_total_return') or 0.0) * 100:.2f}%"),
+            (("超额收益" if lang == "zh" else "Excess Return"), f"{float(attribution_summary.get('excess_total_return') or 0.0) * 100:.2f}%"),
+            (("日均 Alpha" if lang == "zh" else "Avg Daily Alpha"), f"{float(attribution_summary.get('avg_daily_alpha') or 0.0) * 100:.3f}%"),
+            (("成本拖累" if lang == "zh" else "Cost Drag"), f"{float(attribution_summary.get('cost_drag_bps') or 0.0):.1f} bps"),
+        )
+    ) or f"<div class='muted'>{'暂无归因摘要' if lang == 'zh' else 'No attribution summary yet'}</div>"
+    construction_rows = "".join(
+        f"<div class='mini-row'><span>{label}</span><strong>{value}</strong></div>"
+        for label, value in (
+            (("权重规则" if lang == "zh" else "Weighting"), portfolio_construction_summary.get("weighting_rule") or "-"),
+            (("持仓规则" if lang == "zh" else "Continuity"), portfolio_construction_summary.get("continuity_rule") or "-"),
+            (("Top N" if lang == "zh" else "Top N"), portfolio_construction_summary.get("top_n") or 0),
+            (("持有天数" if lang == "zh" else "Holding Days"), portfolio_construction_summary.get("holding_days") or 0),
+            (("调仓阈值" if lang == "zh" else "Rebalance Threshold"), f"{float(portfolio_construction_summary.get('rebalance_threshold') or 0.0) * 100:.1f}%"),
+            (("平均持股数" if lang == "zh" else "Avg Names"), f"{float(portfolio_construction_summary.get('avg_selected_names') or 0.0):.1f}"),
+        )
+    ) or f"<div class='muted'>{'暂无组合构建摘要' if lang == 'zh' else 'No construction summary yet'}</div>"
     return f"""
     <!DOCTYPE html>
     <html lang="{lang}">
       <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>{'模型运行' if lang == 'zh' else 'Model Runs'}</title>
       <style>
-        :root {{ --bg:#f5efe2; --panel:#fffdf7; --ink:#1f2937; --muted:#6b7280; --line:#d6cfc2; --accent:#0f766e; --accent-soft:#dff5ef; }}
-        * {{ box-sizing:border-box; }} body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left,#fff6d8 0,transparent 30%),radial-gradient(circle at top right,#d9f3ee 0,transparent 35%),var(--bg); }}
-        .wrap {{ max-width:1080px; margin:0 auto; padding:32px 20px 56px; }} .card {{ background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); margin-bottom:16px; }}
-        .toolbar {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }} .pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; background:#eef8f5; color:#0f766e; text-decoration:none; font-size:13px; font-weight:700; }}
-        .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
-        .muted {{ color:var(--muted); font-size:14px; }} table {{ width:100%; border-collapse:collapse; font-size:14px; }} th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }} th {{ color:var(--muted); font-weight:600; }}
-        input, select, button {{ border-radius:12px; border:1px solid var(--line); padding:10px 12px; font:inherit; }} button {{ background:var(--accent); color:#fff; border-color:var(--accent); font-weight:700; }} pre, code {{ white-space:pre-wrap; word-break:break-word; }}
+        :root {{ --bg:#071018; --panel:#111c28; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; --accent-2:#52a8ff; }}
+        * {{ box-sizing:border-box; }} body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
+        .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }} {WORKSPACE_SIDEBAR_STYLE}
+        .main {{ padding:28px 30px 48px; }} .wrap {{ max-width:1180px; margin:0 auto; }} .card {{ background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 40px rgba(0,0,0,0.22); margin-bottom:16px; }}
+        .toolbar {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }} .pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; border:1px solid var(--line); background:rgba(17,28,40,0.7); color:var(--ink); text-decoration:none; font-size:13px; font-weight:700; }}
+        .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.12); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
+        .muted {{ color:var(--muted); font-size:14px; }} .grid {{ display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); margin-bottom:16px; }} .mini-row {{ display:flex; justify-content:space-between; gap:12px; padding:10px 0; border-top:1px solid var(--line); font-size:14px; }} .tag-row {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }} .tag {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.12); color:var(--accent); font-size:12px; font-weight:800; }} .table-wrap {{ width:100%; overflow-x:auto; border-radius:14px; border:1px solid var(--line); background:rgba(11,19,29,0.82); }} table {{ width:100%; min-width:820px; border-collapse:collapse; font-size:14px; }} th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; white-space:nowrap; }} th {{ color:var(--muted); font-weight:600; }}
+        input, select, button {{ border-radius:14px; border:1px solid var(--line); padding:10px 12px; font:inherit; background:rgba(21,34,49,0.82); color:var(--ink); }} button {{ background:linear-gradient(135deg, rgba(61,217,182,0.88), rgba(82,168,255,0.82)); color:#03131f; border-color:transparent; font-weight:800; }} pre, code {{ white-space:pre-wrap; word-break:break-word; }}
+        h1 {{ margin:0 0 8px; font-size:36px; line-height:1.05; letter-spacing:-0.03em; }}
       </style></head>
-      <body><main class="wrap">
+      <body><div class="app"><aside class="sidebar"><div class="brand"><span class="brand-tag">PQW</span><h1>{'模型与回测' if lang == 'zh' else 'Models'}</h1><p>{'把训练、回测、可成交性和组合构建放在同一屏里审视。' if lang == 'zh' else 'Review training, backtests, tradability, and construction in one screen.'}</p></div><nav class="side-nav">{nav_html}</nav><div class="sidebar-foot">{'这个页面更像模型审查台，不只是看曲线，也看容量、阻塞和收益归因。' if lang == 'zh' else 'This is a model review desk, not just a curve page.'}</div></aside><main class="main"><div class="wrap">
         <div class="toolbar">
           <a href="/dashboard/ops?lang={lang}&lookback_runs={lookback_runs}" class="pill">← {'返回运维操作台' if lang == 'zh' else 'Back to Operations'}</a>
           <a href="/dashboard/ops/models?lang=en&lookback_runs={lookback_runs}" class="pill">English</a>
           <a href="/dashboard/ops/models?lang=zh&lookback_runs={lookback_runs}" class="pill">中文</a>
         </div>
-        <div class="card"><div class="eyebrow">{'模型运行' if lang == 'zh' else 'Model Runs'}</div><h1 style="margin:0 0 8px;">{'训练与回测视图' if lang == 'zh' else 'Training and Backtest View'}</h1><p class="muted">{'专门查看最近模型运行并从这里回测。' if lang == 'zh' else 'Review recent model runs and trigger backtests from here.'}</p></div>
+        <div class="card"><div class="eyebrow">{'模型运行' if lang == 'zh' else 'Model Runs'}</div><h1>{'训练与回测视图' if lang == 'zh' else 'Training and Backtest View'}</h1><p class="muted">{'专门查看最近模型运行并从这里回测。' if lang == 'zh' else 'Review recent model runs and trigger backtests from here.'}</p></div>
         <section class="card">
           <div class="eyebrow">{_dt(lang, 'run_training')}</div>
           <form action="/jobs/train" method="post" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));align-items:end;">
@@ -4357,10 +6372,33 @@ def dashboard_ops_models_page(request: Request, lang: str = "en", lookback_runs:
         </section>
         <section class="card">
           <div class="eyebrow">{_dt(lang, 'recent_model_runs')}</div>
-          <table><thead><tr><th>ID</th><th>{_dt(lang, 'name')}</th><th>{_dt(lang, 'status')}</th><th>{_dt(lang, 'config')}</th><th>{_dt(lang, 'created')}</th><th>{_dt(lang, 'action')}</th></tr></thead><tbody>{model_rows}</tbody></table>
+          <div class="table-wrap"><table><thead><tr><th>ID</th><th>{_dt(lang, 'name')}</th><th>{_dt(lang, 'status')}</th><th>{_dt(lang, 'config')}</th><th>{_dt(lang, 'created')}</th><th>{_dt(lang, 'action')}</th></tr></thead><tbody>{model_rows}</tbody></table></div>
+        </section>
+        <section class="grid">
+          <article class="card">
+            <div class="eyebrow">{'Tradability' if lang == 'en' else '可成交性'}</div>
+            <div class="muted">{'这次回测到底有多少候选能通过交易门槛。' if lang == 'zh' else 'How many candidates actually passed the tradeability gates.'}</div>
+            <div>{tradeability_rows}</div>
+            <div class="tag-row">{top_block_html}</div>
+          </article>
+          <article class="card">
+            <div class="eyebrow">{'Capacity' if lang == 'en' else '容量'}</div>
+            <div class="muted">{capacity_summary.get('capacity_comment') or ('回测容量与流动性摘要。' if lang == 'zh' else 'Capacity and liquidity summary for the backtest.')}</div>
+            <div>{capacity_rows}</div>
+          </article>
+          <article class="card">
+            <div class="eyebrow">{'Attribution' if lang == 'en' else '归因'}</div>
+            <div class="muted">{attribution_summary.get('alpha_source_hint') or ('先看收益来自超额，还是主要来自执行假设。' if lang == 'zh' else 'Check whether returns come from alpha or from execution assumptions.')}</div>
+            <div>{attribution_rows}</div>
+          </article>
+          <article class="card">
+            <div class="eyebrow">{'Construction' if lang == 'en' else '组合构建'}</div>
+            <div class="muted">{'把权重、换手和延续规则一起看，才能知道这条曲线是不是可实现。' if lang == 'zh' else 'Review weighting, turnover, and continuity rules together to judge whether the curve is implementable.'}</div>
+            <div>{construction_rows}</div>
+          </article>
         </section>
         <section class="card"><div class="eyebrow">{_dt(lang, 'backtest_summary')}</div><pre>{backtest_pre}</pre></section>
-      </main></body></html>
+      </div></main></div></body></html>
     """
 
 
@@ -4370,12 +6408,60 @@ def dashboard_ops_jobs_page(request: Request, lang: str = "en", lookback_runs: i
         return login_redirect("/dashboard/ops/jobs")
     lang = "zh" if lang == "zh" else "en"
     lookback_runs = _clamp_lookback_runs(lookback_runs)
-    recent_jobs = load_recent_jobs_summary(db, limit=8)
+    recent_jobs = load_recent_jobs_summary(db, limit=12)
+    nav_html = render_workspace_nav_html(lang=lang, active_key="ops", lookback_runs=lookback_runs)
     def status_badge(status: str) -> str:
         tone = {"success":("#dcfce7","#166534"),"failed":("#fee2e2","#991b1b"),"partial":("#fef3c7","#92400e"),"running":("#dbeafe","#1d4ed8")}.get(status,("#e5e7eb","#374151"))
         return f"<span style='display:inline-block;padding:4px 8px;border-radius:999px;background:{tone[0]};color:{tone[1]};font-size:12px;font-weight:700;'>{status}</span>"
+
+    def result_summary(job: dict) -> str:
+        result = job.get("result") or {}
+        if not isinstance(result, dict):
+            return "-"
+        if str(job.get("job_type") or "").lower() == "screener_precompute":
+            created = list(result.get("snapshots_created") or [])
+            failed = list(result.get("failed_templates") or [])
+            total = len(created) + len(failed)
+            created_label = len(created)
+            if not total:
+                return "待写入" if lang == "zh" else "Pending"
+            prefix = (
+                f"成功 {created_label}/{total}"
+                if lang == "zh"
+                else f"{created_label}/{total} succeeded"
+            )
+            if failed:
+                failed_models = ", ".join(
+                    _compact_label(str(item.get("model_template") or "-"), 18)
+                    for item in failed[:3]
+                )
+                suffix = (
+                    f"；失败 {len(failed)} 个：{failed_models}"
+                    if lang == "zh"
+                    else f"; failed {len(failed)}: {failed_models}"
+                )
+                return prefix + suffix
+            return prefix
+        if "snapshots_created" in result:
+            created = list(result.get("snapshots_created") or [])
+            failed_count = int(result.get("failed_count") or 0)
+            total = len(created) + failed_count
+            return f"{len(created)}/{total}" if total else "-"
+        return _compact_json_summary(result, 48)
+
     recent_job_rows = "".join(
-        "<tr>" f"<td>{item['id']}</td><td>{item['job_type']}</td><td>{status_badge(item['status'])}</td><td>{item['started_at']}</td><td>{item['finished_at'] or '-'}</td><td><code>{json.dumps(item['params']) if item['params'] else '-'}</code></td><td>{item['message'] or '-'}</td>" "</tr>"
+        "<tr>"
+        f"<td>{item['id']}</td>"
+        f"<td title='{item['job_type']}'>{_compact_job_type(item['job_type'], 22)}</td>"
+        f"<td>{status_badge(item['status'])}</td>"
+        f"<td>{_display_time(item['started_at'])}</td>"
+        f"<td>{_display_time(item['finished_at'])}</td>"
+        f"<td title='{json.dumps(item['params'], ensure_ascii=False) if item['params'] else '-'}'><code>{_compact_json_summary(item['params'], 52)}</code></td>"
+        f"<td>"
+        f"<div title='{item['message'] or '-'}'>{_compact_label(item['message'] or '-', 42)}</div>"
+        f"<div class='job-subtle' title='{result_summary(item)}'>{result_summary(item)}</div>"
+        f"</td>"
+        "</tr>"
         for item in recent_jobs
     ) or f"<tr><td colspan='7'>{'暂无任务' if lang == 'zh' else 'No jobs yet'}</td></tr>"
     return f"""
@@ -4383,22 +6469,24 @@ def dashboard_ops_jobs_page(request: Request, lang: str = "en", lookback_runs: i
     <html lang="{lang}">
       <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>{'任务记录' if lang == 'zh' else 'Job History'}</title>
       <style>
-        :root {{ --bg:#f5efe2; --panel:#fffdf7; --ink:#1f2937; --muted:#6b7280; --line:#d6cfc2; --accent:#0f766e; --accent-soft:#dff5ef; }}
-        * {{ box-sizing:border-box; }} body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left,#fff6d8 0,transparent 30%),radial-gradient(circle at top right,#d9f3ee 0,transparent 35%),var(--bg); }}
-        .wrap {{ max-width:1080px; margin:0 auto; padding:32px 20px 56px; }} .card {{ background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); margin-bottom:16px; }}
-        .toolbar {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }} .pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; background:#eef8f5; color:#0f766e; text-decoration:none; font-size:13px; font-weight:700; }}
-        .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
-        .muted {{ color:var(--muted); font-size:14px; }} table {{ width:100%; border-collapse:collapse; font-size:14px; }} th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }} th {{ color:var(--muted); font-weight:600; }} code {{ white-space:pre-wrap; word-break:break-word; }}
+        :root {{ --bg:#071018; --panel:#111c28; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; }}
+        * {{ box-sizing:border-box; }} body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
+        .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }} {WORKSPACE_SIDEBAR_STYLE}
+        .main {{ padding:28px 30px 48px; }} .wrap {{ max-width:1180px; margin:0 auto; }} .card {{ background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 40px rgba(0,0,0,0.22); margin-bottom:16px; }}
+        .toolbar {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }} .pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; border:1px solid var(--line); background:rgba(17,28,40,0.7); color:var(--ink); text-decoration:none; font-size:13px; font-weight:700; }}
+        .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.12); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
+        .muted {{ color:var(--muted); font-size:14px; }} .job-subtle {{ margin-top:6px; color:var(--muted); font-size:12px; line-height:1.4; white-space:normal; }} .table-wrap {{ width:100%; overflow-x:auto; border-radius:14px; border:1px solid var(--line); background:rgba(11,19,29,0.82); }} table {{ width:100%; min-width:960px; border-collapse:collapse; font-size:14px; }} th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; white-space:nowrap; }} th {{ color:var(--muted); font-weight:600; }} code {{ white-space:pre-wrap; word-break:break-word; }}
+        h1 {{ margin:0 0 8px; font-size:36px; line-height:1.05; letter-spacing:-0.03em; }}
       </style></head>
-      <body><main class="wrap">
+      <body><div class="app"><aside class="sidebar"><div class="brand"><span class="brand-tag">PQW</span><h1>{'任务记录' if lang == 'zh' else 'Job History'}</h1><p>{'最近一次同步、训练、回测和失败信息，都在这里回看。' if lang == 'zh' else 'Review recent sync, training, backtest, and failure details here.'}</p></div><nav class="side-nav">{nav_html}</nav><div class="sidebar-foot">{'这页适合看参数、错误和状态，不适合承载复杂分析，所以保持轻量。' if lang == 'zh' else 'This page stays light and focuses on params, errors, and status history.'}</div></aside><main class="main"><div class="wrap">
         <div class="toolbar">
           <a href="/dashboard/ops?lang={lang}&lookback_runs={lookback_runs}" class="pill">← {'返回运维操作台' if lang == 'zh' else 'Back to Operations'}</a>
           <a href="/dashboard/ops/jobs?lang=en&lookback_runs={lookback_runs}" class="pill">English</a>
           <a href="/dashboard/ops/jobs?lang=zh&lookback_runs={lookback_runs}" class="pill">中文</a>
         </div>
-        <div class="card"><div class="eyebrow">{'任务记录' if lang == 'zh' else 'Job History'}</div><h1 style="margin:0 0 8px;">{'最近任务与参数' if lang == 'zh' else 'Recent Jobs and Parameters'}</h1><p class="muted">{'单独查看任务成功、失败和参数详情。' if lang == 'zh' else 'Inspect recent success, failure, and run parameters in one place.'}</p></div>
-        <section class="card"><div class="eyebrow">{_dt(lang, 'recent_jobs')}</div><table><thead><tr><th>ID</th><th>{_dt(lang, 'type')}</th><th>{_dt(lang, 'status')}</th><th>{_dt(lang, 'started')}</th><th>{_dt(lang, 'finished')}</th><th>{_dt(lang, 'params')}</th><th>{_dt(lang, 'message')}</th></tr></thead><tbody>{recent_job_rows}</tbody></table></section>
-      </main></body></html>
+        <div class="card"><div class="eyebrow">{'任务记录' if lang == 'zh' else 'Job History'}</div><h1>{'最近任务与参数' if lang == 'zh' else 'Recent Jobs and Parameters'}</h1><p class="muted">{'单独查看任务成功、失败和参数详情。' if lang == 'zh' else 'Inspect recent success, failure, and run parameters in one place.'}</p></div>
+        <section class="card"><div class="eyebrow">{_dt(lang, 'recent_jobs')}</div><div class="table-wrap"><table><thead><tr><th>ID</th><th>{_dt(lang, 'type')}</th><th>{_dt(lang, 'status')}</th><th>{_dt(lang, 'started')}</th><th>{_dt(lang, 'finished')}</th><th>{_dt(lang, 'params')}</th><th>{_dt(lang, 'message')}</th></tr></thead><tbody>{recent_job_rows}</tbody></table></div></section>
+      </div></main></div></body></html>
     """
 
 
@@ -4406,7 +6494,7 @@ def dashboard_ops_jobs_page(request: Request, lang: str = "en", lookback_runs: i
 def dashboard_page(request: Request, db: Session = Depends(get_db_session)) -> str:
     if not is_authenticated(request):
         return login_redirect("/dashboard")
-    lang = "zh" if request.query_params.get("lang") == "zh" else "en"
+    lang = resolve_request_lang(request)
     session_mode = str(request.query_params.get("mode", "monitor")).lower()
     if session_mode not in {"premarket", "monitor", "postmarket"}:
         session_mode = "monitor"
@@ -4416,7 +6504,52 @@ def dashboard_page(request: Request, db: Session = Depends(get_db_session)) -> s
     continuous_sort_order = str(request.query_params.get("continuous_sort_order", "desc"))
     continuous_market = str(request.query_params.get("continuous_market", "ALL")).upper()
     continuous_state = str(request.query_params.get("continuous_state", "ALL")).upper()
-    summary = _load_summary(db, lookback_runs=lookback_runs)
+    summary = _load_home_summary(db, lookback_runs=lookback_runs)
+    recent_jobs = summary["recent_jobs"]
+    home_watchlist_snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_HOME_WATCHLIST)
+    home_portfolio_snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_HOME_PORTFOLIO)
+    model_candidates_snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_MODEL_CANDIDATES)
+    pipeline_snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_PIPELINE_STATUS)
+    dashboard_nlp_snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_DASHBOARD_NLP)
+    job_status = request.query_params.get("job_status")
+    job_id = request.query_params.get("job_id")
+    job_message = request.query_params.get("job_message")
+    banner_html = ""
+    if job_status or job_message:
+        tone = {
+            "success": ("#10261b", "#8af0a6"),
+            "failed": ("#2b1520", "#ff93a4"),
+            "partial": ("#2b2412", "#ffd982"),
+        }.get(job_status or "", ("#172534", "#d7e2ec"))
+        banner_html = (
+            f"<div class='banner' style='background:{tone[0]};color:{tone[1]};'>"
+            f"Job {job_id or '-'} · {job_status or 'done'} · {job_message or 'Completed'}"
+            f"</div>"
+        )
+    watchlist_rows = _payload_rows(home_watchlist_snapshot) or _dashboard_home_watchlist_rows(db, lang=lang, session_mode=session_mode)
+    portfolio_rows = _payload_rows(home_portfolio_snapshot)
+    model_candidate_rows = _payload_rows(model_candidates_snapshot)
+    portfolio_payload = (home_portfolio_snapshot or {}).get("payload") if isinstance(home_portfolio_snapshot, dict) else None
+    pipeline_payload = (pipeline_snapshot or {}).get("payload") if isinstance(pipeline_snapshot, dict) else None
+    portfolio_totals = (portfolio_payload or {}).get("totals") if isinstance(portfolio_payload, dict) else None
+    if not portfolio_rows or not isinstance(portfolio_totals, dict):
+        portfolio_rows, portfolio_totals = _dashboard_home_portfolio_rows(db, lang=lang)
+    recent_jobs = _payload_rows(pipeline_snapshot) and ((pipeline_snapshot or {}).get("payload") or {}).get("recent_jobs") or recent_jobs
+    return _render_dashboard_workspace(
+        lang=lang,
+        session_mode=session_mode,
+        lookback_runs=lookback_runs,
+        summary=summary,
+        watchlist_rows=watchlist_rows,
+        portfolio_rows=portfolio_rows,
+        model_candidate_rows=model_candidate_rows,
+        portfolio_totals=portfolio_totals,
+        portfolio_meta=portfolio_payload.get("meta") if isinstance(portfolio_payload, dict) else {},
+        pipeline_payload=pipeline_payload if isinstance(pipeline_payload, dict) else {},
+        recent_jobs=recent_jobs,
+        banner_html=banner_html,
+        nlp_payload=((dashboard_nlp_snapshot or {}).get("payload") if isinstance(dashboard_nlp_snapshot, dict) else {}) or {},
+    )
     generated_at = summary["generated_at"]
     auto_analysis = summary["auto_analysis"]
     data_sources = summary["data_sources"]
@@ -5039,14 +7172,14 @@ def dashboard_page(request: Request, db: Session = Depends(get_db_session)) -> s
             </article>
             <article class="card">
               <div class="eyebrow">{_dt(lang, 'latest_model')}</div>
-              <div class="metric">{latest_model['name'] if latest_model else 'None'}</div>
+              <div class="metric" title="{latest_model['name'] if latest_model else 'None'}">{_compact_run_name((latest_model or {}).get('name'), 24) if latest_model else 'None'}</div>
               <div class="muted">{_dt(lang, 'status')}: {latest_model['status'] if latest_model else '-'}</div>
               <div class="muted">{_dt(lang, 'type')}: {latest_model['model_type'] if latest_model else '-'}</div>
             </article>
             <article class="card">
               <div class="eyebrow">{_dt(lang, 'backtest')}</div>
               <div class="metric">{latest_backtest['status'] if latest_backtest else 'None'}</div>
-              <div class="muted">{_dt(lang, 'run')}: {latest_backtest['name'] if latest_backtest else '-'}</div>
+              <div class="muted" title="{latest_backtest['name'] if latest_backtest else '-'}">{_dt(lang, 'run')}: {_compact_run_name((latest_backtest or {}).get('name'), 24) if latest_backtest else '-'}</div>
               <div class="muted">{_dt(lang, 'period')}: {latest_backtest['start_date'] if latest_backtest else '-'} to {latest_backtest['end_date'] if latest_backtest else '-'}</div>
             </article>
           </section>
@@ -5272,94 +7405,422 @@ def dashboard_top_fragment(
 def dashboard_ai_daily_report(request: Request, db: Session = Depends(get_db_session)) -> str:
     if not is_authenticated(request):
         return login_redirect("/dashboard/ai-daily-report")
-    report = load_ai_daily_report(db=db) or {
+    lang = resolve_request_lang(request)
+    nav_html = render_workspace_nav_html(lang=lang, active_key="ops")
+    report = _load_cached_ai_daily_report(db) or {
         "mood": "-",
         "headline": "暂无可用的 A股 AI 日报，请先运行收盘复盘或手动生成。",
         "strategy": {"headline": "-", "playbook": "-", "bullets": []},
+        "portfolio_summary": {},
+        "portfolio_rows": [],
+        "social_signal_summary": {"accounts": [], "actionable": []},
+        "us_hotspot_validation": [],
+        "market_recommendations": [],
         "rows": [],
         "buy_the_dip_rows": [],
     }
+    if not report.get("social_signal_summary"):
+        current_social_summary = social_signal_summary(db)
+        report = {
+            **report,
+            "social_signal_summary": {
+                "accounts": current_social_summary.get("accounts") or [],
+                "actionable": current_social_summary.get("actionable") or [],
+            },
+        }
 
+    portfolio_summary = report.get("portfolio_summary") or {}
+    portfolio_rows_html = "".join(
+        "<tr>"
+        f"<td>{item.get('ticker')}</td>"
+        f"<td>{item.get('name') or item.get('ticker')}</td>"
+        f"<td>{item.get('quantity') or '-'}</td>"
+        f"<td>{item.get('cost_basis') or '-'}</td>"
+        f"<td>{item.get('latest_price') or '-'}</td>"
+        f"<td>{float(item.get('pnl') or 0.0):.2f}<div class='muted'>{float(item.get('pnl_pct') or 0.0):.2f}%</div></td>"
+        f"<td>{item.get('ai_verdict') or '-'}<div class='muted'>{item.get('ai_headline') or '-'}</div></td>"
+        f"<td>{item.get('action_bucket') or '-'}<div class='muted'>目标: {item.get('target_weight_text') or '-'}</div></td>"
+        f"<td>{item.get('ai_strategy') or '-'}<div class='muted'>触发: {item.get('entry_trigger') or '-'}</div><div class='muted'>失效: {item.get('invalidation_condition') or '-'}</div></td>"
+        "</tr>"
+        for item in (report.get("portfolio_rows") or [])
+    ) or f"<tr><td colspan='9'>{'暂无持仓库数据' if lang == 'zh' else 'No portfolio holdings yet.'}</td></tr>"
+    market_recommendation_rows = report.get("market_recommendations") or report.get("rows") or []
     rows_html = "".join(
         "<tr>"
         f"<td>{item.get('ticker')}</td>"
         f"<td>{item.get('name') or item.get('ticker')}</td>"
         f"<td>{item.get('verdict') or '-'}</td>"
         f"<td>{item.get('confidence') or '-'}</td>"
-        f"<td>{item.get('strategy') or '-'}</td>"
-        f"<td>{item.get('headline') or '-'}</td>"
-        f"<td>{item.get('summary') or '-'}</td>"
+        f"<td>{item.get('quant_rank') or '-'}<div class='muted'>验证分: {item.get('verification_score') or '-'}</div></td>"
+        f"<td>{item.get('strategy') or '-'}<div class='muted'>仓位: {item.get('target_weight') or '-'}</div><div class='muted'>可交易性: {item.get('tradability_status') or '-'}</div></td>"
+        f"<td>{item.get('entry_trigger') or '-'}<div class='muted'>失效: {item.get('invalidation_condition') or '-'}</div></td>"
+        f"<td>{item.get('time_horizon') or '-'}<div class='muted'>滑点: {item.get('max_slippage_bps') or '-'}bps · 流动性: {item.get('liquidity_bucket') or '-'}</div></td>"
+        f"<td>{item.get('verification_note') or '-'}<div class='muted'>止损: {item.get('stop_loss', '-')} · {item.get('stop_loss_type') or '-'}</div></td>"
+        f"<td>{item.get('headline') or '-'}<div class='muted'>{item.get('summary') or '-'}</div></td>"
         "</tr>"
-        for item in (report.get("rows") or [])
-    ) or "<tr><td colspan='7'>No AI daily report yet.</td></tr>"
-    buy_the_dip_html = "".join(
+        for item in market_recommendation_rows[:5]
+    ) or f"<tr><td colspan='10'>{'暂无全市场推荐候选' if lang == 'zh' else 'No full-market recommendations yet.'}</td></tr>"
+    social_payload = report.get("social_signal_summary") or {}
+    social_signal_rows = social_payload.get("actionable") or []
+    social_accounts = social_payload.get("accounts") or []
+    social_signal_rows_html = "".join(
         "<tr>"
-        f"<td>{item.get('ticker')}</td>"
-        f"<td>{item.get('name') or item.get('ticker')}</td>"
-        f"<td>{item.get('quant_rank') or '-'}</td>"
-        f"<td>{item.get('trend_score') or '-'}</td>"
-        f"<td>{item.get('strategy') or '-'}</td>"
-        f"<td>{(item.get('buy_zone') or {}).get('low', '-')} - {(item.get('buy_zone') or {}).get('high', '-')}</td>"
+        f"<td>{html.escape(str(item.get('handle') or '-'))}</td>"
+        f"<td><a href='/insights/{html.escape(str(item.get('ticker') or ''), quote=True)}?lang={lang}'>{html.escape(str(item.get('ticker') or '-'))}</a><div class='muted'>{html.escape(str(item.get('name') or '-'))}</div></td>"
+        f"<td>{html.escape(str(item.get('social_view') or '-'))}</td>"
+        f"<td>{int(item.get('validation_score') or 0)}</td>"
+        f"<td>{html.escape(str(item.get('model_signal_label') or '-'))}<div class='muted'>score {html.escape(str(item.get('model_score') if item.get('model_score') is not None else '-'))}</div></td>"
+        f"<td>{html.escape(str(item.get('system_action') or '-'))}</td>"
+        f"<td>{html.escape(' / '.join(item.get('validation_reasons') or []) or '-')}</td>"
         "</tr>"
-        for item in (report.get("buy_the_dip_rows") or [])
-    ) or "<tr><td colspan='6'>No Buy The Dip candidates yet.</td></tr>"
+        for item in social_signal_rows[:8]
+    ) or f"<tr><td colspan='7'>{'暂无可验证社交信号。请先在社交信号页导入已追踪账号的 X 帖子。' if lang == 'zh' else 'No validated social signals yet. Import X posts from tracked accounts first.'}</td></tr>"
+    social_account_text = ", ".join(str(item.get("handle") or "") for item in social_accounts) or "-"
+    us_hotspot_rows = report.get("us_hotspot_validation") or []
+    us_hotspot_rows_html = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(item.get('handle') or '-'))}</td>"
+        f"<td><a href='/insights/{html.escape(str(item.get('ticker') or ''), quote=True)}?lang={lang}'>{html.escape(str(item.get('ticker') or '-'))}</a><div class='muted'>{html.escape(str(item.get('name') or '-'))}</div></td>"
+        f"<td>{html.escape(str(item.get('social_view') or '-'))}<div class='muted'>社交分 {int(item.get('validation_score') or 0)}</div></td>"
+        f"<td>{html.escape(str(item.get('template') or '-'))}<div class='muted'>Top #{int(item.get('us_rank') or 0)}</div></td>"
+        f"<td>{html.escape(str(item.get('action_label') or '-'))}<div class='muted'>趋势 {html.escape(str(item.get('trend_score') or '-'))}</div></td>"
+        f"<td>{html.escape(str(item.get('cross_validation_note') or '-'))}</td>"
+        "</tr>"
+        for item in us_hotspot_rows[:8]
+    ) or f"<tr><td colspan='6'>{'暂无 X 热点美股与美股模型 Top 候选重合。请先导入 X 帖子，并运行美股预计算 job。' if lang == 'zh' else 'No overlap between X U.S. mentions and U.S. model top candidates yet. Import X posts and run U.S. precompute first.'}</td></tr>"
 
     return f"""
     <!DOCTYPE html>
-    <html lang="zh">
+    <html lang="{lang}">
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>A股 AI 每日决策面板</title>
+        <title>{'A股 AI 每日决策面板' if lang == 'zh' else 'AI Daily Dashboard'}</title>
         <style>
-          body {{ margin:0; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:#f5efe2; color:#1f2937; }}
-          .wrap {{ max-width: 1100px; margin:0 auto; padding:28px 20px 56px; }}
-          .card {{ background:#fffdf7; border:1px solid #d6cfc2; border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); }}
-          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:#dff5ef; color:#0f766e; font-size:12px; font-weight:700; margin-bottom:12px; }}
-          .metric {{ font-size:28px; font-weight:800; margin:4px 0 8px; }}
-          .muted {{ color:#6b7280; font-size:14px; }}
-          table {{ width:100%; border-collapse:collapse; font-size:14px; margin-top:12px; }}
-          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid #d6cfc2; vertical-align:top; }}
-          th {{ color:#6b7280; font-weight:600; }}
-          a {{ color:#0f766e; text-decoration:none; }}
+          :root {{ --bg:#071018; --panel:#111c28; --panel-2:#152231; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; }}
+          * {{ box-sizing:border-box; }}
+          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
+          a {{ color:inherit; text-decoration:none; }}
+          .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .main {{ padding:28px 30px 48px; }}
+          .wrap {{ max-width:1180px; margin:0 auto; }}
+          .toolbar {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }}
+          .pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; border:1px solid var(--line); background:rgba(17,28,40,0.7); color:var(--ink); font-size:13px; font-weight:700; }}
+          .card {{ background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 40px rgba(0,0,0,0.22); margin-bottom:16px; }}
+          .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.12); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
+          .metric {{ font-size:32px; font-weight:800; margin:4px 0 8px; }}
+          .muted {{ color:var(--muted); font-size:14px; line-height:1.55; }}
+          .hero-grid {{ display:grid; grid-template-columns:minmax(0,1.15fr) minmax(320px,0.85fr); gap:16px; margin-bottom:16px; }}
+          .playbook {{ margin-top:12px; padding:14px; border-radius:18px; background:rgba(21,34,49,0.82); border:1px solid var(--line); }}
+          .action-row {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }}
+          .cta {{ display:inline-flex; align-items:center; justify-content:center; padding:10px 14px; border-radius:999px; border:1px solid var(--line); background:rgba(21,34,49,0.92); color:var(--ink); font-size:13px; font-weight:800; }}
+          .table-wrap {{ width:100%; overflow-x:auto; border-radius:16px; border:1px solid var(--line); background:rgba(11,19,29,0.82); margin-top:14px; }}
+          table {{ width:100%; min-width:1120px; border-collapse:collapse; font-size:14px; }}
+          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
+          th {{ color:var(--muted); font-weight:600; }}
+          button {{ border-radius:999px; border:1px solid transparent; padding:10px 14px; font:inherit; font-weight:800; background:linear-gradient(135deg, rgba(61,217,182,0.88), rgba(82,168,255,0.82)); color:#03131f; cursor:pointer; }}
+          @media (max-width: 960px) {{ .app {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }} .main {{ padding:20px 16px 36px; }} .hero-grid {{ grid-template-columns:1fr; }} }}
         </style>
       </head>
       <body>
-        <main class="wrap">
-          <div style="margin-bottom:16px;"><a href="/dashboard?lang=zh">← 返回 dashboard</a></div>
-          <section class="card">
-            <div class="eyebrow">A-Share AI Daily Report</div>
-            <div class="metric">{report.get('mood') or '-'}</div>
-            <div class="muted">A股复盘: {report.get('headline') or '-'}</div>
-            <div style="margin-top:12px;padding:14px;border-radius:14px;background:#f8faf7;border:1px solid #d6cfc2;">
-              <div style="font-weight:800;margin-bottom:6px;">{(report.get('strategy') or {}).get('headline') or '-'}</div>
-              <div class="muted">{(report.get('strategy') or {}).get('playbook') or '-'}</div>
-              <div style="margin-top:8px;">
-                {"".join(f"<div class='muted'>• {item}</div>" for item in ((report.get('strategy') or {}).get('bullets') or [])) or "<div class='muted'>-</div>"}
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{'AI 日报' if lang == 'zh' else 'AI Report'}</h1>
+              <p>{'把 AI 每日复盘、候选动作和推送文本集中在一个稳定入口。' if lang == 'zh' else 'Keep the AI daily review, candidate actions, and push-ready text in one stable workspace.'}</p>
+            </div>
+            <nav class="side-nav">{nav_html}</nav>
+          </aside>
+          <main class="main">
+            <div class="wrap">
+              <div class="toolbar">
+                <a class="pill" href="/dashboard?lang={lang}">← {'返回首页' if lang == 'zh' else 'Back to Dashboard'}</a>
+                <a class="pill" href="/dashboard/ops?lang={lang}">{'打开任务中心' if lang == 'zh' else 'Open Task Center'}</a>
+                <a class="pill" href="/dashboard/ai-daily-report/message?lang={lang}">{'打开推送文本' if lang == 'zh' else 'Open Push Text'}</a>
+                <a class="pill" href="/dashboard/ai-daily-report/history?lang={lang}">{'历史记录' if lang == 'zh' else 'History'}</a>
               </div>
-            </div>
-            <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
-              <a href="/dashboard/ai-daily-report/message">打开 A股推送文本</a>
-              <form action="/jobs/send-ai-daily-report" method="post" style="display:inline;">
-                <input type="hidden" name="redirect_to" value="/dashboard/ai-daily-report" />
-                <button type="submit">发送 A股日报到已配置渠道</button>
-              </form>
-            </div>
-            <table>
+              <section class="hero-grid">
+                <article class="card">
+                  <div class="eyebrow">{'AI 每日复盘' if lang == 'zh' else 'AI Daily Review'}</div>
+                  <div class="metric">{report.get('mood') or '-'}</div>
+                  <div class="muted">{report.get('headline') or '-'}</div>
+                  <div class="playbook">
+                    <div style="font-weight:800;margin-bottom:6px;">{(report.get('strategy') or {}).get('headline') or '-'}</div>
+                    <div class="muted">{(report.get('strategy') or {}).get('playbook') or '-'}</div>
+                    <div style="margin-top:8px;">
+                      {"".join(f"<div class='muted'>• {item}</div>" for item in ((report.get('strategy') or {}).get('bullets') or [])) or "<div class='muted'>-</div>"}
+                    </div>
+                  </div>
+                  <div class="action-row">
+                    <a class="cta" href="/dashboard/ai-daily-report/message?lang={lang}">{'打开 A股推送文本' if lang == 'zh' else 'Open push-ready text'}</a>
+                    <form action="/jobs/send-ai-daily-report" method="post" style="display:inline;">
+                      <input type="hidden" name="redirect_to" value="/dashboard/ai-daily-report?lang={lang}" />
+                      <button type="submit">{'发送 A股日报到已配置渠道' if lang == 'zh' else 'Send report to configured channels'}</button>
+                    </form>
+                  </div>
+                </article>
+                <article class="card">
+                  <div class="eyebrow">{'使用方式' if lang == 'zh' else 'How to use'}</div>
+                  <div class="muted">{'日报现在分四段：持仓复核、A股全市场 Top 5、X 社交信号验证，以及 X 热点美股和美股模型候选交叉验证。' if lang == 'zh' else 'The report now has four parts: portfolio review, A-share full-market Top 5, X social validation, and X U.S. hotspot cross-validation.'}</div>
+                  <div class="playbook">
+                    <div style="font-weight:800;margin-bottom:6px;">{'持仓摘要' if lang == 'zh' else 'Portfolio Summary'}</div>
+                    <div class="muted">{portfolio_summary.get('headline') or '-'}</div>
+                    <div class="muted" style="margin-top:8px;">{portfolio_summary.get('action_note') or '-'}</div>
+                    <div class="muted" style="margin-top:8px;">{'社交账号' if lang == 'zh' else 'Social accounts'}: {html.escape(social_account_text)}</div>
+                  </div>
+                </article>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{'一、持仓库总结' if lang == 'zh' else '1. Portfolio Review'}</div>
+                <div class="muted">{portfolio_summary.get('headline') or '-'}</div>
+                <div class="table-wrap"><table>
               <thead>
-                <tr><th>代码</th><th>名称</th><th>结论</th><th>置信度</th><th>策略</th><th>Headline</th><th>Summary</th></tr>
+                <tr><th>代码</th><th>名称</th><th>数量</th><th>成本</th><th>最新价</th><th>盈亏</th><th>AI 判断</th><th>动作桶</th><th>Note</th></tr>
               </thead>
-              <tbody>{rows_html}</tbody>
-            </table>
-            <div style="margin-top:18px;font-weight:800;">Buy The Dip 10</div>
-            <table>
+              <tbody>{portfolio_rows_html}</tbody></table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{'二、全市场扫描 Top 5' if lang == 'zh' else '2. Full-Market Top 5'}</div>
+                <div class="muted">{'基于收盘后行情、模型信号、趋势结构、可交易性和可验证触发条件筛选。' if lang == 'zh' else 'Selected from post-close market data, model signal, trend structure, tradability, and verifiable triggers.'}</div>
+                <div class="table-wrap"><table>
               <thead>
-                <tr><th>代码</th><th>名称</th><th>量化分</th><th>趋势分</th><th>策略</th><th>回踩区</th></tr>
+                <tr><th>代码</th><th>名称</th><th>结论</th><th>置信度</th><th>量化 / 验证</th><th>策略 / 仓位</th><th>触发 / 失效</th><th>周期 / 流动性</th><th>验证 / 止损</th><th>Headline / Summary</th></tr>
               </thead>
-              <tbody>{buy_the_dip_html}</tbody>
-            </table>
-          </section>
-        </main>
+              <tbody>{rows_html}</tbody></table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{'三、X 账户社交信号验证' if lang == 'zh' else '3. X Account Signal Validation'}</div>
+                <div class="muted">{'这里不是直接照单买入，而是把社交观点和模型信号、触发条件、自选/持仓状态做交叉验证。' if lang == 'zh' else 'This does not copy trades directly; it cross-validates social views against model signals, triggers, watchlist, and portfolio state.'}</div>
+                <div class="table-wrap"><table>
+              <thead>
+                <tr><th>账号</th><th>股票</th><th>观点</th><th>验证分</th><th>模型</th><th>系统动作</th><th>原因</th></tr>
+              </thead>
+              <tbody>{social_signal_rows_html}</tbody></table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{'四、X 热点美股验证' if lang == 'zh' else '4. X U.S. Hotspot Validation'}</div>
+                <div class="muted">{'把 X 帖子里提到的美股，与后台预计算的美股模型候选做交叉验证。没有重合时不强行推荐。' if lang == 'zh' else 'Cross-check U.S. tickers mentioned on X against precomputed U.S. model candidates. No overlap means no forced recommendation.'}</div>
+                <div class="table-wrap"><table>
+              <thead>
+                <tr><th>账号</th><th>股票</th><th>X观点</th><th>美股模型</th><th>模型动作</th><th>验证结论</th></tr>
+              </thead>
+              <tbody>{us_hotspot_rows_html}</tbody></table></div>
+              </section>
+            </div>
+          </main>
+        </div>
+      </body>
+    </html>
+    """
+
+
+@router.get("/ai-daily-report/history", response_class=HTMLResponse)
+def dashboard_ai_daily_report_history(request: Request, db: Session = Depends(get_db_session)) -> str:
+    if not is_authenticated(request):
+        return login_redirect("/dashboard/ai-daily-report/history")
+    lang = resolve_request_lang(request)
+    nav_html = render_workspace_nav_html(lang=lang, active_key="ops")
+    history = list_ai_daily_report_history(limit=60, db=db)
+    rows_html = ""
+    for item in history:
+        payload = item.get("payload") or {}
+        top5 = payload.get("market_recommendations") or payload.get("rows") or []
+        top5_text = ", ".join(
+            str(row.get("ticker") or "")
+            for row in top5[:5]
+            if row.get("ticker")
+        ) or "-"
+        portfolio_rows = payload.get("portfolio_rows") or []
+        rows_html += (
+            "<tr>"
+            f"<td><a href='/dashboard/ai-daily-report/history/{int(item.get('id'))}?lang={lang}'>{html.escape(str(item.get('snapshot_date') or '-'))}</a>"
+            f"<div class='muted'>#{int(item.get('id'))} · {_display_time(item.get('created_at'), with_tz=True)}</div></td>"
+            f"<td>{html.escape(str(payload.get('mood') or '-'))}<div class='muted'>{html.escape(str(payload.get('headline') or '-'))}</div></td>"
+            f"<td>{len(portfolio_rows)}</td>"
+            f"<td>{html.escape(top5_text)}</td>"
+            f"<td><a class='cta' href='/dashboard/ai-daily-report/history/{int(item.get('id'))}?lang={lang}'>{'打开' if lang == 'zh' else 'Open'}</a></td>"
+            "</tr>"
+        )
+    if not rows_html:
+        rows_html = (
+            f"<tr><td colspan='5'>{'暂无历史日报。下一次生成或发送 AI 日报后会自动保存。' if lang == 'zh' else 'No historical reports yet. The next generated or sent AI report will be archived automatically.'}</td></tr>"
+        )
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="{lang}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{'AI 日报历史记录' if lang == 'zh' else 'AI Report History'}</title>
+        <style>
+          :root {{ --bg:#071018; --panel:#111c28; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; }}
+          * {{ box-sizing:border-box; }}
+          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
+          a {{ color:inherit; text-decoration:none; }}
+          .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .main {{ padding:28px 30px 48px; }}
+          .wrap {{ max-width:1080px; margin:0 auto; }}
+          .toolbar {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }}
+          .pill,.cta {{ display:inline-flex; align-items:center; justify-content:center; padding:8px 12px; border-radius:999px; border:1px solid var(--line); background:rgba(17,28,40,0.7); color:var(--ink); font-size:13px; font-weight:800; }}
+          .card {{ background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 40px rgba(0,0,0,0.22); }}
+          .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.12); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
+          h2 {{ margin:0 0 8px; font-size:28px; }}
+          .muted {{ color:var(--muted); font-size:14px; line-height:1.55; }}
+          .table-wrap {{ width:100%; overflow-x:auto; border-radius:16px; border:1px solid var(--line); background:rgba(11,19,29,0.82); margin-top:14px; }}
+          table {{ width:100%; min-width:880px; border-collapse:collapse; font-size:14px; }}
+          th, td {{ text-align:left; padding:12px 10px; border-bottom:1px solid var(--line); vertical-align:top; }}
+          th {{ color:var(--muted); font-weight:700; }}
+          @media (max-width: 960px) {{ .app {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }} .main {{ padding:20px 16px 36px; }} }}
+        </style>
+      </head>
+      <body>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{'日报历史' if lang == 'zh' else 'Report History'}</h1>
+              <p>{'保留每次 AI 日报，方便后续对照推荐是否走出来。' if lang == 'zh' else 'Archive every AI report so later outcomes can be reviewed.'}</p>
+            </div>
+            <nav class="side-nav">{nav_html}</nav>
+          </aside>
+          <main class="main">
+            <div class="wrap">
+              <div class="toolbar">
+                <a class="pill" href="/dashboard/ai-daily-report?lang={lang}">← {'返回 AI 日报' if lang == 'zh' else 'Back to AI Report'}</a>
+                <a class="pill" href="/dashboard/ops?lang={lang}">{'任务中心' if lang == 'zh' else 'Ops'}</a>
+              </div>
+              <section class="card">
+                <div class="eyebrow">{'历史日报' if lang == 'zh' else 'Historical Reports'}</div>
+                <h2>{'日报留档' if lang == 'zh' else 'Report Archive'}</h2>
+                <div class="muted">{'每次生成或发送 AI 日报都会新增一条记录，不覆盖旧版本。后面我们可以在这里继续加“命中率/收益验证”。' if lang == 'zh' else 'Every generated or sent AI report is archived without overwriting older versions. Outcome tracking can be added here next.'}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{'日期' if lang == 'zh' else 'Date'}</th><th>{'市场判断' if lang == 'zh' else 'Market View'}</th><th>{'持仓数' if lang == 'zh' else 'Holdings'}</th><th>{'Top 5' if lang == 'zh' else 'Top 5'}</th><th>{'操作' if lang == 'zh' else 'Action'}</th></tr></thead>
+                  <tbody>{rows_html}</tbody>
+                </table></div>
+              </section>
+            </div>
+          </main>
+        </div>
+      </body>
+    </html>
+    """
+
+
+@router.get("/ai-daily-report/history/{snapshot_id}", response_class=HTMLResponse)
+def dashboard_ai_daily_report_history_detail(snapshot_id: int, request: Request, db: Session = Depends(get_db_session)) -> str:
+    if not is_authenticated(request):
+        return login_redirect(f"/dashboard/ai-daily-report/history/{snapshot_id}")
+    lang = resolve_request_lang(request)
+    nav_html = render_workspace_nav_html(lang=lang, active_key="ops")
+    snapshot = load_ai_daily_report_history_item(snapshot_id, db=db)
+    if snapshot is None:
+        return HTMLResponse("Not found", status_code=404)
+    report = snapshot.get("payload") or {}
+    message = render_ai_daily_report_message(report)
+    report_date = str(snapshot.get("snapshot_date") or report.get("report_date") or "")
+    outcome_rows = _report_outcome_rows(report, report_date=report_date)
+    outcome_summary = _report_outcome_summary(outcome_rows, lang=lang)
+    outcome_rows_html = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(item.get('ticker') or '-'))}<div class='muted'>{html.escape(str(item.get('name') or '-'))}</div></td>"
+        f"<td>{html.escape(str(item.get('baseline_date') or '-'))}<div class='muted'>{_fmt_optional_float(item.get('baseline_close'), digits=3)}</div></td>"
+        f"<td>{html.escape(str(item.get('latest_date') or '-'))}<div class='muted'>{_fmt_optional_float(item.get('latest_close'), digits=3)}</div></td>"
+        f"<td>{_fmt_optional_float(item.get('return_pct'), suffix='%', digits=2)}</td>"
+        f"<td>{_outcome_status_label(item.get('status'), lang=lang)}</td>"
+        "</tr>"
+        for item in outcome_rows
+    ) or f"<tr><td colspan='5'>{'暂无可验证记录。' if lang == 'zh' else 'No measurable records yet.'}</td></tr>"
+    top5 = report.get("market_recommendations") or report.get("rows") or []
+    top5_rows = "".join(
+        "<tr>"
+        f"<td>{index}</td>"
+        f"<td><a href='/insights/{html.escape(str(item.get('ticker') or ''), quote=True)}?lang={lang}'>{html.escape(str(item.get('ticker') or '-'))}</a><div class='muted'>{html.escape(str(item.get('name') or '-'))}</div></td>"
+        f"<td>{html.escape(str(item.get('verdict') or '-'))}</td>"
+        f"<td>{html.escape(str(item.get('quant_rank') or '-'))}<div class='muted'>验证分 {html.escape(str(item.get('verification_score') or '-'))}</div></td>"
+        f"<td>{html.escape(str(item.get('entry_trigger') or '-'))}<div class='muted'>失效: {html.escape(str(item.get('invalidation_condition') or '-'))}</div></td>"
+        f"<td>{html.escape(str(item.get('headline') or item.get('summary') or '-'))}</td>"
+        "</tr>"
+        for index, item in enumerate(top5[:5], start=1)
+    ) or f"<tr><td colspan='6'>{'该历史日报没有 Top 5 记录。' if lang == 'zh' else 'This archived report has no Top 5 records.'}</td></tr>"
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="{lang}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{'AI 日报历史详情' if lang == 'zh' else 'AI Report Detail'}</title>
+        <style>
+          :root {{ --bg:#071018; --panel:#111c28; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; }}
+          * {{ box-sizing:border-box; }}
+          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
+          a {{ color:inherit; text-decoration:none; }}
+          .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .main {{ padding:28px 30px 48px; }}
+          .wrap {{ max-width:1080px; margin:0 auto; }}
+          .toolbar {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }}
+          .pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; border:1px solid var(--line); background:rgba(17,28,40,0.7); color:var(--ink); font-size:13px; font-weight:800; }}
+          .card {{ background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 40px rgba(0,0,0,0.22); margin-bottom:16px; }}
+          .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.12); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
+          h2 {{ margin:0 0 8px; font-size:28px; }}
+          .muted {{ color:var(--muted); font-size:14px; line-height:1.55; }}
+          .table-wrap {{ width:100%; overflow-x:auto; border-radius:16px; border:1px solid var(--line); background:rgba(11,19,29,0.82); margin-top:14px; }}
+          table {{ width:100%; min-width:980px; border-collapse:collapse; font-size:14px; }}
+          th, td {{ text-align:left; padding:12px 10px; border-bottom:1px solid var(--line); vertical-align:top; }}
+          th {{ color:var(--muted); font-weight:700; }}
+          textarea {{ width:100%; min-height:360px; border:1px solid var(--line); border-radius:16px; padding:14px; font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; background:rgba(21,34,49,0.72); color:var(--ink); }}
+          @media (max-width: 960px) {{ .app {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }} .main {{ padding:20px 16px 36px; }} }}
+        </style>
+      </head>
+      <body>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{'历史详情' if lang == 'zh' else 'History Detail'}</h1>
+              <p>{'回看当日报告原文和 Top 5，后续用于验证准确性。' if lang == 'zh' else 'Review the archived report and Top 5 for later accuracy checks.'}</p>
+            </div>
+            <nav class="side-nav">{nav_html}</nav>
+          </aside>
+          <main class="main">
+            <div class="wrap">
+              <div class="toolbar">
+                <a class="pill" href="/dashboard/ai-daily-report/history?lang={lang}">← {'返回历史记录' if lang == 'zh' else 'Back to History'}</a>
+                <a class="pill" href="/dashboard/ai-daily-report?lang={lang}">{'当前日报' if lang == 'zh' else 'Current Report'}</a>
+              </div>
+              <section class="card">
+                <div class="eyebrow">{'历史日报' if lang == 'zh' else 'Archived Report'}</div>
+                <h2>{html.escape(str(snapshot.get('snapshot_date') or '-'))}</h2>
+                <div class="muted">{'保存时间' if lang == 'zh' else 'Saved at'}: {_display_time(snapshot.get('created_at'), with_tz=True)}</div>
+                <div class="muted">{html.escape(str(report.get('headline') or '-'))}</div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{'事后表现验证' if lang == 'zh' else 'Outcome Check'}</div>
+                <div class="muted">{html.escape(outcome_summary)}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{'股票' if lang == 'zh' else 'Ticker'}</th><th>{'基准收盘' if lang == 'zh' else 'Baseline Close'}</th><th>{'最新收盘' if lang == 'zh' else 'Latest Close'}</th><th>{'区间收益' if lang == 'zh' else 'Return'}</th><th>{'状态' if lang == 'zh' else 'Status'}</th></tr></thead>
+                  <tbody>{outcome_rows_html}</tbody>
+                </table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{'当日推荐 Top 5' if lang == 'zh' else 'Daily Top 5'}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>#</th><th>{'股票' if lang == 'zh' else 'Ticker'}</th><th>{'结论' if lang == 'zh' else 'Verdict'}</th><th>{'量化/验证' if lang == 'zh' else 'Quant/Validation'}</th><th>{'触发/失效' if lang == 'zh' else 'Trigger/Invalidation'}</th><th>Headline</th></tr></thead>
+                  <tbody>{top5_rows}</tbody>
+                </table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{'日报原文' if lang == 'zh' else 'Original Message'}</div>
+                <textarea readonly>{html.escape(message)}</textarea>
+              </section>
+            </div>
+          </main>
+        </div>
       </body>
     </html>
     """
@@ -5369,40 +7830,73 @@ def dashboard_ai_daily_report(request: Request, db: Session = Depends(get_db_ses
 def dashboard_ai_daily_report_message(request: Request, db: Session = Depends(get_db_session)) -> str:
     if not is_authenticated(request):
         return login_redirect("/dashboard/ai-daily-report/message")
-    report = load_ai_daily_report(db=db) or {
+    lang = resolve_request_lang(request)
+    nav_html = render_workspace_nav_html(lang=lang, active_key="ops")
+    report = _load_cached_ai_daily_report(db) or {
         "mood": "-",
         "headline": "暂无可用的 A股 AI 日报，请先运行收盘复盘或手动生成。",
         "strategy": {"headline": "-", "playbook": "-", "bullets": []},
         "rows": [],
         "buy_the_dip_rows": [],
     }
+    if not report.get("social_signal_summary"):
+        current_social_summary = social_signal_summary(db)
+        report = {
+            **report,
+            "social_signal_summary": {
+                "accounts": current_social_summary.get("accounts") or [],
+                "actionable": current_social_summary.get("actionable") or [],
+            },
+        }
     message = render_ai_daily_report_message(report)
     return f"""
     <!DOCTYPE html>
-    <html lang="zh">
+    <html lang="{lang}">
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>A股 AI 日报推送文本</title>
+        <title>{'A股 AI 日报推送文本' if lang == 'zh' else 'AI Report Push Text'}</title>
         <style>
-          body {{ margin:0; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:#f5efe2; color:#1f2937; }}
-          .wrap {{ max-width: 960px; margin:0 auto; padding:28px 20px 56px; }}
-          .card {{ background:#fffdf7; border:1px solid #d6cfc2; border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); }}
-          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:#dff5ef; color:#0f766e; font-size:12px; font-weight:700; margin-bottom:12px; }}
-          textarea {{ width:100%; min-height:420px; border:1px solid #d6cfc2; border-radius:14px; padding:14px; font:13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background:#fff; color:#1f2937; }}
-          a {{ color:#0f766e; text-decoration:none; }}
-          .muted {{ color:#6b7280; font-size:14px; }}
+          :root {{ --bg:#071018; --panel:#111c28; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; }}
+          * {{ box-sizing:border-box; }}
+          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
+          a {{ color:inherit; text-decoration:none; }}
+          .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .main {{ padding:28px 30px 48px; }}
+          .wrap {{ max-width:980px; margin:0 auto; }}
+          .toolbar {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }}
+          .pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; border:1px solid var(--line); background:rgba(17,28,40,0.7); color:var(--ink); font-size:13px; font-weight:700; }}
+          .card {{ background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 40px rgba(0,0,0,0.22); }}
+          .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.12); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
+          .muted {{ color:var(--muted); font-size:14px; line-height:1.55; }}
+          textarea {{ width:100%; min-height:420px; border:1px solid var(--line); border-radius:16px; padding:14px; font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; background:rgba(21,34,49,0.72); color:var(--ink); }}
+          @media (max-width: 960px) {{ .app {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }} .main {{ padding:20px 16px 36px; }} }}
         </style>
       </head>
       <body>
-        <main class="wrap">
-          <div style="margin-bottom:16px;"><a href="/dashboard/ai-daily-report">← 返回 A股 AI 每日决策面板</a></div>
-          <section class="card">
-            <div class="eyebrow">A-Share Push Ready</div>
-            <div class="muted">下面这段文本默认只包含 A 股，可直接复制到 Telegram、企业微信、飞书或邮件。</div>
-            <textarea readonly>{message}</textarea>
-          </section>
-        </main>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{'推送文本' if lang == 'zh' else 'Push Text'}</h1>
+              <p>{'把 AI 日报整理成可直接发送的文本。' if lang == 'zh' else 'Prepare the AI report as a push-ready message.'}</p>
+            </div>
+            <nav class="side-nav">{nav_html}</nav>
+          </aside>
+          <main class="main">
+            <div class="wrap">
+              <div class="toolbar">
+                <a class="pill" href="/dashboard/ai-daily-report?lang={lang}">← {'返回 AI 日报' if lang == 'zh' else 'Back to AI report'}</a>
+              </div>
+              <section class="card">
+                <div class="eyebrow">A-Share Push Ready</div>
+                <div class="muted">{'下面这段文本默认只包含 A 股，可直接复制到 Telegram、企业微信、飞书或邮件。' if lang == 'zh' else 'The text below is ready to copy into Telegram, WeCom, Feishu, or email.'}</div>
+                <textarea readonly>{message}</textarea>
+              </section>
+            </div>
+          </main>
+        </div>
       </body>
     </html>
     """

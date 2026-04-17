@@ -1,5 +1,4 @@
 import json
-from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -8,6 +7,7 @@ from app.services.repository import (
     DashboardReadRepository,
 )
 from app.services.runtime_cache import get_or_set
+from app.services.time_utils import app_now_iso
 
 
 def build_data_sources(sync_states: list[dict], concept_summary: dict | None = None) -> dict:
@@ -61,7 +61,7 @@ def load_dashboard_summary(
         latest_signals = snapshot["latest_signals"]
         sync_states = snapshot["sync_states"]
         return {
-            "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            "generated_at": app_now_iso(),
             "lookback_runs": lookback_runs,
             "auto_analysis": auto_analysis_service.get_status(db=db),
             "data_sources": build_data_sources(

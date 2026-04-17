@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from dataclasses import asdict
 import json
 
 from app.core.db import SessionLocal
@@ -22,6 +23,16 @@ from app.services.tushare_client import TushareClient
 
 
 MODEL_TEMPLATES = {
+    "next_tesla_swing": {
+        "label": "Next Tesla Swing",
+        "description": "强趋势二次启动模板：寻找处于强趋势中、回踩支撑或接近干净突破位的领涨股。",
+        "market": "ALL",
+        "mode": "next_tesla",
+        "defaults": {
+            "min_trend_score": 68,
+            "min_volume_ratio": 0.8,
+        },
+    },
     "technical_momentum": {
         "label": "Technical Momentum",
         "description": "Use the current insight engine to rank stocks by trend strength and volume support.",
@@ -249,6 +260,26 @@ class ScreenerService:
         self.technical_patterns = TechnicalPatternService()
         self.tradingview = TradingViewClient()
 
+    def _get_cached_insight(self, ticker: str, *, limit: int | None = None, lang: str = "en") -> dict | None:
+        cache_key = json.dumps(
+            {
+                "ticker": ticker,
+                "limit": limit or 0,
+                "lang": lang,
+            },
+            sort_keys=True,
+        )
+        return get_or_set(
+            "screener_insight",
+            cache_key,
+            ttl_seconds=120.0,
+            loader=lambda: (
+                self.insight_engine.get_insight(ticker, limit=limit, lang=lang)
+                if limit is not None
+                else self.insight_engine.get_insight(ticker, lang=lang)
+            ),
+        )
+
     def screen(
         self,
         *,
@@ -322,6 +353,17 @@ class ScreenerService:
                 market=effective_market,
                 min_trend_score=min_trend_score,
                 min_volume_ratio=min_volume_ratio,
+            )
+        elif template["mode"] == "next_tesla":
+            fixed_market = template.get("market")
+            effective_market = fixed_market if fixed_market and fixed_market != "ALL" else market
+            results = self._screen_next_tesla_swing(
+                universe=universe,
+                market=effective_market,
+                min_trend_score=min_trend_score,
+                min_volume_ratio=min_volume_ratio,
+                recent_snapshot_runs=recent_snapshot_runs,
+                min_snapshot_hits=min_snapshot_hits,
             )
         else:
             results = self._screen_technical(
@@ -494,47 +536,56 @@ class ScreenerService:
         min_snapshot_hits: int,
     ) -> list[dict]:
         tickers = self._load_universe(universe=universe, market=market)
+        cached_snapshot_map = {}
+        results: list[dict] = []
         with SessionLocal() as db:
             model_repo = PredictionRepository(db)
             explanation_repo = PredictionExplanationRepository(db)
             trade_plan_repo = PredictionTradePlanRepository(db)
             technical_snapshot_repo = TechnicalSnapshotRepository(db)
-            model_context_by_ticker = {
-                ticker: self._build_model_highlights(
-                    model_repo.get_latest_model_output_for_ticker(ticker),
-                    explanation_repo.get_latest_for_ticker(ticker),
-                    trade_plan_repo.get_latest_for_ticker(ticker),
-                )
-                for ticker in tickers
-            }
-            cached_snapshot_map = {}
             if universe == "full_market" and market == "CN":
                 cached_snapshot_map = {
                     item["ticker"]: item
                     for item in technical_snapshot_repo.list_latest_for_market(market=market, tickers=tickers)
                 }
-        results: list[dict] = []
-        for ticker in tickers:
-            cached_snapshot = cached_snapshot_map.get(ticker)
-            snapshot = self._snapshot_from_cache(cached_snapshot) if cached_snapshot is not None else self.technical_patterns.evaluate_ticker(ticker)
-            if snapshot is None:
-                continue
-            if required_patterns and not self._matches_required_patterns(snapshot, required_patterns):
-                continue
-            insight = self.insight_engine.get_insight(ticker, lang="en")
-            if insight:
-                if insight["trend_score"] < min_trend_score:
+                tickers = self._rank_cn_snapshot_candidates(
+                    tickers,
+                    cached_snapshot_map,
+                    limit=80,
+                    required_patterns=required_patterns,
+                )
+            model_context_cache: dict[str, dict] = {}
+
+            def _model_context_for(ticker: str) -> dict:
+                if ticker not in model_context_cache:
+                    model_context_cache[ticker] = self._build_model_highlights(
+                        model_repo.get_latest_model_output_for_ticker(ticker),
+                        explanation_repo.get_latest_for_ticker(ticker),
+                        trade_plan_repo.get_latest_for_ticker(ticker),
+                    )
+                return model_context_cache[ticker]
+
+            for ticker in tickers:
+                cached_snapshot = cached_snapshot_map.get(ticker)
+                snapshot = self._snapshot_from_cache(cached_snapshot) if cached_snapshot is not None else self.technical_patterns.evaluate_ticker(ticker)
+                if snapshot is None:
                     continue
-                if action_filter != "ALL" and _normalize_action_value(insight["action_label"]) != _normalize_action_value(action_filter):
+                if required_patterns and not self._matches_required_patterns(snapshot, required_patterns):
                     continue
-                if (insight.get("volume_ratio") or 0.0) < min_volume_ratio:
-                    continue
-                row = self._build_result_from_insight(insight, model_context_by_ticker.get(ticker))
-            else:
-                row = self._build_result_from_fallback_pattern(snapshot, model_context_by_ticker.get(ticker))
-            row["matched_patterns"] = list(snapshot.matched_patterns or [])
-            row["selection_reason"] = self._build_pattern_reason(template_key, row["matched_patterns"], row)
-            results.append(row)
+                insight = self._get_cached_insight(ticker, lang="en")
+                if insight:
+                    if insight["trend_score"] < min_trend_score:
+                        continue
+                    if action_filter != "ALL" and _normalize_action_value(insight["action_label"]) != _normalize_action_value(action_filter):
+                        continue
+                    if (insight.get("volume_ratio") or 0.0) < min_volume_ratio:
+                        continue
+                    row = self._build_result_from_insight(insight, _model_context_for(ticker))
+                else:
+                    row = self._build_result_from_fallback_pattern(snapshot, _model_context_for(ticker))
+                row["matched_patterns"] = list(snapshot.matched_patterns or [])
+                row["selection_reason"] = self._build_pattern_reason(template_key, row["matched_patterns"], row)
+                results.append(row)
 
         results = self._apply_snapshot_persistence_filter(
             results,
@@ -555,6 +606,40 @@ class ScreenerService:
         if not payload:
             return None
         return type("CachedTechnicalSnapshot", (), payload)()
+
+    def _rank_cn_snapshot_candidates(
+        self,
+        tickers: list[str],
+        cached_snapshot_map: dict[str, dict],
+        *,
+        limit: int = 600,
+        required_patterns: list[str] | None = None,
+    ) -> list[str]:
+        if not cached_snapshot_map:
+            return tickers[:limit]
+        ranked: list[tuple[float, str]] = []
+        for ticker in tickers:
+            snapshot = cached_snapshot_map.get(ticker)
+            if not snapshot:
+                continue
+            proxy = self._snapshot_from_cache(snapshot)
+            if required_patterns and not self._matches_required_patterns(proxy, required_patterns):
+                continue
+            score = 0.0
+            score += 4.0 if snapshot.get("volume_breakout") else 0.0
+            score += 3.0 if snapshot.get("bullish_ma_stack") else 0.0
+            score += 2.0 if snapshot.get("ma_cluster") else 0.0
+            score += 1.5 if snapshot.get("macd_underwater_cross") else 0.0
+            score += min(len(snapshot.get("matched_patterns") or []), 4) * 0.6
+            ranked.append((score, ticker))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        selected = [ticker for _, ticker in ranked[:limit]]
+        if required_patterns:
+            return selected
+        if len(selected) < min(limit, len(tickers)):
+            seen = set(selected)
+            selected.extend([ticker for ticker in tickers if ticker not in seen][: max(0, limit - len(selected))])
+        return selected[:limit]
 
     def _matches_required_patterns(self, snapshot, required_patterns: list[str]) -> bool:
         matched_patterns = {str(item).strip() for item in (getattr(snapshot, "matched_patterns", None) or []) if str(item).strip()}
@@ -579,31 +664,40 @@ class ScreenerService:
         min_snapshot_hits: int,
     ) -> list[dict]:
         tickers = self._load_universe(universe=universe, market=market)
+        results: list[dict] = []
         with SessionLocal() as db:
             model_repo = PredictionRepository(db)
             explanation_repo = PredictionExplanationRepository(db)
             trade_plan_repo = PredictionTradePlanRepository(db)
-            model_context_by_ticker = {
-                ticker: self._build_model_highlights(
-                    model_repo.get_latest_model_output_for_ticker(ticker),
-                    explanation_repo.get_latest_for_ticker(ticker),
-                    trade_plan_repo.get_latest_for_ticker(ticker),
-                )
-                for ticker in tickers
-            }
-        results: list[dict] = []
-        for ticker in tickers:
-            insight = self.insight_engine.get_insight(ticker, lang="en")
-            if not insight:
-                continue
-            if insight["trend_score"] < min_trend_score:
-                continue
-            if action_filter != "ALL" and _normalize_action_value(insight["action_label"]) != _normalize_action_value(action_filter):
-                continue
-            volume_ratio = insight.get("volume_ratio") or 0.0
-            if volume_ratio < min_volume_ratio:
-                continue
-            results.append(self._build_result_from_insight(insight, model_context_by_ticker.get(ticker)))
+            if universe == "full_market" and market == "CN":
+                cached_snapshot_map = {
+                    item["ticker"]: item
+                    for item in TechnicalSnapshotRepository(db).list_latest_for_market(market=market, tickers=tickers)
+                }
+                tickers = self._rank_cn_snapshot_candidates(tickers, cached_snapshot_map, limit=120)
+            model_context_cache: dict[str, dict] = {}
+
+            def _model_context_for(ticker: str) -> dict:
+                if ticker not in model_context_cache:
+                    model_context_cache[ticker] = self._build_model_highlights(
+                        model_repo.get_latest_model_output_for_ticker(ticker),
+                        explanation_repo.get_latest_for_ticker(ticker),
+                        trade_plan_repo.get_latest_for_ticker(ticker),
+                    )
+                return model_context_cache[ticker]
+
+            for ticker in tickers:
+                insight = self._get_cached_insight(ticker, lang="en")
+                if not insight:
+                    continue
+                if insight["trend_score"] < min_trend_score:
+                    continue
+                if action_filter != "ALL" and _normalize_action_value(insight["action_label"]) != _normalize_action_value(action_filter):
+                    continue
+                volume_ratio = insight.get("volume_ratio") or 0.0
+                if volume_ratio < min_volume_ratio:
+                    continue
+                results.append(self._build_result_from_insight(insight, _model_context_for(ticker)))
 
         results = self._apply_snapshot_persistence_filter(
             results,
@@ -639,7 +733,7 @@ class ScreenerService:
         symbol_meta = self._load_symbol_meta(candidate_tickers)
         results: list[dict] = []
         for ticker in candidate_tickers:
-            insight = self.insight_engine.get_insight(ticker, lang="en")
+            insight = self._get_cached_insight(ticker, lang="en")
             if not insight:
                 continue
             if (insight.get("trend_score") or 0) < min_trend_score:
@@ -666,6 +760,85 @@ class ScreenerService:
                 -self._tradingview_alignment_score(item.get("tradingview_ratings") or {}),
                 -(item.get("trend_score") or 0),
                 -(item.get("volume_ratio") or 0),
+                item.get("ticker", ""),
+            )
+        )
+        return results
+
+    def _screen_next_tesla_swing(
+        self,
+        *,
+        universe: str,
+        market: str,
+        min_trend_score: int,
+        min_volume_ratio: float,
+        recent_snapshot_runs: int,
+        min_snapshot_hits: int,
+    ) -> list[dict]:
+        tickers = self._load_universe(universe=universe, market=market)
+        results: list[dict] = []
+        with SessionLocal() as db:
+            technical_snapshot_repo = TechnicalSnapshotRepository(db)
+            cached_snapshot_map = {
+                item["ticker"]: item
+                for item in technical_snapshot_repo.list_latest_for_market(
+                    market=market if market != "ALL" else None,
+                    tickers=tickers,
+                )
+            }
+            if universe == "full_market" and market == "CN":
+                tickers = self._rank_cn_snapshot_candidates(tickers, cached_snapshot_map, limit=90)
+            model_repo = PredictionRepository(db)
+            explanation_repo = PredictionExplanationRepository(db)
+            trade_plan_repo = PredictionTradePlanRepository(db)
+            model_context_cache: dict[str, dict] = {}
+
+            def _model_context_for(ticker: str) -> dict:
+                if ticker not in model_context_cache:
+                    model_context_cache[ticker] = self._build_model_highlights(
+                        model_repo.get_latest_model_output_for_ticker(ticker),
+                        explanation_repo.get_latest_for_ticker(ticker),
+                        trade_plan_repo.get_latest_for_ticker(ticker),
+                    )
+                return model_context_cache[ticker]
+
+            min_trend = max(int(min_trend_score or 0), 68)
+            min_volume = max(float(min_volume_ratio or 0.0), 0.8)
+            for ticker in tickers:
+                insight = self._get_cached_insight(ticker, limit=260, lang="en")
+                if not insight:
+                    continue
+                setup_context = self._next_tesla_context(insight)
+                if not self._matches_next_tesla_setup(
+                    insight,
+                    setup_context=setup_context,
+                    min_trend_score=min_trend,
+                    min_volume_ratio=min_volume,
+                ):
+                    continue
+                snapshot = cached_snapshot_map.get(ticker)
+                if snapshot is None:
+                    evaluated = self.technical_patterns.evaluate_ticker(ticker)
+                    snapshot = self._snapshot_from_cache(asdict(evaluated)) if evaluated is not None else None
+                row = self._build_result_from_insight(insight, _model_context_for(ticker))
+                row["matched_patterns"] = list(getattr(snapshot, "matched_patterns", None) or [])
+                row["setup_bucket"] = setup_context.get("setup_bucket")
+                row["distance_to_52w_high_pct"] = setup_context.get("distance_to_52w_high_pct")
+                row["pullback_depth_pct"] = setup_context.get("pullback_depth_pct")
+                row["selection_reason"] = self._build_next_tesla_reason(insight, setup_context, row["matched_patterns"], row)
+                row["template_score"] = self._next_tesla_score(insight, setup_context, row["matched_patterns"])
+                results.append(row)
+
+        results = self._apply_snapshot_persistence_filter(
+            results,
+            recent_snapshot_runs=recent_snapshot_runs,
+            min_snapshot_hits=min_snapshot_hits,
+        )
+        results.sort(
+            key=lambda item: (
+                -(item.get("template_score") or 0),
+                -(item.get("trend_score") or 0),
+                -(item.get("model_signal_strength") or 0),
                 item.get("ticker", ""),
             )
         )
@@ -729,7 +902,7 @@ class ScreenerService:
             ):
                 continue
 
-            insight = self.insight_engine.get_insight(item["ticker"], lang="en")
+            insight = self._get_cached_insight(item["ticker"], lang="en")
             model_context = model_context_by_ticker.get(item["ticker"])
             base = (
                 self._build_result_from_insight(insight, model_context)
@@ -774,6 +947,97 @@ class ScreenerService:
             )
         )
         return results
+
+    def _matches_next_tesla_setup(
+        self,
+        insight: dict,
+        *,
+        setup_context: dict,
+        min_trend_score: int,
+        min_volume_ratio: float,
+    ) -> bool:
+        trend_score = float(insight.get("trend_score") or 0.0)
+        latest_close = float(insight.get("latest_close") or 0.0)
+        ma20 = insight.get("ma20")
+        ma60 = insight.get("ma60")
+        volume_ratio = float(insight.get("volume_ratio") or 0.0)
+        momentum_20 = float(insight.get("momentum_20") or 0.0)
+        momentum_5 = float(insight.get("momentum_5") or 0.0)
+        breakout_distance = float(insight.get("distance_to_breakout_pct") or 0.0)
+        action_label = str(insight.get("action_label") or "").strip().lower()
+        setup_label = str(insight.get("setup_label") or "").strip().lower()
+        distance_to_52w_high = float(setup_context.get("distance_to_52w_high_pct") or 999.0)
+        pullback_depth = float(setup_context.get("pullback_depth_pct") or 0.0)
+
+        if trend_score < min_trend_score:
+            return False
+        if latest_close <= 0 or ma20 is None or ma60 is None:
+            return False
+        if not (latest_close > float(ma20) > float(ma60)):
+            return False
+        if volume_ratio < min_volume_ratio:
+            return False
+        if momentum_20 < 8.0:
+            return False
+        if momentum_5 < -6.0:
+            return False
+        if distance_to_52w_high > 15.0:
+            return False
+        if breakout_distance < -3.0 or breakout_distance > 8.0:
+            return False
+        if action_label not in {"buy_the_dip", "wait_for_breakout"}:
+            return False
+        if setup_label not in {"pullback_buy", "breakout_watch"}:
+            return False
+        if action_label == "buy_the_dip":
+            if latest_close > float(ma20) * 1.05:
+                return False
+            if pullback_depth > 15.0:
+                return False
+        if action_label == "wait_for_breakout" and breakout_distance > 6.0:
+            return False
+        if setup_context.get("setup_bucket") == "failed_reclaim":
+            return False
+        return True
+
+    def _next_tesla_context(self, insight: dict) -> dict:
+        history = insight.get("history") or []
+        highs = [float(row.get("high") or row.get("close") or 0.0) for row in history[-252:] if (row.get("high") or row.get("close"))]
+        lows = [float(row.get("low") or row.get("close") or 0.0) for row in history[-20:] if (row.get("low") or row.get("close"))]
+        latest_close = float(insight.get("latest_close") or 0.0)
+        ma20 = float(insight.get("ma20") or 0.0)
+        breakout_distance = float(insight.get("distance_to_breakout_pct") or 0.0)
+        fifty_two_week_high = max(highs) if highs else latest_close
+        distance_to_52w_high_pct = round(((fifty_two_week_high / latest_close) - 1.0) * 100.0, 2) if latest_close > 0 else None
+        recent_swing_high = max(highs[-30:]) if len(highs) >= 5 else fifty_two_week_high
+        pullback_depth_pct = round(((recent_swing_high - latest_close) / recent_swing_high) * 100.0, 2) if recent_swing_high and latest_close > 0 else None
+        higher_low = self._is_first_higher_low(history)
+
+        if breakout_distance <= 3.5:
+            setup_bucket = "breakout_ready"
+        elif latest_close >= ma20 * 0.985 and higher_low:
+            setup_bucket = "pullback_reentry"
+        elif latest_close >= ma20 * 0.97:
+            setup_bucket = "support_hold"
+        else:
+            setup_bucket = "failed_reclaim"
+        return {
+            "distance_to_52w_high_pct": distance_to_52w_high_pct,
+            "pullback_depth_pct": pullback_depth_pct,
+            "setup_bucket": setup_bucket,
+            "higher_low": higher_low,
+        }
+
+    def _is_first_higher_low(self, history: list[dict]) -> bool:
+        recent = history[-15:] if len(history) >= 15 else history
+        if len(recent) < 8:
+            return False
+        lows = [float(row.get("low") or row.get("close") or 0.0) for row in recent]
+        earlier = lows[: len(lows) // 2]
+        later = lows[len(lows) // 2 :]
+        if not earlier or not later:
+            return False
+        return min(later) > min(earlier)
 
     def _apply_snapshot_persistence_filter(
         self,
@@ -1142,6 +1406,52 @@ class ScreenerService:
                 f"ROE 3Y {self._fmt(item.get('roe_avg_3y'))}%"
             )
         return base.get("selection_reason") or "Matched the active template."
+
+    def _build_next_tesla_reason(self, insight: dict, setup_context: dict, matched_patterns: list[str], row: dict) -> str:
+        parts: list[str] = []
+        action_label = str(insight.get("action_label") or "")
+        if action_label:
+            parts.append(action_label.replace("_", " "))
+        setup_bucket = setup_context.get("setup_bucket")
+        if setup_bucket:
+            parts.append(setup_bucket.replace("_", " "))
+        parts.append(f"trend {int(float(insight.get('trend_score') or 0))}")
+        if insight.get("momentum_20") is not None:
+            parts.append(f"20D {float(insight.get('momentum_20') or 0):.1f}%")
+        if insight.get("volume_ratio") is not None:
+            parts.append(f"volume {float(insight.get('volume_ratio') or 0):.1f}x")
+        if setup_context.get("distance_to_52w_high_pct") is not None:
+            parts.append(f"52W {float(setup_context.get('distance_to_52w_high_pct') or 0):.1f}%")
+        if setup_context.get("pullback_depth_pct") is not None:
+            parts.append(f"pullback {float(setup_context.get('pullback_depth_pct') or 0):.1f}%")
+        if insight.get("distance_to_breakout_pct") is not None:
+            parts.append(f"breakout {float(insight.get('distance_to_breakout_pct') or 0):.1f}%")
+        if matched_patterns:
+            parts.append(" / ".join(matched_patterns[:2]))
+        signal_label = row.get("model_signal_label")
+        if signal_label:
+            parts.append(f"model {signal_label}")
+        return ", ".join(parts)
+
+    def _next_tesla_score(self, insight: dict, setup_context: dict, matched_patterns: list[str]) -> float:
+        trend = float(insight.get("trend_score") or 0.0)
+        momentum_20 = max(float(insight.get("momentum_20") or 0.0), 0.0)
+        volume_ratio = max(float(insight.get("volume_ratio") or 0.0), 0.0)
+        breakout_distance = abs(float(insight.get("distance_to_breakout_pct") or 0.0))
+        distance_to_52w = abs(float(setup_context.get("distance_to_52w_high_pct") or 0.0))
+        pullback_depth = abs(float(setup_context.get("pullback_depth_pct") or 0.0))
+        score = trend * 0.55
+        score += momentum_20 * 1.4
+        score += min(volume_ratio, 3.0) * 8.0
+        score += max(0.0, 8.0 - breakout_distance)
+        score += max(0.0, 12.0 - distance_to_52w) * 0.8
+        score += max(0.0, 12.0 - pullback_depth) * 0.6
+        score += min(len(matched_patterns), 3) * 3.0
+        if setup_context.get("higher_low"):
+            score += 4.0
+        if setup_context.get("setup_bucket") == "breakout_ready":
+            score += 3.0
+        return round(score, 2)
 
     def _build_pattern_reason(self, template_key: str, matched_patterns: list[str], row: dict) -> str:
         matched = " / ".join(matched_patterns or []) or "技术形态触发"

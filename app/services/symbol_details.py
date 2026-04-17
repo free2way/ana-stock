@@ -2,6 +2,7 @@ import csv
 from pathlib import Path
 
 from app.core.config import get_settings
+from app.services.market_lake import load_lake_price_history
 from app.services.ticker_format import market_ticker_candidates
 
 
@@ -17,6 +18,10 @@ class SymbolDataService:
             if rows:
                 rows.sort(key=lambda item: item["date"] or "")
                 return rows[-limit:]
+        for market, symbol in self._lake_candidates(ticker):
+            rows = load_lake_price_history(market=market, ticker=symbol, limit=limit)
+            if rows:
+                return rows
         return []
 
     def _candidate_paths(self, ticker: str) -> list[Path]:
@@ -32,6 +37,16 @@ class SymbolDataService:
                 paths.append(self.settings.normalized_data_dir / f"{candidate[:-3]}.csv")
                 paths.append(self.settings.raw_data_dir / f"{candidate[:-3]}.csv")
         return paths
+
+    def _lake_candidates(self, ticker: str) -> list[tuple[str, str]]:
+        upper = ticker.upper().strip()
+        if not upper:
+            return []
+        if upper.endswith((".SS", ".SZ", ".SH", ".BJ")) or (upper.isdigit() and len(upper) == 6):
+            return [("CN", candidate) for candidate in market_ticker_candidates(upper, "CN")]
+        if upper.endswith(".HK"):
+            return []
+        return [("US", upper)]
 
     def _read_rows(self, path: Path, requested_ticker: str) -> list[dict]:
         acceptable_symbols = {candidate.upper() for candidate in market_ticker_candidates(requested_ticker.upper(), "HK" if requested_ticker.upper().endswith(".HK") else None)}

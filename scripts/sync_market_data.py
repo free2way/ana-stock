@@ -16,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tickers", nargs="*", help="Ticker list to sync. Defaults to all symbols in the database.")
     parser.add_argument("--start-date", help="Optional start date in YYYY-MM-DD.")
     parser.add_argument("--end-date", help="Optional end date in YYYY-MM-DD.")
-    parser.add_argument("--provider", default="yfinance", help="OpenBB provider to use. Default: yfinance.")
+    parser.add_argument("--provider", default="auto", help="Provider policy to use. Default: auto.")
     return parser.parse_args()
 
 

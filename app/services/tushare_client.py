@@ -222,6 +222,90 @@ class TushareClient:
         rows.sort(key=lambda item: item["date"] or "")
         return rows
 
+    def fetch_cn_daily_history_bulk(
+        self,
+        tickers: list[str],
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict[str, list[dict]]:
+        if not self.token:
+            return {}
+
+        try:
+            import tushare as ts  # type: ignore
+        except ImportError:
+            return {}
+
+        pro = ts.pro_api(self.token)
+        if pro is None:
+            return {}
+
+        normalized_tickers = {
+            str(ticker or "").strip().upper()
+            for ticker in tickers
+            if str(ticker or "").strip()
+        }
+        if not normalized_tickers:
+            return {}
+
+        start = self._parse_iso_date(start_date) or (date.today() - timedelta(days=10))
+        end = self._parse_iso_date(end_date) or date.today()
+        if end < start:
+            start, end = end, start
+
+        rows_by_ticker: dict[str, list[dict]] = {ticker: [] for ticker in normalized_tickers}
+        current = start
+        page_size = 2000
+        while current <= end:
+            trade_date = current.strftime("%Y%m%d")
+            offset = 0
+            while True:
+                try:
+                    daily_df = pro.daily(
+                        trade_date=trade_date,
+                        fields="ts_code,trade_date,open,high,low,close,vol,amount",
+                        offset=offset,
+                        limit=page_size,
+                    )
+                except Exception:
+                    daily_df = None
+                if daily_df is None or daily_df.empty:
+                    break
+
+                for _, row in daily_df.iterrows():
+                    row_dict = row.to_dict()
+                    app_ticker = self._to_app_ticker(str(row_dict.get("ts_code") or ""))
+                    if app_ticker not in normalized_tickers:
+                        continue
+                    volume = self._to_float(row_dict.get("vol"))
+                    if volume is not None:
+                        volume *= 100.0
+                    rows_by_ticker.setdefault(app_ticker, []).append(
+                        {
+                            "date": self._normalize_date(row_dict.get("trade_date")),
+                            "symbol": app_ticker,
+                            "open": self._to_float(row_dict.get("open")),
+                            "high": self._to_float(row_dict.get("high")),
+                            "low": self._to_float(row_dict.get("low")),
+                            "close": self._to_float(row_dict.get("close")),
+                            "volume": volume,
+                            "adj_close": self._to_float(row_dict.get("close")),
+                            "dividend": None,
+                            "split_ratio": None,
+                        }
+                    )
+
+                if len(daily_df) < page_size:
+                    break
+                offset += page_size
+            current += timedelta(days=1)
+
+        for ticker, rows in rows_by_ticker.items():
+            rows.sort(key=lambda item: item["date"] or "")
+            rows_by_ticker[ticker] = rows
+        return rows_by_ticker
+
     def fetch_cn_concepts(self, tickers: list[str] | None = None) -> list[CNConceptRow]:
         if not self.token:
             return []
@@ -283,6 +367,15 @@ class TushareClient:
         if len(raw) == 8 and raw.isdigit():
             return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
         return raw
+
+    def _parse_iso_date(self, value: str | None) -> date | None:
+        normalized = self._normalize_date(value)
+        if not normalized:
+            return None
+        try:
+            return date.fromisoformat(normalized)
+        except ValueError:
+            return None
 
     def _latest_row_by_date(self, dataframe, date_column: str) -> dict | None:
         if dataframe is None or dataframe.empty or date_column not in dataframe.columns:

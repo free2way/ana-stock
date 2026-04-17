@@ -6093,19 +6093,14 @@ class AppFlowTests(unittest.TestCase):
         self.assertTrue(status_response.json()["enabled"])
 
         with SessionLocal() as db:
-            latest_job = DataJobRepository(db).list_recent_jobs(limit=1)[0]
-        self.assertEqual("cn_close_review", latest_job["job_type"])
-        self.assertEqual("success", latest_job["status"])
+            recent_jobs = DataJobRepository(db).list_recent_jobs(limit=10)
+        close_review_job = next(item for item in recent_jobs if item["job_type"] == "cn_close_review")
+        self.assertEqual("success", close_review_job["status"])
 
     def test_close_review_refresh_falls_back_when_primary_result_fails(self) -> None:
-        responses = [
-            {"status": "failed", "success_count": 0, "failure_count": 20, "message": "primary failed"},
-            {"status": "success", "success_count": 12, "failure_count": 0, "message": "fallback ok"},
-        ]
-
         with patch(
-            "app.services.close_review_scheduler.refresh_cn_market_data_daily",
-            side_effect=responses,
+            "app.services.close_review_scheduler.refresh_cn_market_data_lake_only",
+            return_value={"status": "success", "success_count": 12, "failure_count": 0, "message": "lake ok"},
         ) as mocked_refresh, patch(
             "app.services.close_review_scheduler.rebuild_technical_snapshots",
             return_value={"status": "success", "snapshots_rebuilt": 34, "message": "ok"},
@@ -6118,13 +6113,13 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         payload = response.json()
         self.assertEqual("success", payload["status"])
-        self.assertEqual("yfinance", payload["refresh_result"]["provider_used"])
-        self.assertEqual(["tushare", "yfinance"], payload["refresh_result"]["providers_attempted"])
-        self.assertEqual(2, mocked_refresh.call_count)
+        self.assertEqual("tushare_lake", payload["refresh_result"]["provider_used"])
+        self.assertEqual(["tushare_lake"], payload["refresh_result"]["providers_attempted"])
+        self.assertEqual(1, mocked_refresh.call_count)
 
     def test_close_review_runs_auto_analysis_for_cn_only(self) -> None:
         with patch(
-            "app.services.close_review_scheduler.refresh_cn_market_data_daily",
+            "app.services.close_review_scheduler.refresh_cn_market_data_lake_only",
             return_value={"status": "success", "success_count": 12, "message": "ok"},
         ), patch(
             "app.services.close_review_scheduler.rebuild_technical_snapshots",

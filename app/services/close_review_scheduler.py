@@ -5,20 +5,36 @@ from zoneinfo import ZoneInfo
 
 from app.core.db import SessionLocal
 from app.services.auto_analysis import auto_analysis_service
-from app.services.cn_market_universe import refresh_cn_market_data_daily
-from app.services.repository import AppSettingRepository, DataJobRepository
+from app.services.cn_market_universe import refresh_cn_market_data_daily, refresh_cn_market_data_lake_only
+from app.services.nlp_snapshots import NEWS_ENRICHMENT_JOB_TYPE, refresh_nlp_snapshots
+from app.services.repository import AppSettingRepository, DataJobRepository, WatchlistRepository
+from app.services.screener_snapshots import refresh_precomputed_screener_snapshots
 from app.services.technical_snapshot_cache import rebuild_technical_snapshots
+from app.services.workspace_snapshots import (
+    SNAPSHOT_MARKET_HEATMAP_WORKSPACE,
+    SNAPSHOT_MARKET_WORKSPACE,
+    SNAPSHOT_MARKET_WORKSPACE_MONITOR,
+    SNAPSHOT_MARKET_WORKSPACE_POSTMARKET,
+    SNAPSHOT_MARKET_WORKSPACE_PREMARKET,
+    build_market_heatmap_snapshot,
+    build_market_mode_snapshot,
+    build_market_workspace_snapshot,
+    refresh_workspace_snapshots,
+)
+from app.services.time_utils import app_today_iso
 
 
 CLOSE_REVIEW_CONFIG_KEY = "close_review_scheduler_config"
 CLOSE_REVIEW_JOB_TYPE = "cn_close_review"
+SCREENER_PRECOMPUTE_JOB_TYPE = "screener_precompute"
+MARKET_SNAPSHOT_JOB_TYPE = "market_snapshot_refresh"
 SH_TZ = ZoneInfo("Asia/Shanghai")
 
 DEFAULT_CLOSE_REVIEW_CONFIG = {
     "enabled": False,
-    "run_hour": 16,
+    "run_hour": 18,
     "run_minute": 0,
-    "provider": "tushare",
+    "provider": "auto",
     "days_back": 7,
     "overlap_days": 3,
     "refresh_limit": 500,
@@ -84,20 +100,13 @@ class CloseReviewSchedulerService:
         config["max_attempts_per_day"] = max(1, _safe_int(config.get("max_attempts_per_day"), 4))
         config["last_attempt_count"] = max(0, _safe_int(config.get("last_attempt_count"), 0))
         config["last_scheduler_attempt_count"] = max(0, _safe_int(config.get("last_scheduler_attempt_count"), 0))
-        config["provider"] = str(config.get("provider") or "tushare").strip() or "tushare"
+        config["provider"] = str(config.get("provider") or "auto").strip() or "auto"
         return config
 
     def save_config(self, updates: dict) -> dict:
         with SessionLocal() as db:
             config = self.get_config(db=db)
             config.update({key: value for key, value in updates.items() if value is not None})
-            enabled = bool(config.get("enabled"))
-            now = sh_now()
-            if enabled and (now.hour, now.minute) >= (_safe_int(config.get("run_hour"), 16), _safe_int(config.get("run_minute"), 0)):
-                today = now.date().isoformat()
-                config["last_scheduler_attempt_date"] = today
-                config["last_scheduler_attempt_at"] = now.isoformat()
-                config["last_scheduler_attempt_count"] = config.get("max_attempts_per_day", 4)
             AppSettingRepository(db).set(CLOSE_REVIEW_CONFIG_KEY, json.dumps(config))
             return self.get_status(db=db)
 
@@ -169,13 +178,17 @@ class CloseReviewSchedulerService:
         config, job_id, cleaned_jobs = self._prepare_close_review_run(trigger)
         try:
             refresh_limit = None if config["refresh_limit"] == 0 else config["refresh_limit"]
-            refresh_result = self._run_refresh_with_fallbacks(
+            refresh_result = self._run_lake_refresh_with_fallback(
                 provider=config["provider"],
                 days_back=config["days_back"],
                 limit=refresh_limit,
                 overlap_days=config["overlap_days"],
+                rebuild_snapshots=False,
             )
-            rebuild_result = rebuild_technical_snapshots(market="CN", limit=None)
+            rebuild_result = rebuild_technical_snapshots(
+                market="CN",
+                tickers=self._load_cn_watchlist_tickers(),
+            )
             rebuilt_count = rebuild_result.get("snapshots_rebuilt")
             if rebuilt_count is None:
                 rebuilt_count = rebuild_result.get("rows_written", 0)
@@ -188,13 +201,37 @@ class CloseReviewSchedulerService:
                     job_id,
                     status="success",
                     message=(
-                        f"Close review finished: refreshed {refresh_result['success_count']} symbol(s), "
-                        f"rebuilt {rebuilt_count} snapshot(s), "
-                        f"analyzed {len(analysis_result.get('tickers', []))} watchlist stock(s)"
+                        f"Close review finished: CN lake refresh {refresh_result['success_count']} row(s), "
+                        f"watchlist snapshot rebuild {rebuilt_count} symbol(s), "
+                        f"watchlist deep analysis {len(analysis_result.get('tickers', []))} stock(s)"
                         + (f", cleaned {cleaned_jobs} stale job(s)" if cleaned_jobs else "")
                     ),
                 )
                 self._persist_last_run(db)
+            threading.Thread(
+                target=self._refresh_workspace_snapshots_safe,
+                args=(job_id,),
+                name=f"close-review-workspace-snapshot-{job_id}",
+                daemon=True,
+            ).start()
+            threading.Thread(
+                target=self._run_screener_precompute_job_safe,
+                args=(job_id,),
+                name=f"close-review-screener-precompute-{job_id}",
+                daemon=True,
+            ).start()
+            threading.Thread(
+                target=self._run_news_enrichment_job_safe,
+                args=(job_id,),
+                name=f"close-review-news-enrichment-{job_id}",
+                daemon=True,
+            ).start()
+            threading.Thread(
+                target=self._run_market_snapshot_job_safe,
+                args=(job_id,),
+                name=f"close-review-market-snapshot-{job_id}",
+                daemon=True,
+            ).start()
             return {
                 "status": "success",
                 "job_id": job_id,
@@ -209,6 +246,34 @@ class CloseReviewSchedulerService:
                 DataJobRepository(db).complete_job(job_id, status="failed", message=str(exc))
             raise
 
+    def _run_lake_refresh_with_fallback(
+        self,
+        *,
+        provider: str,
+        days_back: int,
+        limit: int | None,
+        overlap_days: int,
+        rebuild_snapshots: bool,
+    ) -> dict:
+        end_date = sh_now().date()
+        start_date = end_date - timedelta(days=max(0, days_back - 1))
+        if str(provider or "auto").strip().lower() in {"auto", "tushare"}:
+            result = refresh_cn_market_data_lake_only(
+                start_date=start_date.isoformat(),
+                end_date=end_date.isoformat(),
+                limit=limit,
+            )
+            result["provider_used"] = "tushare_lake"
+            result["providers_attempted"] = ["tushare_lake"]
+            return result
+        return self._run_refresh_with_fallbacks(
+            provider=provider,
+            days_back=days_back,
+            limit=limit,
+            overlap_days=overlap_days,
+            rebuild_snapshots=rebuild_snapshots,
+        )
+
     def _run_refresh_with_fallbacks(
         self,
         *,
@@ -216,6 +281,7 @@ class CloseReviewSchedulerService:
         days_back: int,
         limit: int | None,
         overlap_days: int,
+        rebuild_snapshots: bool,
     ) -> dict:
         attempted: list[str] = []
         last_result: dict | None = None
@@ -227,6 +293,7 @@ class CloseReviewSchedulerService:
                     limit=limit,
                     provider=candidate,
                     overlap_days=overlap_days,
+                    rebuild_snapshots=rebuild_snapshots,
                 )
             except Exception as exc:
                 if self._should_fallback_from_exception(candidate, exc):
@@ -249,17 +316,203 @@ class CloseReviewSchedulerService:
 
     def _refresh_provider_candidates(self, provider: str) -> list[str]:
         normalized = str(provider or "tushare").strip().lower() or "tushare"
+        if normalized == "auto":
+            normalized = "tushare"
         ordered = [normalized]
         for candidate in ("tushare", "yfinance"):
             if candidate not in ordered:
                 ordered.append(candidate)
         return ordered
 
+    def _load_cn_watchlist_tickers(self) -> list[str]:
+        with SessionLocal() as db:
+            watchlist_repo = WatchlistRepository(db)
+            watchlist = watchlist_repo.get_or_create_default()
+            return [
+                item["ticker"]
+                for item in watchlist_repo.list_items(watchlist.id)
+                if item.get("sync_enabled") and str(item.get("market") or "").upper() == "CN"
+            ]
+
     def _should_fallback_from_exception(self, provider: str, exc: Exception) -> bool:
         message = str(exc).lower()
         if provider == "yfinance" and ("guce.yahoo.com" in message or "nodename nor servname" in message):
             return True
         return False
+
+    def _run_screener_precompute_job_safe(self, source_job_id: int) -> None:
+        precompute_job_id: int | None = None
+        try:
+            with SessionLocal() as db:
+                job_repo = DataJobRepository(db)
+                if job_repo.has_running_job(SCREENER_PRECOMPUTE_JOB_TYPE):
+                    return
+                job = DataJobRepository(db).create_job(
+                    job_type=SCREENER_PRECOMPUTE_JOB_TYPE,
+                    status="running",
+                    params={"source_job_id": source_job_id},
+                    message="Precomputing screener model results after close review.",
+                )
+                precompute_job_id = job.id
+            with SessionLocal() as db:
+                result = refresh_precomputed_screener_snapshots(
+                    db,
+                    source_job_id=source_job_id,
+                    lake_only=True,
+                )
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(
+                    precompute_job_id,
+                    status="success" if result.get("count", 0) > 0 else "failed",
+                    message=(
+                        f"Precomputed {result.get('count', 0)} screener model snapshot(s) "
+                        f"after close review job {source_job_id}"
+                        + (
+                            f"; {result.get('failed_count', 0)} template(s) failed."
+                            if result.get("failed_count", 0)
+                            else "."
+                        )
+                    ),
+                    result=result,
+                )
+        except Exception:
+            try:
+                if precompute_job_id is not None:
+                    with SessionLocal() as db:
+                        DataJobRepository(db).complete_job(
+                            precompute_job_id,
+                            status="failed",
+                            message="Screener precompute failed.",
+                        )
+            except Exception:
+                pass
+            return
+
+    def _run_news_enrichment_job_safe(self, source_job_id: int) -> None:
+        enrichment_job_id: int | None = None
+        try:
+            with SessionLocal() as db:
+                job_repo = DataJobRepository(db)
+                if job_repo.has_running_job(NEWS_ENRICHMENT_JOB_TYPE):
+                    return
+                job = job_repo.create_job(
+                    job_type=NEWS_ENRICHMENT_JOB_TYPE,
+                    status="running",
+                    params={"source_job_id": source_job_id},
+                    message="Refreshing watchlist and portfolio news snapshots after close review.",
+                )
+                enrichment_job_id = job.id
+            with SessionLocal() as db:
+                result = refresh_nlp_snapshots(db, source_job_id=source_job_id)
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(
+                    enrichment_job_id,
+                    status="success" if result else "failed",
+                    message=(
+                        f"Refreshed {len(result)} NLP snapshot(s) after close review job {source_job_id}."
+                        if result
+                        else "No NLP snapshots were refreshed."
+                    ),
+                    result=result,
+                )
+        except Exception:
+            try:
+                if enrichment_job_id is not None:
+                    with SessionLocal() as db:
+                        DataJobRepository(db).complete_job(
+                            enrichment_job_id,
+                            status="failed",
+                            message="News enrichment failed.",
+                        )
+            except Exception:
+                pass
+            return
+
+    def _run_market_snapshot_job_safe(self, source_job_id: int) -> None:
+        market_job_id: int | None = None
+        try:
+            with SessionLocal() as db:
+                job_repo = DataJobRepository(db)
+                if job_repo.has_running_job(MARKET_SNAPSHOT_JOB_TYPE):
+                    return
+                job = job_repo.create_job(
+                    job_type=MARKET_SNAPSHOT_JOB_TYPE,
+                    status="running",
+                    params={"source_job_id": source_job_id},
+                    message="Refreshing market snapshot boards after close review.",
+                )
+                market_job_id = job.id
+            preview_payload = build_market_workspace_snapshot(None)
+            premarket_payload = build_market_mode_snapshot("premarket")
+            monitor_payload = build_market_mode_snapshot("monitor")
+            postmarket_payload = build_market_mode_snapshot("postmarket")
+            heatmap_payload = build_market_heatmap_snapshot(None)
+            with SessionLocal() as db:
+                from app.services.repository import WorkspaceSnapshotRepository
+
+                repo = WorkspaceSnapshotRepository(db)
+                rows = {
+                    SNAPSHOT_MARKET_WORKSPACE: repo.create_snapshot(
+                        snapshot_type=SNAPSHOT_MARKET_WORKSPACE,
+                        snapshot_date=app_today_iso(),
+                        payload=preview_payload,
+                        source_job_id=source_job_id,
+                    ),
+                    SNAPSHOT_MARKET_WORKSPACE_PREMARKET: repo.create_snapshot(
+                        snapshot_type=SNAPSHOT_MARKET_WORKSPACE_PREMARKET,
+                        snapshot_date=app_today_iso(),
+                        payload=premarket_payload,
+                        source_job_id=source_job_id,
+                    ),
+                    SNAPSHOT_MARKET_WORKSPACE_MONITOR: repo.create_snapshot(
+                        snapshot_type=SNAPSHOT_MARKET_WORKSPACE_MONITOR,
+                        snapshot_date=app_today_iso(),
+                        payload=monitor_payload,
+                        source_job_id=source_job_id,
+                    ),
+                    SNAPSHOT_MARKET_WORKSPACE_POSTMARKET: repo.create_snapshot(
+                        snapshot_type=SNAPSHOT_MARKET_WORKSPACE_POSTMARKET,
+                        snapshot_date=app_today_iso(),
+                        payload=postmarket_payload,
+                        source_job_id=source_job_id,
+                    ),
+                    SNAPSHOT_MARKET_HEATMAP_WORKSPACE: repo.create_snapshot(
+                        snapshot_type=SNAPSHOT_MARKET_HEATMAP_WORKSPACE,
+                        snapshot_date=app_today_iso(),
+                        payload=heatmap_payload,
+                        source_job_id=source_job_id,
+                    ),
+                }
+                DataJobRepository(db).complete_job(
+                    market_job_id,
+                    status="success",
+                    message=(
+                        f"Refreshed market snapshot workspace after close review job {source_job_id}."
+                    ),
+                    result={
+                        "snapshot_ids": {key: row.id for key, row in rows.items()},
+                        "modes": ["premarket", "monitor", "postmarket"],
+                    },
+                )
+        except Exception:
+            try:
+                if market_job_id is not None:
+                    with SessionLocal() as db:
+                        DataJobRepository(db).complete_job(
+                            market_job_id,
+                            status="failed",
+                            message="Market snapshot refresh failed.",
+                        )
+            except Exception:
+                pass
+            return
+
+    def _refresh_workspace_snapshots_safe(self, job_id: int) -> None:
+        try:
+            with SessionLocal() as db:
+                refresh_workspace_snapshots(db, source_job_id=job_id)
+        except Exception:
+            return
 
     def _persist_last_run(self, db) -> None:
         config = self.get_config(db=db)

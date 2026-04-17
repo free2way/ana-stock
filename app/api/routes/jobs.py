@@ -9,11 +9,18 @@ from app.core.db import get_db_session
 from app.services.auto_analysis import auto_analysis_service
 from app.services.auth import is_authenticated, login_redirect
 from app.services.backtester import BacktestRunner
-from app.services.ai_daily_report import build_ai_daily_report, load_ai_daily_report, render_ai_daily_report_message, save_ai_daily_report
+from app.services.ai_daily_report import (
+    build_ai_daily_report,
+    load_ai_daily_report,
+    render_ai_daily_report_message,
+    render_ai_daily_report_push_messages,
+    save_ai_daily_report,
+)
 from app.services.cn_market_universe import (
     init_cn_market_data,
     refresh_cn_market_data,
     refresh_cn_market_data_daily,
+    refresh_cn_market_data_lake_only,
     sync_cn_symbol_universe,
 )
 from app.services.close_review_scheduler import close_review_scheduler_service
@@ -23,15 +30,41 @@ from app.services.dataset_build import build_dataset
 from app.services.global_fundamentals import sync_global_fundamentals
 from app.services.job_response import build_job_payload, complete_job_and_build_payload, fail_job_and_build_payload
 from app.services.market_sync import sync_market_data
+from app.services.market_lake import query_us_daily_summary
+from app.services.market_csv_cleanup import cleanup_market_csv_files
 from app.services.model_output_importer import ExternalModelOutputImporter
 from app.services.push_notifications import PushNotificationService
 from app.services.repository import DataJobRepository, PriceSyncStateRepository
 from app.services.sample_data import seed_sample_data
+from app.services.screener_snapshots import refresh_precomputed_screener_snapshots
 from app.services.technical_snapshot_cache import rebuild_technical_snapshots
 from app.services.trainer import SignalTrainer
+from app.services.us_market_universe import refresh_us_grouped_daily
+from app.services.us_market_universe import refresh_us_grouped_daily_range
 
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+
+PROVIDER_OPTIONS = {
+    "price": [
+        {"value": "auto", "label": "Auto", "description": "CN uses TuShare; US uses Alpaca with yfinance fallback; HK uses yfinance."},
+        {"value": "alpaca", "label": "Alpaca", "description": "Preferred for U.S. daily bars when Alpaca credentials are configured."},
+        {"value": "polygon_grouped_daily", "label": "Polygon Grouped Daily", "description": "Batch U.S. EOD refresh for the full market through Polygon grouped daily."},
+        {"value": "tushare", "label": "TuShare", "description": "Preferred for A-share historical sync and close-review flows."},
+        {"value": "yfinance", "label": "yfinance", "description": "Default for global price sync outside A-shares."},
+        {"value": "openbb", "label": "OpenBB", "description": "OpenBB wrapper with fallback behavior when available."},
+    ],
+    "fundamental": [
+        {"value": "auto", "label": "Auto", "description": "CN uses TuShare; US/HK uses OpenBB/yfinance fundamentals."},
+        {"value": "tushare", "label": "TuShare", "description": "Preferred for A-share fundamental snapshots."},
+        {"value": "openbb", "label": "OpenBB", "description": "Preferred for US/HK fundamental snapshots."},
+    ],
+    "concept": [
+        {"value": "auto", "label": "Auto", "description": "CN concept mapping uses TuShare concept data."},
+        {"value": "tushare", "label": "TuShare", "description": "Primary source for A-share concept memberships."},
+    ],
+}
 
 
 def _maybe_redirect(redirect_to: str | None, payload: dict):
@@ -76,6 +109,13 @@ def _as_int(value, default: int) -> int:
         return default
 
 
+def _as_float(value, default: float) -> float:
+    try:
+        return float(value if value not in (None, "") else default)
+    except (TypeError, ValueError):
+        return default
+
+
 def _as_optional_int(value):
     try:
         return int(value) if value not in (None, "", "0") else None
@@ -106,21 +146,35 @@ def job_templates(request: Request):
     if not is_authenticated(request):
         return login_redirect("/dashboard")
     return [
-        {"job_type": "sync_market_data", "description": "Fetch and persist market data with OpenBB."},
+        {"job_type": "sync_market_data", "description": "Fetch and persist market data through the unified price provider layer."},
         {"job_type": "sync_cn_symbol_universe", "description": "Sync the A-share stock universe into local symbols."},
         {"job_type": "init_cn_market_data", "description": "Initialize A-share market price history for full-market scans."},
         {"job_type": "refresh_cn_market_data", "description": "Refresh recent A-share market prices for daily full-market scans."},
         {"job_type": "refresh_cn_market_data_daily", "description": "Incrementally refresh A-share market prices from each symbol's last synced date."},
+        {"job_type": "refresh_cn_market_data_lake_only", "description": "Refresh A-share market prices directly into Parquet lake without generating CSV files."},
         {"job_type": "cn_close_review", "description": "Run the post-close CN incremental refresh, rebuild, AI review, and recommendations pipeline."},
+        {"job_type": "social_signal_poll", "description": "Poll tracked X accounts every 30 minutes and parse ticker mentions automatically."},
+        {"job_type": "social_us_price_sync", "description": "Automatically sync Alpaca-backed U.S. prices for tickers mentioned in imported X posts."},
+        {"job_type": "precompute_us_screeners", "description": "Precompute U.S. screener snapshots after U.S. close using the locally synced U.S. symbol pool."},
+        {"job_type": "refresh_us_grouped_daily", "description": "Refresh U.S. grouped daily EOD bars from Polygon for full-market U.S. scans."},
+        {"job_type": "refresh_us_grouped_daily_range", "description": "Refresh a U.S. grouped daily date range directly into Parquet lake without per-symbol CSV files."},
+        {"job_type": "cleanup_market_csv", "description": "Dry-run or delete market CSV files that are already covered by Parquet market lake."},
         {"job_type": "rebuild_technical_snapshots", "description": "Cache technical pattern snapshots for faster full-market scans."},
-        {"job_type": "sync_cn_fundamentals", "description": "Fetch and persist A-share fundamentals with TuShare Pro."},
-        {"job_type": "sync_cn_concepts", "description": "Fetch and persist A-share concept memberships with TuShare Pro."},
-        {"job_type": "sync_global_fundamentals", "description": "Fetch and persist US/HK fundamentals with yfinance."},
+        {"job_type": "sync_cn_fundamentals", "description": "Fetch and persist A-share fundamentals through the unified fundamental provider layer."},
+        {"job_type": "sync_cn_concepts", "description": "Fetch and persist A-share concept memberships through the unified concept provider layer."},
+        {"job_type": "sync_global_fundamentals", "description": "Fetch and persist US/HK fundamentals through the unified fundamental provider layer."},
         {"job_type": "build_dataset", "description": "Normalize price files and build a Qlib dataset."},
         {"job_type": "train_model", "description": "Train a signal model with Qlib."},
         {"job_type": "import_model_output", "description": "Import external model predictions into predictions and model details."},
         {"job_type": "run_backtest", "description": "Run a backtest from stored predictions."},
     ]
+
+
+@router.get("/provider-options")
+def provider_options(request: Request):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    return PROVIDER_OPTIONS
 
 
 @router.get("/sync-states")
@@ -173,13 +227,27 @@ async def send_ai_daily_report(request: Request, db: Session = Depends(get_db_se
             report = build_ai_daily_report(limit=8)
             save_ai_daily_report(report)
         notifier = PushNotificationService()
-        result = notifier.send_text(
-            title="A股 AI 每日决策面板",
-            body=render_ai_daily_report_message(report),
-            channels=selected_channels or None,
-        )
+        push_messages = render_ai_daily_report_push_messages(report)
+        sent: list[str] = []
+        failed: list[dict] = []
+        results: list[dict] = []
+        for message_item in push_messages:
+            result = notifier.send_text(
+                title=message_item["title"],
+                body=message_item["body"],
+                channels=selected_channels or None,
+            )
+            results.append({"title": message_item["title"], **result})
+            sent.extend(item for item in (result.get("sent") or []) if item not in sent)
+            failed.extend(result.get("failed") or [])
+        result = {
+            "status": "success" if sent and not failed else "partial" if sent else "failed",
+            "sent": sent,
+            "failed": failed,
+            "messages": results,
+        }
         message = (
-            f"Sent A-share AI daily report to {', '.join(result['sent'])}"
+            f"Sent A-share AI daily report as {len(push_messages)} message(s) to {', '.join(result['sent'])}"
             if result.get("sent")
             else "No AI daily report channels were available."
         )
@@ -224,7 +292,7 @@ async def run_sync_market_data(request: Request, db: Session = Depends(get_db_se
         return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
     tickers_raw = await _request_value(request, "tickers", "")
-    provider = str(await _request_value(request, "provider", "yfinance")).strip() or "yfinance"
+    provider = str(await _request_value(request, "provider", "auto")).strip() or "auto"
     start_date = await _request_value(request, "start_date")
     end_date = await _request_value(request, "end_date")
     tickers = [item.strip().upper() for item in str(tickers_raw).split(",") if item.strip()] or None
@@ -264,6 +332,194 @@ async def run_sync_market_data(request: Request, db: Session = Depends(get_db_se
         return _maybe_redirect(redirect_to, payload)
 
 
+@router.post("/precompute-us-screeners")
+async def run_precompute_us_screeners(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    include_watchlist = _as_bool(await _request_value(request, "include_watchlist", False), default=False)
+    lake_only = _as_bool(await _request_value(request, "lake_only", True), default=True)
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type="precompute_us_screeners",
+        status="running",
+        params={"markets": ["US"], "include_watchlist": include_watchlist, "lake_only": lake_only},
+    )
+    try:
+        result = refresh_precomputed_screener_snapshots(
+            db,
+            source_job_id=job.id,
+            markets=["US"],
+            include_watchlist=include_watchlist,
+            lake_only=lake_only,
+        )
+        status = _result_status(result)
+        extra = {key: value for key, value in result.items() if key not in {"status", "message"}}
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status=status,
+            message=f"Precomputed {result.get('count', 0)} U.S. screener snapshot(s).",
+            **extra,
+        )
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
+        return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/refresh-us-grouped-daily")
+async def run_refresh_us_grouped_daily(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    trade_date = str(await _request_value(request, "trade_date", "") or "").strip() or None
+    adjusted = _as_bool(await _request_value(request, "adjusted", True), default=True)
+    normalize = _as_bool(await _request_value(request, "normalize", False), default=False)
+    persist_per_symbol = _as_bool(await _request_value(request, "persist_per_symbol", False), default=False)
+    write_lake = _as_bool(await _request_value(request, "write_lake", True), default=True)
+    write_snapshot = _as_bool(await _request_value(request, "write_snapshot", False), default=False)
+    limit = _as_optional_int(await _request_value(request, "limit", None))
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type="refresh_us_grouped_daily",
+        status="running",
+        params={
+            "trade_date": trade_date,
+            "adjusted": adjusted,
+            "limit": limit,
+            "normalize": normalize,
+            "persist_per_symbol": persist_per_symbol,
+            "write_lake": write_lake,
+            "write_snapshot": write_snapshot,
+        },
+    )
+    try:
+        result = refresh_us_grouped_daily(
+            trade_date=trade_date,
+            adjusted=adjusted,
+            limit=limit,
+            normalize=normalize,
+            persist_per_symbol=persist_per_symbol,
+            write_lake=write_lake,
+            write_snapshot=write_snapshot,
+        )
+        status = _result_status(result)
+        extra = {key: value for key, value in result.items() if key not in {"status", "message"}}
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status=status,
+            message=result.get("message") or "U.S. grouped daily refresh finished.",
+            **extra,
+        )
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
+        return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/refresh-us-grouped-daily-range")
+async def run_refresh_us_grouped_daily_range(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    start_date = str(await _request_value(request, "start_date", "") or "").strip()
+    end_date = str(await _request_value(request, "end_date", "") or "").strip()
+    limit = _as_optional_int(await _request_value(request, "limit", None))
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type="refresh_us_grouped_daily_range",
+        status="running",
+        params={"start_date": start_date, "end_date": end_date, "limit": limit},
+    )
+    try:
+        result = refresh_us_grouped_daily_range(start_date=start_date, end_date=end_date, limit=limit)
+        status = _result_status(result)
+        extra = {key: value for key, value in result.items() if key not in {"status", "message"}}
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status=status,
+            message=result.get("message") or "U.S. grouped daily range refresh finished.",
+            **extra,
+        )
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
+        return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/refresh-cn-market-data-lake-only")
+async def run_refresh_cn_market_data_lake_only(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    start_date = str(await _request_value(request, "start_date", "") or "").strip()
+    end_date = str(await _request_value(request, "end_date", "") or "").strip() or None
+    limit = _as_optional_int(await _request_value(request, "limit", None))
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type="refresh_cn_market_data_lake_only",
+        status="running",
+        params={"start_date": start_date, "end_date": end_date, "limit": limit},
+    )
+    try:
+        result = refresh_cn_market_data_lake_only(start_date=start_date, end_date=end_date, limit=limit)
+        status = _result_status(result)
+        extra = {key: value for key, value in result.items() if key not in {"status", "message"}}
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status=status,
+            message=result.get("message") or "CN lake-only refresh finished.",
+            **extra,
+        )
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
+        return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/cleanup-market-csv")
+async def run_cleanup_market_csv(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    dry_run = _as_bool(await _request_value(request, "dry_run", True), default=True)
+    confirm = str(await _request_value(request, "confirm", "") or "").strip() or None
+    markets_raw = str(await _request_value(request, "markets", "CN,US") or "CN,US")
+    markets = [item.strip().upper() for item in markets_raw.split(",") if item.strip()]
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type="cleanup_market_csv",
+        status="running",
+        params={"dry_run": dry_run, "markets": markets, "confirm": bool(confirm)},
+    )
+    try:
+        result = cleanup_market_csv_files(dry_run=dry_run, confirm=confirm, markets=markets)
+        status = _result_status(result)
+        extra = {key: value for key, value in result.items() if key not in {"status", "message"}}
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status=status,
+            message=result.get("message") or "CSV cleanup finished.",
+            **extra,
+        )
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
+        return _maybe_redirect(redirect_to, payload)
+
+
+@router.get("/market-lake/us-daily-summary")
+def market_lake_us_daily_summary(request: Request, trade_date: str | None = None, limit: int = 10):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    return query_us_daily_summary(trade_date=trade_date, limit=limit)
+
+
 @router.post("/sync-cn-symbol-universe")
 async def run_sync_cn_symbol_universe(request: Request, db: Session = Depends(get_db_session)):
     if not is_authenticated(request):
@@ -295,7 +551,7 @@ async def run_init_cn_market_data(request: Request, db: Session = Depends(get_db
     if not is_authenticated(request):
         return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
-    provider = str(await _request_value(request, "provider", "yfinance")).strip() or "yfinance"
+    provider = str(await _request_value(request, "provider", "auto")).strip() or "auto"
     days_back_raw = await _request_value(request, "days_back", 180)
     offset_raw = await _request_value(request, "offset", 0)
     batch_size_raw = await _request_value(request, "batch_size", None)
@@ -352,7 +608,7 @@ async def run_refresh_cn_market_data(request: Request, db: Session = Depends(get
     if not is_authenticated(request):
         return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
-    provider = str(await _request_value(request, "provider", "yfinance")).strip() or "yfinance"
+    provider = str(await _request_value(request, "provider", "auto")).strip() or "auto"
     days_back_raw = await _request_value(request, "days_back", 7)
     limit_raw = await _request_value(request, "limit", None)
     incremental_raw = await _request_value(request, "incremental", None)
@@ -401,7 +657,7 @@ async def run_refresh_cn_market_data_daily(request: Request, db: Session = Depen
     if not is_authenticated(request):
         return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
-    provider = str(await _request_value(request, "provider", "yfinance")).strip() or "yfinance"
+    provider = str(await _request_value(request, "provider", "auto")).strip() or "auto"
     days_back_raw = await _request_value(request, "days_back", 7)
     limit_raw = await _request_value(request, "limit", None)
     overlap_days_raw = await _request_value(request, "overlap_days", 3)
@@ -648,6 +904,17 @@ async def run_backtest(request: Request, db: Session = Depends(get_db_session)):
         return login_redirect("/dashboard")
     top_n_raw = await _request_value(request, "top_n", 1)
     top_n = _as_int(top_n_raw, 1)
+    holding_days = _as_int(await _request_value(request, "holding_days", 3), 3)
+    commission_bps = _as_float(await _request_value(request, "commission_bps", 8.0), 8.0)
+    slippage_bps = _as_float(await _request_value(request, "slippage_bps", 12.0), 12.0)
+    max_position_weight = _as_float(await _request_value(request, "max_position_weight", 0.2), 0.2)
+    min_signal_score = _as_float(await _request_value(request, "min_signal_score", 0.05), 0.05)
+    max_sector_weight = _as_float(await _request_value(request, "max_sector_weight", 0.35), 0.35)
+    min_adv = _as_float(await _request_value(request, "min_adv", 50000000.0), 50000000.0)
+    max_gap_pct = _as_float(await _request_value(request, "max_gap_pct", 0.08), 0.08)
+    rebalance_threshold = _as_float(await _request_value(request, "rebalance_threshold", 0.02), 0.02)
+    benchmark_symbol_raw = await _request_value(request, "benchmark_symbol")
+    benchmark_symbol = str(benchmark_symbol_raw).strip().upper() if benchmark_symbol_raw not in (None, "") else None
     model_run_raw = await _request_value(request, "model_run_id")
     model_run_id = _as_optional_int_except(model_run_raw, {"latest"})
     redirect_to = await _request_value(request, "redirect_to")
@@ -655,13 +922,40 @@ async def run_backtest(request: Request, db: Session = Depends(get_db_session)):
     job = job_repo.create_job(
         job_type="backtest",
         status="running",
-        params={"top_n": top_n, "model_run_id": model_run_id},
+        params={
+            "top_n": top_n,
+            "model_run_id": model_run_id,
+            "holding_days": holding_days,
+            "commission_bps": commission_bps,
+            "slippage_bps": slippage_bps,
+            "max_position_weight": max_position_weight,
+            "min_signal_score": min_signal_score,
+            "benchmark_symbol": benchmark_symbol,
+            "max_sector_weight": max_sector_weight,
+            "min_adv": min_adv,
+            "max_gap_pct": max_gap_pct,
+            "rebalance_threshold": rebalance_threshold,
+        },
     )
     runner = BacktestRunner()
     try:
-        count = runner.run(top_n=top_n, model_run_id=model_run_id)
+        count = runner.run(
+            top_n=top_n,
+            model_run_id=model_run_id,
+            holding_days=holding_days,
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
+            max_position_weight=max_position_weight,
+            min_signal_score=min_signal_score,
+            benchmark_symbol=benchmark_symbol,
+            max_sector_weight=max_sector_weight,
+            min_adv=min_adv,
+            max_gap_pct=max_gap_pct,
+            rebalance_threshold=rebalance_threshold,
+        )
         run_label = f"model_run_id={model_run_id}" if model_run_id is not None else "latest_model"
-        message = f"Wrote {count} backtest rows ({run_label}, top_n={top_n})"
+        benchmark_label = benchmark_symbol or "universe_equal_weight"
+        message = f"Wrote {count} backtest rows ({run_label}, top_n={top_n}, benchmark={benchmark_label})"
         payload = complete_job_and_build_payload(
             job_repo,
             job_id=job.id,
@@ -670,6 +964,16 @@ async def run_backtest(request: Request, db: Session = Depends(get_db_session)):
             daily_rows_written=count,
             top_n=top_n,
             model_run_id=model_run_id,
+            holding_days=holding_days,
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
+            max_position_weight=max_position_weight,
+            min_signal_score=min_signal_score,
+            benchmark_symbol=benchmark_symbol,
+            max_sector_weight=max_sector_weight,
+            min_adv=min_adv,
+            max_gap_pct=max_gap_pct,
+            rebalance_threshold=rebalance_threshold,
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -679,6 +983,16 @@ async def run_backtest(request: Request, db: Session = Depends(get_db_session)):
             message=str(exc),
             top_n=top_n,
             model_run_id=model_run_id,
+            holding_days=holding_days,
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
+            max_position_weight=max_position_weight,
+            min_signal_score=min_signal_score,
+            benchmark_symbol=benchmark_symbol,
+            max_sector_weight=max_sector_weight,
+            min_adv=min_adv,
+            max_gap_pct=max_gap_pct,
+            rebalance_threshold=rebalance_threshold,
         )
         job_repo.complete_job(job.id, status="failed", message=str(exc))
         return _maybe_redirect(redirect_to, payload)
@@ -690,7 +1004,7 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
         return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
     tickers_raw = await _request_value(request, "tickers", "")
-    provider = str(await _request_value(request, "provider", "yfinance")).strip() or "yfinance"
+    provider = str(await _request_value(request, "provider", "auto")).strip() or "auto"
     start_date = await _request_value(request, "start_date")
     end_date = await _request_value(request, "end_date")
     run_name = str(await _request_value(request, "run_name", "pipeline_run")).strip() or "pipeline_run"
@@ -699,6 +1013,19 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
     top_n_raw = await _request_value(request, "top_n", 1)
     lookback_days = _as_int(lookback_raw, 3)
     top_n = _as_int(top_n_raw, 1)
+    holding_days = _as_int(await _request_value(request, "holding_days", 3), 3)
+    commission_bps = _as_float(await _request_value(request, "commission_bps", 8.0), 8.0)
+    slippage_bps = _as_float(await _request_value(request, "slippage_bps", 12.0), 12.0)
+    max_position_weight = _as_float(await _request_value(request, "max_position_weight", 0.2), 0.2)
+    min_signal_score = _as_float(await _request_value(request, "min_signal_score", 0.05), 0.05)
+    max_sector_weight = _as_float(await _request_value(request, "max_sector_weight", 0.35), 0.35)
+    min_adv = _as_float(await _request_value(request, "min_adv", 50000000.0), 50000000.0)
+    max_gap_pct = _as_float(await _request_value(request, "max_gap_pct", 0.08), 0.08)
+    rebalance_threshold = _as_float(await _request_value(request, "rebalance_threshold", 0.02), 0.02)
+    benchmark_symbol_raw = await _request_value(request, "benchmark_symbol")
+    benchmark_symbol = str(benchmark_symbol_raw).strip().upper() if benchmark_symbol_raw not in (None, "") else None
+    model_run_raw = await _request_value(request, "model_run_id")
+    model_run_id = _as_optional_int_except(model_run_raw, {"latest"})
 
     tickers = [item.strip().upper() for item in str(tickers_raw).split(",") if item.strip()] or None
 
@@ -715,6 +1042,17 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
             "signal_type": signal_type,
             "lookback_days": lookback_days,
             "top_n": top_n,
+            "model_run_id": model_run_id,
+            "holding_days": holding_days,
+            "commission_bps": commission_bps,
+            "slippage_bps": slippage_bps,
+            "max_position_weight": max_position_weight,
+            "min_signal_score": min_signal_score,
+            "benchmark_symbol": benchmark_symbol,
+            "max_sector_weight": max_sector_weight,
+            "min_adv": min_adv,
+            "max_gap_pct": max_gap_pct,
+            "rebalance_threshold": rebalance_threshold,
         },
     )
 
@@ -731,7 +1069,20 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
             signal_type=signal_type,
             lookback_days=lookback_days,
         )
-        daily_rows_written = BacktestRunner().run(top_n=top_n)
+        daily_rows_written = BacktestRunner().run(
+            top_n=top_n,
+            model_run_id=model_run_id,
+            holding_days=holding_days,
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
+            max_position_weight=max_position_weight,
+            min_signal_score=min_signal_score,
+            benchmark_symbol=benchmark_symbol,
+            max_sector_weight=max_sector_weight,
+            min_adv=min_adv,
+            max_gap_pct=max_gap_pct,
+            rebalance_threshold=rebalance_threshold,
+        )
         message = (
             f"Pipeline complete: synced {len(sync_results)} ticker(s), "
             f"normalized {len(build_result['normalized_files'])} file(s), "
@@ -746,6 +1097,18 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
             build_result=build_result,
             predictions_written=predictions_written,
             daily_rows_written=daily_rows_written,
+            top_n=top_n,
+            model_run_id=model_run_id,
+            holding_days=holding_days,
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
+            max_position_weight=max_position_weight,
+            min_signal_score=min_signal_score,
+            benchmark_symbol=benchmark_symbol,
+            max_sector_weight=max_sector_weight,
+            min_adv=min_adv,
+            max_gap_pct=max_gap_pct,
+            rebalance_threshold=rebalance_threshold,
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -760,7 +1123,7 @@ async def update_auto_analysis_config(request: Request):
     redirect_to = await _request_value(request, "redirect_to")
     enabled_raw = await _request_value(request, "enabled", "")
     interval_hours = await _request_value(request, "interval_hours", 24)
-    provider = await _request_value(request, "provider", "yfinance")
+    provider = await _request_value(request, "provider", "auto")
     start_date = await _request_value(request, "start_date", "2025-01-01")
     signal_type = await _request_value(request, "signal_type", "momentum")
     lookback_days = await _request_value(request, "lookback_days", 3)
@@ -795,9 +1158,9 @@ async def update_close_review_config(request: Request):
         return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
     enabled_raw = await _request_value(request, "enabled", "")
-    run_hour = await _request_value(request, "run_hour", 16)
+    run_hour = await _request_value(request, "run_hour", 18)
     run_minute = await _request_value(request, "run_minute", 0)
-    provider = await _request_value(request, "provider", "yfinance")
+    provider = await _request_value(request, "provider", "auto")
     days_back = await _request_value(request, "days_back", 7)
     overlap_days = await _request_value(request, "overlap_days", 3)
     refresh_limit = await _request_value(request, "refresh_limit", 0)

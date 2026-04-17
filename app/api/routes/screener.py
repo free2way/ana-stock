@@ -2,22 +2,42 @@ import json
 import csv
 from io import StringIO
 from urllib.parse import urlencode
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy.orm import Session
 
-from app.core.db import get_db_session
+from app.core.db import SessionLocal, get_db_session
 from app.services.auth import is_authenticated, login_redirect
 from app.services.market_intelligence import build_market_sentiment_snapshot
 from app.models.schema import SymbolCreate
 from app.services.market_sync import sync_market_data
-from app.services.repository import AppSettingRepository, SymbolRepository, WatchlistRepository
+from app.services.repository import AppSettingRepository, SymbolRepository, WatchlistRepository, WorkspaceSnapshotRepository
+from app.services.runtime_cache import get_or_set
 from app.services.screener import MODEL_TEMPLATES, ScreenerService
+from app.services.screener_snapshots import (
+    build_base_precompute_params,
+    screener_snapshot_key,
+    screener_snapshot_type,
+)
 from app.services.focus_pool import add_to_today_focus_pool, enrich_focus_pool_with_symbols, load_today_focus_pool
+from app.services.ui_lang import resolve_request_lang
+from app.services.workspace_nav import WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
+from app.services.workspace_snapshots import (
+    SNAPSHOT_MARKET_WORKSPACE_MONITOR,
+    SNAPSHOT_MARKET_WORKSPACE_POSTMARKET,
+    SNAPSHOT_MARKET_WORKSPACE_PREMARKET,
+    load_latest_workspace_snapshot,
+)
+from app.services.workspace_snapshots import refresh_workspace_snapshots
+from app.services.time_utils import app_now_iso
 
 
 router = APIRouter(prefix="/screeners", tags=["screeners"])
+
+
+SCREENER_SNAPSHOT_TTL = timedelta(hours=18)
 
 
 ACTION_OPTIONS = [
@@ -230,6 +250,7 @@ SCREEN_TEXT = {
 }
 
 TEMPLATE_LABELS = {
+    "next_tesla_swing": {"en": "Next Tesla Swing", "zh": "强趋势二次启动"},
     "technical_momentum": {"en": "Technical Momentum", "zh": "技术动量"},
     "cn_limit_up_watch": {"en": "Yesterday Limit-Up Watch", "zh": "昨日涨停观察"},
     "cn_volume_breakout": {"en": "Volume Breakout From Base", "zh": "底部放量突破"},
@@ -261,6 +282,15 @@ def _lang_text(lang: str, key: str) -> str:
 
 def _template_label(template_key: str, fallback: str, lang: str) -> str:
     return TEMPLATE_LABELS.get(template_key, {}).get(lang, fallback)
+
+
+def _compact_text(value: str | None, limit: int = 28) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 1]}…"
 
 
 def _market_section_label(market: str | None, lang: str) -> str:
@@ -803,6 +833,9 @@ def _banner_html(message: str | None, lang: str) -> str:
     if "watchlist" in message.lower():
         actions = (
             "<div style='display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;'>"
+            f"<a href='/dashboard?lang={lang}' style='display:inline-flex;align-items:center;padding:8px 12px;border-radius:999px;"
+            "background:#0f172a;color:#dff5ef;border:1px solid #223246;font-weight:700;text-decoration:none;'>"
+            f"{'打开 Dashboard' if lang == 'zh' else 'Open Dashboard'}</a>"
             "<a href='/watchlist' style='display:inline-flex;align-items:center;padding:8px 12px;border-radius:999px;"
             f"background:#eef8f5;color:#0f766e;font-weight:700;text-decoration:none;'>{_lang_text(lang, 'open_watchlist')}</a>"
             "<a href='/watchlist' style='display:inline-flex;align-items:center;padding:8px 12px;border-radius:999px;"
@@ -959,31 +992,208 @@ def _current_params(
 
 
 def _run_screen(service: ScreenerService, params: dict) -> list[dict]:
-    return service.screen(
-        model_template=str(params.get("model_template", "technical_momentum")),
-        universe=str(params.get("universe", "watchlist")),
-        market=str(params.get("market", "ALL")),
-        min_trend_score=int(float(params.get("min_trend_score", 60))),
-        action_filter=str(params.get("action_filter", "ALL")),
-        min_volume_ratio=float(params.get("min_volume_ratio", 0.0)),
-        min_listing_days=int(float(params.get("min_listing_days", 365))),
-        pe_min=float(params.get("pe_min", 0.0)),
-        pe_max=float(params.get("pe_max", 30.0)),
-        min_roe_avg_3y=float(params.get("min_roe_avg_3y", 12.0)),
-        min_net_profit_yoy=float(params.get("min_net_profit_yoy", 20.0)),
-        min_revenue_yoy=float(params.get("min_revenue_yoy", 0.0)),
-        max_debt_to_assets=float(params.get("max_debt_to_assets", 100.0)),
-        min_dividend_yield=float(params.get("min_dividend_yield", 0.0)),
-        exclude_bottom_market_cap_pct=float(params.get("exclude_bottom_market_cap_pct", 10.0)),
-        recent_snapshot_runs=int(float(params.get("recent_snapshot_runs", 0))),
-        min_snapshot_hits=int(float(params.get("min_snapshot_hits", 0))),
+    normalized = {
+        "model_template": str(params.get("model_template", "technical_momentum")),
+        "universe": str(params.get("universe", "watchlist")),
+        "market": str(params.get("market", "ALL")),
+        "min_trend_score": int(float(params.get("min_trend_score", 60))),
+        "action_filter": str(params.get("action_filter", "ALL")),
+        "min_volume_ratio": float(params.get("min_volume_ratio", 0.0)),
+        "min_listing_days": int(float(params.get("min_listing_days", 365))),
+        "pe_min": float(params.get("pe_min", 0.0)),
+        "pe_max": float(params.get("pe_max", 30.0)),
+        "min_roe_avg_3y": float(params.get("min_roe_avg_3y", 12.0)),
+        "min_net_profit_yoy": float(params.get("min_net_profit_yoy", 20.0)),
+        "min_revenue_yoy": float(params.get("min_revenue_yoy", 0.0)),
+        "max_debt_to_assets": float(params.get("max_debt_to_assets", 100.0)),
+        "min_dividend_yield": float(params.get("min_dividend_yield", 0.0)),
+        "exclude_bottom_market_cap_pct": float(params.get("exclude_bottom_market_cap_pct", 10.0)),
+        "recent_snapshot_runs": int(float(params.get("recent_snapshot_runs", 0))),
+        "min_snapshot_hits": int(float(params.get("min_snapshot_hits", 0))),
+        "model_signal_filter": str(params.get("model_signal_filter", "ALL")),
+        "min_model_signal_strength": float(params.get("min_model_signal_strength", 0.0)),
+        "execution_tag_filter": str(params.get("execution_tag_filter", "ALL")),
+        "exclude_execution_tag_filter": str(params.get("exclude_execution_tag_filter", "ALL")),
+        "sort_by": str(params.get("sort_by", "default")),
+        "sort_order": str(params.get("sort_order", "desc")),
+        "limit": 500,
+    }
+    snapshot_rows = _load_precomputed_screener_rows(service, normalized)
+    if snapshot_rows is not None:
+        return snapshot_rows
+    snapshot_rows = _load_screener_snapshot(normalized)
+    if snapshot_rows is not None:
+        return snapshot_rows
+    cache_key = json.dumps(normalized, sort_keys=True, ensure_ascii=False)
+    rows = get_or_set(
+        "screener_results",
+        cache_key,
+        ttl_seconds=90.0,
+        loader=lambda: service.screen(**normalized),
+    )
+    _persist_screener_snapshot(normalized, rows)
+    return rows
+
+
+def _normalize_action_filter(value: str | None) -> str:
+    return str(value or "").strip().lower().replace(" ", "_")
+
+
+def _load_precomputed_screener_rows(service: ScreenerService, params: dict) -> list[dict] | None:
+    base_params = build_base_precompute_params(
+        model_template=str(params.get("model_template") or "technical_momentum"),
+        universe=str(params.get("universe") or "watchlist"),
+        market=str(params.get("market") or "ALL"),
+    )
+    snapshot_rows = _load_screener_snapshot(base_params)
+    if snapshot_rows is None:
+        return None
+    return _filter_precomputed_rows(service, snapshot_rows, params)
+
+
+def _filter_precomputed_rows(service: ScreenerService, rows: list[dict], params: dict) -> list[dict]:
+    min_trend_score = int(params.get("min_trend_score", 60))
+    action_filter = str(params.get("action_filter", "ALL"))
+    min_volume_ratio = float(params.get("min_volume_ratio", 0.0))
+    min_listing_days = int(params.get("min_listing_days", 365))
+    pe_min = float(params.get("pe_min", 0.0))
+    pe_max = float(params.get("pe_max", 30.0))
+    min_roe_avg_3y = float(params.get("min_roe_avg_3y", 12.0))
+    min_net_profit_yoy = float(params.get("min_net_profit_yoy", 20.0))
+    min_revenue_yoy = float(params.get("min_revenue_yoy", 0.0))
+    max_debt_to_assets = float(params.get("max_debt_to_assets", 100.0))
+    min_dividend_yield = float(params.get("min_dividend_yield", 0.0))
+    recent_snapshot_runs = int(params.get("recent_snapshot_runs", 0))
+    min_snapshot_hits = int(params.get("min_snapshot_hits", 0))
+    filtered: list[dict] = []
+    normalized_action_filter = _normalize_action_filter(action_filter)
+
+    for row in rows:
+        trend_score = row.get("trend_score")
+        if trend_score is not None and float(trend_score or 0.0) < min_trend_score:
+            continue
+        if normalized_action_filter not in {"", "all"}:
+            if _normalize_action_filter(row.get("action_label")) != normalized_action_filter:
+                continue
+        if float(row.get("volume_ratio") or 0.0) < min_volume_ratio:
+            continue
+        listing_days = row.get("listing_days")
+        if listing_days is not None and int(listing_days or 0) < min_listing_days:
+            continue
+        pe_ttm = row.get("pe_ttm")
+        if pe_ttm is not None and not (pe_min <= float(pe_ttm) <= pe_max):
+            continue
+        roe_avg_3y = row.get("roe_avg_3y")
+        if roe_avg_3y is not None and float(roe_avg_3y) < min_roe_avg_3y:
+            continue
+        net_profit_yoy = row.get("net_profit_yoy")
+        if net_profit_yoy is not None and float(net_profit_yoy) < min_net_profit_yoy:
+            continue
+        revenue_yoy = row.get("revenue_yoy")
+        if revenue_yoy is not None and float(revenue_yoy) < min_revenue_yoy:
+            continue
+        debt_to_assets = row.get("debt_to_assets")
+        if debt_to_assets is not None and float(debt_to_assets) > max_debt_to_assets:
+            continue
+        dividend_yield = row.get("dividend_yield")
+        if dividend_yield is not None and float(dividend_yield) < min_dividend_yield:
+            continue
+        filtered.append(dict(row))
+
+    filtered = service._apply_snapshot_persistence_filter(
+        filtered,
+        recent_snapshot_runs=recent_snapshot_runs,
+        min_snapshot_hits=min_snapshot_hits,
+    )
+    filtered = service._apply_model_signal_filter(
+        filtered,
         model_signal_filter=str(params.get("model_signal_filter", "ALL")),
         min_model_signal_strength=float(params.get("min_model_signal_strength", 0.0)),
+    )
+    filtered = service._apply_execution_tag_filter(
+        filtered,
         execution_tag_filter=str(params.get("execution_tag_filter", "ALL")),
         exclude_execution_tag_filter=str(params.get("exclude_execution_tag_filter", "ALL")),
+    )
+    filtered = service._sort_results(
+        filtered,
         sort_by=str(params.get("sort_by", "default")),
         sort_order=str(params.get("sort_order", "desc")),
-        limit=500,
+    )
+    limit = int(params.get("limit", 500))
+    return filtered[:limit]
+
+
+def _should_execute_screen(request: Request) -> bool:
+    if str(request.query_params.get("run") or "").strip() == "1":
+        return True
+    meaningful_keys = {
+        "model_template",
+        "universe",
+        "market",
+        "min_trend_score",
+        "action_filter",
+        "min_volume_ratio",
+        "min_listing_days",
+        "pe_min",
+        "pe_max",
+        "min_roe_avg_3y",
+        "min_net_profit_yoy",
+        "min_revenue_yoy",
+        "max_debt_to_assets",
+        "min_dividend_yield",
+        "exclude_bottom_market_cap_pct",
+        "recent_snapshot_runs",
+        "min_snapshot_hits",
+        "model_signal_filter",
+        "min_model_signal_strength",
+        "execution_tag_filter",
+        "exclude_execution_tag_filter",
+        "sort_by",
+        "sort_order",
+    }
+    return any(key in meaningful_keys for key in request.query_params.keys())
+
+
+def _load_screener_snapshot(params: dict) -> list[dict] | None:
+    with SessionLocal() as db:
+        snapshot = WorkspaceSnapshotRepository(db).get_latest_snapshot(screener_snapshot_type(params))
+    if not snapshot:
+        return None
+    payload = snapshot.get("payload") or {}
+    if payload.get("key") != screener_snapshot_key(params):
+        return None
+    created_at = str(snapshot.get("created_at") or "")
+    try:
+        created = datetime.fromisoformat(created_at)
+    except ValueError:
+        return None
+    if datetime.fromisoformat(app_now_iso()) - created > SCREENER_SNAPSHOT_TTL:
+        return None
+    rows = payload.get("rows")
+    return rows if isinstance(rows, list) else None
+
+
+def _persist_screener_snapshot(params: dict, rows: list[dict]) -> None:
+    payload = {
+        "key": screener_snapshot_key(params),
+        "rows": rows,
+        "updated_at": app_now_iso(),
+    }
+    with SessionLocal() as db:
+        WorkspaceSnapshotRepository(db).create_snapshot(
+            snapshot_type=screener_snapshot_type(params),
+            snapshot_date=app_now_iso(),
+            payload=payload,
+        )
+
+
+def _load_today_focus_items() -> list[dict]:
+    return get_or_set(
+        "today_focus_items",
+        "latest",
+        ttl_seconds=30.0,
+        loader=lambda: enrich_focus_pool_with_symbols(load_today_focus_pool()),
     )
 
 
@@ -1073,6 +1283,7 @@ def screener_page(
 ) -> str:
     if not is_authenticated(request):
         return login_redirect("/screeners")
+    lang = resolve_request_lang(request)
 
     service = ScreenerService()
     saved_presets = _load_saved_presets(db)
@@ -1105,11 +1316,14 @@ def screener_page(
         sort_by=sort_by,
         sort_order=sort_order,
     )
-    results = _run_screen(service, current_params)
+    should_execute = _should_execute_screen(request)
+    results = _run_screen(service, current_params) if should_execute else []
+    total_results = len(results)
+    visible_results = results[:120]
     risk_counts: dict[str, int] = {}
     risk_examples: list[dict[str, object]] = []
     tagged_names = 0
-    for item in results:
+    for item in visible_results:
         tags = [str(tag).strip() for tag in (item.get("model_execution_tags") or []) if str(tag).strip()]
         if not tags:
             continue
@@ -1121,8 +1335,8 @@ def screener_page(
     risk_top_tags = sorted(risk_counts.items(), key=lambda pair: (-pair[1], pair[0]))[:3]
     if sort_by == "watchlist_state":
         reverse = sort_order != "asc"
-        results = sorted(
-            results,
+        visible_results = sorted(
+            visible_results,
             key=lambda item: (
                 _sync_state_rank(watchlist_map.get(item["ticker"])),
                 item.get("ticker", ""),
@@ -1172,10 +1386,25 @@ def screener_page(
         f"<option value='{value}' {'selected' if market == value else ''}>{label}</option>"
         for value, label in market_options
     )
+    template_cards_html = "".join(
+        (
+            f"<a class='template-card{' active' if value == model_template else ''}' href='{_build_screen_query({**current_params, 'model_template': value, 'market': config.get('market') or market})}'>"
+            f"<div class='template-top'><span class='template-mode'>{config.get('mode', 'mixed')}</span><span class='template-market'>{config.get('market', 'ALL')}</span></div>"
+            f"<div class='template-title'>{_template_label(value, config['label'], lang)}</div>"
+            f"<div class='template-desc'>{config.get('description') or ''}</div>"
+            "</a>"
+        )
+        for value, config in MODEL_TEMPLATES.items()
+    )
+    active_defaults = active_template.get("defaults") or {}
+    active_defaults_html = "".join(
+        f"<span class='default-chip'>{key}: {value}</span>"
+        for key, value in active_defaults.items()
+    ) or f"<span class='default-chip'>{'No template defaults' if lang == 'en' else '无模板默认值'}</span>"
 
     row_chunks: list[str] = []
     previous_market = None
-    for item in results:
+    for item in visible_results:
         current_market = (item.get("market") or "").upper()
         sync_badge = _sync_status_badge(watchlist_map.get(item["ticker"]), lang)
         snapshot_badge = _number_badge(
@@ -1194,34 +1423,41 @@ def screener_page(
             "<tr>"
             f"<td class='sticky-col sticky-col-1'><a href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a></td>"
             f"<td class='sticky-col sticky-col-2'>{item.get('name') or '-'}</td>"
-            f"<td>{item['market']}</td>"
-            f"<td>{_trend_badge(item['trend_score'])}</td>"
-            f"<td>{_action_badge(item['action_label'], lang)}</td>"
-            f"<td>{_price_badge(item['latest_close'])}</td>"
+            f"<td>{item.get('market') or '-'}</td>"
+            f"<td>{_trend_badge(item.get('trend_score'))}</td>"
+            f"<td>{_action_badge(item.get('action_label'), lang)}</td>"
+            f"<td>{_price_badge(item.get('latest_close') if item.get('latest_close') is not None else item.get('close'))}</td>"
             f"<td>{_model_cell(item, lang)}</td>"
             f"<td>{sync_badge}</td>"
             f"<td>{snapshot_badge}</td>"
-            f"<td>{_change_chip(item['momentum_5'])}</td>"
-            f"<td>{_change_chip(item['momentum_20'])}</td>"
-            f"<td>{_number_badge(item['volume_ratio'], suffix='x', higher_is_good=True)}</td>"
+            f"<td>{_change_chip(item.get('momentum_5'))}</td>"
+            f"<td>{_change_chip(item.get('momentum_20'))}</td>"
+            f"<td>{_number_badge(item.get('volume_ratio'), suffix='x', higher_is_good=True)}</td>"
             f"<td>{_number_badge(item.get('pe_ttm'), higher_is_good=False)}</td>"
             f"<td>{_number_badge(item.get('roe_avg_3y'), suffix='%', higher_is_good=True)}</td>"
             f"<td>{_number_badge(item.get('net_profit_yoy'), suffix='%', higher_is_good=True)}</td>"
             f"<td>{_number_badge(item.get('dividend_yield'), suffix='%', higher_is_good=True)}</td>"
-            f"<td>{_number_badge(item['distance_to_breakout_pct'], suffix='%', higher_is_good=False)}</td>"
+            f"<td>{_number_badge(item.get('distance_to_breakout_pct'), suffix='%', higher_is_good=False)}</td>"
             f"<td><a class='main-open-link' href='/insights/{item['ticker']}?lang={lang}'>{_lang_text(lang, 'open_insight')}</a></td>"
             "</tr>"
             "<tr class='detail-row'>"
             f"<td colspan='18'>{_detail_panel(item, watchlist_map, current_params, lang)}</td>"
             "</tr>"
         )
-    rows = "".join(row_chunks) or f"<tr><td colspan='18'>{_lang_text(lang, 'no_match')}</td></tr>"
+    empty_state = (
+        "先选择一个模板或调整参数后再执行筛选，首屏默认不自动跑重计算。"
+        if lang == "zh"
+        else "Choose a template or adjust rules, then run the screen. The first load stays lightweight by default."
+    )
+    rows = "".join(row_chunks) or (
+        f"<tr><td colspan='18'>{_lang_text(lang, 'no_match') if should_execute else empty_state}</td></tr>"
+    )
     preset_rows = "".join(
         "<tr>"
-        f"<td>{preset['name']}</td>"
-        f"<td>{_template_label(preset['params'].get('model_template', ''), MODEL_TEMPLATES.get(preset['params'].get('model_template', ''), {'label': preset['params'].get('model_template', '-')})['label'], lang)}</td>"
-        f"<td>{_preset_summary(preset['params'])}</td>"
-        f"<td>{len(_run_screen(service, preset['params']))}</td>"
+        f"<td title='{preset['name']}'>{_compact_text(preset['name'], 26)}</td>"
+        f"<td title='{_template_label(preset['params'].get('model_template', ''), MODEL_TEMPLATES.get(preset['params'].get('model_template', ''), {'label': preset['params'].get('model_template', '-')})['label'], lang)}'>{_compact_text(_template_label(preset['params'].get('model_template', ''), MODEL_TEMPLATES.get(preset['params'].get('model_template', ''), {'label': preset['params'].get('model_template', '-')})['label'], lang), 24)}</td>"
+        f"<td title='{_preset_summary(preset['params'])}'>{_compact_text(_preset_summary(preset['params']), 44)}</td>"
+        f"<td>{'点击加载后查看' if lang == 'zh' else 'Load to view'}</td>"
         f"<td><a href='{_build_screen_query(preset['params'])}'>{_lang_text(lang, 'load')}</a></td>"
         f"<td><form method='post' action='/screeners/delete' style='margin:0;'><input type='hidden' name='preset_name' value='{preset['name']}' /><input type='hidden' name='lang' value='{lang}' /><button type='submit'>{_lang_text(lang, 'delete')}</button></form></td>"
         "</tr>"
@@ -1238,8 +1474,21 @@ def screener_page(
         f"<input type='hidden' name='{key}' value='{value}' />"
         for key, value in current_params.items()
     )
-    bulk_add_disabled = "disabled" if not results else ""
-    bulk_add_label = _lang_text(lang, "add_current_results") if results else _lang_text(lang, "no_results_to_add")
+    bulk_add_disabled = "disabled" if not total_results else ""
+    bulk_add_label = _lang_text(lang, "add_current_results") if total_results else _lang_text(lang, "no_results_to_add")
+    visible_note = (
+        (
+            f"当前共命中 {total_results} 只，页面先展示前 {len(visible_results)} 只；导出 CSV 仍包含全部结果。"
+            if lang == "zh"
+            else f"{total_results} names matched; the page shows the top {len(visible_results)} first, while CSV export still includes the full result set."
+        )
+        if should_execute
+        else (
+            "当前页面默认只展示模板和规则，避免首屏直接跑重计算。选择模板后点击“运行筛选”即可。"
+            if lang == "zh"
+            else "The first load only shows templates and rules to keep the page fast. Click Run Screen when you're ready."
+        )
+    )
     lang_switch_html = "".join(
         f"<a href='{_build_screen_query({**current_params, 'lang': code})}' style='padding:8px 12px;border-radius:999px;border:1px solid var(--line);background:{'#eef8f5' if lang == code else '#fff'};text-decoration:none;color:var(--ink);font-weight:700;'>{label}</a>"
         for code, label in LANG_OPTIONS
@@ -1254,13 +1503,14 @@ def screener_page(
         <title>{_lang_text(lang, 'title')}</title>
         <style>
           :root {{
-            --bg: #f5efe2;
-            --panel: #fffdf7;
-            --ink: #1f2937;
-            --muted: #6b7280;
-            --line: #d6cfc2;
-            --accent: #0f766e;
-            --accent-soft: #dff5ef;
+            --bg: #071018;
+            --panel: #111c28;
+            --panel-2: #152231;
+            --ink: #e6edf3;
+            --muted: #90a3b8;
+            --line: #223246;
+            --accent: #3dd9b6;
+            --accent-soft: rgba(61,217,182,0.12);
           }}
           * {{ box-sizing: border-box; }}
           body {{
@@ -1268,38 +1518,64 @@ def screener_page(
             font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             color: var(--ink);
             background:
-              radial-gradient(circle at top left, #fff6d8 0, transparent 30%),
-              radial-gradient(circle at top right, #d9f3ee 0, transparent 35%),
+              radial-gradient(circle at top left, rgba(82,168,255,0.14) 0, transparent 28%),
+              radial-gradient(circle at top right, rgba(61,217,182,0.10) 0, transparent 26%),
               var(--bg);
           }}
-          .wrap {{ max-width: 1120px; margin: 0 auto; padding: 28px 20px 56px; }}
+          .app {{ display:grid; grid-template-columns:280px minmax(0, 1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .content {{ padding:28px; }}
+          .wrap {{ max-width: 1120px; margin: 0 auto; padding: 0 0 56px; }}
           .toolbar {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }}
           .toolbar a {{ color: var(--accent); text-decoration:none; font-weight:700; }}
-          .card {{ background: var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); margin-bottom:16px; min-width:0; overflow:hidden; }}
+          .card {{ background: linear-gradient(180deg, rgba(21,34,49,0.98), rgba(17,28,40,0.98)); border:1px solid var(--line); border-radius:22px; padding:18px; box-shadow:0 24px 48px rgba(0,0,0,0.18); margin-bottom:16px; min-width:0; overflow:hidden; }}
           .nav-grid {{ display:grid; gap:16px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-bottom:16px; }}
           .nav-card {{
             display:block;
             text-decoration:none;
             color:inherit;
-            background:linear-gradient(180deg, #fffdf7 0%, #f8faf7 100%);
+            background:linear-gradient(180deg, rgba(17,28,40,0.98) 0%, rgba(21,34,49,0.98) 100%);
             border:1px solid var(--line);
             border-radius:18px;
             padding:18px;
-            box-shadow:0 8px 24px rgba(31,41,55,0.05);
+            box-shadow:0 12px 30px rgba(0,0,0,0.12);
           }}
-          .nav-card:hover {{ border-color:#0f766e; box-shadow:0 12px 28px rgba(15,118,110,0.10); }}
+          .nav-card:hover {{ border-color:var(--accent); box-shadow:0 12px 28px rgba(61,217,182,0.08); }}
           .nav-head {{ display:flex; align-items:center; gap:12px; margin-bottom:10px; }}
           .nav-icon {{
             width:42px; height:42px; border-radius:14px; display:inline-flex; align-items:center; justify-content:center;
-            background:#eef8f5; color:#0f766e; font-size:12px; font-weight:900; letter-spacing:0.04em; border:1px solid #cde9e4; flex:0 0 auto;
+            background:rgba(61,217,182,0.10); color:var(--accent); font-size:12px; font-weight:900; letter-spacing:0.04em; border:1px solid rgba(61,217,182,0.18); flex:0 0 auto;
           }}
-          .nav-title {{ font-size:18px; font-weight:800; color:#0f766e; }}
+          .nav-title {{ font-size:18px; font-weight:800; color:var(--ink); }}
           .nav-kicker {{ color:var(--muted); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; }}
           .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
           h1 {{ margin:0 0 8px; font-size:38px; }}
           .lead {{ margin:0; color:var(--muted); max-width:760px; }}
           .stack {{ display:grid; gap:12px; }}
           .section-stack {{ display:grid; gap:16px; }}
+          .template-grid {{ display:grid; gap:14px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-top:14px; }}
+          .template-card {{
+            display:grid;
+            gap:10px;
+            padding:16px;
+            border-radius:18px;
+            border:1px solid var(--line);
+            background:rgba(11,19,29,0.82);
+          }}
+          .template-card.active {{ border-color:rgba(61,217,182,0.34); background:linear-gradient(180deg, rgba(61,217,182,0.14), rgba(82,168,255,0.08)); }}
+          .template-top {{ display:flex; align-items:center; justify-content:space-between; gap:8px; }}
+          .template-mode, .template-market, .default-chip {{
+            display:inline-flex; align-items:center; padding:6px 10px; border-radius:999px; font-size:11px; font-weight:800;
+          }}
+          .template-mode {{ background:rgba(61,217,182,0.10); color:var(--accent); text-transform:uppercase; }}
+          .template-market {{ background:rgba(82,168,255,0.10); color:#9acbff; }}
+          .template-title {{ font-size:16px; font-weight:800; color:var(--ink); }}
+          .template-desc {{ color:var(--muted); font-size:13px; line-height:1.5; }}
+          .default-chip {{ background:rgba(246,200,95,0.10); color:#ffd982; }}
+          details.advanced-panel {{ border-top:1px solid var(--line); padding-top:12px; margin-top:12px; }}
+          details.advanced-panel > summary {{ cursor:pointer; list-style:none; font-weight:800; color:var(--ink); }}
+          details.advanced-panel > summary::-webkit-details-marker {{ display:none; }}
+          .summary-note {{ color:var(--muted); font-size:13px; margin-top:8px; }}
           .rules-grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); align-items:end; }}
           .action-grid {{ display:grid; gap:12px; grid-template-columns:repeat(2, minmax(0, 1fr)); }}
           .action-form {{
@@ -1310,7 +1586,7 @@ def screener_page(
             padding:14px;
             border:1px solid var(--line);
             border-radius:16px;
-            background:#fbfaf5;
+            background:rgba(11,19,29,0.82);
           }}
           .action-head {{
             display:flex;
@@ -1413,17 +1689,18 @@ def screener_page(
             border:1px solid var(--line);
             padding:10px 12px;
             font:inherit;
-            background:#fff;
+            background:rgba(11,19,29,0.82);
+            color:var(--ink);
             width:100%;
             max-width:100%;
           }}
           button {{ background:var(--accent); color:#fff; border-color:var(--accent); font-weight:700; }}
           .muted {{ color:var(--muted); font-size:14px; }}
-          .table-wrap {{ width:100%; max-width:100%; overflow-x:auto; overflow-y:hidden; border-radius:14px; border:1px solid var(--line); background:#fff; padding-bottom:8px; scrollbar-gutter:stable both-edges; }}
+          .table-wrap {{ width:100%; max-width:100%; overflow-x:auto; overflow-y:hidden; border-radius:14px; border:1px solid var(--line); background:rgba(11,19,29,0.82); padding-bottom:8px; scrollbar-gutter:stable both-edges; }}
           .table-wrap::-webkit-scrollbar {{ height:12px; }}
-          .table-wrap::-webkit-scrollbar-track {{ background:#efe7d7; border-radius:999px; }}
-          .table-wrap::-webkit-scrollbar-thumb {{ background:#c6b79e; border-radius:999px; border:2px solid #efe7d7; }}
-          .table-wrap::-webkit-scrollbar-thumb:hover {{ background:#a9987d; }}
+          .table-wrap::-webkit-scrollbar-track {{ background:#0f1823; border-radius:999px; }}
+          .table-wrap::-webkit-scrollbar-thumb {{ background:#32465d; border-radius:999px; border:2px solid #0f1823; }}
+          .table-wrap::-webkit-scrollbar-thumb:hover {{ background:#47627f; }}
           table {{ width:100%; border-collapse:collapse; min-width:1660px; font-size:14px; table-layout:auto; }}
           th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; white-space:nowrap; }}
           th {{ color:var(--muted); font-weight:600; white-space:nowrap; }}
@@ -1436,8 +1713,8 @@ def screener_page(
           th.sticky-col {{ z-index:4; }}
           .sticky-col-1 {{ left:0; min-width:124px; box-shadow: 10px 0 14px rgba(31,41,55,0.05); }}
           .sticky-col-2 {{ left:124px; min-width:180px; box-shadow: 10px 0 14px rgba(31,41,55,0.05); }}
-          .market-section-row td {{ background:#f7f4ec; color:#0f766e; font-weight:800; letter-spacing:0.03em; border-top:1px solid var(--line); }}
-          .detail-row td {{ white-space:normal; background:#fcfaf4; padding:12px 10px 14px; }}
+          .market-section-row td {{ background:#132031; color:var(--accent); font-weight:800; letter-spacing:0.03em; border-top:1px solid var(--line); }}
+          .detail-row td {{ white-space:normal; background:#0d1722; padding:12px 10px 14px; }}
           .row-detail-toggle > summary {{
             cursor:pointer;
             color:var(--accent);
@@ -1449,9 +1726,9 @@ def screener_page(
             justify-content:space-between;
             gap:12px;
             padding:10px 12px;
-            border:1px dashed #c5ddda;
+            border:1px dashed #294256;
             border-radius:14px;
-            background:#f6fbfa;
+            background:#0f1823;
           }}
           .row-detail-toggle > summary::-webkit-details-marker {{ display:none; }}
           .detail-summary-meta {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-left:auto; }}
@@ -1469,7 +1746,7 @@ def screener_page(
           .detail-card {{
             border:1px solid var(--line);
             border-radius:14px;
-            background:#fff;
+            background:#111c28;
             padding:12px;
             min-width:0;
             overflow:hidden;
@@ -1493,8 +1770,8 @@ def screener_page(
             justify-content:center;
             padding:10px 14px;
             border-radius:12px;
-            background:#eef8f5;
-            color:#0f766e;
+            background:rgba(61,217,182,0.10);
+            color:var(--accent);
             font-weight:800;
             text-decoration:none;
           }}
@@ -1504,8 +1781,8 @@ def screener_page(
             justify-content:center;
             padding:6px 9px;
             border-radius:999px;
-            background:#eef8f5;
-            color:#0f766e;
+            background:rgba(61,217,182,0.10);
+            color:var(--accent);
             text-decoration:none;
             font-weight:800;
             font-size:12px;
@@ -1522,7 +1799,6 @@ def screener_page(
           @media (max-width: 920px) {{
             .rules-grid {{ grid-template-columns:1fr; }}
             .action-grid {{ grid-template-columns:1fr; }}
-            .wrap {{ padding: 20px 14px 40px; }}
             h1 {{ font-size:30px; }}
             .sticky-col, .sticky-col-1, .sticky-col-2 {{ position:static; box-shadow:none; min-width:auto; }}
             .table-wrap th:nth-child(7), .table-wrap td:nth-child(7),
@@ -1533,10 +1809,25 @@ def screener_page(
             .row-detail-toggle > summary {{ align-items:flex-start; flex-direction:column; }}
             .detail-summary-meta {{ margin-left:0; }}
           }}
+          @media (max-width: 1120px) {{
+            .app {{ grid-template-columns:1fr; }}
+            .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }}
+            .content {{ padding:20px 14px 40px; }}
+          }}
         </style>
       </head>
       <body>
-        <main class="wrap">
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{'模型选股' if lang == 'zh' else 'Screeners'}</h1>
+              <p>{'先选模板，再看结果，再决定是否加入自选或盯盘池。' if lang == 'zh' else 'Pick a template, review results, then move names into tracking.'}</p>
+            </div>
+            <nav class="side-nav">{render_workspace_nav_html(lang=lang, active_key='screeners')}</nav>
+          </aside>
+          <main class="content">
+        <div class="wrap">
           <div class="toolbar">
             <a href="/dashboard">← {_lang_text(lang, 'back_to_dashboard')}</a>
             <a href="/watchlist">{_lang_text(lang, 'open_watchlist')}</a>
@@ -1604,13 +1895,20 @@ def screener_page(
             <div class="eyebrow">{_lang_text(lang, 'quant_screener')}</div>
             <h1>{_lang_text(lang, 'title')}</h1>
             <p class="lead">{active_template['description']}</p>
+            <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;">
+              <span class="default-chip">{'Active template' if lang == 'en' else '当前模板'}: {_template_label(model_template, active_template['label'], lang)}</span>
+              {active_defaults_html}
+            </div>
           </div>
           {banner_html}
           <section class="section-stack">
             <article class="card">
               <div class="eyebrow">{_lang_text(lang, 'rules')}</div>
+              <div class="template-grid">{template_cards_html}</div>
               <form class="stack" method="get" action="/screeners">
                 <input type="hidden" name="lang" value="{lang}" />
+                <input type="hidden" name="run" value="1" />
+                <div class="summary-note">{'先选模板，再决定是否展开高级规则。' if lang == 'zh' else 'Start with a template, then open advanced rules only if needed.'}</div>
                 <div class="rules-grid">
                   <div>
                     <label class="muted">{_lang_text(lang, 'model_template')}</label>
@@ -1637,8 +1935,10 @@ def screener_page(
                     <input type="number" name="min_volume_ratio" min="0" step="0.1" value="{min_volume_ratio}" />
                   </div>
                 </div>
-                <div style="border-top:1px solid var(--line);padding-top:12px;">
-                  <div class="muted" style="margin-bottom:8px;font-weight:700;">{_lang_text(lang, 'cn_rules')}</div>
+                <details class="advanced-panel">
+                  <summary>{_lang_text(lang, 'cn_rules')}</summary>
+                  <div class="summary-note">{'这些参数保留给需要做精细筛选的时候。' if lang == 'zh' else 'Use these only when you need a more precise filter pass.'}</div>
+                  <div style="height:12px;"></div>
                   <div class="rules-grid">
                     <div>
                       <label class="muted">{_lang_text(lang, 'min_listing_days')}</label>
@@ -1715,7 +2015,7 @@ def screener_page(
                     <option value="earnings-soon"></option>
                     <option value="thin-liquidity"></option>
                   </datalist>
-                </div>
+                </details>
                 <button type="submit">{_lang_text(lang, 'run_screener')}</button>
               </form>
             </article>
@@ -1821,12 +2121,13 @@ def screener_page(
               </div>
               <div class="eyebrow">{_lang_text(lang, 'results')}</div>
               <div class="results-toolbar">
-                <div class="muted">{len(results)} {_lang_text(lang, 'stocks_matched')}</div>
+                <div class="muted">{total_results} {_lang_text(lang, 'stocks_matched')}</div>
                 <form method="get" action="/screeners/export">
                   {hidden_fields}
                   <button type="submit">{_lang_text(lang, 'export_csv')}</button>
                 </form>
               </div>
+              <div class="muted" style="margin-bottom:12px;">{visible_note}</div>
               <div class="table-wrap">
                 <table>
                   <thead>
@@ -1840,14 +2141,18 @@ def screener_page(
           </section>
           <section class="card">
             <div class="eyebrow">{_lang_text(lang, 'saved_strategies')}</div>
+            <div class="table-wrap">
             <table>
               <thead>
                 <tr><th>{_lang_text(lang, 'name')}</th><th>{_lang_text(lang, 'model_template')}</th><th>{_lang_text(lang, 'summary')}</th><th>{_lang_text(lang, 'hits')}</th><th>{_lang_text(lang, 'load')}</th><th>{_lang_text(lang, 'delete')}</th></tr>
               </thead>
               <tbody>{preset_rows}</tbody>
             </table>
+            </div>
           </section>
-        </main>
+        </div>
+          </main>
+        </div>
         <script>
           function appendExecutionTag(inputName, tag) {{
             const form = document.querySelector('form[action="/screeners"]');
@@ -2110,6 +2415,7 @@ def add_screener_result_to_watchlist(
         )
     )
     watchlist_repo.add_symbol(watchlist.id, symbol.id)
+    refresh_workspace_snapshots(db)
     params = _current_params(
         lang=lang,
         model_template=model_template,
@@ -2137,7 +2443,7 @@ def add_screener_result_to_watchlist(
         sort_order=sort_order,
     )
     return RedirectResponse(
-        url=f"{_build_screen_query(params)}&message={urlencode({'m': f'Added {ticker} to watchlist'})[2:]}",
+        url=f"{_build_screen_query(params)}&message={urlencode({'m': f'Added {ticker} to watchlist · dashboard refreshed'})[2:]}",
         status_code=303,
     )
 
@@ -2207,10 +2513,11 @@ def add_all_screener_results_to_watchlist(
         top_n=bulk_top_n,
         auto_enable_sync=auto_enable_sync == "1",
     )
+    refresh_workspace_snapshots(db)
     if added:
-        message = f"Added {added} screener results to watchlist"
+        message = f"Added {added} screener results to watchlist · dashboard refreshed"
     elif already_in_watchlist:
-        message = "All matching stocks are already in your watchlist"
+        message = "All matching stocks are already in your watchlist · dashboard refreshed"
     else:
         message = "No matching stocks to add"
     if sync_enabled_count:
@@ -2257,7 +2564,7 @@ def sync_screener_symbol(
     watchlist_repo = WatchlistRepository(db)
     if item_id is not None:
         watchlist_repo.set_sync_enabled(item_id, True)
-    results = sync_market_data(tickers=[ticker], start_date="2025-01-01", provider="yfinance")
+    results = sync_market_data(tickers=[ticker], start_date="2025-01-01", provider="auto")
     result = results[0] if results else None
     if result and result["status"] == "success":
         message = f"Synced {ticker} with {result['rows']} rows"
@@ -2364,7 +2671,7 @@ def sync_top_screener_results(
     tickers = [item["ticker"] for item in results]
     if not tickers:
         return _redirect_with_message("No screener results available to sync.", lang=lang)
-    sync_results = sync_market_data(tickers=tickers, start_date="2025-01-01", provider="yfinance")
+    sync_results = sync_market_data(tickers=tickers, start_date="2025-01-01", provider="auto")
     success_count = sum(1 for item in sync_results if item["status"] == "success")
     return RedirectResponse(
         url=f"{_build_screen_query(params)}&message={urlencode({'m': f'Synced {success_count}/{len(sync_results)} screener results'})[2:]}",
@@ -2449,7 +2756,7 @@ def today_focus_pool_page(request: Request, lang: str = Query("en"), db: Session
     watchlist_repo = WatchlistRepository(db)
     watchlist = watchlist_repo.get_or_create_default()
     watchlist_map = watchlist_repo.list_ticker_map(watchlist.id)
-    items = enrich_focus_pool_with_symbols(load_today_focus_pool())
+    items = _load_today_focus_items()
     item_rows = []
     for item in items:
         ticker = str(item.get("ticker") or "").upper()
@@ -2477,21 +2784,43 @@ def today_focus_pool_page(request: Request, lang: str = Query("en"), db: Session
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{_lang_text(lang, 'today_focus_pool')}</title>
         <style>
-          body {{ margin: 0; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:#1f2937; background:#f5efe2; }}
-          .wrap {{ max-width:1080px; margin:0 auto; padding:28px 20px 56px; }}
+          :root {{ --bg:#071018; --panel:#111c28; --panel-2:#152231; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; --accent-soft:rgba(61,217,182,0.12); }}
+          body {{ margin:0; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.14) 0, transparent 28%),radial-gradient(circle at top right, rgba(61,217,182,0.10) 0, transparent 26%),var(--bg); }}
+          .app {{ display:grid; grid-template-columns:280px minmax(0, 1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .content {{ padding:28px; }}
+          .wrap {{ max-width:1080px; margin:0 auto; padding:0 0 56px; }}
           .toolbar {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }}
-          .toolbar a {{ color:#0f766e; text-decoration:none; font-weight:700; }}
-          .card {{ background:#fffdf7; border:1px solid #d6cfc2; border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); margin-bottom:16px; }}
-          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:#dff5ef; color:#0f766e; font-size:12px; font-weight:700; text-transform:uppercase; margin-bottom:12px; }}
-          .table-wrap {{ overflow-x:auto; border-radius:14px; border:1px solid #d6cfc2; background:#fff; }}
+          .toolbar a {{ color:var(--accent); text-decoration:none; font-weight:700; }}
+          .card {{ background:linear-gradient(180deg, rgba(21,34,49,0.98), rgba(17,28,40,0.98)); border:1px solid var(--line); border-radius:22px; padding:18px; box-shadow:0 24px 48px rgba(0,0,0,0.18); margin-bottom:16px; }}
+          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; text-transform:uppercase; margin-bottom:12px; }}
+          .table-wrap {{ overflow-x:auto; border-radius:14px; border:1px solid var(--line); background:rgba(11,19,29,0.82); }}
           table {{ width:100%; border-collapse:collapse; min-width:980px; }}
-          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid #d6cfc2; white-space:nowrap; }}
-          th {{ color:#6b7280; font-weight:700; }}
-          .main-open-link {{ display:inline-flex; align-items:center; justify-content:center; padding:6px 9px; border-radius:999px; background:#eef8f5; color:#0f766e; text-decoration:none; font-weight:800; font-size:12px; }}
+          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }}
+          th {{ color:var(--muted); font-weight:700; }}
+          .main-open-link {{ display:inline-flex; align-items:center; justify-content:center; padding:6px 9px; border-radius:999px; background:rgba(61,217,182,0.10); color:var(--accent); text-decoration:none; font-weight:800; font-size:12px; }}
+          h1 {{ margin:0 0 8px; font-size:36px; }}
+          p {{ color:var(--muted); }}
+          @media (max-width: 1120px) {{
+            .app {{ grid-template-columns:1fr; }}
+            .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }}
+            .content {{ padding:20px 14px 40px; }}
+          }}
         </style>
       </head>
       <body>
-        <main class="wrap">
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{_lang_text(lang, 'today_focus_pool')}</h1>
+              <p>{'把今天最值得先看的股票先放进一个临时研究池。' if lang == 'zh' else 'Collect the names you want to review first into a temporary focus pool.'}</p>
+            </div>
+            <nav class="side-nav">{render_workspace_nav_html(lang=lang, active_key='screeners')}</nav>
+            <div class="sidebar-foot">{'这页更像盘前/盘后优先级列表，决定谁先看，而不是最终持有清单。' if lang == 'zh' else 'This page acts like a premarket/postmarket priority list rather than a final holdings list.'}</div>
+          </aside>
+          <main class="content">
+        <div class="wrap">
           <div class="toolbar">
             <a href="/screeners?lang={lang}">← {_lang_text(lang, 'quant_screener')}</a>
             <a href="/watchlist?lang={lang}">{_lang_text(lang, 'open_watchlist')}</a>
@@ -2521,7 +2850,9 @@ def today_focus_pool_page(request: Request, lang: str = Query("en"), db: Session
               </table>
             </div>
           </div>
-        </main>
+        </div>
+          </main>
+        </div>
       </body>
     </html>
     """
@@ -2544,8 +2875,23 @@ def market_snapshot_page(
     view_mode = (mode or "monitor").strip().lower()
     if view_mode not in {"premarket", "monitor", "postmarket"}:
         view_mode = "monitor"
-    boards = ScreenerService().build_market_snapshot(market="CN", limit_per_board=10, mode=view_mode)
-    sentiment = build_market_sentiment_snapshot(boards=boards)
+    snapshot_type = {
+        "premarket": SNAPSHOT_MARKET_WORKSPACE_PREMARKET,
+        "monitor": SNAPSHOT_MARKET_WORKSPACE_MONITOR,
+        "postmarket": SNAPSHOT_MARKET_WORKSPACE_POSTMARKET,
+    }[view_mode]
+    market_snapshot = load_latest_workspace_snapshot(db, snapshot_type)
+    payload = (market_snapshot or {}).get("payload") if isinstance(market_snapshot, dict) else None
+    boards = (payload or {}).get("boards") if isinstance(payload, dict) else None
+    snapshot_ready = isinstance(boards, list) and bool(boards)
+    if not snapshot_ready:
+        boards = []
+    sentiment = get_or_set(
+        "screener_market_sentiment",
+        json.dumps({"mode": view_mode}, sort_keys=True, ensure_ascii=False),
+        ttl_seconds=45.0,
+        loader=lambda: build_market_sentiment_snapshot(boards=boards),
+    )
     sentiment_chip = _signal_chip("Market", sentiment.get("sentiment") or "neutral")
     sentiment_summary = (
         f"Avg score {sentiment.get('average_snapshot_score', '-')} | "
@@ -2564,6 +2910,14 @@ def market_snapshot_page(
             f"{_market_snapshot_table(board.get('rows') or [], watchlist_map, lang)}"
             "</section>"
         )
+    loading_hint = (
+        "<div class='card'>"
+        f"<div class='eyebrow'>{'后台预计算' if lang == 'zh' else 'Background Precompute'}</div>"
+        f"<p style='margin:0;color:#6b7280;'>{'市场快照仍在后台生成，稍后刷新即可。' if lang == 'zh' else 'Market snapshot boards are still being generated in the background. Please refresh shortly.'}</p>"
+        "</div>"
+        if not snapshot_ready
+        else ""
+    )
     return f"""
     <!DOCTYPE html>
     <html lang="{lang}">
@@ -2572,22 +2926,44 @@ def market_snapshot_page(
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{_lang_text(lang, 'market_snapshot')}</title>
         <style>
-          body {{ margin: 0; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:#1f2937; background:#f5efe2; }}
-          .wrap {{ max-width:1200px; margin:0 auto; padding:28px 20px 56px; }}
+          :root {{ --bg:#071018; --panel:#111c28; --panel-2:#152231; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; --accent-soft:rgba(61,217,182,0.12); }}
+          body {{ margin:0; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.14) 0, transparent 28%),radial-gradient(circle at top right, rgba(61,217,182,0.10) 0, transparent 26%),var(--bg); }}
+          .app {{ display:grid; grid-template-columns:280px minmax(0, 1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .content {{ padding:28px; }}
+          .wrap {{ max-width:1200px; margin:0 auto; padding:0 0 56px; }}
           .toolbar {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }}
-          .toolbar a {{ color:#0f766e; text-decoration:none; font-weight:700; }}
-          .card {{ background:#fffdf7; border:1px solid #d6cfc2; border-radius:18px; padding:18px; box-shadow:0 8px 24px rgba(31,41,55,0.05); margin-bottom:16px; }}
-          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:#dff5ef; color:#0f766e; font-size:12px; font-weight:700; text-transform:uppercase; margin-bottom:12px; }}
-          .table-wrap {{ overflow-x:auto; border-radius:14px; border:1px solid #d6cfc2; background:#fff; }}
+          .toolbar a {{ color:var(--accent); text-decoration:none; font-weight:700; }}
+          .card {{ background:linear-gradient(180deg, rgba(21,34,49,0.98), rgba(17,28,40,0.98)); border:1px solid var(--line); border-radius:22px; padding:18px; box-shadow:0 24px 48px rgba(0,0,0,0.18); margin-bottom:16px; }}
+          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; text-transform:uppercase; margin-bottom:12px; }}
+          .table-wrap {{ overflow-x:auto; border-radius:14px; border:1px solid var(--line); background:rgba(11,19,29,0.82); }}
           table {{ width:100%; border-collapse:collapse; min-width:1080px; }}
-          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid #d6cfc2; vertical-align:top; }}
-          th {{ color:#6b7280; font-weight:700; white-space:nowrap; }}
-          .main-open-link {{ display:inline-flex; align-items:center; justify-content:center; padding:6px 9px; border-radius:999px; background:#eef8f5; color:#0f766e; text-decoration:none; font-weight:800; font-size:12px; white-space:nowrap; }}
-          .muted {{ color:#6b7280; }}
+          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
+          th {{ color:var(--muted); font-weight:700; white-space:nowrap; }}
+          .main-open-link {{ display:inline-flex; align-items:center; justify-content:center; padding:6px 9px; border-radius:999px; background:rgba(61,217,182,0.10); color:var(--accent); text-decoration:none; font-weight:800; font-size:12px; white-space:nowrap; }}
+          .muted {{ color:var(--muted); }}
+          h1 {{ margin:0 0 8px; font-size:36px; }}
+          p {{ color:var(--muted); }}
+          @media (max-width: 1120px) {{
+            .app {{ grid-template-columns:1fr; }}
+            .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }}
+            .content {{ padding:20px 14px 40px; }}
+          }}
         </style>
       </head>
       <body>
-        <main class="wrap">
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{_lang_text(lang, 'market_snapshot')}</h1>
+              <p>{'把强势、收口、连阳、放量候选放进一个盘面快照板。' if lang == 'zh' else 'Collect momentum, squeeze, candle, and volume candidates into one market snapshot board.'}</p>
+            </div>
+            <nav class="side-nav">{render_workspace_nav_html(lang=lang, active_key='screeners')}</nav>
+            <div class="sidebar-foot">{'这个页面适合盘前盘后扫榜，不适合做深度研究；看中某只票再进入洞察页。' if lang == 'zh' else 'Use this page for a fast premarket/postmarket scan, then open insight for deep work.'}</div>
+          </aside>
+          <main class="content">
+        <div class="wrap">
           <div class="toolbar">
             <a href="/screeners?lang={lang}">← {_lang_text(lang, 'quant_screener')}</a>
             <a href="/screeners/focus/today?lang={lang}">{_lang_text(lang, 'today_focus_pool')}</a>
@@ -2608,8 +2984,11 @@ def market_snapshot_page(
             <p style="margin:12px 0 0;color:#6b7280;">{sentiment_summary}</p>
           </div>
           {_banner_html(message, lang)}
+          {loading_hint}
           {''.join(board_html)}
-        </main>
+        </div>
+          </main>
+        </div>
       </body>
     </html>
     """
