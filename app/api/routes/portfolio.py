@@ -18,10 +18,17 @@ from app.services.portfolio_intelligence import (
     build_portfolio_intelligence,
 )
 from app.services.portfolio_book import (
+    SELL_REASON_OPTIONS,
+    apply_suggested_trade_reasons,
+    backfill_trade_audit_snapshot,
+    backfill_trade_audit_snapshots,
     load_portfolio_positions,
     load_portfolio_trades,
     remove_portfolio_position,
     sell_portfolio_position,
+    suggest_trade_reason,
+    trade_reason_label,
+    update_portfolio_trade_reason,
     upsert_portfolio_position,
 )
 from app.services.price_snapshot import load_latest_close, load_latest_closes
@@ -31,7 +38,7 @@ from app.services.symbol_catalog import infer_symbol_record, search_symbol_catal
 from app.services.ticker_format import normalize_ticker_for_market
 from app.services.time_utils import app_today_iso
 from app.services.ui_lang import resolve_request_lang
-from app.services.workspace_nav import WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
+from app.services.workspace_nav import WORKSPACE_COMPACT_STYLE, WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
 from app.services.workspace_snapshots import (
     SNAPSHOT_PORTFOLIO_NLP,
     SNAPSHOT_PORTFOLIO_WORKSPACE,
@@ -49,7 +56,6 @@ MARKET_OPTIONS = [
     ("HK", "Hong Kong Stocks", "Examples: 0700.HK, 9988.HK"),
 ]
 
-
 def _compact_text(value: str | None, limit: int = 28) -> str:
     text = str(value or "").strip()
     if not text:
@@ -57,6 +63,56 @@ def _compact_text(value: str | None, limit: int = 28) -> str:
     if len(text) <= limit:
         return text
     return f"{text[: limit - 1]}…"
+
+
+def _portfolio_action_chip(value: str | None) -> str:
+    text = str(value or "-").strip() or "-"
+    lowered = text.lower()
+    bg = "#1a2430"
+    fg = "#d7e3ef"
+    if any(token in lowered for token in ("减", "trim", "exit", "sell", "降")):
+        bg, fg = "#34161d", "#ffb4c0"
+    elif any(token in lowered for token in ("加", "buy", "entry", "增")):
+        bg, fg = "#123328", "#91f0c5"
+    elif any(token in lowered for token in ("观察", "review", "watch", "复核")):
+        bg, fg = "#1a2940", "#9fcaff"
+    return (
+        "<span style='display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;"
+        f"background:{bg};color:{fg};font-weight:800;font-size:12px;line-height:1.2;white-space:nowrap;'>{html.escape(text)}</span>"
+    )
+
+
+def _portfolio_risk_chip(value: str | None) -> str:
+    text = str(value or "-").strip() or "-"
+    lowered = text.lower()
+    bg = "#1a2430"
+    fg = "#d7e3ef"
+    if any(token in lowered for token in ("高", "high", "earnings", "event", "gap", "risk")):
+        bg, fg = "#35220f", "#ffd58a"
+    elif any(token in lowered for token in ("低", "low", "ok", "normal")):
+        bg, fg = "#163021", "#8ce8b6"
+    return (
+        "<span style='display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;"
+        f"background:{bg};color:{fg};font-weight:800;font-size:12px;line-height:1.2;white-space:nowrap;'>{html.escape(text)}</span>"
+    )
+
+
+def _portfolio_priority_rank(value: object) -> int:
+    raw = str(value or "").strip()
+    if not raw:
+        return 0
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        pass
+    lowered = raw.lower()
+    if raw in {"高", "high", "H", "A"} or lowered == "high":
+        return 3
+    if raw in {"中", "medium", "med", "M", "B"} or lowered in {"medium", "med"}:
+        return 2
+    if raw in {"低", "low", "L", "C"} or lowered == "low":
+        return 1
+    return 0
 
 
 def _redirect(message: str | None = None) -> RedirectResponse:
@@ -187,6 +243,10 @@ def portfolio_page(
         for item in (nlp_rows or [])
         if isinstance(item, dict) and item.get("ticker")
     }
+    sell_reason_options_html = "".join(
+        f"<option value='{html.escape(value, quote=True)}'>{html.escape(value if lang == 'zh' else en_label)}</option>"
+        for value, en_label in SELL_REASON_OPTIONS
+    )
     snapshot_payload = (snapshot or {}).get("payload") if isinstance(snapshot, dict) else None
     intelligence = (snapshot_payload or {}).get("intelligence") if isinstance(snapshot_payload, dict) else None
     if not isinstance(intelligence, dict):
@@ -304,7 +364,16 @@ def portfolio_page(
         row["news_sentiment_label"] = news_row.get("sentiment_label") or ("中性" if lang == "zh" else "neutral")
         row["news_summary"] = news_row.get("summary_text") or ""
         row["news_headline_count"] = int(news_row.get("headline_count") or 0)
-    for row in intelligence.get("watch_items", []):
+    watch_items = sorted(
+        list(intelligence.get("watch_items", [])),
+        key=lambda row: (
+            -_portfolio_priority_rank(row.get("action_priority")),
+            -abs(float(row.get("rebalance_gap_pct") or 0.0)),
+            -abs(float(row.get("weight_pct") or 0.0)),
+            str(row.get("ticker") or ""),
+        ),
+    )
+    for row in watch_items:
         news_row = nlp_map.get(str(row.get("ticker") or "").strip().upper()) or {}
         row["news_text"] = news_row.get("summary_text") or ("暂无相关新闻摘要" if lang == "zh" else "No relevant news summary yet")
     total_pnl = total_market_value - total_cost
@@ -319,8 +388,89 @@ def portfolio_page(
     )
     banner = f"<div class='banner'>{message}</div>" if message else ""
     trades = sorted(load_portfolio_trades(), key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    unresolved_trade_count = sum(1 for row in trades if str(row.get("reason") or "").strip() == "其他")
+    resolved_trade_count = max(0, len(trades) - unresolved_trade_count)
+    suggested_trade_count = sum(
+        1
+        for row in trades
+        if str(row.get("reason") or "").strip() == "其他" and suggest_trade_reason(row) != "其他"
+    )
+    missing_audit_count = sum(
+        1
+        for row in trades
+        if not str(row.get("audit_snapshot_at") or "").strip()
+        and not str(row.get("action_hint_at_exit") or "").strip()
+        and not str(row.get("action_reason_at_exit") or "").strip()
+    )
+    sell_reason_progress_html = (
+        f"<div style='display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;'>"
+        f"<span style='display:inline-flex;align-items:center;padding:7px 11px;border-radius:999px;background:rgba(61,217,182,0.12);color:var(--accent);font-weight:800;font-size:12px;'>"
+        f"{'已结构化' if lang == 'zh' else 'Structured'} {resolved_trade_count}</span>"
+        f"<span style='display:inline-flex;align-items:center;padding:7px 11px;border-radius:999px;background:rgba(246,193,119,0.14);color:#f6c177;font-weight:800;font-size:12px;'>"
+        f"{'待补录' if lang == 'zh' else 'Needs review'} {unresolved_trade_count}</span>"
+        f"<span style='display:inline-flex;align-items:center;padding:7px 11px;border-radius:999px;background:rgba(159,202,255,0.14);color:#9fcaff;font-weight:800;font-size:12px;'>"
+        f"{'可按建议补录' if lang == 'zh' else 'Can autofill'} {suggested_trade_count}</span>"
+        f"<span style='display:inline-flex;align-items:center;padding:7px 11px;border-radius:999px;background:rgba(255,180,192,0.12);color:#ffb4c0;font-weight:800;font-size:12px;'>"
+        f"{'待补录建议快照' if lang == 'zh' else 'Missing audit snapshot'} {missing_audit_count}</span>"
+        f"<a href='/dashboard/weekly-review?lang={lang}' style='display:inline-flex;align-items:center;padding:7px 11px;border-radius:999px;border:1px solid var(--line);background:rgba(17,28,40,0.7);font-weight:800;font-size:12px;'>"
+        f"{'打开每周复盘' if lang == 'zh' else 'Open Weekly Review'}</a>"
+        f"<form method='post' action='/portfolio/trade-reason/suggest-all' style='margin:0;'>"
+        f"<input type='hidden' name='lang' value='{lang}' />"
+        f"<button type='submit' class='ghost-btn' style='padding:7px 11px;' {'disabled' if suggested_trade_count <= 0 else ''}>{'一键按建议补录' if lang == 'zh' else 'Autofill suggestions'}</button>"
+        "</form>"
+        f"<form method='post' action='/portfolio/trade-audit/backfill-all' style='margin:0;'>"
+        f"<input type='hidden' name='lang' value='{lang}' />"
+        f"<button type='submit' class='ghost-btn' style='padding:7px 11px;' {'disabled' if missing_audit_count <= 0 else ''}>{'一键补录建议快照' if lang == 'zh' else 'Backfill audit snapshots'}</button>"
+        "</form>"
+        "</div>"
+    ) if trades else ""
+    def _render_trade_reason_cell(row: dict) -> str:
+        current_reason = str(row.get("reason") or "").strip()
+        base_form = (
+            f"<form method='post' action='/portfolio/trade-reason' style='display:flex;gap:8px;align-items:center;min-width:220px;'>"
+            f"<input type='hidden' name='trade_id' value='{int(row.get('id') or 0)}' />"
+            f"<input type='hidden' name='lang' value='{lang}' />"
+            f"<select name='reason' style='min-width:138px;'>"
+            + "".join(
+                f"<option value='{html.escape(value, quote=True)}' {'selected' if value == current_reason else ''}>{html.escape(value if lang == 'zh' else en_label)}</option>"
+                for value, en_label in SELL_REASON_OPTIONS
+            )
+            + "</select>"
+            + f"<button type='submit' class='ghost-btn' style='padding:7px 10px;'>{'保存' if lang == 'zh' else 'Save'}</button>"
+            + "</form>"
+        )
+        suggested_form = ""
+        if current_reason == "其他":
+            suggested_form = (
+                f"<form method='post' action='/portfolio/trade-reason/suggest' style='display:flex;gap:8px;align-items:center;margin-top:6px;'>"
+                f"<input type='hidden' name='trade_id' value='{int(row.get('id') or 0)}' />"
+                f"<input type='hidden' name='lang' value='{lang}' />"
+                f"<button type='submit' class='ghost-btn' style='padding:6px 10px;'>{'按建议补录' if lang == 'zh' else 'Use suggestion'}</button>"
+                f"<span class='muted'>{html.escape(suggest_trade_reason(row))}</span>"
+                "</form>"
+            )
+        reason_label = trade_reason_label(row.get("reason"), lang=lang)
+        audit_form = ""
+        has_audit = bool(str(row.get("audit_snapshot_at") or "").strip()) or bool(
+            str(row.get("action_hint_at_exit") or "").strip() or str(row.get("action_reason_at_exit") or "").strip()
+        )
+        if not has_audit:
+            audit_form = (
+                f"<form method='post' action='/portfolio/trade-audit/backfill' style='display:flex;gap:8px;align-items:center;margin-top:6px;'>"
+                f"<input type='hidden' name='trade_id' value='{int(row.get('id') or 0)}' />"
+                f"<input type='hidden' name='lang' value='{lang}' />"
+                f"<button type='submit' class='ghost-btn' style='padding:6px 10px;'>{'补录建议快照' if lang == 'zh' else 'Backfill audit'}</button>"
+                f"<span class='muted'>{'历史补录' if lang == 'zh' else 'Historical backfill'}</span>"
+                "</form>"
+            )
+        return (
+            base_form
+            + suggested_form
+            + audit_form
+            + f"<div class='muted' style='margin-top:6px;' title='{html.escape(reason_label, quote=True)}'>{_compact_text(reason_label, 18)}</div>"
+        )
     recent_sell_rows = "".join(
-        "<tr>"
+        f"<tr style='background:{'rgba(246,193,119,0.06)' if str(row.get('reason') or '').strip() == '其他' else 'transparent'};'>"
         f"<td>{html.escape(str(row.get('trade_date') or '-'))}</td>"
         f"<td>{html.escape(row.get('ticker') or '-')}</td>"
         f"<td title='{html.escape(row.get('name') or '-', quote=True)}'>{_compact_text(row.get('name') or row.get('ticker'), 18)}</td>"
@@ -329,7 +479,7 @@ def portfolio_page(
         f"<td>{float(row.get('cost_basis') or 0.0):.2f}</td>"
         f"<td>{float(row.get('realized_pnl') or 0.0):.2f} ({float(row.get('realized_pnl_pct') or 0.0):.1f}%)</td>"
         f"<td>{float(row.get('remaining_quantity') or 0.0):.0f}</td>"
-        f"<td title='{html.escape(row.get('reason') or '-', quote=True)}'>{_compact_text(row.get('reason') or '-', 18)}</td>"
+        f"<td>{_render_trade_reason_cell(row)}</td>"
         "</tr>"
         for row in trades[:10]
     ) or f"<tr><td colspan='9'>{'暂无卖出记录' if lang == 'zh' else 'No sell records yet.'}</td></tr>"
@@ -341,12 +491,43 @@ def portfolio_page(
         "</article>"
         for row in intelligence["sector_rankings"]
     ) or f"<div class='muted'>{'暂无行业暴露数据' if lang == 'zh' else 'No sector exposure data yet'}</div>"
-    watch_items_html = "".join(
-        "<article style='display:flex;justify-content:space-between;gap:12px;padding:12px 0;border-top:1px solid var(--line);align-items:flex-start;'>"
-        f"<div><div style='font-weight:800'>{row['ticker']}</div><div class='muted' style='margin-top:4px;'>{row.get('name') or row['ticker']}</div><div class='muted' style='margin-top:4px;'>{row['sector']} · {row['signal_label']} · {row['risk_tag']}</div><div class='muted' style='margin-top:6px;'>{row['action_reason']}</div><div class='muted' style='margin-top:6px;'>{row['rebalance_action']}</div><div class='muted' style='margin-top:6px;'>{row['execution_risk_summary']}</div><div class='muted' style='margin-top:6px;'>{row.get('news_text') or '-'}</div></div>"
-        f"<div style='text-align:right;'><div style='font-weight:700'>{row['action_hint']}</div><div class='muted'>{'优先级' if lang == 'zh' else 'Priority'}: {row['action_priority']}</div><div class='muted'>{row['pnl_pct']:.1f}% · {row['weight_pct']:.1f}%</div><div class='muted'>{'目标仓位' if lang == 'zh' else 'Target'}: {(f"{row['target_weight_pct']:.1f}%" if row.get('target_weight_pct') is not None else '-')}</div><div class='muted'>{'偏离' if lang == 'zh' else 'Gap'}: {(f"{row['rebalance_gap_pct']:.1f}%" if row.get('rebalance_gap_pct') is not None else '-')}</div></div>"
+    watch_action_rows_html = "".join(
+        "<tr>"
+        f"<td>{row['ticker']}</td>"
+        f"<td title='{html.escape(str(row.get('name') or row['ticker']), quote=True)}'>{_compact_text(row.get('name') or row['ticker'], 20)}</td>"
+        f"<td>{_portfolio_action_chip(row['action_hint'])}</td>"
+        f"<td>{row['action_priority']}</td>"
+        f"<td>{row['sector']}</td>"
+        f"<td>{row['signal_label']}</td>"
+        f"<td>{_portfolio_risk_chip(row['risk_tag'])}</td>"
+        f"<td>{row['pnl_pct']:.1f}%</td>"
+        f"<td>{row['weight_pct']:.1f}%</td>"
+        f"<td>{(format(row['target_weight_pct'], '.1f') + '%' if row.get('target_weight_pct') is not None else '-')}</td>"
+        f"<td>{(format(row['rebalance_gap_pct'], '.1f') + '%' if row.get('rebalance_gap_pct') is not None else '-')}</td>"
+        f"<td title='{html.escape(row['action_reason'], quote=True)}'>{_compact_text(row['action_reason'], 28)}</td>"
+        f"<td title='{html.escape(row['rebalance_action'], quote=True)}'>{_compact_text(row['rebalance_action'], 24)}</td>"
+        f"<td title='{html.escape(row['execution_risk_summary'], quote=True)}'>{_compact_text(row['execution_risk_summary'], 24)}</td>"
+        f"<td title='{html.escape(row.get('news_text') or '-', quote=True)}'>{_compact_text(row.get('news_text') or '-', 28)}</td>"
+        "</tr>"
+        for row in watch_items
+    ) or f"<tr><td colspan='15'>{'暂无持仓动作建议' if lang == 'zh' else 'No action items yet'}</td></tr>"
+    watch_action_cards_html = "".join(
+        "<article class='mobile-action-card'>"
+        f"<div class='mobile-position-head'><div><div class='mobile-position-ticker'>{row['ticker']}</div><div class='muted'>{_compact_text(row.get('name') or row['ticker'], 24)} · {row['sector']}</div></div><div style='text-align:right;'><div>{_portfolio_action_chip(row['action_hint'])}</div><div class='muted' style='margin-top:6px;'>{'优先级' if lang == 'zh' else 'Priority'} {row['action_priority']}</div></div></div>"
+        f"<div class='mobile-position-grid'>"
+        f"<div><span class='muted'>{'信号' if lang == 'zh' else 'Signal'}</span><div>{row['signal_label']}</div></div>"
+        f"<div><span class='muted'>{'风险' if lang == 'zh' else 'Risk'}</span><div>{_portfolio_risk_chip(row['risk_tag'])}</div></div>"
+        f"<div><span class='muted'>PnL</span><div>{row['pnl_pct']:.1f}%</div></div>"
+        f"<div><span class='muted'>{'仓位' if lang == 'zh' else 'Weight'}</span><div>{row['weight_pct']:.1f}%</div></div>"
+        f"<div><span class='muted'>{'目标' if lang == 'zh' else 'Target'}</span><div>{(format(row['target_weight_pct'], '.1f') + '%' if row.get('target_weight_pct') is not None else '-')}</div></div>"
+        f"<div><span class='muted'>{'偏离' if lang == 'zh' else 'Gap'}</span><div>{(format(row['rebalance_gap_pct'], '.1f') + '%' if row.get('rebalance_gap_pct') is not None else '-')}</div></div>"
+        "</div>"
+        f"<div class='muted' style='margin-top:8px;'>{_compact_text(row['action_reason'], 88)}</div>"
+        f"<div class='muted' style='margin-top:6px;'>{_compact_text(row['rebalance_action'], 88)}</div>"
+        f"<div class='muted' style='margin-top:6px;'>{_compact_text(row['execution_risk_summary'], 88)}</div>"
+        f"<div class='muted' style='margin-top:6px;'>{_compact_text(row.get('news_text') or '-', 88)}</div>"
         "</article>"
-        for row in intelligence["watch_items"]
+        for row in watch_items
     ) or f"<div class='muted'>{'暂无持仓动作建议' if lang == 'zh' else 'No action items yet'}</div>"
     rows_html = "".join(
         "<tr>"
@@ -366,21 +547,36 @@ def portfolio_page(
         f"<td title='{html.escape(row.get('news_summary') or '-', quote=True)}'>{html.escape(row.get('news_sentiment_label') or '-')} · {int(row.get('news_headline_count') or 0)}</td>"
         f"<td title='{html.escape(row['note'] or '-', quote=True)}'>{_compact_text(row['note'] or '-', 20)}</td>"
         "<td>"
-        f"<form action='/portfolio/sell' method='post' style='display:grid;gap:6px;min-width:220px;'>"
-        f"<input type='hidden' name='ticker' value='{row['ticker']}' />"
-        f"<input type='hidden' name='lang' value='{lang}' />"
-        f"<input type='date' name='trade_date' value='{app_today_iso()}' title='{'卖出日期' if lang == 'zh' else 'Sell date'}' />"
-        f"<input type='number' name='quantity' min='0.0001' max='{float(row['quantity']):.6f}' step='0.0001' value='{float(row['quantity']):.0f}' title='{'卖出数量' if lang == 'zh' else 'Sell quantity'}' />"
-        f"<input type='number' name='price' min='0.0001' step='0.0001' value='{float(row['latest_price']):.2f}' title='{'卖出价格' if lang == 'zh' else 'Sell price'}' />"
-        f"<input type='number' name='fee' min='0' step='0.01' value='0' title='{'手续费' if lang == 'zh' else 'Fee'}' />"
-        f"<input type='text' name='reason' placeholder='{'卖出原因' if lang == 'zh' else 'Sell reason'}' />"
-        f"<button type='submit'>{'卖出' if lang == 'zh' else 'Sell'}</button>"
-        f"</form>"
-        f"<form action='/portfolio/remove' method='post' style='margin-top:6px;'><input type='hidden' name='ticker' value='{row['ticker']}' /><button type='submit'>{'删除记录' if lang == 'zh' else 'Remove Record'}</button></form>"
+        "<div class='position-actions'>"
+        f"<button type='button' class='ghost-btn' onclick=\"openSellModal('{html.escape(row['ticker'], quote=True)}','{html.escape(row['name'], quote=True)}','{float(row['quantity']):.6f}','{float(row['latest_price']):.2f}')\">{'卖出' if lang == 'zh' else 'Sell'}</button>"
+        f"<form action='/portfolio/remove' method='post' style='margin:0;'><input type='hidden' name='ticker' value='{row['ticker']}' /><button type='submit' class='ghost-btn danger-btn'>{'删除' if lang == 'zh' else 'Delete'}</button></form>"
+        "</div>"
         "</td>"
         "</tr>"
         for row in rows
     ) or "<tr><td colspan='16'>No positions yet.</td></tr>"
+    mobile_rows_html = "".join(
+        "<article class='mobile-position-card'>"
+        f"<div class='mobile-position-head'><div><div class='mobile-position-ticker'>{row['ticker']}</div><div class='muted'>{_compact_text(row['name'], 24)} · {row['market']}</div></div><div style='text-align:right;'><div style='font-weight:800;'>{row['pnl']:.2f}</div><div class='muted'>{row['pnl_pct']:.1f}%</div></div></div>"
+        f"<div class='mobile-position-grid'>"
+        f"<div><span class='muted'>{'数量' if lang == 'zh' else 'Qty'}</span><div>{row['quantity']:.0f}</div></div>"
+        f"<div><span class='muted'>{'成本' if lang == 'zh' else 'Cost'}</span><div>{row['cost_basis']:.2f}</div></div>"
+        f"<div><span class='muted'>{'最新价' if lang == 'zh' else 'Last'}</span><div>{row['latest_price']:.2f}</div></div>"
+        f"<div><span class='muted'>{'市值' if lang == 'zh' else 'Value'}</span><div>{row['market_value']:.2f}</div></div>"
+        f"<div><span class='muted'>AI</span><div>{row['ai_verdict']}</div></div>"
+        f"<div><span class='muted'>{'动作桶' if lang == 'zh' else 'Bucket'}</span><div>{row['action_bucket']}</div></div>"
+        "</div>"
+        f"<div class='muted' style='margin-top:8px;'>{_compact_text(row['ai_headline'], 60)}</div>"
+        f"<div class='muted' style='margin-top:6px;'>{_compact_text(row['ai_strategy'], 56)}</div>"
+        f"<div class='muted' style='margin-top:6px;'>{'目标仓位' if lang == 'zh' else 'Target'}: {row['target_weight_text']} · {'新闻' if lang == 'zh' else 'News'}: {html.escape(row.get('news_sentiment_label') or '-')} · {int(row.get('news_headline_count') or 0)}</div>"
+        f"<div class='muted' style='margin-top:6px;'>{_compact_text(row['note'] or '-', 72)}</div>"
+        "<div class='mobile-position-actions'>"
+        f"<button type='button' class='ghost-btn' onclick=\"openSellModal('{html.escape(row['ticker'], quote=True)}','{html.escape(row['name'], quote=True)}','{float(row['quantity']):.6f}','{float(row['latest_price']):.2f}')\">{'卖出' if lang == 'zh' else 'Sell'}</button>"
+        f"<form action='/portfolio/remove' method='post' style='margin:0;'><input type='hidden' name='ticker' value='{row['ticker']}' /><button type='submit' class='ghost-btn danger-btn'>{'删除' if lang == 'zh' else 'Delete'}</button></form>"
+        "</div>"
+        "</article>"
+        for row in rows
+    ) or f"<div class='muted'>{'暂无持仓。' if lang == 'zh' else 'No positions yet.'}</div>"
 
     return f"""
     <!DOCTYPE html>
@@ -403,24 +599,144 @@ def portfolio_page(
             radial-gradient(circle at top left, rgba(82,168,255,0.14) 0, transparent 28%),
             radial-gradient(circle at top right, rgba(61,217,182,0.10) 0, transparent 26%),
             var(--bg); color:var(--ink); }}
-          .app {{ display:grid; grid-template-columns:280px minmax(0, 1fr); min-height:100vh; }}
+          {WORKSPACE_COMPACT_STYLE}
           {WORKSPACE_SIDEBAR_STYLE}
-          .content {{ padding:28px; }}
-          .wrap {{ max-width: 1200px; margin:0 auto; padding:0 0 56px; }}
-          .grid {{ display:grid; gap:16px; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); margin-bottom:16px; }}
-          .card {{ background: linear-gradient(180deg, rgba(21,34,49,0.98), rgba(17,28,40,0.98)); border:1px solid var(--line); border-radius:22px; padding:18px; box-shadow:0 24px 48px rgba(0,0,0,0.18); }}
-          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.12); color:var(--accent); font-size:12px; font-weight:700; margin-bottom:12px; }}
-          .metric {{ font-size:28px; font-weight:800; margin:4px 0 8px; }}
-          .muted {{ color:var(--muted); font-size:14px; }}
-          .banner {{ margin-bottom:16px; padding:14px 16px; border-radius:16px; background:rgba(61,217,182,0.14); color:var(--accent); font-weight:700; }}
-          .table-wrap {{ width:100%; max-width:100%; overflow-x:auto; overflow-y:hidden; border-radius:14px; border:1px solid var(--line); background:rgba(11,19,29,0.82); padding-bottom:8px; scrollbar-gutter:stable both-edges; }}
+          .content {{ padding:20px 18px 28px; }}
+          .wrap {{ max-width:none; margin:0; padding:0 0 36px; }}
+          .grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-bottom:12px; }}
+          .metric {{ font-size:24px; font-weight:800; margin:2px 0 6px; }}
+          .banner {{ margin-bottom:12px; padding:12px 14px; border-radius:14px; background:rgba(61,217,182,0.14); color:var(--accent); font-weight:700; }}
+          .table-wrap {{ width:100%; max-width:100%; overflow-x:auto; overflow-y:hidden; border-radius:12px; border:1px solid var(--line); background:rgba(11,19,29,0.82); padding-bottom:8px; scrollbar-gutter:stable both-edges; }}
           .table-wrap::-webkit-scrollbar {{ height:12px; }}
           .table-wrap::-webkit-scrollbar-track {{ background:#0f1823; border-radius:999px; }}
           .table-wrap::-webkit-scrollbar-thumb {{ background:#32465d; border-radius:999px; border:2px solid #0f1823; }}
           .table-wrap::-webkit-scrollbar-thumb:hover {{ background:#47627f; }}
-          table {{ width:100%; min-width:1380px; border-collapse:collapse; font-size:14px; }}
-          th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; white-space:nowrap; }}
+          table {{ width:100%; min-width:1380px; border-collapse:collapse; font-size:13px; }}
+          th, td {{ text-align:left; padding:9px 8px; border-bottom:1px solid var(--line); vertical-align:top; white-space:nowrap; }}
           th {{ color:var(--muted); font-weight:600; }}
+          .mobile-position-list {{ display:none; gap:10px; margin-top:2px; }}
+          .mobile-position-card {{
+            border:1px solid var(--line);
+            border-radius:14px;
+            background:rgba(11,19,29,0.82);
+            padding:12px;
+          }}
+          .mobile-position-head {{
+            display:flex;
+            justify-content:space-between;
+            gap:10px;
+            align-items:flex-start;
+          }}
+          .mobile-position-ticker {{ font-size:15px; font-weight:800; color:var(--accent); }}
+          .mobile-position-grid {{
+            display:grid;
+            gap:8px;
+            grid-template-columns:repeat(2, minmax(0, 1fr));
+            margin-top:10px;
+          }}
+          .mobile-position-grid > div {{
+            border:1px solid rgba(255,255,255,0.04);
+            border-radius:12px;
+            background:rgba(21,34,49,0.9);
+            padding:10px 12px;
+          }}
+          .mobile-position-actions {{ display:grid; gap:8px; margin-top:10px; }}
+          .position-actions {{ display:grid; gap:6px; min-width:120px; }}
+          .ghost-btn {{
+            width:100%;
+            padding:10px 12px;
+            border-radius:12px;
+            border:1px solid var(--line);
+            background:#0f1823;
+            color:var(--ink);
+            font-weight:700;
+            cursor:pointer;
+          }}
+          .danger-btn {{ color:#fda4af; border-color:#4b1d28; background:#191018; }}
+          .sell-modal {{
+            position:fixed;
+            inset:0;
+            display:none;
+            align-items:center;
+            justify-content:center;
+            padding:20px;
+            background:rgba(3, 8, 14, 0.72);
+            z-index:40;
+          }}
+          .sell-modal.open {{ display:flex; }}
+          .sell-modal-card {{
+            width:min(100%, 440px);
+            border:1px solid var(--line);
+            border-radius:18px;
+            background:linear-gradient(180deg, rgba(21,34,49,0.98), rgba(17,28,40,0.98));
+            box-shadow:0 28px 60px rgba(0,0,0,0.32);
+            padding:18px;
+          }}
+          .sell-modal-head {{
+            display:flex;
+            justify-content:space-between;
+            gap:12px;
+            align-items:flex-start;
+            margin-bottom:12px;
+          }}
+          .sell-modal-form {{ display:grid; gap:10px; }}
+          .sell-modal-actions {{ display:flex; gap:10px; justify-content:flex-end; margin-top:6px; }}
+          .secondary-btn {{
+            padding:10px 14px;
+            border-radius:12px;
+            border:1px solid var(--line);
+            background:#0f1823;
+            color:var(--ink);
+            font-weight:700;
+            cursor:pointer;
+          }}
+          .action-table-wrap table {{ min-width:1560px; }}
+          .action-table th:nth-child(1),
+          .action-table td:nth-child(1) {{
+            position:sticky;
+            left:0;
+            z-index:4;
+            min-width:104px;
+            background:#0b131d;
+            box-shadow:8px 0 18px rgba(0,0,0,0.22);
+          }}
+          .action-table th:nth-child(2),
+          .action-table td:nth-child(2) {{
+            position:sticky;
+            left:104px;
+            z-index:4;
+            min-width:150px;
+            max-width:150px;
+            overflow:hidden;
+            text-overflow:ellipsis;
+            background:#0b131d;
+            box-shadow:8px 0 18px rgba(0,0,0,0.16);
+          }}
+          .action-table th:nth-child(3),
+          .action-table td:nth-child(3) {{
+            position:sticky;
+            left:254px;
+            z-index:4;
+            min-width:150px;
+            max-width:150px;
+            overflow:hidden;
+            text-overflow:ellipsis;
+            background:#0b131d;
+            box-shadow:8px 0 18px rgba(0,0,0,0.10);
+          }}
+          .action-table th:nth-child(1),
+          .action-table th:nth-child(2),
+          .action-table th:nth-child(3) {{
+            z-index:5;
+            background:#101b27;
+          }}
+          .mobile-action-list {{ display:none; gap:10px; margin-top:2px; }}
+          .mobile-action-card {{
+            border:1px solid var(--line);
+            border-radius:14px;
+            background:rgba(11,19,29,0.82);
+            padding:12px;
+          }}
           .positions-table th:first-child,
           .positions-table td:first-child {{
             position:sticky;
@@ -457,7 +773,7 @@ def portfolio_page(
             z-index:10;
             background:#111c28;
             border:1px solid var(--line);
-            border-radius:14px;
+            border-radius:12px;
             box-shadow:0 10px 28px rgba(0,0,0,0.18);
             margin-top:6px;
             display:none;
@@ -472,7 +788,7 @@ def portfolio_page(
             border:none;
             border-bottom:1px solid var(--line);
             border-radius:0;
-            padding:12px;
+            padding:10px;
             cursor:pointer;
           }}
           .suggestion:last-child {{ border-bottom:none; }}
@@ -501,6 +817,13 @@ def portfolio_page(
           @media (max-width: 1120px) {{
             .app {{ grid-template-columns:1fr; }}
             .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }}
+          }}
+          @media (max-width: 720px) {{
+            .positions-table-wrap {{ display:none; }}
+            .action-table-wrap {{ display:none; }}
+            .mobile-position-list {{ display:grid; }}
+            .mobile-action-list {{ display:grid; }}
+            .quote-grid {{ grid-template-columns:1fr; }}
           }}
         </style>
         <script>
@@ -543,6 +866,24 @@ def portfolio_page(
             const tonePctClass = pnlPct !== null && pnlPct > 0 ? "quote-value positive" : (pnlPct !== null && pnlPct < 0 ? "quote-value negative" : "quote-value");
             pnlEl.className = toneClass;
             pnlPctEl.className = tonePctClass;
+          }}
+
+          function openSellModal(ticker, name, quantity, price) {{
+            const modal = document.getElementById("sell-modal");
+            document.getElementById("sell-modal-title").textContent = ticker + (name ? " · " + name : "");
+            document.getElementById("sell-ticker").value = ticker || "";
+            document.getElementById("sell-quantity").value = Number(quantity || 0).toFixed(0);
+            document.getElementById("sell-quantity").max = String(quantity || "");
+            document.getElementById("sell-price").value = Number(price || 0).toFixed(2);
+            document.getElementById("sell-reason").value = "止盈/保护利润";
+            document.getElementById("sell-fee").value = "0";
+            document.getElementById("sell-date").value = "{app_today_iso()}";
+            modal.classList.add("open");
+          }}
+
+          function closeSellModal() {{
+            const modal = document.getElementById("sell-modal");
+            modal.classList.remove("open");
           }}
 
           async function loadPortfolioQuote() {{
@@ -641,6 +982,11 @@ def portfolio_page(
                 loadPortfolioQuote();
               }});
             }}
+            document.addEventListener("keydown", (event) => {{
+              if (event.key === "Escape") {{
+                closeSellModal();
+              }}
+            }});
             updatePortfolioPreview();
           }});
         </script>
@@ -657,6 +1003,37 @@ def portfolio_page(
           </aside>
           <main class="content">
         <div class="wrap">
+          <div id="sell-modal" class="sell-modal" onclick="if (event.target === this) closeSellModal();">
+            <div class="sell-modal-card">
+              <div class="sell-modal-head">
+                <div>
+                  <div class="eyebrow">{'卖出持仓' if lang == 'zh' else 'Sell Position'}</div>
+                  <div id="sell-modal-title" style="font-size:18px;font-weight:800;"></div>
+                </div>
+                <button type="button" class="secondary-btn" onclick="closeSellModal()">{'关闭' if lang == 'zh' else 'Close'}</button>
+              </div>
+              <form action="/portfolio/sell" method="post" class="sell-modal-form">
+                <input id="sell-ticker" type="hidden" name="ticker" />
+                <input type="hidden" name="lang" value="{lang}" />
+                <label class="muted">{'卖出日期' if lang == 'zh' else 'Sell Date'}</label>
+                <input id="sell-date" type="date" name="trade_date" value="{app_today_iso()}" required />
+                <label class="muted">{'卖出数量' if lang == 'zh' else 'Sell Quantity'}</label>
+                <input id="sell-quantity" type="number" name="quantity" min="0.0001" step="0.0001" required />
+                <label class="muted">{'卖出价格' if lang == 'zh' else 'Sell Price'}</label>
+                <input id="sell-price" type="number" name="price" min="0.0001" step="0.0001" required />
+                <label class="muted">{'手续费' if lang == 'zh' else 'Fee'}</label>
+                <input id="sell-fee" type="number" name="fee" min="0" step="0.01" value="0" />
+                <label class="muted">{'卖出原因' if lang == 'zh' else 'Sell Reason'}</label>
+                <select id="sell-reason" name="reason">
+                  {sell_reason_options_html}
+                </select>
+                <div class="sell-modal-actions">
+                  <button type="button" class="secondary-btn" onclick="closeSellModal()">{'取消' if lang == 'zh' else 'Cancel'}</button>
+                  <button type="submit">{'确认卖出' if lang == 'zh' else 'Confirm Sell'}</button>
+                </div>
+              </form>
+            </div>
+          </div>
           <div style="margin-bottom:16px;"><a href="/dashboard?lang={lang}">← {'返回首页' if lang == 'zh' else 'Back to dashboard'}</a></div>
           {banner}
           <section class="grid">
@@ -722,19 +1099,28 @@ def portfolio_page(
               </form>
             </article>
             <article class="card">
-              <div class="eyebrow">{'动作建议' if lang == 'zh' else 'Action Board'}</div>
-              <div class="muted">{'先看高暴露持仓和模型态度变化，再决定是否加减仓。' if lang == 'zh' else 'Review the highest-exposure positions and model posture changes first.'}</div>
-              <div style="margin-top:12px;">{watch_items_html}</div>
-            </article>
-            <article class="card">
               <div class="eyebrow">{'行业暴露' if lang == 'zh' else 'Sector Exposure'}</div>
               <div class="muted">{'先确认组合有没有过度集中在单一行业。' if lang == 'zh' else 'Check whether the portfolio is too concentrated in one sector first.'}</div>
               <div style="margin-top:12px;">{sector_rankings_html}</div>
             </article>
           </section>
           <section class="card">
+            <div class="eyebrow">{'动作建议' if lang == 'zh' else 'Action Board'}</div>
+            <div class="muted">{'先看高暴露持仓和模型态度变化，再决定是否加减仓。桌面端用宽表统一处理，移动端保留卡片阅读。' if lang == 'zh' else 'Review the highest-exposure positions and model posture changes first. Desktop uses a wide table while mobile keeps the card view.'}</div>
+            <div class="table-wrap action-table-wrap" style="margin-top:12px;">
+              <table class="action-table">
+                <thead>
+                  <tr><th>Ticker</th><th>{'名称' if lang == 'zh' else 'Name'}</th><th>{'动作建议' if lang == 'zh' else 'Action'}</th><th>{'优先级' if lang == 'zh' else 'Priority'}</th><th>{'行业' if lang == 'zh' else 'Sector'}</th><th>{'信号' if lang == 'zh' else 'Signal'}</th><th>{'风险标签' if lang == 'zh' else 'Risk Tag'}</th><th>PnL %</th><th>{'当前权重' if lang == 'zh' else 'Weight'}</th><th>{'目标权重' if lang == 'zh' else 'Target'}</th><th>{'偏离' if lang == 'zh' else 'Gap'}</th><th>{'原因' if lang == 'zh' else 'Reason'}</th><th>{'调仓说明' if lang == 'zh' else 'Rebalance'}</th><th>{'执行风险' if lang == 'zh' else 'Execution Risk'}</th><th>{'新闻' if lang == 'zh' else 'News'}</th></tr>
+                </thead>
+                <tbody>{watch_action_rows_html}</tbody>
+              </table>
+            </div>
+            <div class="mobile-action-list">{watch_action_cards_html}</div>
+            <div class="muted" style="margin-top:10px;">{'桌面端可拖动底部滚动条查看更多列。' if lang == 'zh' else 'On desktop you can drag the horizontal scrollbar to inspect more columns.'}</div>
+          </section>
+          <section class="card">
             <div class="eyebrow">Positions</div>
-            <div class="table-wrap">
+            <div class="table-wrap positions-table-wrap">
             <table class="positions-table">
               <thead>
                 <tr><th>Ticker</th><th>Name</th><th>Market</th><th>Qty</th><th>Cost</th><th>Last</th><th>Market Value</th><th>PnL</th><th>AI Verdict</th><th>AI Headline</th><th>AI Strategy</th><th>{'目标仓位' if lang == 'zh' else 'Target Wt'}</th><th>{'动作桶' if lang == 'zh' else 'Action Bucket'}</th><th>{'新闻' if lang == 'zh' else 'News'}</th><th>{'备注' if lang == 'zh' else 'Note'}</th><th>{'操作' if lang == 'zh' else 'Actions'}</th></tr>
@@ -742,15 +1128,18 @@ def portfolio_page(
               <tbody>{rows_html}</tbody>
             </table>
             </div>
+            <div class="mobile-position-list">{mobile_rows_html}</div>
             <div class="muted" style="margin-top:10px;">{'可拖动底部滚动条查看更多列。' if lang == 'zh' else 'Drag the horizontal scrollbar to see more columns.'}</div>
           </section>
           <section class="card">
             <div class="eyebrow">{'卖出记录' if lang == 'zh' else 'Sell Records'}</div>
             <div class="muted">{('已实现盈亏合计: ' + f'{realized_total:.2f}') if lang == 'zh' else ('Total realized PnL: ' + f'{realized_total:.2f}')}</div>
+            <div class="muted" style="margin-top:8px;">{'下方可直接修正历史卖出原因；标黄的记录仍待补录，会影响每周复盘里的建议有效性统计。' if lang == 'zh' else 'You can correct historical sell reasons below. Highlighted rows still need review and will weaken the advice-effectiveness section in weekly review.'}</div>
+            {sell_reason_progress_html}
             <div class="table-wrap" style="margin-top:12px;">
               <table>
                 <thead>
-                  <tr><th>{'日期' if lang == 'zh' else 'Date'}</th><th>Ticker</th><th>Name</th><th>{'数量' if lang == 'zh' else 'Qty'}</th><th>{'卖出价' if lang == 'zh' else 'Sell Price'}</th><th>{'成本' if lang == 'zh' else 'Cost'}</th><th>{'已实现盈亏' if lang == 'zh' else 'Realized PnL'}</th><th>{'剩余数量' if lang == 'zh' else 'Remaining'}</th><th>{'原因' if lang == 'zh' else 'Reason'}</th></tr>
+                  <tr><th>{'日期' if lang == 'zh' else 'Date'}</th><th>Ticker</th><th>Name</th><th>{'数量' if lang == 'zh' else 'Qty'}</th><th>{'卖出价' if lang == 'zh' else 'Sell Price'}</th><th>{'成本' if lang == 'zh' else 'Cost'}</th><th>{'已实现盈亏' if lang == 'zh' else 'Realized PnL'}</th><th>{'剩余数量' if lang == 'zh' else 'Remaining'}</th><th>{'原因 / 修正' if lang == 'zh' else 'Reason / Edit'}</th></tr>
                 </thead>
                 <tbody>{recent_sell_rows}</tbody>
               </table>
@@ -820,10 +1209,20 @@ def sell_portfolio(
     fee: float = Form(0.0),
     reason: str | None = Form(None),
     note: str | None = Form(None),
+    db: Session = Depends(get_db_session),
 ) -> RedirectResponse:
     if not is_authenticated(request):
         return login_redirect("/portfolio")
     try:
+        normalized_reason = str(reason or "").strip() or "其他"
+        intelligence = build_portfolio_intelligence(db, lang="zh")
+        audit_row = next(
+            (
+                item for item in (intelligence.get("all_items") or [])
+                if str(item.get("ticker") or "").strip().upper() == str(ticker or "").strip().upper()
+            ),
+            {},
+        )
         result = sell_portfolio_position(
             {
                 "ticker": ticker,
@@ -831,8 +1230,13 @@ def sell_portfolio(
                 "price": price,
                 "trade_date": trade_date,
                 "fee": fee,
-                "reason": reason,
+                "reason": normalized_reason,
                 "note": note,
+                "action_hint_at_exit": audit_row.get("action_hint"),
+                "action_priority_at_exit": audit_row.get("action_priority"),
+                "action_reason_at_exit": audit_row.get("action_reason"),
+                "rebalance_action_at_exit": audit_row.get("rebalance_action"),
+                "risk_tag_at_exit": audit_row.get("risk_tag"),
             }
         )
     except ValueError as exc:
@@ -843,6 +1247,88 @@ def sell_portfolio(
     _refresh_workspace_snapshots_async()
     return _redirect(
         f"卖出 {trade['ticker']} {trade['quantity']:.0f} 股，已实现盈亏 {trade['realized_pnl']:.2f}，{status}。"
+    )
+
+
+@router.post("/trade-reason")
+def portfolio_trade_reason(
+    request: Request,
+    trade_id: int = Form(...),
+    reason: str = Form("其他"),
+    lang: str = Form("zh"),
+) -> RedirectResponse:
+    if not is_authenticated(request):
+        return login_redirect("/portfolio")
+    update_portfolio_trade_reason(trade_id, reason)
+    _refresh_workspace_snapshots_async()
+    return _redirect("卖出原因已更新" if lang == "zh" else "Trade reason updated")
+
+
+@router.post("/trade-reason/suggest")
+def portfolio_trade_reason_suggest(
+    request: Request,
+    trade_id: int = Form(...),
+    lang: str = Form("zh"),
+) -> RedirectResponse:
+    if not is_authenticated(request):
+        return login_redirect("/portfolio")
+    row = next((item for item in load_portfolio_trades() if int(item.get("id") or 0) == int(trade_id)), None)
+    if row is None:
+        return _redirect("未找到卖出记录" if lang == "zh" else "Trade record not found")
+    suggested = suggest_trade_reason(row)
+    update_portfolio_trade_reason(trade_id, suggested)
+    _refresh_workspace_snapshots_async()
+    return _redirect(
+        f"{'已按建议补录为' if lang == 'zh' else 'Suggested reason applied:'} {suggested}"
+    )
+
+
+@router.post("/trade-reason/suggest-all")
+def portfolio_trade_reason_suggest_all(
+    request: Request,
+    lang: str = Form("zh"),
+) -> RedirectResponse:
+    if not is_authenticated(request):
+        return login_redirect("/portfolio")
+    result = apply_suggested_trade_reasons(only_missing=True)
+    _refresh_workspace_snapshots_async()
+    return _redirect(
+        (
+            f"已按建议补录 {int(result.get('changed') or 0)} 条卖出记录"
+            if lang == "zh"
+            else f"Applied suggestions to {int(result.get('changed') or 0)} sell records"
+        )
+    )
+
+
+@router.post("/trade-audit/backfill")
+def portfolio_trade_audit_backfill(
+    request: Request,
+    trade_id: int = Form(...),
+    lang: str = Form("zh"),
+) -> RedirectResponse:
+    if not is_authenticated(request):
+        return login_redirect("/portfolio")
+    backfill_trade_audit_snapshot(trade_id)
+    _refresh_workspace_snapshots_async()
+    return _redirect("已补录历史建议快照" if lang == "zh" else "Historical audit snapshot backfilled")
+
+
+@router.post("/trade-audit/backfill-all")
+def portfolio_trade_audit_backfill_all(
+    request: Request,
+    lang: str = Form("zh"),
+) -> RedirectResponse:
+    if not is_authenticated(request):
+        return login_redirect("/portfolio")
+    result = backfill_trade_audit_snapshots(only_missing=True)
+    _refresh_workspace_snapshots_async()
+    return _redirect(
+        (
+            f"已补录 {int(result.get('changed') or 0)} 条历史建议快照"
+            if lang == "zh"
+            else f"Backfilled {int(result.get('changed') or 0)} historical audit snapshots"
+        )
     )
 
 

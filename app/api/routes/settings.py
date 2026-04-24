@@ -12,7 +12,7 @@ from app.services.push_notifications import PushNotificationService
 from app.services.repository import DataJobRepository, SymbolRepository
 from app.services.time_utils import format_app_datetime
 from app.services.ui_lang import resolve_request_lang
-from app.services.workspace_nav import WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
+from app.services.workspace_nav import WORKSPACE_COMPACT_STYLE, WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
 
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -52,29 +52,18 @@ def _settings_shell(*, lang: str, title: str, lead: str, body_html: str, active_
           * {{ box-sizing:border-box; }}
           body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
           a {{ color:inherit; text-decoration:none; }}
-          .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }}
+          {WORKSPACE_COMPACT_STYLE}
           {WORKSPACE_SIDEBAR_STYLE}
-          .main {{ padding:28px 30px 48px; }}
-          .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:24px; flex-wrap:wrap; }}
+          .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:16px; flex-wrap:wrap; }}
           .chip-row {{ display:flex; flex-wrap:wrap; gap:10px; }}
           .top-pill {{ display:inline-flex; align-items:center; justify-content:center; padding:8px 12px; border-radius:999px; border:1px solid var(--line); background:rgba(17,28,40,0.7); color:var(--muted); font-size:13px; font-weight:700; }}
-          .card {{ background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 40px rgba(0,0,0,0.22); }}
-          .hero {{ display:grid; grid-template-columns:minmax(0,1.4fr) minmax(280px,0.9fr); gap:16px; margin-bottom:16px; }}
-          .workspace {{ display:grid; grid-template-columns:minmax(0,1.1fr) minmax(320px,0.9fr); gap:16px; }}
-          .stack,.list-stack,.quick-grid {{ display:grid; gap:16px; }}
+          .hero {{ display:grid; grid-template-columns:minmax(0,1.3fr) minmax(260px,0.85fr); gap:12px; margin-bottom:12px; }}
+          .workspace {{ display:grid; grid-template-columns:minmax(0,1.05fr) minmax(300px,0.95fr); gap:12px; }}
+          .stack,.list-stack,.quick-grid {{ display:grid; gap:12px; }}
           .quick-grid {{ grid-template-columns:repeat(auto-fit, minmax(220px,1fr)); }}
-          .quick-link {{ display:block; padding:18px; border-radius:20px; border:1px solid var(--line); background:rgba(21,34,49,0.82); }}
+          .quick-link {{ display:block; padding:14px; border-radius:16px; border:1px solid var(--line); background:rgba(21,34,49,0.82); }}
           .quick-link:hover {{ border-color:var(--accent); box-shadow:0 12px 28px rgba(61,217,182,0.08); }}
           form {{ margin:0; }}
-          input, select, button {{
-            width:100%;
-            padding:10px 12px;
-            border-radius:12px;
-            border:1px solid var(--line);
-            background:#0f1823;
-            color:var(--ink);
-            font:inherit;
-          }}
           button {{
             width:auto;
             background:var(--accent);
@@ -83,18 +72,17 @@ def _settings_shell(*, lang: str, title: str, lead: str, body_html: str, active_
             cursor:pointer;
           }}
           .form-grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); }}
-          .form-actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }}
+          .form-actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }}
           .checkline {{ display:inline-flex; align-items:center; gap:8px; color:var(--muted); font-size:14px; }}
           .checkline input {{ width:auto; }}
-          .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.12); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.06em; text-transform:uppercase; }}
-          h1 {{ margin:14px 0 10px; font-size:40px; line-height:1.02; letter-spacing:-0.03em; }}
-          .section-title {{ margin:0 0 6px; font-size:22px; }}
+          h1 {{ margin:10px 0 8px; font-size:34px; line-height:1.04; letter-spacing:-0.03em; }}
+          .section-title {{ margin:0 0 4px; font-size:20px; }}
           .lead,.section-copy,.subtle,.muted {{ color:var(--muted); }}
-          .lead,.section-copy {{ font-size:15px; line-height:1.6; }}
+          .lead,.section-copy {{ font-size:14px; line-height:1.5; }}
           .ticker {{ font-weight:800; font-size:15px; color:var(--ink); }}
-          .list-row {{ display:flex; justify-content:space-between; align-items:flex-start; gap:14px; padding:14px 0; border-top:1px solid rgba(144,163,184,0.12); }}
+          .list-row {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; padding:10px 0; border-top:1px solid rgba(144,163,184,0.12); }}
           .list-row:first-child {{ border-top:none; padding-top:0; }}
-          @media (max-width:1100px) {{ .app {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }} .hero,.workspace {{ grid-template-columns:1fr; }} }}
+          @media (max-width:1100px) {{ .hero,.workspace {{ grid-template-columns:1fr; }} }}
         </style>
       </head>
       <body>

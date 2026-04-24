@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
+import re
+from datetime import datetime
 
 import duckdb
 import polars as pl
@@ -20,6 +24,14 @@ LAKE_OHLCV_COLUMNS = [
     "dividend",
     "split_ratio",
 ]
+
+LAKE_PARQUET_CHUNK_SIZE = 48
+LAKE_DUCKDB_MAX_CONCURRENT_READS = 2
+LAKE_DUCKDB_MAX_RETRIES = 3
+LAKE_MIN_PARQUET_BYTES = 64
+_LAKE_DUCKDB_READ_SEMAPHORE = threading.BoundedSemaphore(LAKE_DUCKDB_MAX_CONCURRENT_READS)
+_LAKE_BAD_FILE_REGISTRY_LOCK = threading.Lock()
+_LAKE_BAD_FILE_REGISTRY: dict[str, dict] = {}
 
 
 def market_lake_root() -> Path:
@@ -53,8 +65,8 @@ def daily_parquet_glob(market: str) -> str:
 
 
 def query_us_daily_summary(*, trade_date: str | None = None, limit: int = 10) -> dict:
-    parquet_glob = us_daily_parquet_glob()
-    if not list((market_lake_root() / "us_daily").glob("date=*/*.parquet")):
+    parquet_files = _all_parquet_files("US")
+    if not parquet_files:
         return {"status": "empty", "message": "No U.S. daily Parquet lake files found.", "rows": []}
     where_clause = "WHERE date = ?" if trade_date else ""
     params = [trade_date] if trade_date else []
@@ -65,14 +77,12 @@ def query_us_daily_summary(*, trade_date: str | None = None, limit: int = 10) ->
             close,
             volume,
             close * volume AS dollar_volume
-        FROM read_parquet('{parquet_glob}', hive_partitioning = true)
+        FROM read_parquet(?, hive_partitioning = true)
         {where_clause}
         ORDER BY dollar_volume DESC NULLS LAST
         LIMIT {max(1, int(limit))}
     """
-    with duckdb.connect(database=":memory:") as connection:
-        rows = connection.execute(sql, params).fetchall()
-        columns = [item[0] for item in connection.description]
+    rows, columns = _duckdb_fetchall(sql, [parquet_files, *params])
     return {
         "status": "success",
         "trade_date": trade_date,
@@ -84,7 +94,6 @@ def query_us_daily_summary(*, trade_date: str | None = None, limit: int = 10) ->
 def load_lake_price_history(*, market: str, ticker: str, limit: int = 120) -> list[dict]:
     market_code = str(market or "").strip().upper()
     symbol = str(ticker or "").strip().upper()
-    market_dir = market_lake_root() / f"{market_code.lower()}_daily"
     parquet_files = _recent_parquet_files(market_code, limit=max(20, int(limit) * 2))
     if market_code not in {"CN", "US"} or not symbol or not parquet_files:
         return []
@@ -101,25 +110,115 @@ def load_lake_price_history(*, market: str, ticker: str, limit: int = 120) -> li
         FROM read_parquet(?, hive_partitioning = true)
         WHERE symbol = ?
         ORDER BY CAST(date AS DATE) DESC
-        LIMIT {max(1, int(limit))}
     """
-    with duckdb.connect(database=":memory:") as connection:
-        rows = connection.execute(sql, [parquet_files, symbol]).fetchall()
-        columns = [item[0] for item in connection.description]
-    history = [_json_ready_row(dict(zip(columns, row, strict=False))) for row in rows]
+    history: list[dict] = []
+    columns: list[str] = []
+    for file_chunk in _chunked_paths(parquet_files):
+        rows, chunk_columns = _duckdb_fetchall(sql, [file_chunk, symbol])
+        if not columns:
+            columns = chunk_columns
+        history.extend(_json_ready_row(dict(zip(columns, row, strict=False))) for row in rows)
+    history.sort(key=lambda item: item.get("date") or "", reverse=True)
+    history = history[: max(1, int(limit))]
     history.sort(key=lambda item: item.get("date") or "")
     return history
 
 
 def _recent_parquet_files(market: str, *, limit: int) -> list[str]:
+    return _all_parquet_files(market)[: max(1, int(limit))]
+
+
+def _all_parquet_files(market: str) -> list[str]:
     market_code = str(market or "").strip().lower()
     market_dir = market_lake_root() / f"{market_code}_daily"
     files = sorted(
-        market_dir.glob("date=*/*.parquet"),
+        (
+            path
+            for path in market_dir.glob("date=*/*.parquet")
+            if path.is_file() and path.stat().st_size >= LAKE_MIN_PARQUET_BYTES
+        ),
         key=lambda path: path.parent.name,
         reverse=True,
     )
-    return [str(path) for path in files[: max(1, int(limit))]]
+    return [str(path) for path in files]
+
+
+def _chunked_paths(paths: list[str], *, chunk_size: int = LAKE_PARQUET_CHUNK_SIZE) -> list[list[str]]:
+    size = max(1, int(chunk_size))
+    return [paths[index : index + size] for index in range(0, len(paths), size)]
+
+
+def _is_too_many_open_files_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "too many open files" in message or "errno 24" in message
+
+
+def _extract_invalid_parquet_path(exc: Exception) -> str | None:
+    message = str(exc)
+    lowered = message.lower()
+    if "parquet" in lowered:
+        match = re.search(r"File '([^']+\.parquet)'", message)
+        if match:
+            return str(match.group(1) or "").strip() or None
+        match = re.search(r"'([^']+\.parquet)'", message)
+        if match:
+            return str(match.group(1) or "").strip() or None
+    match = re.search(r"file:\s*([^,\s]+\.parquet)", message, re.IGNORECASE)
+    if match:
+        return str(match.group(1) or "").strip() or None
+    return None
+
+
+def _record_bad_parquet_path(path: str, exc: Exception) -> None:
+    normalized = str(path or "").strip()
+    if not normalized:
+        return
+    now = datetime.now().isoformat(timespec="seconds")
+    with _LAKE_BAD_FILE_REGISTRY_LOCK:
+        existing = _LAKE_BAD_FILE_REGISTRY.get(normalized) or {}
+        _LAKE_BAD_FILE_REGISTRY[normalized] = {
+            "path": normalized,
+            "count": int(existing.get("count") or 0) + 1,
+            "first_seen_at": str(existing.get("first_seen_at") or now),
+            "last_seen_at": now,
+            "last_error": str(exc).splitlines()[0][:240],
+        }
+
+
+def _bad_file_registry_snapshot() -> list[dict]:
+    with _LAKE_BAD_FILE_REGISTRY_LOCK:
+        rows = list(_LAKE_BAD_FILE_REGISTRY.values())
+    rows.sort(key=lambda item: (-int(item.get("count") or 0), str(item.get("path") or "")))
+    return rows
+
+
+def _duckdb_fetchall(sql: str, params: list | tuple) -> tuple[list[tuple], list[str]]:
+    last_error: Exception | None = None
+    normalized_params = list(params)
+    for attempt in range(LAKE_DUCKDB_MAX_RETRIES):
+        try:
+            with _LAKE_DUCKDB_READ_SEMAPHORE:
+                with duckdb.connect(database=":memory:") as connection:
+                    rows = connection.execute(sql, normalized_params).fetchall()
+                    columns = [item[0] for item in connection.description]
+            return rows, columns
+        except Exception as exc:
+            last_error = exc
+            bad_path = _extract_invalid_parquet_path(exc)
+            if bad_path and normalized_params and isinstance(normalized_params[0], list):
+                _record_bad_parquet_path(bad_path, exc)
+                filtered_paths = [path for path in normalized_params[0] if str(path) != bad_path]
+                if filtered_paths and len(filtered_paths) < len(normalized_params[0]):
+                    normalized_params[0] = filtered_paths
+                    continue
+                if not filtered_paths:
+                    return [], []
+            if not _is_too_many_open_files_error(exc) or attempt >= LAKE_DUCKDB_MAX_RETRIES - 1:
+                raise
+            time.sleep(0.2 * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+    return [], []
 
 
 def load_lake_rows(*, markets: list[str] | None = None, tickers: set[str] | None = None, limit_per_symbol: int | None = None) -> list[dict]:
@@ -131,32 +230,13 @@ def load_lake_rows(*, markets: list[str] | None = None, tickers: set[str] | None
     normalized_tickers = {str(ticker or "").strip().upper() for ticker in (tickers or set()) if str(ticker or "").strip()}
     all_rows: list[dict] = []
     for market_code in market_codes:
-        market_dir = market_lake_root() / f"{market_code.lower()}_daily"
-        if not list(market_dir.glob("date=*/*.parquet")):
+        parquet_files = _all_parquet_files(market_code)
+        if not parquet_files:
             continue
-        parquet_glob = daily_parquet_glob(market_code)
         ticker_filter = "WHERE symbol = ANY(?)" if normalized_tickers else ""
-        params = [sorted(normalized_tickers)] if normalized_tickers else []
-        limit_clause = ""
-        if limit_per_symbol is not None and int(limit_per_symbol) > 0:
-            limit_clause = f"WHERE rn <= {int(limit_per_symbol)}"
         sql = f"""
-            WITH base AS (
-                SELECT
-                    CAST(date AS DATE) AS trade_date,
-                    symbol,
-                    open,
-                    high,
-                    low,
-                    close,
-                    volume,
-                    adj_close,
-                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY CAST(date AS DATE) DESC) AS rn
-                FROM read_parquet('{parquet_glob}', hive_partitioning = true)
-                {ticker_filter}
-            )
             SELECT
-                CAST(trade_date AS VARCHAR) AS date,
+                CAST(date AS VARCHAR) AS date,
                 symbol,
                 open,
                 high,
@@ -164,32 +244,51 @@ def load_lake_rows(*, markets: list[str] | None = None, tickers: set[str] | None
                 close,
                 volume,
                 adj_close
-            FROM base
-            {limit_clause}
-            ORDER BY symbol, trade_date
+            FROM read_parquet(?, hive_partitioning = true)
+            {ticker_filter}
+            ORDER BY symbol, CAST(date AS DATE) DESC
         """
-        with duckdb.connect(database=":memory:") as connection:
-            rows = connection.execute(sql, params).fetchall()
-            columns = [item[0] for item in connection.description]
-        all_rows.extend(_json_ready_row(dict(zip(columns, row, strict=False))) for row in rows)
+        columns: list[str] = []
+        for file_chunk in _chunked_paths(parquet_files):
+            params = [file_chunk]
+            if normalized_tickers:
+                params.append(sorted(normalized_tickers))
+            rows, chunk_columns = _duckdb_fetchall(sql, params)
+            if not columns:
+                columns = chunk_columns
+            all_rows.extend(_json_ready_row(dict(zip(columns, row, strict=False))) for row in rows)
+    if limit_per_symbol is not None and int(limit_per_symbol) > 0:
+        limited_rows: list[dict] = []
+        counts: dict[str, int] = {}
+        for row in all_rows:
+            symbol = str(row.get("symbol") or "").strip().upper()
+            if not symbol:
+                continue
+            used = counts.get(symbol, 0)
+            if used >= int(limit_per_symbol):
+                continue
+            limited_rows.append(row)
+            counts[symbol] = used + 1
+        all_rows = limited_rows
     all_rows.sort(key=lambda row: (row.get("symbol") or "", row.get("date") or ""))
     return all_rows
 
 
 def list_lake_symbols(*, market: str) -> set[str]:
     market_code = str(market or "").strip().upper()
-    market_dir = market_lake_root() / f"{market_code.lower()}_daily"
-    if market_code not in {"CN", "US"} or not list(market_dir.glob("date=*/*.parquet")):
+    parquet_files = _all_parquet_files(market_code)
+    if market_code not in {"CN", "US"} or not parquet_files:
         return set()
-    parquet_glob = daily_parquet_glob(market_code)
-    sql = f"""
+    sql = """
         SELECT DISTINCT symbol
-        FROM read_parquet('{parquet_glob}', hive_partitioning = true)
+        FROM read_parquet(?, hive_partitioning = true)
         WHERE symbol IS NOT NULL
     """
-    with duckdb.connect(database=":memory:") as connection:
-        rows = connection.execute(sql).fetchall()
-    return {str(row[0] or "").strip().upper() for row in rows if row and row[0]}
+    symbols: set[str] = set()
+    for file_chunk in _chunked_paths(parquet_files):
+        rows, _ = _duckdb_fetchall(sql, [file_chunk])
+        symbols.update(str(row[0] or "").strip().upper() for row in rows if row and row[0])
+    return symbols
 
 
 def write_ohlcv_rows_to_lake(*, market: str, rows: list[dict], merge_existing: bool = False) -> list[Path]:
@@ -215,9 +314,8 @@ def screen_cn_lake_momentum(*, trade_date: str | None = None, limit: int = 160, 
 
 def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: int = 160, min_dollar_volume: float = 1_000_000.0) -> list[dict]:
     market_code = str(market or "").strip().upper() or "US"
-    market_dir = market_lake_root() / f"{market_code.lower()}_daily"
-    parquet_glob = daily_parquet_glob(market_code)
-    if not list(market_dir.glob("date=*/*.parquet")):
+    parquet_files = _recent_parquet_files(market_code, limit=260)
+    if not parquet_files:
         return []
     date_filter = "WHERE date <= ?" if trade_date else ""
     params = [trade_date] if trade_date else []
@@ -229,7 +327,7 @@ def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: i
                 close,
                 volume,
                 close * volume AS dollar_volume
-            FROM read_parquet('{parquet_glob}', hive_partitioning = true)
+            FROM read_parquet(?, hive_partitioning = true)
             {date_filter}
         ),
         enriched AS (
@@ -278,9 +376,7 @@ def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: i
           dollar_volume DESC
         LIMIT {max(1, int(limit))}
     """
-    with duckdb.connect(database=":memory:") as connection:
-        rows = connection.execute(sql, [*params, float(min_dollar_volume)]).fetchall()
-        columns = [item[0] for item in connection.description]
+    rows, columns = _duckdb_fetchall(sql, [parquet_files, *params, float(min_dollar_volume)])
     results: list[dict] = []
     for index, row in enumerate(rows, start=1):
         item = _json_ready_row(dict(zip(columns, row, strict=False)))
@@ -387,3 +483,40 @@ def _fmt_pct(value) -> str:
         return f"{float(value) * 100:.2f}%"
     except (TypeError, ValueError):
         return "-"
+
+
+def lake_file_health_summary() -> dict:
+    issues: list[dict] = []
+    root = market_lake_root()
+    for market_code in ("cn", "us"):
+        market_dir = root / f"{market_code}_daily"
+        small_files = [
+            path
+            for path in market_dir.glob("date=*/*.parquet")
+            if path.is_file() and path.stat().st_size < LAKE_MIN_PARQUET_BYTES
+        ]
+        if small_files:
+            issues.append(
+                {
+                    "market": market_code.upper(),
+                    "issue": "small_parquet",
+                    "count": len(small_files),
+                    "examples": [str(path) for path in small_files[:5]],
+                }
+            )
+    skipped_runtime = _bad_file_registry_snapshot()
+    if skipped_runtime:
+        issues.append(
+            {
+                "market": "MULTI",
+                "issue": "runtime_skipped_parquet",
+                "count": len(skipped_runtime),
+                "examples": [str(item.get("path") or "") for item in skipped_runtime[:5]],
+                "rows": skipped_runtime[:20],
+            }
+        )
+    return {
+        "status": "healthy" if not issues else "warning",
+        "issues": issues,
+        "issue_count": sum(int(item.get("count") or 0) for item in issues),
+    }

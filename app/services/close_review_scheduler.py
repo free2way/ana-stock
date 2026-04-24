@@ -4,12 +4,22 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from app.core.db import SessionLocal
+from app.services.cn_fundamentals import sync_cn_fundamentals
+from app.services.cn_concepts import sync_cn_concepts
 from app.services.auto_analysis import auto_analysis_service
 from app.services.cn_market_universe import refresh_cn_market_data_daily, refresh_cn_market_data_lake_only
+from app.services.focus_pool import load_today_focus_pool
+from app.services.market_lake import list_lake_symbols
 from app.services.nlp_snapshots import NEWS_ENRICHMENT_JOB_TYPE, refresh_nlp_snapshots
-from app.services.repository import AppSettingRepository, DataJobRepository, WatchlistRepository
-from app.services.screener_snapshots import refresh_precomputed_screener_snapshots
+from app.services.repository import AppSettingRepository, DataJobRepository, PredictionRepository, WatchlistRepository
+from app.services.screener_snapshots import (
+    FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES,
+    FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
+    WATCHLIST_PRECOMPUTE_TEMPLATES,
+    refresh_precomputed_screener_snapshots,
+)
 from app.services.technical_snapshot_cache import rebuild_technical_snapshots
+from app.services.trainer import SignalTrainer
 from app.services.workspace_snapshots import (
     SNAPSHOT_MARKET_HEATMAP_WORKSPACE,
     SNAPSHOT_MARKET_WORKSPACE,
@@ -26,6 +36,9 @@ from app.services.time_utils import app_today_iso
 
 CLOSE_REVIEW_CONFIG_KEY = "close_review_scheduler_config"
 CLOSE_REVIEW_JOB_TYPE = "cn_close_review"
+CN_SIGNAL_TRAIN_JOB_TYPE = "train_cn_signals"
+CN_FUNDAMENTAL_SYNC_JOB_TYPE = "sync_cn_fundamentals"
+CN_CONCEPT_SYNC_JOB_TYPE = "sync_cn_concepts"
 SCREENER_PRECOMPUTE_JOB_TYPE = "screener_precompute"
 MARKET_SNAPSHOT_JOB_TYPE = "market_snapshot_refresh"
 SH_TZ = ZoneInfo("Asia/Shanghai")
@@ -209,27 +222,9 @@ class CloseReviewSchedulerService:
                 )
                 self._persist_last_run(db)
             threading.Thread(
-                target=self._refresh_workspace_snapshots_safe,
+                target=self._run_post_close_followups_safe,
                 args=(job_id,),
-                name=f"close-review-workspace-snapshot-{job_id}",
-                daemon=True,
-            ).start()
-            threading.Thread(
-                target=self._run_screener_precompute_job_safe,
-                args=(job_id,),
-                name=f"close-review-screener-precompute-{job_id}",
-                daemon=True,
-            ).start()
-            threading.Thread(
-                target=self._run_news_enrichment_job_safe,
-                args=(job_id,),
-                name=f"close-review-news-enrichment-{job_id}",
-                daemon=True,
-            ).start()
-            threading.Thread(
-                target=self._run_market_snapshot_job_safe,
-                args=(job_id,),
-                name=f"close-review-market-snapshot-{job_id}",
+                name=f"close-review-followups-{job_id}",
                 daemon=True,
             ).start()
             return {
@@ -345,6 +340,11 @@ class CloseReviewSchedulerService:
         try:
             with SessionLocal() as db:
                 job_repo = DataJobRepository(db)
+                job_repo.complete_stale_running_jobs(
+                    job_types=[SCREENER_PRECOMPUTE_JOB_TYPE],
+                    stale_after_hours=1,
+                    message_prefix="Close-review cleanup closed a stale screener precompute job.",
+                )
                 if job_repo.has_running_job(SCREENER_PRECOMPUTE_JOB_TYPE):
                     return
                 job = DataJobRepository(db).create_job(
@@ -354,12 +354,63 @@ class CloseReviewSchedulerService:
                     message="Precomputing screener model results after close review.",
                 )
                 precompute_job_id = job.id
-            with SessionLocal() as db:
-                result = refresh_precomputed_screener_snapshots(
-                    db,
-                    source_job_id=source_job_id,
-                    lake_only=True,
-                )
+            core_cn_templates = ["lightgbm_top_picks", "next_tesla_swing", "technical_momentum"]
+            remaining_cn_templates = [
+                template for template in FULL_MARKET_CN_PRECOMPUTE_TEMPLATES if template not in core_cn_templates
+            ]
+            batch_plan = [
+                {
+                    "label": "cn_full_market_core",
+                    "template_keys": core_cn_templates,
+                    "universes": ["full_market"],
+                    "include_watchlist": False,
+                },
+                {
+                    "label": "cn_full_market_rest",
+                    "template_keys": remaining_cn_templates,
+                    "universes": ["full_market"],
+                    "include_watchlist": False,
+                },
+                {
+                    "label": "watchlist",
+                    "template_keys": WATCHLIST_PRECOMPUTE_TEMPLATES,
+                    "universes": ["watchlist"],
+                    "include_watchlist": True,
+                },
+                {
+                    "label": "full_market_all",
+                    "template_keys": FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES,
+                    "universes": ["full_market"],
+                    "include_watchlist": False,
+                },
+            ]
+            batch_results: list[dict] = []
+            total_created = 0
+            total_failed = 0
+            for batch in batch_plan:
+                template_keys = [key for key in (batch.get("template_keys") or []) if key]
+                if not template_keys:
+                    continue
+                with SessionLocal() as db:
+                    batch_result = refresh_precomputed_screener_snapshots(
+                        db,
+                        source_job_id=source_job_id,
+                        markets=["CN"],
+                        include_watchlist=bool(batch.get("include_watchlist")),
+                        lake_only=False,
+                        template_keys=template_keys,
+                        universes=batch.get("universes") or None,
+                    )
+                batch_result["batch"] = batch["label"]
+                batch_results.append(batch_result)
+                total_created += int(batch_result.get("count", 0) or 0)
+                total_failed += int(batch_result.get("failed_count", 0) or 0)
+            result = {
+                "status": "success" if total_created > 0 else "failed",
+                "count": total_created,
+                "failed_count": total_failed,
+                "batches": batch_results,
+            }
             with SessionLocal() as db:
                 DataJobRepository(db).complete_job(
                     precompute_job_id,
@@ -375,14 +426,201 @@ class CloseReviewSchedulerService:
                     ),
                     result=result,
                 )
-        except Exception:
+        except Exception as exc:
             try:
                 if precompute_job_id is not None:
                     with SessionLocal() as db:
                         DataJobRepository(db).complete_job(
                             precompute_job_id,
                             status="failed",
-                            message="Screener precompute failed.",
+                            message=f"Screener precompute failed: {exc}",
+                        )
+            except Exception:
+                pass
+            return
+
+    def _run_post_close_followups_safe(self, source_job_id: int) -> None:
+        try:
+            self._run_cn_signal_training_job_safe(source_job_id)
+            self._refresh_workspace_snapshots_safe(source_job_id)
+            self._run_cn_fundamental_sync_job_safe(source_job_id)
+            self._run_cn_concept_sync_job_safe(source_job_id)
+            self._run_news_enrichment_job_safe(source_job_id)
+            self._run_screener_precompute_job_safe(source_job_id)
+            self._run_market_snapshot_job_safe(source_job_id)
+        except Exception:
+            return
+
+    def _run_cn_signal_training_job_safe(self, source_job_id: int) -> None:
+        cn_job_id: int | None = None
+        try:
+            cn_tickers = sorted(list_lake_symbols(market="CN"))
+            if not cn_tickers:
+                return
+            with SessionLocal() as db:
+                job_repo = DataJobRepository(db)
+                job_repo.complete_stale_running_jobs(
+                    job_types=[CN_SIGNAL_TRAIN_JOB_TYPE],
+                    stale_after_hours=2,
+                    message_prefix="Close-review cleanup closed a stale CN signal train job.",
+                )
+                if job_repo.has_running_job(CN_SIGNAL_TRAIN_JOB_TYPE):
+                    return
+                job = job_repo.create_job(
+                    job_type=CN_SIGNAL_TRAIN_JOB_TYPE,
+                    status="running",
+                    params={
+                        "source_job_id": source_job_id,
+                        "market": "CN",
+                        "ticker_count": len(cn_tickers),
+                        "model_type": "lightgbm",
+                    },
+                    message="Training A-share LightGBM signals after close review.",
+                )
+                cn_job_id = job.id
+            trainer = SignalTrainer()
+            predictions_written = trainer.train(
+                run_name=f"cn_close_{sh_now().date().isoformat()}",
+                model_type="lightgbm",
+                signal_type="momentum",
+                lookback_days=3,
+                tickers=cn_tickers,
+                market="CN",
+                universe="full_market_cn_lake",
+            )
+            with SessionLocal() as db:
+                refresh_workspace_snapshots(db, source_job_id=cn_job_id)
+                DataJobRepository(db).complete_job(
+                    cn_job_id,
+                    status="success",
+                    message=(
+                        f"Trained {len(cn_tickers)} A-share symbols with LightGBM and wrote {predictions_written} predictions."
+                    ),
+                    result={
+                        "market": "CN",
+                        "ticker_count": len(cn_tickers),
+                        "predictions_written": predictions_written,
+                    },
+                )
+        except Exception:
+            try:
+                if cn_job_id is not None:
+                    with SessionLocal() as db:
+                        DataJobRepository(db).complete_job(
+                            cn_job_id,
+                            status="failed",
+                            message="A-share LightGBM signal training failed.",
+                        )
+            except Exception:
+                pass
+            return
+
+    def _run_cn_fundamental_sync_job_safe(self, source_job_id: int) -> None:
+        cn_fund_job_id: int | None = None
+        try:
+            with SessionLocal() as db:
+                job_repo = DataJobRepository(db)
+                job_repo.complete_stale_running_jobs(
+                    job_types=[CN_FUNDAMENTAL_SYNC_JOB_TYPE],
+                    stale_after_hours=4,
+                    message_prefix="Close-review cleanup closed a stale CN fundamentals sync job.",
+                )
+                if job_repo.has_running_job(CN_FUNDAMENTAL_SYNC_JOB_TYPE):
+                    return
+                job = job_repo.create_job(
+                    job_type=CN_FUNDAMENTAL_SYNC_JOB_TYPE,
+                    status="running",
+                    params={"source_job_id": source_job_id, "market": "CN"},
+                    message="Syncing A-share fundamentals after close review.",
+                )
+                cn_fund_job_id = job.id
+            result = sync_cn_fundamentals()
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(
+                    cn_fund_job_id,
+                    status=str(result.get("status") or "success"),
+                    message=str(result.get("message") or "A-share fundamentals sync completed."),
+                    result=result,
+                )
+        except Exception:
+            try:
+                if cn_fund_job_id is not None:
+                    with SessionLocal() as db:
+                        DataJobRepository(db).complete_job(
+                            cn_fund_job_id,
+                            status="failed",
+                            message="A-share fundamentals sync failed.",
+                        )
+            except Exception:
+                pass
+            return
+
+    def _load_cn_concept_sync_tickers(self) -> list[str]:
+        tickers: list[str] = []
+        with SessionLocal() as db:
+            watchlist_repo = WatchlistRepository(db)
+            prediction_repo = PredictionRepository(db)
+            watchlist = watchlist_repo.get_or_create_default()
+            for item in watchlist_repo.list_items(watchlist.id):
+                ticker = str(item.get("ticker") or "").strip().upper()
+                if ticker.endswith((".SS", ".SZ")):
+                    tickers.append(ticker)
+            latest_signals = prediction_repo.list_latest_signal_decisions(limit=120)
+            for row in latest_signals:
+                ticker = str(row.get("ticker") or "").strip().upper()
+                if ticker.endswith((".SS", ".SZ")):
+                    tickers.append(ticker)
+        for item in load_today_focus_pool():
+            ticker = str(item.get("ticker") or "").strip().upper()
+            if ticker.endswith((".SS", ".SZ")):
+                tickers.append(ticker)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for ticker in tickers:
+            if not ticker or ticker in seen:
+                continue
+            seen.add(ticker)
+            deduped.append(ticker)
+        return deduped[:180]
+
+    def _run_cn_concept_sync_job_safe(self, source_job_id: int) -> None:
+        cn_concept_job_id: int | None = None
+        try:
+            tickers = self._load_cn_concept_sync_tickers()
+            if not tickers:
+                return
+            with SessionLocal() as db:
+                job_repo = DataJobRepository(db)
+                job_repo.complete_stale_running_jobs(
+                    job_types=[CN_CONCEPT_SYNC_JOB_TYPE],
+                    stale_after_hours=4,
+                    message_prefix="Close-review cleanup closed a stale CN concept sync job.",
+                )
+                if job_repo.has_running_job(CN_CONCEPT_SYNC_JOB_TYPE):
+                    return
+                job = job_repo.create_job(
+                    job_type=CN_CONCEPT_SYNC_JOB_TYPE,
+                    status="running",
+                    params={"source_job_id": source_job_id, "market": "CN", "ticker_count": len(tickers)},
+                    message="Syncing A-share concepts for watchlist and model candidates after close review.",
+                )
+                cn_concept_job_id = job.id
+            result = sync_cn_concepts(tickers=tickers)
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(
+                    cn_concept_job_id,
+                    status=str(result.get("status") or "success"),
+                    message=str(result.get("message") or "A-share concept sync completed."),
+                    result={**result, "candidate_ticker_count": len(tickers)},
+                )
+        except Exception:
+            try:
+                if cn_concept_job_id is not None:
+                    with SessionLocal() as db:
+                        DataJobRepository(db).complete_job(
+                            cn_concept_job_id,
+                            status="failed",
+                            message="A-share concept sync failed.",
                         )
             except Exception:
                 pass
@@ -545,7 +783,7 @@ class CloseReviewSchedulerService:
             config = self.get_config(db=db)
             job_repo = DataJobRepository(db)
             cleaned_jobs = job_repo.complete_stale_running_jobs(
-                job_types=[CLOSE_REVIEW_JOB_TYPE, "watchlist_auto_analysis", "init_cn_market_data"],
+                job_types=[CLOSE_REVIEW_JOB_TYPE, "watchlist_auto_analysis", "init_cn_market_data", CN_SIGNAL_TRAIN_JOB_TYPE],
                 stale_after_hours=config["stale_job_hours"],
                 message_prefix="Scheduler cleanup closed a stale running job.",
             )

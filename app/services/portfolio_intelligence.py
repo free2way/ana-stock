@@ -448,6 +448,7 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
             "top_market": top_market[0],
             "concentration_pct": concentration_pct,
             "sector_rankings": sector_rankings[:5],
+            "all_items": row_actions,
             "watch_items": row_actions[:5],
             "action_mix": action_mix,
             "rebalance_alerts": sum(

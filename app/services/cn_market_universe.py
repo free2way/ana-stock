@@ -70,6 +70,8 @@ def sync_cn_symbol_universe() -> dict:
                     name=row.get("name"),
                     market="CN",
                     exchange=exchange,
+                    sector=row.get("sector"),
+                    industry=row.get("industry"),
                 )
             )
             written += 1

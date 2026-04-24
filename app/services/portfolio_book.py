@@ -9,6 +9,85 @@ from app.services.time_utils import app_now_iso, app_today_iso
 
 PORTFOLIO_BOOK_KEY = "portfolio_book"
 PORTFOLIO_TRADE_LOG_KEY = "portfolio_trade_log"
+SELL_REASON_OPTIONS = [
+    ("止盈/保护利润", "Take profit / protect gains"),
+    ("止损/风险收缩", "Stop loss / reduce risk"),
+    ("调仓", "Rebalance"),
+    ("复核后卖出", "Review-led exit"),
+    ("事件风险", "Event risk"),
+    ("其他", "Other"),
+]
+_SELL_REASON_LABELS_EN = {label: en_label for label, en_label in SELL_REASON_OPTIONS}
+_SELL_REASON_BUCKETS = {
+    "止盈/保护利润": "profit_protection",
+    "止损/风险收缩": "risk_reduction",
+    "调仓": "rebalance",
+    "复核后卖出": "review",
+    "事件风险": "event_risk",
+    "其他": "other",
+}
+
+
+def normalize_trade_reason(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "其他"
+    lowered = text.lower()
+    if text == "事件风险" or any(token in lowered for token in ("event", "earnings", "news risk", "macro")):
+        return "事件风险"
+    if text == "止盈/保护利润" or any(token in lowered for token in ("止盈", "trim", "profit", "take profit", "protect")):
+        return "止盈/保护利润"
+    if text == "止损/风险收缩" or any(token in lowered for token in ("止损", "stop", "risk", "cut loss")):
+        return "止损/风险收缩"
+    if text == "调仓" or any(token in lowered for token in ("调仓", "rebalance", "rotate", "rotation")):
+        return "调仓"
+    if text == "复核后卖出" or any(token in lowered for token in ("复核", "review", "观察", "watch")):
+        return "复核后卖出"
+    if text in _SELL_REASON_LABELS_EN.values():
+        for label, en_label in _SELL_REASON_LABELS_EN.items():
+            if text == en_label:
+                return label
+    return "其他"
+
+
+def trade_reason_bucket(value: str | None) -> str:
+    return _SELL_REASON_BUCKETS.get(normalize_trade_reason(value), "other")
+
+
+def trade_reason_label(value: str | None, *, lang: str = "zh") -> str:
+    normalized = normalize_trade_reason(value)
+    if lang == "zh":
+        return normalized
+    return _SELL_REASON_LABELS_EN.get(normalized, normalized)
+
+
+def suggest_trade_reason(item: dict | None) -> str:
+    row = item or {}
+    note_text = str(row.get("note") or "").strip().lower()
+    action_hint = str(row.get("action_hint_at_exit") or "").strip().lower()
+    action_reason = str(row.get("action_reason_at_exit") or "").strip().lower()
+    rebalance_action = str(row.get("rebalance_action_at_exit") or "").strip().lower()
+    remaining_quantity = float(row.get("remaining_quantity") or 0.0)
+    realized_pnl = float(row.get("realized_pnl") or 0.0)
+    realized_return_pct = row.get("realized_return_pct")
+    if realized_return_pct is None:
+        realized_return_pct = row.get("realized_pnl_pct")
+    realized_return_pct = float(realized_return_pct or 0.0)
+
+    event_tokens = ("event", "earnings", "macro", "news", "财报", "事件", "公告")
+    if any(token in text for token in event_tokens for text in (note_text, action_reason)):
+        return "事件风险"
+    if any(token in text for token in ("review", "watch", "复核", "观察") for text in (action_hint, action_reason)):
+        return "复核后卖出"
+    if remaining_quantity > 0:
+        return "调仓"
+    if any(token in text for token in ("rebalance", "rotate", "调仓", "仓位") for text in (action_hint, action_reason, rebalance_action, note_text)):
+        return "调仓"
+    if realized_pnl < 0 or realized_return_pct < 0:
+        return "止损/风险收缩"
+    if realized_pnl > 0 or realized_return_pct > 0:
+        return "止盈/保护利润"
+    return "调仓"
 
 
 def load_portfolio_positions() -> list[dict]:
@@ -81,10 +160,16 @@ def load_portfolio_trades() -> list[dict]:
                 "realized_pnl": float(item.get("realized_pnl") or 0.0),
                 "realized_pnl_pct": float(item.get("realized_pnl_pct") or 0.0),
                 "trade_date": item.get("trade_date"),
-                "reason": item.get("reason") or "",
+                "reason": normalize_trade_reason(item.get("reason")),
                 "note": item.get("note") or "",
                 "created_at": item.get("created_at"),
                 "remaining_quantity": float(item.get("remaining_quantity") or 0.0),
+                "audit_snapshot_at": item.get("audit_snapshot_at"),
+                "action_hint_at_exit": item.get("action_hint_at_exit") or "",
+                "action_priority_at_exit": item.get("action_priority_at_exit") or "",
+                "action_reason_at_exit": item.get("action_reason_at_exit") or "",
+                "rebalance_action_at_exit": item.get("rebalance_action_at_exit") or "",
+                "risk_tag_at_exit": item.get("risk_tag_at_exit") or "",
             }
         )
     return trades
@@ -149,6 +234,7 @@ def sell_portfolio_position(payload: dict) -> dict:
     if sell_price <= 0:
         raise ValueError("Sell price must be greater than zero.")
 
+    normalized_reason = normalize_trade_reason(payload.get("reason"))
     positions = load_portfolio_positions()
     target = next((item for item in positions if item["ticker"] == ticker), None)
     if target is None:
@@ -194,10 +280,16 @@ def sell_portfolio_position(payload: dict) -> dict:
         "realized_pnl": realized_pnl,
         "realized_pnl_pct": realized_pnl_pct,
         "trade_date": str(payload.get("trade_date") or "").strip() or app_today_iso(),
-        "reason": payload.get("reason") or "",
+        "reason": normalized_reason,
         "note": payload.get("note") or "",
         "created_at": app_now_iso(),
         "remaining_quantity": remaining_quantity,
+        "audit_snapshot_at": app_now_iso(),
+        "action_hint_at_exit": payload.get("action_hint_at_exit") or "",
+        "action_priority_at_exit": payload.get("action_priority_at_exit") or "",
+        "action_reason_at_exit": payload.get("action_reason_at_exit") or "",
+        "rebalance_action_at_exit": payload.get("rebalance_action_at_exit") or "",
+        "risk_tag_at_exit": payload.get("risk_tag_at_exit") or "",
     }
     trades.append(trade)
     save_portfolio_trades(trades)
@@ -206,3 +298,131 @@ def sell_portfolio_position(payload: dict) -> dict:
         "positions": updated_positions,
         "closed": remaining_quantity <= 0,
     }
+
+
+def update_portfolio_trade_reason(trade_id: int | str, reason: str | None) -> list[dict]:
+    normalized_id = int(trade_id)
+    trades = load_portfolio_trades()
+    updated: list[dict] = []
+    for item in trades:
+        current_id = int(item.get("id") or 0)
+        if current_id == normalized_id:
+            updated.append({**item, "reason": normalize_trade_reason(reason)})
+        else:
+            updated.append(item)
+    save_portfolio_trades(updated)
+    return updated
+
+
+def apply_suggested_trade_reasons(*, only_missing: bool = True) -> dict:
+    trades = load_portfolio_trades()
+    updated = []
+    changed = 0
+    for item in trades:
+        current = normalize_trade_reason(item.get("reason"))
+        if only_missing and current != "其他":
+            updated.append(item)
+            continue
+        suggested = suggest_trade_reason(item)
+        next_row = {**item, "reason": suggested}
+        if suggested != current:
+            changed += 1
+        updated.append(next_row)
+    save_portfolio_trades(updated)
+    return {
+        "total": len(trades),
+        "changed": changed,
+    }
+
+
+def _historical_audit_seed(reason: str | None) -> dict[str, str]:
+    normalized = normalize_trade_reason(reason)
+    if normalized == "止盈/保护利润":
+        return {
+            "action_hint_at_exit": "TRIM",
+            "action_priority_at_exit": "historical_backfill",
+            "action_reason_at_exit": "历史补录：依据结构化卖出原因推断，当时更可能偏向锁定利润。",
+            "rebalance_action_at_exit": "锁定部分利润 / 压缩追涨仓位",
+            "risk_tag_at_exit": "历史补录",
+            "audit_snapshot_source": "historical_backfill",
+        }
+    if normalized == "止损/风险收缩":
+        return {
+            "action_hint_at_exit": "EXIT",
+            "action_priority_at_exit": "historical_backfill",
+            "action_reason_at_exit": "历史补录：依据结构化卖出原因推断，当时更可能偏向风险收缩。",
+            "rebalance_action_at_exit": "降低风险暴露 / 退出弱势仓位",
+            "risk_tag_at_exit": "历史补录",
+            "audit_snapshot_source": "historical_backfill",
+        }
+    if normalized == "复核后卖出":
+        return {
+            "action_hint_at_exit": "REVIEW",
+            "action_priority_at_exit": "historical_backfill",
+            "action_reason_at_exit": "历史补录：依据结构化卖出原因推断，当时更可能由人工复核主导。",
+            "rebalance_action_at_exit": "复核后退出 / 重新评估持仓逻辑",
+            "risk_tag_at_exit": "历史补录",
+            "audit_snapshot_source": "historical_backfill",
+        }
+    if normalized == "事件风险":
+        return {
+            "action_hint_at_exit": "EXIT",
+            "action_priority_at_exit": "historical_backfill",
+            "action_reason_at_exit": "历史补录：依据结构化卖出原因推断，当时更可能在事件风险前后收缩仓位。",
+            "rebalance_action_at_exit": "事件前减仓 / 规避不确定性",
+            "risk_tag_at_exit": "事件风险",
+            "audit_snapshot_source": "historical_backfill",
+        }
+    return {
+        "action_hint_at_exit": "TRIM",
+        "action_priority_at_exit": "historical_backfill",
+        "action_reason_at_exit": "历史补录：依据结构化卖出原因推断，当时更可能偏向调仓处理。",
+        "rebalance_action_at_exit": "仓位再平衡 / 调仓处理",
+        "risk_tag_at_exit": "历史补录",
+        "audit_snapshot_source": "historical_backfill",
+    }
+
+
+def backfill_trade_audit_snapshot(trade_id: int | str) -> list[dict]:
+    normalized_id = int(trade_id)
+    trades = load_portfolio_trades()
+    updated: list[dict] = []
+    for item in trades:
+        current_id = int(item.get("id") or 0)
+        if current_id != normalized_id:
+            updated.append(item)
+            continue
+        seed = _historical_audit_seed(item.get("reason"))
+        updated.append(
+            {
+                **item,
+                **seed,
+                "audit_snapshot_at": item.get("audit_snapshot_at") or app_now_iso(),
+            }
+        )
+    save_portfolio_trades(updated)
+    return updated
+
+
+def backfill_trade_audit_snapshots(*, only_missing: bool = True) -> dict:
+    trades = load_portfolio_trades()
+    updated: list[dict] = []
+    changed = 0
+    for item in trades:
+        has_snapshot = bool(str(item.get("audit_snapshot_at") or "").strip()) or bool(
+            str(item.get("action_hint_at_exit") or "").strip() or str(item.get("action_reason_at_exit") or "").strip()
+        )
+        if only_missing and has_snapshot:
+            updated.append(item)
+            continue
+        seed = _historical_audit_seed(item.get("reason"))
+        updated.append(
+            {
+                **item,
+                **seed,
+                "audit_snapshot_at": item.get("audit_snapshot_at") or app_now_iso(),
+            }
+        )
+        changed += 1
+    save_portfolio_trades(updated)
+    return {"total": len(trades), "changed": changed}

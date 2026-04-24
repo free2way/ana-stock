@@ -2,7 +2,7 @@ import json
 import time
 from datetime import UTC, date, datetime, timedelta
 
-from sqlalchemy import case, delete, desc, func, insert, select
+from sqlalchemy import case, delete, desc, func, insert, or_, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -446,6 +446,78 @@ class PredictionRepository:
             for prediction, symbol, detail in rows
         ]
 
+    def list_predictions_for_run(
+        self,
+        run_id: int,
+        *,
+        market: str | None = None,
+        tickers: list[str] | None = None,
+        trade_date: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict]:
+        normalized_market = str(market or "").upper()
+        normalized_tickers = [str(ticker).strip().upper() for ticker in (tickers or []) if str(ticker).strip()]
+
+        effective_trade_date = trade_date
+        if not effective_trade_date:
+            latest_date_stmt = (
+                select(func.max(Prediction.trade_date))
+                .select_from(Prediction)
+                .join(Symbol, Symbol.id == Prediction.symbol_id)
+                .where(Prediction.model_run_id == run_id)
+            )
+            if normalized_market and normalized_market != "ALL":
+                latest_date_stmt = latest_date_stmt.where(Symbol.market == normalized_market)
+            if normalized_tickers:
+                latest_date_stmt = latest_date_stmt.where(Symbol.ticker.in_(normalized_tickers))
+            effective_trade_date = self.db.scalar(latest_date_stmt)
+        if effective_trade_date is None:
+            return []
+
+        stmt = (
+            select(Prediction, Symbol, PredictionDetail)
+            .join(Symbol, Symbol.id == Prediction.symbol_id)
+            .outerjoin(PredictionDetail, PredictionDetail.prediction_id == Prediction.id)
+            .where(Prediction.model_run_id == run_id)
+            .where(Prediction.trade_date == effective_trade_date)
+            .order_by(desc(Prediction.score), Symbol.ticker.asc())
+        )
+        if normalized_market and normalized_market != "ALL":
+            stmt = stmt.where(Symbol.market == normalized_market)
+        if normalized_tickers:
+            stmt = stmt.where(Symbol.ticker.in_(normalized_tickers))
+        if limit and limit > 0:
+            stmt = stmt.limit(limit)
+
+        rows = self.db.execute(stmt).all()
+        return [
+            {
+                "prediction_id": prediction.id,
+                "model_run_id": prediction.model_run_id,
+                "trade_date": prediction.trade_date,
+                "ticker": symbol.ticker,
+                "name": symbol.name,
+                "market": symbol.market,
+                "score": prediction.score,
+                "rank_value": prediction.rank_value,
+                "confidence": (detail.confidence if detail is not None else None),
+                "signal_label": (detail.signal_label if detail is not None else None),
+                "signal_strength": (detail.signal_strength if detail is not None else None),
+                "expected_return_5d": (detail.expected_return_5d if detail is not None else None),
+                "expected_return_20d": (detail.expected_return_20d if detail is not None else None),
+                "expected_drawdown_20d": (detail.expected_drawdown_20d if detail is not None else None),
+                "model_reward_risk_ratio": (detail.model_reward_risk_ratio if detail is not None else None),
+                "conviction_bucket": (detail.conviction_bucket if detail is not None else None),
+                "position_size_hint": (detail.position_size_hint if detail is not None else None),
+                "entry_style": (detail.entry_style if detail is not None else None),
+                "percentile": (detail.percentile if detail is not None else None),
+                "summary_text": (detail.summary_text if detail is not None else None),
+                "sector": symbol.sector,
+                "industry": symbol.industry,
+            }
+            for prediction, symbol, detail in rows
+        ]
+
     def list_symbol_predictions(self, ticker: str, limit: int = 120, latest_run_only: bool = False) -> list[dict]:
         latest_model_run_id = None
         if latest_run_only:
@@ -776,36 +848,45 @@ class PredictionDetailRepository:
 
         prediction_map = {(prediction.symbol_id, prediction.trade_date): prediction.id for prediction in predictions}
         now = utc_now_iso()
-        payload_rows: list[dict] = []
+        payload_by_prediction_id: dict[int, dict] = {}
         for row in rows:
             prediction_id = prediction_map.get((row["symbol_id"], row["trade_date"]))
             if prediction_id is None:
                 continue
-            payload_rows.append(
-                {
-                    "prediction_id": prediction_id,
-                    "confidence": row.get("confidence"),
-                    "bullish_prob": row.get("bullish_prob"),
-                    "bearish_prob": row.get("bearish_prob"),
-                    "expected_return_5d": row.get("expected_return_5d"),
-                    "expected_return_20d": row.get("expected_return_20d"),
-                    "expected_drawdown_20d": row.get("expected_drawdown_20d"),
-                    "model_reward_risk_ratio": row.get("model_reward_risk_ratio"),
-                    "risk_score": row.get("risk_score"),
-                    "target_horizon_days": row.get("target_horizon_days"),
-                    "universe_size": row.get("universe_size"),
-                    "percentile": row.get("percentile"),
-                    "regime_label": row.get("regime_label"),
-                    "conviction_bucket": row.get("conviction_bucket"),
-                    "position_size_hint": row.get("position_size_hint"),
-                    "entry_style": row.get("entry_style"),
-                    "signal_label": row.get("signal_label"),
-                    "signal_strength": row.get("signal_strength"),
-                    "summary_text": row.get("summary_text"),
-                    "created_at": now,
-                }
-            )
+            payload = {
+                "prediction_id": prediction_id,
+                "confidence": row.get("confidence"),
+                "bullish_prob": row.get("bullish_prob"),
+                "bearish_prob": row.get("bearish_prob"),
+                "expected_return_5d": row.get("expected_return_5d"),
+                "expected_return_20d": row.get("expected_return_20d"),
+                "expected_drawdown_20d": row.get("expected_drawdown_20d"),
+                "model_reward_risk_ratio": row.get("model_reward_risk_ratio"),
+                "risk_score": row.get("risk_score"),
+                "target_horizon_days": row.get("target_horizon_days"),
+                "universe_size": row.get("universe_size"),
+                "percentile": row.get("percentile"),
+                "regime_label": row.get("regime_label"),
+                "conviction_bucket": row.get("conviction_bucket"),
+                "position_size_hint": row.get("position_size_hint"),
+                "entry_style": row.get("entry_style"),
+                "signal_label": row.get("signal_label"),
+                "signal_strength": row.get("signal_strength"),
+                "summary_text": row.get("summary_text"),
+                "created_at": now,
+            }
+            existing = payload_by_prediction_id.get(prediction_id)
+            if existing is None:
+                payload_by_prediction_id[prediction_id] = payload
+                continue
+            existing_strength = float(existing.get("signal_strength") or 0.0)
+            incoming_strength = float(payload.get("signal_strength") or 0.0)
+            existing_confidence = float(existing.get("confidence") or 0.0)
+            incoming_confidence = float(payload.get("confidence") or 0.0)
+            if (incoming_strength, incoming_confidence) > (existing_strength, existing_confidence):
+                payload_by_prediction_id[prediction_id] = payload
 
+        payload_rows = list(payload_by_prediction_id.values())
         inserted = len(payload_rows)
         for row_chunk in chunked_rows(payload_rows, self._batch_size):
             self.db.execute(insert(PredictionDetail), row_chunk)
@@ -1475,6 +1556,15 @@ class DashboardReadRepository:
         sync_repo = PriceSyncStateRepository(self.db)
         job_repo = DataJobRepository(self.db)
         concept_repo = ConceptSnapshotRepository(self.db)
+        job_repo.complete_stale_running_jobs(
+            job_types=["social_us_price_sync"],
+            stale_after_hours=1,
+            message_prefix="Dashboard cleanup closed a stale social U.S. price sync job.",
+        )
+        job_repo.complete_stale_running_jobs(
+            stale_after_hours=6,
+            message_prefix="Dashboard cleanup closed a stale running job.",
+        )
         latest_signals = signal_repo.list_latest_signal_decisions(limit=10)
         return {
             "latest_signals": latest_signals,
@@ -2106,6 +2196,34 @@ class ModelRunRepository:
             "finished_at": run.finished_at,
         }
 
+    def get_latest_successful_run(
+        self,
+        *,
+        market: str | None = None,
+        model_types: list[str] | None = None,
+        universe_like: list[str] | None = None,
+    ) -> ModelRun | None:
+        stmt = select(ModelRun).where(ModelRun.status == "success")
+        if market and str(market).upper() != "ALL":
+            normalized_market = str(market).upper()
+            stmt = stmt.where(or_(ModelRun.market == normalized_market, ModelRun.market == "MIXED"))
+        if model_types:
+            normalized_types = [str(item).strip() for item in model_types if str(item).strip()]
+            if normalized_types:
+                stmt = stmt.where(ModelRun.model_type.in_(normalized_types))
+        if universe_like:
+            universe_clauses = []
+            for candidate in universe_like:
+                normalized_candidate = str(candidate or "").strip()
+                if not normalized_candidate:
+                    continue
+                universe_clauses.append(ModelRun.universe == normalized_candidate)
+                universe_clauses.append(ModelRun.universe.like(f"{normalized_candidate}%"))
+            if universe_clauses:
+                stmt = stmt.where(or_(*universe_clauses))
+        stmt = stmt.order_by(ModelRun.id.desc()).limit(1)
+        return self.db.scalar(stmt)
+
     def list_recent_runs(self, limit: int = 10) -> list[dict]:
         stmt = select(ModelRun).order_by(ModelRun.id.desc()).limit(limit)
         rows = self.db.scalars(stmt).all()
@@ -2148,8 +2266,25 @@ class PredictionWriteRepository:
             self.db.execute(delete(Prediction).where(Prediction.model_run_id == model_run_id))
             self.db.flush()
 
-        now = utc_now_iso()
+        deduped_rows: dict[tuple[int, str], dict] = {}
         for row in rows:
+            key = (int(row["symbol_id"]), str(row["trade_date"]))
+            existing = deduped_rows.get(key)
+            if existing is None:
+                deduped_rows[key] = dict(row)
+                continue
+            existing_score = float(existing.get("score") or 0.0)
+            incoming_score = float(row.get("score") or 0.0)
+            existing_rank = float(existing.get("rank_value") or 0.0)
+            incoming_rank = float(row.get("rank_value") or 0.0)
+            if (
+                incoming_score > existing_score
+                or (incoming_score == existing_score and (incoming_rank <= existing_rank or existing_rank <= 0.0))
+            ):
+                deduped_rows[key] = dict(row)
+
+        now = utc_now_iso()
+        for row in deduped_rows.values():
             prediction = Prediction(
                 model_run_id=model_run_id,
                 symbol_id=row["symbol_id"],
@@ -2161,7 +2296,7 @@ class PredictionWriteRepository:
             self.db.add(prediction)
 
         self.db.commit()
-        return len(rows)
+        return len(deduped_rows)
 
     def list_for_model_run(self, model_run_id: int) -> list[Prediction]:
         stmt = (

@@ -10,15 +10,18 @@ from app.core.db import SessionLocal, get_db_session
 from app.models.schema import SymbolCreate
 from app.services.auth import is_authenticated, login_redirect
 from app.services.market_sync import sync_market_data
+from app.services.market_lake import load_lake_price_history
+from app.services.price_snapshot import load_latest_closes
 from app.services.repository import PredictionRepository, PredictionTradePlanRepository, SymbolRepository, WatchlistRepository
 from app.services.model_signal_summary import build_signal_label, model_confidence, signal_strength
+from app.services.nlp_snapshots import summarize_news_rows
 from app.services.runtime_cache import clear_namespace, get_or_set
 from app.services.symbol_details import SymbolDataService
 from app.services.symbol_catalog import infer_symbol_record, search_symbol_catalog
 from app.services.ticker_format import normalize_ticker_for_market
 from app.services.ui_lang import resolve_request_lang
 from app.services.watchlist_metadata import refresh_watchlist_metadata
-from app.services.workspace_nav import WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
+from app.services.workspace_nav import WORKSPACE_COMPACT_STYLE, WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
 from app.services.workspace_snapshots import (
     SNAPSHOT_WATCHLIST_NLP,
     SNAPSHOT_WATCHLIST_WORKSPACE,
@@ -74,7 +77,7 @@ def _market_section_label(market: str | None) -> str:
     return MARKET_LABELS.get((market or "").upper(), "其他")
 
 
-def _decision_chip(value: str) -> str:
+def _decision_chip(value: str, *, lang: str = "en") -> str:
     normalized = str(value or "HOLD").upper()
     bg = "#f3f4f6"
     fg = "#374151"
@@ -84,10 +87,118 @@ def _decision_chip(value: str) -> str:
         bg, fg = "#fee2e2", "#991b1b"
     elif "HOLD" in normalized:
         bg, fg = "#fef3c7", "#92400e"
+    if lang == "zh":
+        if "BUY" in normalized:
+            label = "偏多"
+        elif "SELL" in normalized:
+            label = "偏弱"
+        elif "WATCH" in normalized:
+            label = "观察"
+        else:
+            label = "中性"
+    else:
+        label = normalized
     return (
         "<span style='display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;"
-        f"background:{bg};color:{fg};font-weight:800;font-size:12px;white-space:nowrap;'>{normalized}</span>"
+        f"background:{bg};color:{fg};font-weight:800;font-size:12px;white-space:nowrap;'>{label}</span>"
     )
+
+
+def _execution_tag_label(tag: str, *, lang: str) -> str:
+    normalized = str(tag or "").strip().lower().replace("_", "-")
+    if lang != "zh":
+        return str(tag or "").strip()
+    mapping = {
+        "earnings-soon": "财报临近",
+        "earnings-near": "财报临近",
+        "gap-risk": "跳空风险",
+        "gap-risk-high": "跳空风险",
+        "breakout-only": "仅看突破",
+        "wait-for-breakout": "等待突破",
+        "pullback-preferred": "偏向回踩",
+        "buy-the-dip": "回踩买点",
+        "low-liquidity": "流动性弱",
+        "crowded-sector": "板块拥挤",
+        "event-pending": "事件待定",
+        "trim-on-5pct": "冲高减仓",
+        "time-stop-5d": "时间止损",
+        "funding-risk": "融资风险",
+        "regulatory-risk": "监管风险",
+        "news-risk": "消息风险",
+        "high-volatility": "高波动",
+        "chase-risk": "追高风险",
+    }
+    return mapping.get(normalized, str(tag or "").strip())
+
+
+def _execution_tag_chip(tag: str, *, lang: str) -> str:
+    normalized = str(tag or "").strip().lower().replace("_", "-")
+    bg = "rgba(148,163,184,0.14)"
+    fg = "#cbd5e1"
+    if any(keyword in normalized for keyword in ("risk", "earnings", "event", "low-liquidity", "crowded")):
+        bg = "rgba(220,38,38,0.16)"
+        fg = "#fca5a5"
+    elif any(keyword in normalized for keyword in ("breakout", "buy-the-dip", "pullback")):
+        bg = "rgba(14,165,233,0.16)"
+        fg = "#7dd3fc"
+    elif any(keyword in normalized for keyword in ("trim", "time-stop")):
+        bg = "rgba(245,158,11,0.16)"
+        fg = "#fcd34d"
+    label = _execution_tag_label(tag, lang=lang)
+    return (
+        "<span style='display:inline-flex;align-items:center;padding:5px 9px;border-radius:999px;"
+        f"background:{bg};color:{fg};font-weight:700;font-size:11px;white-space:nowrap;'>{html.escape(label)}</span>"
+    )
+
+
+def _execution_tag_chips(tags: list[str] | None, *, lang: str) -> str:
+    cleaned = [str(tag).strip() for tag in (tags or []) if str(tag).strip()]
+    if not cleaned:
+        return "<span class='muted'>-</span>"
+    return "".join(_execution_tag_chip(tag, lang=lang) for tag in cleaned[:3])
+
+
+def _derive_watchlist_execution_tags(item: dict) -> list[str]:
+    combined = item.get("combined_analysis") or {}
+    decision = str(combined.get("decision") or "HOLD").upper()
+    confidence = int(combined.get("confidence") or 0)
+    signal_strength_value = int(combined.get("signal_strength") or 0)
+    daily_change_pct = item.get("daily_change_pct")
+    try:
+        day_move = float(daily_change_pct) if daily_change_pct is not None else None
+    except (TypeError, ValueError):
+        day_move = None
+
+    derived: list[str] = []
+    if decision in {"BUY", "WATCH"} and day_move is not None and day_move >= 3.0:
+        derived.append("chase-risk")
+    if decision in {"BUY", "WATCH"} and signal_strength_value >= 55 and day_move is not None and day_move >= 1.5:
+        derived.append("wait-for-breakout")
+    if decision == "BUY" and confidence >= 70 and day_move is not None and day_move <= 0.8:
+        derived.append("pullback-preferred")
+    if decision == "BUY" and signal_strength_value >= 65 and day_move is not None and day_move >= 1.0:
+        derived.append("breakout-only")
+    if decision == "WATCH" and signal_strength_value >= 40 and day_move is not None and day_move <= 0:
+        derived.append("buy-the-dip")
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for tag in derived:
+        clean = str(tag).strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        ordered.append(clean)
+    return ordered[:3]
+
+
+def _ensure_watchlist_execution_tags(items: list[dict]) -> None:
+    for item in items:
+        existing = [str(tag).strip() for tag in (item.get("execution_tags") or []) if str(tag).strip()]
+        if existing:
+            item["execution_tags"] = existing
+            continue
+        item["execution_tags"] = _derive_watchlist_execution_tags(item)
 
 
 def _matches_execution_tag_filter(tags: list[str] | None, execution_tag_filter: str) -> bool:
@@ -195,20 +306,114 @@ def _watchlist_action_hint(item: dict, *, lang: str) -> tuple[str, str]:
     combined = item.get("combined_analysis") or {}
     decision = str(combined.get("decision") or "HOLD").upper()
     confidence = int(combined.get("confidence") or 0)
+    signal_strength_value = int(combined.get("signal_strength") or 0)
+    score = int(combined.get("score") or 0)
+    daily_change_pct = item.get("daily_change_pct")
     tags = [str(tag).strip() for tag in (item.get("execution_tags") or []) if str(tag).strip()]
-    if decision in {"BUY", "STRONG BUY"} and confidence >= 70:
-        action = "优先复核入场条件" if lang == "zh" else "Review entry setup first"
-        reason = "模型偏强且信心较高，适合优先检查是否接近触发位。" if lang == "zh" else "Model posture is strong with high confidence; check whether the trigger level is near."
-    elif decision in {"SELL", "STRONG SELL"}:
+    try:
+        day_move = float(daily_change_pct) if daily_change_pct is not None else None
+    except (TypeError, ValueError):
+        day_move = None
+    if decision in {"SELL", "STRONG SELL"}:
         action = "降低关注优先级" if lang == "zh" else "Lower priority"
         reason = "当前模型态度偏弱，除非有新的价格结构改善，否则不宜放到前排。" if lang == "zh" else "Current model posture is weak; keep it out of the front row unless price structure improves."
     elif tags:
         action = "先核对风险标签" if lang == "zh" else "Check risk tags first"
         reason = "这只股票带有执行提醒，先确认风险事件再决定是否继续跟踪。" if lang == "zh" else "This name carries execution warnings, so verify those risks before continuing."
+    elif decision in {"BUY", "STRONG BUY"} and confidence >= 76 and (day_move is None or day_move <= 1.5):
+        action = "优先复核入场条件" if lang == "zh" else "Review entry trigger"
+        reason = "模型偏强且位置还不算过热，适合优先检查是否接近入场触发位。" if lang == "zh" else "Model posture is strong without looking overextended; review whether price is near the entry trigger."
+    elif decision in {"BUY", "STRONG BUY"} and day_move is not None and day_move >= 2.5:
+        action = "等待放量突破" if lang == "zh" else "Wait for breakout follow-through"
+        reason = "日内已经明显走强，更适合等突破后的延续性和量能确认。" if lang == "zh" else "The name is already extended on the day, so wait for follow-through and volume confirmation after the breakout."
+    elif decision in {"BUY", "STRONG BUY"}:
+        action = "等待回踩确认" if lang == "zh" else "Wait for pullback confirmation"
+        reason = "模型仍偏多，但更适合等价格回踩后再确认承接强度。" if lang == "zh" else "The model is still constructive, but a pullback can provide a cleaner confirmation of support."
+    elif decision == "WATCH" and signal_strength_value >= 55 and day_move is not None and day_move >= 1.5:
+        action = "等待放量突破" if lang == "zh" else "Wait for breakout confirmation"
+        reason = "信号开始转强，若继续放量上攻，再把它前置会更合适。" if lang == "zh" else "The setup is strengthening; move it up only if price keeps pushing higher on volume."
+    elif decision == "WATCH" and signal_strength_value >= 40 and day_move is not None and day_move <= 0:
+        action = "等待回踩企稳" if lang == "zh" else "Wait for pullback stabilization"
+        reason = "现在更像回踩过程中的观察标的，先看支撑是否站稳。" if lang == "zh" else "This looks more like a pullback setup, so watch whether support stabilizes."
+    elif decision == "WATCH" and signal_strength_value >= 35:
+        action = "趋势未破，继续跟踪" if lang == "zh" else "Trend intact, keep tracking"
+        reason = "结构还没走坏，但触发条件也不够清晰，适合继续跟踪。" if lang == "zh" else "The structure is still intact, but the trigger is not clear enough yet, so keep tracking it."
+    elif decision == "HOLD" and score >= 1:
+        action = "信号偏弱，暂不前置" if lang == "zh" else "Weak signal, keep in background"
+        reason = "模型没有明显转空，但强度还不足以放到前排处理。" if lang == "zh" else "The model is not bearish, but the setup is not strong enough to move to the front of the queue."
     else:
-        action = "继续观察确认" if lang == "zh" else "Keep monitoring"
-        reason = "目前更像等待确认的观察标的，适合继续跟踪量价和模型变化。" if lang == "zh" else "This still looks like a confirmation watch, so keep tracking price, volume, and model changes."
+        action = "等待更多确认" if lang == "zh" else "Wait for more confirmation"
+        reason = "当前还缺少足够清晰的触发条件，先观察量价与模型变化再决定是否前置。" if lang == "zh" else "The setup still lacks a clean trigger, so watch price, volume, and model changes before promoting it."
     return action, reason
+
+
+def _format_watchlist_close(value: float | None) -> str:
+    if value is None:
+        return "-"
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if abs(numeric) >= 1000:
+        return f"{numeric:,.2f}"
+    if abs(numeric) >= 1:
+        return f"{numeric:.2f}"
+    return f"{numeric:.4f}"
+
+
+def _render_daily_change_chip(value: float | None) -> str:
+    if value is None:
+        return "<span class='muted'>-</span>"
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "<span class='muted'>-</span>"
+    bg = "rgba(148,163,184,0.12)"
+    fg = "#cbd5e1"
+    if numeric > 0:
+        bg = "rgba(22,163,74,0.16)"
+        fg = "#4ade80"
+    elif numeric < 0:
+        bg = "rgba(220,38,38,0.16)"
+        fg = "#f87171"
+    return (
+        "<span style='display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;"
+        f"background:{bg};color:{fg};font-weight:800;font-size:12px;white-space:nowrap;'>{numeric:+.2f}%</span>"
+    )
+
+
+def _load_watchlist_daily_change_pct(*, market: str | None, ticker: str) -> float | None:
+    market_value = str(market or "").strip().upper()
+    normalized_ticker = normalize_ticker_for_market(ticker, market_value)
+    if market_value not in {"CN", "US"} or not normalized_ticker:
+        return None
+    rows = load_lake_price_history(market=market_value, ticker=normalized_ticker, limit=2)
+    if len(rows) < 2:
+        return None
+    latest = rows[-1]
+    previous = rows[-2]
+    latest_close = latest.get("close") or latest.get("adj_close")
+    previous_close = previous.get("close") or previous.get("adj_close")
+    try:
+        latest_value = float(latest_close)
+        previous_value = float(previous_close)
+    except (TypeError, ValueError):
+        return None
+    if previous_value == 0:
+        return None
+    return ((latest_value / previous_value) - 1.0) * 100.0
+
+
+def _attach_watchlist_price_fields(items: list[dict]) -> None:
+    tickers = [str(item.get("ticker") or "").strip().upper() for item in items if str(item.get("ticker") or "").strip()]
+    latest_closes = load_latest_closes(tickers)
+    for item in items:
+        ticker = str(item.get("ticker") or "").strip().upper()
+        item["latest_close"] = latest_closes.get(ticker)
+        item["daily_change_pct"] = _load_watchlist_daily_change_pct(
+            market=item.get("market"),
+            ticker=item.get("ticker") or "",
+        )
 
 
 def _load_watchlist_items(
@@ -260,13 +465,150 @@ def _watchlist_render_signature(items: list[dict]) -> str:
             "sync_enabled": item.get("sync_enabled"),
             "sync_status": item.get("sync_status"),
             "last_synced_date": item.get("last_synced_date"),
+            "latest_close": item.get("latest_close"),
+            "daily_change_pct": item.get("daily_change_pct"),
             "score": ((item.get("model_output") or {}).get("score")),
             "signal_strength": ((item.get("model_output") or {}).get("signal_strength")),
             "tags": item.get("execution_tags") or [],
+            "news_count": item.get("news_headline_count"),
+            "news_score": item.get("news_sentiment_score"),
         }
         for item in items
     ]
     return urlencode({"payload": str(payload)})[:2000]
+
+
+def _is_news_risk_item(item: dict) -> bool:
+    label = str(item.get("news_sentiment_label") or "").strip().lower()
+    score = float(item.get("news_sentiment_score") or 0.0)
+    risk_tags = item.get("news_risk_tags") or []
+    return int(item.get("news_headline_count") or 0) > 0 and (
+        label == "negative" or score < 0 or bool(risk_tags)
+    )
+
+
+def _is_news_opportunity_item(item: dict) -> bool:
+    label = str(item.get("news_sentiment_label") or "").strip().lower()
+    score = float(item.get("news_sentiment_score") or 0.0)
+    return int(item.get("news_headline_count") or 0) > 0 and (label == "positive" or score > 0)
+
+
+def _render_watchlist_news_panel(
+    *,
+    items: list[dict],
+    news_view: str,
+    lang: str,
+    mode: str,
+    execution_tag_filter: str,
+    exclude_execution_tag_filter: str,
+) -> str:
+    rows = [
+        {
+            "ticker": item.get("ticker"),
+            "name": item.get("name") or item.get("ticker"),
+            "market": item.get("market"),
+            "headline_count": int(item.get("news_headline_count") or 0),
+            "sentiment_label": item.get("news_sentiment_label") or ("中性" if lang == "zh" else "neutral"),
+            "sentiment_score": float(item.get("news_sentiment_score") or 0.0),
+            "risk_tags": item.get("news_risk_tags") or [],
+            "summary_text": item.get("news_summary") or "",
+            "source_counts": item.get("news_source_counts") or {},
+        }
+        for item in items
+    ]
+    meta = summarize_news_rows(rows)
+    market_meta = {
+        market: summarize_news_rows([row for row in rows if str(row.get("market") or "").upper() == market])
+        for market in ("CN", "US")
+    }
+    risk_rows = sorted(
+        [item for item in items if _is_news_risk_item(item)],
+        key=lambda item: (
+            float(item.get("news_sentiment_score") or 0.0),
+            -len(item.get("news_risk_tags") or []),
+            -int(item.get("news_headline_count") or 0),
+            str(item.get("ticker") or ""),
+        ),
+    )
+    opportunity_rows = sorted(
+        [item for item in items if _is_news_opportunity_item(item)],
+        key=lambda item: (
+            -float(item.get("news_sentiment_score") or 0.0),
+            -int(item.get("news_headline_count") or 0),
+            str(item.get("ticker") or ""),
+        ),
+    )
+    no_news_rows = [item for item in items if int(item.get("news_headline_count") or 0) <= 0]
+
+    def _tab(label: str, value: str, count: int | None = None) -> str:
+        params = {"lang": lang, "mode": mode, "news_view": value}
+        if execution_tag_filter and execution_tag_filter.upper() != "ALL":
+            params["execution_tag_filter"] = execution_tag_filter
+        if exclude_execution_tag_filter and exclude_execution_tag_filter.upper() != "ALL":
+            params["exclude_execution_tag_filter"] = exclude_execution_tag_filter
+        active = " active" if news_view == value else ""
+        suffix = f" · {count}" if count is not None else ""
+        return f"<a class='news-tab{active}' href='/watchlist?{urlencode(params)}'>{label}{suffix}</a>"
+
+    def _row(item: dict, *, risk_mode: bool = False) -> str:
+        summary = html.escape(str(item.get("news_summary") or "-"))
+        risk_text = " / ".join(str(tag) for tag in (item.get("news_risk_tags") or [])) or "-"
+        sentiment = html.escape(str(item.get("news_sentiment_label") or "-"))
+        tone = "risk" if risk_mode else "opportunity"
+        return (
+            "<article class='news-row'>"
+            f"<div><a class='ticker' href='/insights/{item.get('ticker')}?lang={lang}'>{item.get('ticker')}</a>"
+            f"<div class='muted'>{html.escape(str(item.get('name') or item.get('ticker') or '-'))} · {html.escape(str(item.get('market') or '-'))}</div>"
+            f"<div class='muted'>{summary}</div></div>"
+            f"<div class='news-row-right'><span class='news-chip {tone}'>{sentiment} · {int(item.get('news_headline_count') or 0)}</span>"
+            f"<div class='muted'>{html.escape(risk_text if risk_mode else str(item.get('news_source_text') or '-'))}</div></div>"
+            "</article>"
+        )
+
+    if news_view == "risk":
+        body = "".join(_row(item, risk_mode=True) for item in risk_rows[:12])
+    elif news_view == "opportunity":
+        body = "".join(_row(item) for item in opportunity_rows[:12])
+    elif news_view == "coverage":
+        body = "".join(_row(item) for item in no_news_rows[:12])
+    else:
+        body = "".join(
+            [
+                "<div class='news-subtitle'>" + ("新闻机会" if lang == "zh" else "News opportunities") + "</div>",
+                "".join(_row(item) for item in opportunity_rows[:4]) or f"<div class='muted'>{'暂无新闻机会。' if lang == 'zh' else 'No news opportunities yet.'}</div>",
+                "<div class='news-subtitle'>" + ("新闻风险" if lang == "zh" else "News risks") + "</div>",
+                "".join(_row(item, risk_mode=True) for item in risk_rows[:4]) or f"<div class='muted'>{'暂无新闻风险。' if lang == 'zh' else 'No news risks yet.'}</div>",
+            ]
+        )
+    body = body or f"<div class='muted'>{'暂无匹配新闻。' if lang == 'zh' else 'No matching news yet.'}</div>"
+
+    cn_meta = market_meta.get("CN") or {}
+    us_meta = market_meta.get("US") or {}
+    return f"""
+      <section class="card news-console" id="news">
+        <div class="eyebrow">{'自选股新闻' if lang == 'zh' else 'Watchlist News'}</div>
+        <div class="news-head">
+          <div>
+            <h2>{'新闻只跟踪自选股' if lang == 'zh' else 'News tracks watchlist names only'}</h2>
+            <p class="muted">{'首页只保留新闻状态，具体新闻机会、风险和覆盖诊断都收在这里。' if lang == 'zh' else 'The dashboard only keeps a news status; opportunities, risks, and coverage diagnostics live here.'}</p>
+          </div>
+          <div class="news-score"><strong>{meta.get('coverage_pct', 0)}%</strong><span>{'覆盖率' if lang == 'zh' else 'coverage'}</span></div>
+        </div>
+        <div class="news-metrics">
+          <div><strong>{meta.get('matched_ticker_count', 0)}/{meta.get('ticker_count', 0)}</strong><span>{'命中股票' if lang == 'zh' else 'matched names'}</span></div>
+          <div><strong>{cn_meta.get('matched_ticker_count', 0)}/{cn_meta.get('ticker_count', 0)}</strong><span>A股</span></div>
+          <div><strong>{us_meta.get('matched_ticker_count', 0)}/{us_meta.get('ticker_count', 0)}</strong><span>US</span></div>
+          <div><strong>{meta.get('headline_total', 0)}</strong><span>{'新闻数' if lang == 'zh' else 'headlines'}</span></div>
+        </div>
+        <div class="news-tabs">
+          {_tab('全部' if lang == 'zh' else 'All', 'all')}
+          {_tab('新闻机会' if lang == 'zh' else 'Opportunities', 'opportunity', len(opportunity_rows))}
+          {_tab('新闻风险' if lang == 'zh' else 'Risks', 'risk', len(risk_rows))}
+          {_tab('覆盖诊断' if lang == 'zh' else 'Coverage', 'coverage', len(no_news_rows))}
+        </div>
+        <div class="news-list">{body}</div>
+      </section>
+    """
 
 
 def _render_watchlist_analysis_fragment(
@@ -406,6 +748,20 @@ def _render_watchlist_analysis_fragment(
 
 
 def _render_watchlist_table_fragment(*, items: list[dict], lang: str) -> str:
+    def news_chip(item: dict) -> str:
+        count = int(item.get("news_headline_count") or 0)
+        label = str(item.get("news_sentiment_label") or ("中性" if lang == "zh" else "neutral"))
+        tone = "news-neutral"
+        if label.lower() == "positive" or label == "positive":
+            tone = "news-positive"
+        if label.lower() == "negative" or label == "negative":
+            tone = "news-negative"
+        summary = html.escape(str(item.get("news_summary") or "-"), quote=True)
+        return (
+            f"<span class='news-chip {tone}' title='{summary}'>{html.escape(label)} · {count}</span>"
+            f"<div class='muted news-line' title='{summary}'>{summary}</div>"
+        )
+
     def sync_state_text(item: dict) -> str:
         if item["sync_enabled"] and item["sync_status"] == "success":
             return "Ready"
@@ -420,25 +776,21 @@ def _render_watchlist_table_fragment(*, items: list[dict], lang: str) -> str:
         if current_market != previous_market:
             item_rows_list.append(
                 "<tr class='market-section'>"
-                f"<td colspan='12'>{_market_section_label(current_market)}</td>"
+                f"<td colspan='10'>{_market_section_label(current_market)}</td>"
                 "</tr>"
             )
             previous_market = current_market
         item_rows_list.append(
             "<tr>"
-            f"<td><a href='/watchlist/open/{item['item_id']}'>{item['ticker']}</a></td>"
-            f"<td>{item['name'] or item['ticker']}</td>"
+            f"<td class='sticky-col sticky-col-1'><a href='/watchlist/open/{item['item_id']}'>{item['ticker']}</a></td>"
+            f"<td class='sticky-col sticky-col-2'>{item['name'] or item['ticker']}</td>"
             f"<td>{item['market'] or '-'}</td>"
-            f"<td>{item['exchange'] or '-'}</td>"
-            f"<td>{_decision_chip((item.get('combined_analysis') or {}).get('decision') or 'HOLD')}</td>"
-            f"<td>{(item.get('combined_analysis') or {}).get('confidence') or '-'}</td>"
-                f"<td>{item.get('decision_brief', {}).get('headline') or '-'}</td>"
-                f"<td>{item.get('action_hint') or '-'}</td>"
-                f"<td>{item.get('ai_brief') or '-'}</td>"
-                f"<td title='{html.escape(item.get('news_summary') or '-', quote=True)}'>{html.escape(item.get('news_sentiment_label') or '-')} · {int(item.get('news_headline_count') or 0)}</td>"
-                f"<td>{' · '.join(item.get('execution_tags') or []) or '-'}</td>"
-                f"<td>{sync_state_text(item)}</td>"
-                f"<td>{item['last_synced_date'] or '-'}</td>"
+            f"<td>{_format_watchlist_close(item.get('latest_close'))}</td>"
+            f"<td>{_render_daily_change_chip(item.get('daily_change_pct'))}</td>"
+            f"<td>{_decision_chip((item.get('combined_analysis') or {}).get('decision') or 'HOLD', lang=lang)}</td>"
+            f"<td>{item.get('action_hint') or '-'}</td>"
+            f"<td><div style='display:flex;gap:6px;flex-wrap:wrap;'>{_execution_tag_chips(item.get('execution_tags'), lang=lang)}</div></td>"
+            f"<td>{news_chip(item)}</td>"
             "<td style='white-space:nowrap;'>"
             f"<a class='linkbtn' href='/watchlist/open/{item['item_id']}'>Open Insight</a>"
             f"<form action='/watchlist/toggle-sync' method='post' style='display:inline-block;margin-left:8px;'>"
@@ -453,18 +805,37 @@ def _render_watchlist_table_fragment(*, items: list[dict], lang: str) -> str:
             "</td>"
             "</tr>"
         )
-    item_rows = "".join(item_rows_list) or "<tr><td colspan='14'>No stocks in your watchlist yet.</td></tr>"
+    item_rows = "".join(item_rows_list) or "<tr><td colspan='10'>No stocks in your watchlist yet.</td></tr>"
+    mobile_cards = "".join(
+        "<article class='mobile-stock-card'>"
+        f"<div class='mobile-stock-head'><div><a class='mobile-stock-ticker' href='/watchlist/open/{item['item_id']}'>{item['ticker']}</a><div class='muted'>{item['name'] or item['ticker']} · {item.get('market') or '-'}</div></div>{_decision_chip((item.get('combined_analysis') or {}).get('decision') or 'HOLD', lang=lang)}</div>"
+        f"<div class='mobile-stock-grid'>"
+        f"<div><span class='muted'>{'收盘价' if lang == 'zh' else 'Close'}</span><div>{_format_watchlist_close(item.get('latest_close'))}</div></div>"
+        f"<div><span class='muted'>{'涨幅' if lang == 'zh' else 'Day %'}</span><div>{_render_daily_change_chip(item.get('daily_change_pct'))}</div></div>"
+        "</div>"
+        f"<div class='muted' style='margin-top:8px;'>{item.get('action_hint') or '-'}</div>"
+        f"<div class='muted' style='margin-top:8px;'>{'新闻' if lang == 'zh' else 'News'}: {news_chip(item)}</div>"
+        f"<div style='display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;'>{_execution_tag_chips(item.get('execution_tags'), lang=lang)}</div>"
+        "<div class='mobile-stock-actions'>"
+        f"<a class='linkbtn' href='/watchlist/open/{item['item_id']}'>{'打开分析' if lang == 'zh' else 'Open'}</a>"
+        f"<form action='/watchlist/toggle-sync' method='post' style='display:inline-block;'><input type='hidden' name='item_id' value='{item['item_id']}' /><input type='hidden' name='enabled' value='{'0' if item['sync_enabled'] else '1'}' /><button type='submit'>{'关闭同步' if item['sync_enabled'] else '开启同步'}</button></form>"
+        f"<form action='/watchlist/remove' method='post' style='display:inline-block;'><input type='hidden' name='item_id' value='{item['item_id']}' /><button type='submit' class='danger'>{'删除' if lang == 'zh' else 'Remove'}</button></form>"
+        "</div>"
+        "</article>"
+        for item in items
+    ) or f"<div class='muted'>{'暂无自选股。' if lang == 'zh' else 'No watchlist names yet.'}</div>"
     return f"""
       <section class="card table-card">
         <div class="eyebrow">Saved Stocks</div>
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>Ticker</th><th>Name</th><th>Market</th><th>Exchange</th><th>Decision</th><th>Confidence</th><th>Decision Brief</th><th>{'下一步' if lang == 'zh' else 'Next Step'}</th><th>AI Brief</th><th>{'新闻情绪' if lang == 'zh' else 'News Sentiment'}</th><th>Execution Tags</th><th>Sync</th><th>Last Sync</th><th>Actions</th></tr>
+              <tr><th class='sticky-col sticky-col-1'>Ticker</th><th class='sticky-col sticky-col-2'>Name</th><th>Market</th><th>{'收盘价' if lang == 'zh' else 'Close'}</th><th>{'涨幅' if lang == 'zh' else 'Day %'}</th><th>Decision</th><th>{'下一步' if lang == 'zh' else 'Next Step'}</th><th>Execution Tags</th><th>{'新闻' if lang == 'zh' else 'News'}</th><th>Actions</th></tr>
             </thead>
             <tbody>{item_rows}</tbody>
           </table>
         </div>
+        <div class="mobile-stock-list">{mobile_cards}</div>
         <div class="muted" style="margin-top:10px;">{'可拖动底部滚动条查看更多列。' if lang == 'zh' else 'Drag the horizontal scrollbar to see more columns.'}</div>
       </section>
     """
@@ -513,6 +884,7 @@ def watchlist_page(
     request: Request,
     message: str | None = None,
     mode: str = Query("monitor"),
+    news_view: str = Query("all"),
     analysis_limit: int = Query(12, ge=1, le=60),
     ai_analysis_limit: int = Query(3, ge=0, le=12),
     execution_tag_filter: str = Query("ALL"),
@@ -525,6 +897,9 @@ def watchlist_page(
     view_mode = (mode or "monitor").strip().lower()
     if view_mode not in {"premarket", "monitor", "postmarket"}:
         view_mode = "monitor"
+    news_view = (news_view or "all").strip().lower()
+    if news_view not in {"all", "opportunity", "risk", "coverage"}:
+        news_view = "all"
     execution_tag_filter = execution_tag_filter.strip()
     exclude_execution_tag_filter = exclude_execution_tag_filter.strip()
     force_live = bool(message)
@@ -563,6 +938,7 @@ def watchlist_page(
             item["combined_analysis"] = combined
             item["decision_brief"] = decision_brief
             item["ai_brief"] = "AI brief available for top-ranked names."
+    _attach_watchlist_price_fields(items)
     for item in items:
         combined = item.get("combined_analysis") or _lightweight_watchlist_analysis(item.get("model_output"))
         item["combined_analysis"] = combined
@@ -571,9 +947,34 @@ def watchlist_page(
         item["ai_brief"] = item.get("ai_brief") or "AI brief available for top-ranked names."
         news_row = nlp_map.get(str(item.get("ticker") or "").strip().upper()) or {}
         item["news_sentiment_label"] = news_row.get("sentiment_label") or ("中性" if lang == "zh" else "neutral")
+        item["news_sentiment_score"] = float(news_row.get("sentiment_score") or 0.0)
         item["news_summary"] = news_row.get("summary_text") or ""
         item["news_headline_count"] = int(news_row.get("headline_count") or 0)
-    render_signature = _watchlist_render_signature(items)
+        item["news_risk_tags"] = news_row.get("risk_tags") or []
+        item["news_source_counts"] = news_row.get("source_counts") or {}
+        item["news_source_text"] = " · ".join(
+            f"{source}({count})"
+            for source, count in list((item["news_source_counts"] or {}).items())[:2]
+            if source
+        )
+    _ensure_watchlist_execution_tags(items)
+    if news_view == "risk":
+        display_items = [item for item in items if _is_news_risk_item(item)]
+    elif news_view == "opportunity":
+        display_items = [item for item in items if _is_news_opportunity_item(item)]
+    elif news_view == "coverage":
+        display_items = [item for item in items if int(item.get("news_headline_count") or 0) <= 0]
+    else:
+        display_items = items
+    render_signature = _watchlist_render_signature(display_items)
+    news_panel_html = _render_watchlist_news_panel(
+        items=items,
+        news_view=news_view,
+        lang=lang,
+        mode=view_mode,
+        execution_tag_filter=execution_tag_filter,
+        exclude_execution_tag_filter=exclude_execution_tag_filter,
+    )
     analysis_panel_html = get_or_set(
         "watchlist_analysis_fragment",
         f"{render_signature}|mode={view_mode}|analysis={analysis_limit}|ai={ai_analysis_limit}|lang={lang}",
@@ -588,14 +989,14 @@ def watchlist_page(
     )
     table_panel_html = get_or_set(
         "watchlist_table_fragment",
-        f"{render_signature}|lang={lang}",
+        f"{render_signature}|lang={lang}|news={news_view}",
         ttl_seconds=60.0,
-        loader=lambda: _render_watchlist_table_fragment(items=items, lang=lang),
+        loader=lambda: _render_watchlist_table_fragment(items=display_items, lang=lang),
     )
 
     mode_switch_html = "".join(
         (
-            f"<a href='/watchlist?{urlencode({'mode': value, 'lang': lang})}' "
+            f"<a href='/watchlist?{urlencode({'mode': value, 'lang': lang, 'news_view': news_view})}' "
             "style='display:inline-flex;align-items:center;padding:8px 12px;border-radius:999px;"
             f"border:1px solid {'#0f766e' if value == view_mode else '#cde9e4'};"
             f"background:{'#0f766e' if value == view_mode else '#fffdf7'};"
@@ -652,40 +1053,36 @@ def watchlist_page(
             radial-gradient(circle at top left, rgba(82,168,255,0.14) 0, transparent 28%),
             radial-gradient(circle at top right, rgba(61,217,182,0.10) 0, transparent 26%),
             var(--bg); }}
-          .app {{ display:grid; grid-template-columns:280px minmax(0, 1fr); min-height:100vh; }}
+          {WORKSPACE_COMPACT_STYLE}
           {WORKSPACE_SIDEBAR_STYLE}
-          .content {{ padding:28px; }}
-          .wrap {{ max-width: 1120px; margin: 0 auto; padding: 0 0 56px; }}
-          .topbar {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }}
+          .content {{ padding:20px 18px 28px; }}
+          .wrap {{ max-width:none; margin:0; padding: 0 0 36px; }}
+          .topbar {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }}
           .topbar a {{ color: var(--accent); text-decoration:none; }}
-          .banner {{ margin-bottom:16px; padding:14px 16px; border-radius:16px; background:rgba(61,217,182,0.14); color:var(--accent); font-weight:700; }}
-          .hero {{ display:grid; gap:16px; grid-template-columns: minmax(320px, 1.1fr) minmax(340px, 1fr); margin-bottom:16px; }}
-          .card {{ background: linear-gradient(180deg, rgba(21,34,49,0.98), rgba(17,28,40,0.98)); border:1px solid var(--line); border-radius:22px; padding:18px; box-shadow:0 24px 48px rgba(0,0,0,0.18); }}
-          .nav-grid {{ display:grid; gap:16px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-bottom:16px; }}
+          .banner {{ margin-bottom:12px; padding:12px 14px; border-radius:14px; background:rgba(61,217,182,0.14); color:var(--accent); font-weight:700; }}
+          .hero {{ display:grid; gap:12px; grid-template-columns: minmax(280px, 1.05fr) minmax(320px, 0.95fr); margin-bottom:12px; }}
+          .nav-grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-bottom:12px; }}
           .nav-card {{
             display:block;
             text-decoration:none;
             color:inherit;
             background:linear-gradient(180deg, rgba(17,28,40,0.98) 0%, rgba(21,34,49,0.98) 100%);
             border:1px solid var(--line);
-            border-radius:18px;
-            padding:18px;
-            box-shadow:0 12px 30px rgba(0,0,0,0.12);
+            border-radius:15px;
+            padding:14px;
+            box-shadow:0 10px 22px rgba(0,0,0,0.12);
           }}
           .nav-card:hover {{ border-color:var(--accent); box-shadow:0 12px 28px rgba(61,217,182,0.08); }}
-          .nav-head {{ display:flex; align-items:center; gap:12px; margin-bottom:10px; }}
+          .nav-head {{ display:flex; align-items:center; gap:10px; margin-bottom:8px; }}
           .nav-icon {{
-            width:42px; height:42px; border-radius:14px; display:inline-flex; align-items:center; justify-content:center;
-            background:rgba(61,217,182,0.10); color:var(--accent); font-size:12px; font-weight:900; letter-spacing:0.04em; border:1px solid rgba(61,217,182,0.18); flex:0 0 auto;
+            width:38px; height:38px; border-radius:12px; display:inline-flex; align-items:center; justify-content:center;
+            background:rgba(61,217,182,0.10); color:var(--accent); font-size:11px; font-weight:900; letter-spacing:0.04em; border:1px solid rgba(61,217,182,0.18); flex:0 0 auto;
           }}
-          .nav-title {{ font-size:18px; font-weight:800; color:var(--ink); }}
-          .nav-kicker {{ color:var(--muted); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; }}
-          .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
-          h1 {{ margin:0 0 8px; font-size:38px; }}
+          .nav-title {{ font-size:16px; font-weight:800; color:var(--ink); }}
+          .nav-kicker {{ color:var(--muted); font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; }}
+          h1 {{ margin:0 0 6px; font-size:32px; }}
           p {{ margin:0; }}
-          .muted {{ color:var(--muted); font-size:14px; }}
           form {{ margin:0; }}
-          .stack {{ display:grid; gap:12px; }}
           .suggest-wrap {{ position:relative; }}
           .suggestions {{
             position:absolute;
@@ -695,7 +1092,7 @@ def watchlist_page(
             z-index:10;
             background:#111c28;
             border:1px solid var(--line);
-            border-radius:14px;
+            border-radius:12px;
             box-shadow:0 10px 28px rgba(0,0,0,0.18);
             margin-top:6px;
             display:none;
@@ -710,21 +1107,13 @@ def watchlist_page(
             border:none;
             border-bottom:1px solid var(--line);
             border-radius:0;
-            padding:12px;
+            padding:10px;
             cursor:pointer;
           }}
           .suggestion:last-child {{ border-bottom:none; }}
           .suggestion:hover {{ background:rgba(61,217,182,0.10); color:var(--accent); }}
           .suggest-name {{ display:block; font-weight:700; }}
           .suggest-meta {{ display:block; color:var(--muted); font-size:12px; margin-top:4px; }}
-          input, select, button {{
-            border-radius:12px;
-            border:1px solid var(--line);
-            padding:10px 12px;
-            font:inherit;
-            background:#0f1823;
-            color:var(--ink);
-          }}
           button {{ background:var(--accent); color:#fff; border-color:var(--accent); font-weight:700; }}
           button.danger {{ background:var(--danger); border-color:var(--danger); padding:8px 10px; }}
           .hint {{ color:var(--muted); font-size:13px; }}
@@ -739,18 +1128,51 @@ def watchlist_page(
           th {{ color:var(--muted); font-weight:600; }}
           .table-wrap th:nth-child(1), .table-wrap td:nth-child(1) {{ min-width:108px; }}
           .table-wrap th:nth-child(2), .table-wrap td:nth-child(2) {{ min-width:160px; max-width:160px; overflow:hidden; text-overflow:ellipsis; }}
-          .table-wrap th:nth-child(5), .table-wrap td:nth-child(5) {{ min-width:110px; }}
-          .table-wrap th:nth-child(7), .table-wrap td:nth-child(7) {{ min-width:180px; max-width:180px; overflow:hidden; text-overflow:ellipsis; }}
-          .table-wrap th:nth-child(8), .table-wrap td:nth-child(8) {{ min-width:160px; max-width:160px; overflow:hidden; text-overflow:ellipsis; }}
-          .table-wrap th:nth-child(9), .table-wrap td:nth-child(9) {{ min-width:180px; max-width:180px; overflow:hidden; text-overflow:ellipsis; }}
-          .table-wrap th:nth-child(10), .table-wrap td:nth-child(10) {{ min-width:150px; max-width:150px; overflow:hidden; text-overflow:ellipsis; }}
-          .table-wrap th:nth-child(13), .table-wrap td:nth-child(13) {{ min-width:220px; }}
+          .table-wrap th:nth-child(4), .table-wrap td:nth-child(4) {{ min-width:108px; }}
+          .table-wrap th:nth-child(5), .table-wrap td:nth-child(5) {{ min-width:108px; }}
+          .table-wrap th:nth-child(6), .table-wrap td:nth-child(6) {{ min-width:110px; }}
+          .table-wrap th:nth-child(7), .table-wrap td:nth-child(7) {{ min-width:160px; max-width:160px; overflow:hidden; text-overflow:ellipsis; }}
+          .table-wrap th:nth-child(8), .table-wrap td:nth-child(8) {{ min-width:180px; max-width:180px; overflow:hidden; text-overflow:ellipsis; }}
+          .table-wrap th:nth-child(9), .table-wrap td:nth-child(9) {{ min-width:220px; }}
+          .sticky-col {{ position:sticky; background:var(--panel); z-index:2; }}
+          th.sticky-col {{ z-index:4; }}
+          .sticky-col-1 {{ left:0; min-width:108px; box-shadow:10px 0 14px rgba(31,41,55,0.05); }}
+          .sticky-col-2 {{ left:108px; min-width:160px; max-width:160px; box-shadow:10px 0 14px rgba(31,41,55,0.04); }}
           .market-section td {{ background:#132031; color:var(--accent); font-weight:800; letter-spacing:0.03em; border-top:1px solid var(--line); }}
           .table-card a {{ color: var(--accent); text-decoration:none; }}
           .linkbtn {{ display:inline-block; padding:8px 10px; border-radius:10px; background:rgba(61,217,182,0.10); color:var(--accent); font-weight:700; }}
-          @media (max-width: 1120px) {{
-            .app {{ grid-template-columns:1fr; }}
-            .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }}
+          .news-console {{ margin-bottom:16px; }}
+          .news-head {{ display:flex; justify-content:space-between; gap:16px; align-items:flex-start; }}
+          .news-head h2 {{ margin:0 0 6px; }}
+          .news-score {{ min-width:108px; text-align:right; }}
+          .news-score strong {{ display:block; font-size:28px; color:var(--accent); }}
+          .news-score span {{ color:var(--muted); font-size:12px; }}
+          .news-metrics {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin:14px 0; }}
+          .news-metrics div {{ border:1px solid var(--line); border-radius:14px; background:rgba(11,19,29,0.62); padding:10px; }}
+          .news-metrics strong {{ display:block; color:var(--ink); }}
+          .news-metrics span {{ color:var(--muted); font-size:12px; }}
+          .news-tabs {{ display:flex; gap:8px; flex-wrap:wrap; margin:10px 0 14px; }}
+          .news-tab {{ display:inline-flex; padding:8px 12px; border:1px solid var(--line); border-radius:999px; color:var(--muted); text-decoration:none; font-weight:800; font-size:12px; }}
+          .news-tab.active {{ color:var(--accent); border-color:rgba(61,217,182,0.55); background:rgba(61,217,182,0.10); }}
+          .news-list {{ display:grid; gap:10px; }}
+          .news-subtitle {{ color:var(--ink); font-weight:900; margin-top:6px; }}
+          .news-row {{ display:flex; justify-content:space-between; gap:14px; align-items:flex-start; border:1px solid var(--line); border-radius:14px; background:rgba(11,19,29,0.56); padding:12px; }}
+          .news-row-right {{ text-align:right; min-width:130px; }}
+          .news-chip {{ display:inline-flex; padding:4px 8px; border-radius:999px; font-weight:900; font-size:12px; border:1px solid var(--line); }}
+          .news-chip.news-positive,.news-chip.opportunity {{ color:#8df0aa; background:rgba(74,222,128,0.12); border-color:rgba(74,222,128,0.26); }}
+          .news-chip.news-negative,.news-chip.risk {{ color:#ff9aaa; background:rgba(255,107,129,0.12); border-color:rgba(255,107,129,0.26); }}
+          .news-chip.news-neutral {{ color:#d7e0ea; background:rgba(148,163,184,0.12); border-color:rgba(148,163,184,0.22); }}
+          .news-line {{ margin-top:4px; max-width:180px; overflow:hidden; text-overflow:ellipsis; }}
+          .mobile-stock-list {{ display:none; gap:10px; }}
+          .mobile-stock-card {{ border:1px solid var(--line); border-radius:14px; background:rgba(11,19,29,0.82); padding:12px; }}
+          .mobile-stock-head {{ display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }}
+          .mobile-stock-ticker {{ font-weight:800; color:var(--accent); text-decoration:none; }}
+          .mobile-stock-grid {{ display:grid; gap:8px; grid-template-columns:repeat(2, minmax(0,1fr)); margin-top:10px; }}
+          .mobile-stock-actions {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }}
+          @media (max-width: 720px) {{
+            .table-wrap {{ display:none; }}
+            .mobile-stock-list {{ display:grid; }}
+            .sticky-col, .sticky-col-1, .sticky-col-2 {{ position:static; box-shadow:none; min-width:auto; max-width:none; }}
           }}
         </style>
         <script>
@@ -928,6 +1350,7 @@ def watchlist_page(
             <div class="eyebrow">{'执行过滤' if lang == 'zh' else 'Execution Filters'}</div>
             <form class="stack" action="/watchlist" method="get" style="max-width:420px;">
               <input type="hidden" name="lang" value="{lang}" />
+              <input type="hidden" name="news_view" value="{news_view}" />
               <div>
                 <label class="muted" style="display:block;margin-bottom:6px;">{'执行标签' if lang == 'zh' else 'Execution Tag'}</label>
                 <input type="text" name="execution_tag_filter" list="execution-tag-options" value="{execution_tag_filter if execution_tag_filter.upper() != 'ALL' else ''}" placeholder="gap-risk, earnings-soon" />
@@ -962,6 +1385,8 @@ def watchlist_page(
           </section>
 
           <div id="watchlist-analysis-panels">{analysis_panel_html}</div>
+
+          {news_panel_html}
 
           <div id="watchlist-table-panel">{table_panel_html}</div>
         </div>

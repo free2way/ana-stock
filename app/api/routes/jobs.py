@@ -30,7 +30,7 @@ from app.services.dataset_build import build_dataset
 from app.services.global_fundamentals import sync_global_fundamentals
 from app.services.job_response import build_job_payload, complete_job_and_build_payload, fail_job_and_build_payload
 from app.services.market_sync import sync_market_data
-from app.services.market_lake import query_us_daily_summary
+from app.services.market_lake import list_lake_symbols, query_us_daily_summary
 from app.services.market_csv_cleanup import cleanup_market_csv_files
 from app.services.model_output_importer import ExternalModelOutputImporter
 from app.services.push_notifications import PushNotificationService
@@ -41,6 +41,7 @@ from app.services.technical_snapshot_cache import rebuild_technical_snapshots
 from app.services.trainer import SignalTrainer
 from app.services.us_market_universe import refresh_us_grouped_daily
 from app.services.us_market_universe import refresh_us_grouped_daily_range
+from app.services.workspace_snapshots import refresh_workspace_snapshots
 
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -153,11 +154,13 @@ def job_templates(request: Request):
         {"job_type": "refresh_cn_market_data_daily", "description": "Incrementally refresh A-share market prices from each symbol's last synced date."},
         {"job_type": "refresh_cn_market_data_lake_only", "description": "Refresh A-share market prices directly into Parquet lake without generating CSV files."},
         {"job_type": "cn_close_review", "description": "Run the post-close CN incremental refresh, rebuild, AI review, and recommendations pipeline."},
+        {"job_type": "train_cn_signals", "description": "Train the LightGBM A-share multifactor signal model from the local CN Parquet market lake and write predictions."},
         {"job_type": "social_signal_poll", "description": "Poll tracked X accounts every 30 minutes and parse ticker mentions automatically."},
         {"job_type": "social_us_price_sync", "description": "Automatically sync Alpaca-backed U.S. prices for tickers mentioned in imported X posts."},
         {"job_type": "precompute_us_screeners", "description": "Precompute U.S. screener snapshots after U.S. close using the locally synced U.S. symbol pool."},
         {"job_type": "refresh_us_grouped_daily", "description": "Refresh U.S. grouped daily EOD bars from Polygon for full-market U.S. scans."},
         {"job_type": "refresh_us_grouped_daily_range", "description": "Refresh a U.S. grouped daily date range directly into Parquet lake without per-symbol CSV files."},
+        {"job_type": "train_us_signals", "description": "Train the LightGBM U.S. multifactor signal model from the local U.S. Parquet market lake and write predictions."},
         {"job_type": "cleanup_market_csv", "description": "Dry-run or delete market CSV files that are already covered by Parquet market lake."},
         {"job_type": "rebuild_technical_snapshots", "description": "Cache technical pattern snapshots for faster full-market scans."},
         {"job_type": "sync_cn_fundamentals", "description": "Fetch and persist A-share fundamentals through the unified fundamental provider layer."},
@@ -214,18 +217,32 @@ async def send_ai_daily_report(request: Request, db: Session = Depends(get_db_se
     redirect_to = await _request_value(request, "redirect_to")
     channels_raw = str(await _request_value(request, "channels", "")).strip()
     selected_channels = [item.strip().lower() for item in channels_raw.split(",") if item.strip()]
+    force_send = _as_bool(await _request_value(request, "force_send", False), default=False)
 
     job_repo = DataJobRepository(db)
     job = job_repo.create_job(
         job_type="send_ai_daily_report",
         status="running",
-        params={"channels": selected_channels or None},
+        params={"channels": selected_channels or None, "force_send": force_send},
     )
     try:
         report = load_ai_daily_report()
         if report is None:
             report = build_ai_daily_report(limit=8)
             save_ai_daily_report(report)
+        market_meta = report.get("market_recommendations_meta") or {}
+        market_status = str(market_meta.get("status") or "").strip().lower()
+        if market_status in {"fallback", "not_ready"} and not force_send:
+            note = str(market_meta.get("note") or "").strip() or "今日 A股全市场候选尚未就绪。"
+            payload = complete_job_and_build_payload(
+                job_repo,
+                job_id=job.id,
+                status="failed",
+                message=f"Skipped AI daily report send: {note}",
+                blocked_reason="market_recommendations_not_ready",
+                market_recommendations_meta=market_meta,
+            )
+            return _maybe_redirect(redirect_to, payload)
         notifier = PushNotificationService()
         push_messages = render_ai_daily_report_push_messages(report)
         sent: list[str] = []
@@ -245,12 +262,15 @@ async def send_ai_daily_report(request: Request, db: Session = Depends(get_db_se
             "sent": sent,
             "failed": failed,
             "messages": results,
+            "forced": force_send,
         }
         message = (
             f"Sent A-share AI daily report as {len(push_messages)} message(s) to {', '.join(result['sent'])}"
             if result.get("sent")
             else "No AI daily report channels were available."
         )
+        if force_send and market_status in {"fallback", "not_ready"}:
+            message = f"{message} (forced while market candidates were {market_status})"
         payload = complete_job_and_build_payload(
             job_repo,
             job_id=job.id,
@@ -361,6 +381,148 @@ async def run_precompute_us_screeners(request: Request, db: Session = Depends(ge
             status=status,
             message=f"Precomputed {result.get('count', 0)} U.S. screener snapshot(s).",
             **extra,
+        )
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
+        return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/train-us-signals")
+async def run_train_us_signals(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    run_name = str(await _request_value(request, "run_name", "us_close_lightgbm")).strip() or "us_close_lightgbm"
+    model_type = str(await _request_value(request, "model_type", "lightgbm")).strip() or "lightgbm"
+    signal_type = str(await _request_value(request, "signal_type", "momentum")).strip() or "momentum"
+    lookback_days = _as_int(await _request_value(request, "lookback_days", 3), 3)
+    top_n = _as_int(await _request_value(request, "top_n", 5), 5)
+    us_tickers = sorted(list_lake_symbols(market="US"))
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type="train_us_signals",
+        status="running",
+        params={
+            "run_name": run_name,
+            "signal_type": signal_type,
+            "lookback_days": lookback_days,
+            "top_n": top_n,
+            "market": "US",
+            "ticker_count": len(us_tickers),
+            "model_type": model_type,
+        },
+    )
+    if not us_tickers:
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status="failed",
+            message="No U.S. symbols found in the Parquet market lake. Refresh U.S. grouped daily first.",
+            predictions_written=0,
+            ticker_count=0,
+            market="US",
+        )
+        return _maybe_redirect(redirect_to, payload)
+    trainer = SignalTrainer()
+    runner = BacktestRunner()
+    try:
+        predictions_written = trainer.train(
+            run_name=run_name,
+            model_type=model_type,
+            signal_type=signal_type,
+            lookback_days=lookback_days,
+            tickers=us_tickers,
+            market="US",
+            universe="full_market_us_lake",
+        )
+        daily_rows_written = runner.run(top_n=max(1, top_n))
+        refresh_workspace_snapshots(db, source_job_id=job.id)
+        message = (
+            f"{run_name}: trained {len(us_tickers)} U.S. symbols with {model_type}, wrote {predictions_written} predictions "
+            f"and {daily_rows_written} backtest rows."
+        )
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status="success",
+            message=message,
+            predictions_written=predictions_written,
+            daily_rows_written=daily_rows_written,
+            run_name=run_name,
+            signal_type=signal_type,
+            lookback_days=lookback_days,
+            ticker_count=len(us_tickers),
+            market="US",
+            model_type=model_type,
+        )
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
+        return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/train-cn-signals")
+async def run_train_cn_signals(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    run_name = str(await _request_value(request, "run_name", "cn_close_lightgbm")).strip() or "cn_close_lightgbm"
+    model_type = str(await _request_value(request, "model_type", "lightgbm")).strip() or "lightgbm"
+    signal_type = str(await _request_value(request, "signal_type", "momentum")).strip() or "momentum"
+    lookback_days = _as_int(await _request_value(request, "lookback_days", 3), 3)
+    cn_tickers = sorted(list_lake_symbols(market="CN"))
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type="train_cn_signals",
+        status="running",
+        params={
+            "run_name": run_name,
+            "signal_type": signal_type,
+            "lookback_days": lookback_days,
+            "market": "CN",
+            "ticker_count": len(cn_tickers),
+            "model_type": model_type,
+        },
+    )
+    if not cn_tickers:
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status="failed",
+            message="No A-share symbols found in the Parquet market lake. Refresh CN market data first.",
+            predictions_written=0,
+            ticker_count=0,
+            market="CN",
+        )
+        return _maybe_redirect(redirect_to, payload)
+    trainer = SignalTrainer()
+    try:
+        predictions_written = trainer.train(
+            run_name=run_name,
+            model_type=model_type,
+            signal_type=signal_type,
+            lookback_days=lookback_days,
+            tickers=cn_tickers,
+            market="CN",
+            universe="full_market_cn_lake",
+        )
+        refresh_workspace_snapshots(db, source_job_id=job.id)
+        message = (
+            f"{run_name}: trained {len(cn_tickers)} A-share symbols with {model_type} and wrote {predictions_written} predictions."
+        )
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status="success",
+            message=message,
+            predictions_written=predictions_written,
+            run_name=run_name,
+            signal_type=signal_type,
+            lookback_days=lookback_days,
+            ticker_count=len(cn_tickers),
+            market="CN",
+            model_type=model_type,
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -867,8 +1029,9 @@ async def run_train(request: Request, db: Session = Depends(get_db_session)):
     if not is_authenticated(request):
         return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
-    run_name = await _request_value(request, "run_name", "baseline_momentum")
-    run_name = str(run_name).strip() or "baseline_momentum"
+    run_name = await _request_value(request, "run_name", "lightgbm_momentum")
+    run_name = str(run_name).strip() or "lightgbm_momentum"
+    model_type = str(await _request_value(request, "model_type", "lightgbm")).strip() or "lightgbm"
     signal_type = str(await _request_value(request, "signal_type", "momentum")).strip() or "momentum"
     lookback_raw = await _request_value(request, "lookback_days", 3)
     lookback_days = _as_int(lookback_raw, 3)
@@ -876,12 +1039,12 @@ async def run_train(request: Request, db: Session = Depends(get_db_session)):
     job = job_repo.create_job(
         job_type="train",
         status="running",
-        params={"run_name": run_name, "signal_type": signal_type, "lookback_days": lookback_days},
+        params={"run_name": run_name, "model_type": model_type, "signal_type": signal_type, "lookback_days": lookback_days},
     )
     trainer = SignalTrainer()
     try:
-        count = trainer.train(run_name=run_name, signal_type=signal_type, lookback_days=lookback_days)
-        message = f"{run_name}: wrote {count} predictions ({signal_type}, {lookback_days}d)"
+        count = trainer.train(run_name=run_name, model_type=model_type, signal_type=signal_type, lookback_days=lookback_days)
+        message = f"{run_name}: wrote {count} predictions ({model_type}, {signal_type}, {lookback_days}d)"
         payload = complete_job_and_build_payload(
             job_repo,
             job_id=job.id,
@@ -889,6 +1052,7 @@ async def run_train(request: Request, db: Session = Depends(get_db_session)):
             message=message,
             predictions_written=count,
             run_name=run_name,
+            model_type=model_type,
             signal_type=signal_type,
             lookback_days=lookback_days,
         )
@@ -907,6 +1071,7 @@ async def run_backtest(request: Request, db: Session = Depends(get_db_session)):
     holding_days = _as_int(await _request_value(request, "holding_days", 3), 3)
     commission_bps = _as_float(await _request_value(request, "commission_bps", 8.0), 8.0)
     slippage_bps = _as_float(await _request_value(request, "slippage_bps", 12.0), 12.0)
+    model_type = str(await _request_value(request, "model_type", "lightgbm")).strip() or "lightgbm"
     max_position_weight = _as_float(await _request_value(request, "max_position_weight", 0.2), 0.2)
     min_signal_score = _as_float(await _request_value(request, "min_signal_score", 0.05), 0.05)
     max_sector_weight = _as_float(await _request_value(request, "max_sector_weight", 0.35), 0.35)
@@ -1039,6 +1204,7 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
             "start_date": start_date,
             "end_date": end_date,
             "run_name": run_name,
+            "model_type": model_type,
             "signal_type": signal_type,
             "lookback_days": lookback_days,
             "top_n": top_n,
@@ -1066,6 +1232,7 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
         build_result = build_dataset(normalize_only=True)
         predictions_written = SignalTrainer().train(
             run_name=run_name,
+            model_type=model_type,
             signal_type=signal_type,
             lookback_days=lookback_days,
         )

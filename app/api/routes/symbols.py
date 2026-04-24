@@ -409,6 +409,7 @@ def symbol_news_feed(
     headlines = MarketNewsService().fetch_symbol_headlines(
         ticker=overview["ticker"],
         name=overview.get("name"),
+        market=overview.get("market"),
         limit=limit,
     )
     return {"ticker": overview["ticker"], "status": "success", "items": headlines}
@@ -506,10 +507,10 @@ def symbol_page(ticker: str, request: Request, db: Session = Depends(get_db_sess
             radial-gradient(circle at top left, rgba(82,168,255,0.14) 0, transparent 28%),
             radial-gradient(circle at bottom right, rgba(61,217,182,0.10) 0, transparent 26%),
             var(--bg); }}
-          .app {{ display:grid; grid-template-columns:280px minmax(0, 1fr); min-height:100vh; }}
+          .app {{ display:grid; grid-template-columns:260px minmax(0, 1fr); min-height:100vh; }}
           {WORKSPACE_SIDEBAR_STYLE}
-          .content {{ padding:28px; }}
-          .wrap {{ max-width: 1120px; margin: 0 auto; padding: 0 0 56px; }}
+          .content {{ padding:20px 18px 28px; }}
+          .wrap {{ max-width: 1120px; margin: 0 auto; padding: 0 0 36px; }}
           .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom: 16px; }}
           .topbar a {{ color:var(--accent); text-decoration:none; }}
           .grid {{ display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); margin-bottom: 16px; }}

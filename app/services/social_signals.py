@@ -21,7 +21,9 @@ SOCIAL_ACCOUNTS_KEY = "social_signal_accounts"
 SOCIAL_POSTS_KEY = "social_signal_posts"
 SOCIAL_ANALYSES_KEY = "social_signal_analyses"
 SOCIAL_POLL_STATE_KEY = "social_signal_poll_state"
+SOCIAL_US_SYNC_FAILURES_KEY = "social_us_price_sync_failures"
 SOCIAL_POLL_JOB_TYPE = "social_signal_poll"
+_SOCIAL_US_SYNC_BLACKLIST = {"ALRIB", "IQE", "KUR", "RPI", "SIVE", "SOI"}
 
 _US_SYMBOL_STOPWORDS = {
     "A",
@@ -443,12 +445,117 @@ def save_social_analyses(db: Session, analyses: list[dict]) -> None:
     AppSettingRepository(db).set(SOCIAL_ANALYSES_KEY, json.dumps(analyses[-300:], ensure_ascii=False))
 
 
+def _load_social_us_sync_failures(db: Session) -> dict[str, dict]:
+    raw = AppSettingRepository(db).get(SOCIAL_US_SYNC_FAILURES_KEY)
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    cleaned: dict[str, dict] = {}
+    for ticker, item in payload.items():
+        normalized = _normalize_us_symbol_token(str(ticker or ""))
+        if not normalized or not isinstance(item, dict):
+            continue
+        cleaned[normalized] = {
+            "count": int(item.get("count") or 0),
+            "last_failed_at": item.get("last_failed_at"),
+            "last_message": item.get("last_message"),
+            "suppressed": bool(item.get("suppressed")),
+        }
+    return cleaned
+
+
+def _save_social_us_sync_failures(db: Session, payload: dict[str, dict]) -> None:
+    AppSettingRepository(db).set(SOCIAL_US_SYNC_FAILURES_KEY, json.dumps(payload, ensure_ascii=False))
+
+
+def _is_ambiguous_social_us_ticker(ticker: str) -> bool:
+    normalized = _normalize_us_symbol_token(ticker)
+    if len(normalized.replace(".", "")) <= 2:
+        return True
+    if re.fullmatch(r"[A-Z]\d", normalized):
+        return True
+    return False
+
+
+def _should_suppress_social_us_ticker(ticker: str, failure_state: dict[str, dict] | None = None) -> bool:
+    normalized = _normalize_us_symbol_token(ticker)
+    if not normalized:
+        return True
+    if normalized in _SOCIAL_US_SYNC_BLACKLIST:
+        return True
+    item = (failure_state or {}).get(normalized) or {}
+    if bool(item.get("suppressed")):
+        return True
+    return False
+
+
+def _mark_social_mentions_suppressed(
+    analyses: list[dict],
+    *,
+    tickers: set[str],
+    reason: str,
+    job_id: int | None = None,
+) -> bool:
+    changed = False
+    for analysis in analyses:
+        for mention in analysis.get("mentions") or []:
+            ticker = _normalize_us_symbol_token(str(mention.get("ticker") or ""))
+            if str(mention.get("market") or "").upper() != "US" or ticker not in tickers:
+                continue
+            mention["sync_suppressed"] = True
+            mention["sync_suppressed_reason"] = reason
+            if job_id is not None:
+                mention["price_sync_job_id"] = job_id
+            changed = True
+    return changed
+
+
 def start_social_us_price_sync_job(db: Session, analyses: list[dict], *, start_date: str = "2025-01-01") -> dict | None:
     analysis_ids = [str(item.get("id") or "") for item in analyses if item.get("id")]
     tickers = _us_tickers_from_analyses(analyses)
     if not analysis_ids or not tickers:
         return None
-    job = DataJobRepository(db).create_job(
+    job_repo = DataJobRepository(db)
+    job_repo.complete_stale_running_jobs(
+        job_types=["social_us_price_sync"],
+        stale_after_hours=1,
+        message_prefix="Social sync bootstrap closed a stale social U.S. price sync job.",
+    )
+    if job_repo.has_running_job("social_us_price_sync"):
+        return {
+            "job_id": None,
+            "tickers": tickers,
+            "count": len(tickers),
+            "start_date": start_date,
+            "status": "already_running",
+            "message": "A social US price sync job is already running.",
+        }
+    failure_state = _load_social_us_sync_failures(db)
+    suppressed_tickers = {ticker for ticker in tickers if _should_suppress_social_us_ticker(ticker, failure_state)}
+    if suppressed_tickers:
+        if _mark_social_mentions_suppressed(
+            analyses,
+            tickers=suppressed_tickers,
+            reason="suppressed_after_price_sync_failures",
+        ):
+            save_social_analyses(db, analyses)
+    tickers = [ticker for ticker in tickers if ticker not in suppressed_tickers]
+    if not tickers:
+        return {
+            "job_id": None,
+            "tickers": [],
+            "count": 0,
+            "start_date": start_date,
+            "status": "suppressed",
+            "suppressed_tickers": sorted(suppressed_tickers),
+            "message": "All detected U.S. tickers are currently suppressed from auto sync.",
+        }
+    job = job_repo.create_job(
         job_type="social_us_price_sync",
         status="running",
         params={
@@ -522,9 +629,38 @@ def _run_social_us_price_sync_job(job_id: int, analysis_ids: list[str], tickers:
         result_map = {str(item.get("ticker") or "").upper(): item for item in results}
         success_count = sum(1 for item in results if item.get("status") == "success")
         failure_count = sum(1 for item in results if item.get("status") == "failed")
+        failed_tickers = [
+            str(item.get("ticker") or "").upper()
+            for item in results
+            if str(item.get("status") or "").lower() == "failed" and str(item.get("ticker") or "").strip()
+        ]
         with SessionLocal() as db:
             analyses = load_social_analyses(db)
             selected_ids = set(analysis_ids)
+            failure_state = _load_social_us_sync_failures(db)
+            for ticker in tickers:
+                normalized = _normalize_us_symbol_token(ticker)
+                if not normalized:
+                    continue
+                if normalized in failed_tickers:
+                    item = failure_state.get(normalized) or {}
+                    next_count = int(item.get("count") or 0) + 1
+                    message = str((result_map.get(normalized) or {}).get("message") or "").strip() or None
+                    suppressed = bool(item.get("suppressed"))
+                    if _is_ambiguous_social_us_ticker(normalized):
+                        suppressed = True
+                    elif next_count >= 2:
+                        suppressed = True
+                    failure_state[normalized] = {
+                        "count": next_count,
+                        "last_failed_at": _now_iso(),
+                        "last_message": message,
+                        "suppressed": suppressed,
+                    }
+                    if suppressed:
+                        _SOCIAL_US_SYNC_BLACKLIST.add(normalized)
+                else:
+                    failure_state.pop(normalized, None)
             changed = False
             for analysis in analyses:
                 if str(analysis.get("id") or "") not in selected_ids:
@@ -542,13 +678,31 @@ def _run_social_us_price_sync_job(job_id: int, analysis_ids: list[str], tickers:
                     mention["price_sync_provider_ticker"] = result.get("provider_ticker")
                     mention["price_sync_message"] = result.get("message")
                     changed = True
+                    if ticker in failed_tickers:
+                        failure_item = failure_state.get(ticker) or {}
+                        if bool(failure_item.get("suppressed")):
+                            mention["sync_suppressed"] = True
+                            mention["sync_suppressed_reason"] = "suppressed_after_price_sync_failures"
+                    else:
+                        mention.pop("sync_suppressed", None)
+                        mention.pop("sync_suppressed_reason", None)
             if changed:
                 save_social_analyses(db, analyses)
+            _save_social_us_sync_failures(db, failure_state)
+            failed_suffix = ""
+            if failed_tickers:
+                shown = ", ".join(failed_tickers[:5])
+                failed_suffix = f" Failed tickers: {shown}."
             DataJobRepository(db).complete_job(
                 job_id,
                 status="success" if failure_count == 0 else "partial",
-                message=f"Social US price sync finished: {success_count} success, {failure_count} failed.",
-                result={"results": results, "success_count": success_count, "failure_count": failure_count},
+                message=f"Social US price sync finished: {success_count} success, {failure_count} failed.{failed_suffix}",
+                result={
+                    "results": results,
+                    "success_count": success_count,
+                    "failure_count": failure_count,
+                    "failed_tickers": failed_tickers,
+                },
             )
     except Exception as exc:
         with SessionLocal() as db:
@@ -766,7 +920,7 @@ def _us_tickers_from_analyses(analyses: list[dict]) -> list[str]:
         for mention in analysis.get("mentions") or []:
             if str(mention.get("market") or "").upper() == "US":
                 ticker = str(mention.get("ticker") or "").strip().upper()
-                if ticker:
+                if ticker and ticker not in _SOCIAL_US_SYNC_BLACKLIST and not bool(mention.get("sync_suppressed")):
                     tickers.add(ticker)
     return sorted(tickers)
 
@@ -778,7 +932,7 @@ def _extract_symbol_mentions(db: Session, text: str) -> list[dict]:
     symbol_repo = SymbolRepository(db)
     for match in re.findall(r"\$[A-Z][A-Z0-9]{0,5}(?:[.-][A-Z])?\b", upper_text):
         raw = _normalize_us_symbol_token(match.replace("$", ""))
-        if _is_us_symbol_stopword(raw):
+        if _is_us_symbol_stopword(raw) or raw in _SOCIAL_US_SYNC_BLACKLIST:
             continue
         _remember_symbol_mention(
             mentions,
@@ -801,7 +955,7 @@ def _extract_symbol_mentions(db: Session, text: str) -> list[dict]:
                     break
     for match in re.findall(r"\b[A-Z][A-Z0-9]{0,5}(?:[.-][A-Z])?\b", text):
         raw = _normalize_us_symbol_token(match.replace("$", ""))
-        if _is_us_symbol_stopword(raw):
+        if _is_us_symbol_stopword(raw) or raw in _SOCIAL_US_SYNC_BLACKLIST:
             continue
         candidates = _ticker_candidates(raw)
         for ticker in candidates:
@@ -911,6 +1065,10 @@ def _should_keep_social_mention(mention: dict) -> bool:
     match_type = str(mention.get("match_type") or "").strip().lower()
     market = str(mention.get("market") or "").strip().upper()
     if not ticker:
+        return False
+    if bool(mention.get("sync_suppressed")):
+        return False
+    if ticker in _SOCIAL_US_SYNC_BLACKLIST:
         return False
     if match_type == "ticker_auto":
         return False

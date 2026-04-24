@@ -26,7 +26,7 @@ from app.services.social_signal_scheduler import social_signal_scheduler_service
 from app.services.symbol_catalog import infer_symbol_record
 from app.services.ticker_format import infer_market_from_ticker, normalize_ticker_for_market
 from app.services.ui_lang import resolve_request_lang
-from app.services.workspace_nav import WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
+from app.services.workspace_nav import WORKSPACE_COMPACT_STYLE, WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
 from app.services.workspace_snapshots import refresh_workspace_snapshots
 
 
@@ -171,31 +171,19 @@ def social_signals_page(
           * {{ box-sizing:border-box; }}
           body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
           a {{ color:inherit; text-decoration:none; }}
-          .app {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:100vh; }}
+          {WORKSPACE_COMPACT_STYLE}
           {WORKSPACE_SIDEBAR_STYLE}
-          .main {{ padding:28px 30px 48px; min-width:0; }}
-          .wrap {{ max-width:1180px; margin:0 auto; }}
+          .main {{ padding:20px 18px 28px; }}
+          .wrap {{ max-width:none; margin:0; }}
           .hero,.grid {{ display:grid; gap:16px; grid-template-columns:minmax(0,1.15fr) minmax(320px,0.85fr); margin-bottom:16px; }}
-          .card {{ background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 40px rgba(0,0,0,0.22); margin-bottom:16px; }}
-          .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.12); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.06em; text-transform:uppercase; margin-bottom:12px; }}
-          h1 {{ margin:10px 0; font-size:40px; line-height:1.02; letter-spacing:-0.03em; }}
-          .muted,.lead {{ color:var(--muted); line-height:1.55; }}
-          .stack {{ display:grid; gap:12px; }}
-          .list-row {{ display:flex; justify-content:space-between; gap:14px; padding:12px 0; border-top:1px solid var(--line); }}
-          .list-row:first-child {{ border-top:none; padding-top:0; }}
+          h1 {{ margin:8px 0; font-size:34px; line-height:1.04; letter-spacing:-0.03em; }}
           .ticker {{ font-weight:800; }}
-          .score {{ font-size:24px; font-weight:900; color:var(--accent); }}
-          input, textarea, button {{ width:100%; padding:10px 12px; border-radius:12px; border:1px solid var(--line); background:#0f1823; color:var(--ink); font:inherit; }}
-          textarea {{ min-height:150px; resize:vertical; }}
+          .score {{ font-size:22px; font-weight:900; color:var(--accent); }}
           button {{ width:auto; background:linear-gradient(135deg, rgba(61,217,182,0.88), rgba(82,168,255,0.82)); color:#03131f; border-color:transparent; font-weight:800; cursor:pointer; }}
           button.danger {{ background:rgba(255,107,107,0.14); color:#ffb4b4; border-color:rgba(255,107,107,0.32); }}
           .form-grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); }}
-          .table-wrap {{ width:100%; overflow-x:auto; border-radius:16px; border:1px solid var(--line); background:rgba(11,19,29,0.82); }}
           table {{ width:100%; min-width:1120px; border-collapse:collapse; font-size:14px; }}
-          th,td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
-          th {{ color:var(--muted); font-weight:700; }}
           .banner {{ margin-bottom:16px; padding:14px 16px; border-radius:16px; background:rgba(61,217,182,0.12); color:var(--accent); border:1px solid rgba(61,217,182,0.24); font-weight:800; }}
-          @media (max-width:1100px) {{ .app,.hero,.grid {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }} .main {{ padding:20px 16px 36px; }} }}
         </style>
       </head>
       <body>

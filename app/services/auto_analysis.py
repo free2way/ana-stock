@@ -8,7 +8,7 @@ from app.services.ai_daily_report import build_ai_daily_report, render_ai_daily_
 from app.services.backtester import BacktestRunner
 from app.services.cn_concepts import sync_cn_concepts
 from app.services.dataset_build import build_dataset
-from app.services.market_lake import load_lake_rows
+from app.services.market_lake import load_lake_price_history
 from app.services.market_sync import sync_market_data
 from app.services.push_notifications import PushNotificationService
 from app.services.repository import AppSettingRepository, DataJobRepository, WatchlistRepository
@@ -25,6 +25,7 @@ DEFAULT_AUTO_ANALYSIS_CONFIG = {
     "interval_hours": 24,
     "provider": "auto",
     "start_date": "2025-01-01",
+    "model_type": "lightgbm",
     "signal_type": "momentum",
     "lookback_days": 3,
     "top_n": 1,
@@ -73,6 +74,7 @@ class AutoAnalysisService:
         config["lookback_days"] = max(1, _safe_int(config.get("lookback_days"), 3))
         config["top_n"] = max(1, _safe_int(config.get("top_n"), 1))
         config["provider"] = str(config.get("provider") or "auto").strip() or "auto"
+        config["model_type"] = str(config.get("model_type") or "lightgbm").strip() or "lightgbm"
         config["signal_type"] = str(config.get("signal_type") or "momentum").strip() or "momentum"
         config["start_date"] = str(config.get("start_date") or "2025-01-01").strip() or "2025-01-01"
         config["sync_cn_concepts"] = bool(config.get("sync_cn_concepts", True))
@@ -195,6 +197,7 @@ class AutoAnalysisService:
                         }
             predictions_written = SignalTrainer().train(
                 run_name=run_name,
+                model_type=str(config.get("model_type") or "lightgbm"),
                 signal_type=config["signal_type"],
                 lookback_days=config["lookback_days"],
                 tickers=tickers,
@@ -271,8 +274,16 @@ class AutoAnalysisService:
             return False
         if markets and not markets.issubset({"CN", "US"}):
             return False
-        rows = load_lake_rows(tickers={ticker.upper() for ticker in tickers}, limit_per_symbol=2)
-        return bool(rows)
+        sample_tickers = tickers[: min(3, len(tickers))]
+        default_market = next(iter(markets)) if len(markets) == 1 else None
+        for ticker in sample_tickers:
+            market_code = default_market
+            if market_code is None:
+                upper = str(ticker or "").strip().upper()
+                market_code = "CN" if upper.endswith((".SS", ".SZ")) else "US"
+            if load_lake_price_history(market=market_code, ticker=ticker, limit=1):
+                return True
+        return False
 
     def _persist_last_run(self, db) -> None:
         repo = AppSettingRepository(db)

@@ -4,7 +4,7 @@ from pathlib import Path
 from app.core.config import get_settings
 from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
-from app.services.market_lake import write_ohlcv_rows_to_lake
+from app.services.market_lake import load_lake_price_history, write_ohlcv_rows_to_lake
 from app.services.normalizer import MarketDataNormalizer
 from app.services.openbb_client import HistoricalPriceRequest
 from app.services.providers import resolve_price_provider
@@ -163,9 +163,41 @@ def sync_market_data(
                             rows = candidate_rows
                             selected_provider_ticker = candidate
                             provider_used = getattr(price_provider, "last_source_used", provider) or provider
-                if not rows:
-                    raise RuntimeError(f"No market data returned for {selected_provider_ticker}")
                 market_code = str(symbol.market or infer_market_from_ticker(symbol.ticker) or "").upper()
+                if not rows:
+                    existing_rows = []
+                    if market_code in {"CN", "US"}:
+                        existing_rows = load_lake_price_history(market=market_code, ticker=symbol.ticker, limit=5)
+                    if existing_rows:
+                        last_synced_date = str(existing_rows[-1].get("date") or "") or None
+                        message = (
+                            f"No new market data returned for {selected_provider_ticker}; "
+                            f"retained existing lake history through {last_synced_date}."
+                        )
+                        sync_repo.upsert_state(
+                            symbol_id=symbol.id,
+                            provider=provider_used,
+                            last_synced_date=last_synced_date,
+                            status="success",
+                            message=message,
+                        )
+                        results.append(
+                            {
+                                "ticker": symbol.ticker,
+                                "status": "success",
+                                "rows": 0,
+                                "stored_rows": 0,
+                                "provider_ticker": selected_provider_ticker,
+                                "last_synced_date": last_synced_date,
+                                "lake_paths": [],
+                                "raw_path": None,
+                                "normalized_path": None,
+                                "persist_csv": persist_csv,
+                                "message": message,
+                            }
+                        )
+                        continue
+                    raise RuntimeError(f"No market data returned for {selected_provider_ticker}")
                 lake_paths = []
                 if market_code in {"CN", "US"} and not bulk_rows_by_ticker:
                     lake_paths = write_ohlcv_rows_to_lake(market=market_code, rows=rows, merge_existing=True)

@@ -17,8 +17,20 @@ def sync_cn_concepts(tickers: list[str] | None = None) -> dict:
 
     normalized_tickers = [normalize_ticker_for_market(ticker, "CN") for ticker in (tickers or []) if ticker.strip()]
     rows = []
-    for ticker in normalized_tickers:
-        rows.extend(provider.fetch_memberships(ticker))
+    try:
+        for ticker in normalized_tickers:
+            rows.extend(provider.fetch_memberships(ticker))
+    except Exception as exc:
+        message = str(exc)
+        if "concept_detail" in message or "访问权限" in message:
+            return {
+                "status": "not_configured",
+                "message": "Current TuShare plan does not have concept_detail permission, so CN concept sync cannot refresh concept memberships yet.",
+                "rows_written": 0,
+                "tickers": normalized_tickers,
+                "provider": getattr(provider, "last_source_used", "tushare_concept"),
+            }
+        raise
     if not rows:
         return {
             "status": "empty",

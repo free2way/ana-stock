@@ -19,11 +19,23 @@ class BacktestRunner:
     def __init__(self) -> None:
         self.settings = get_settings()
 
-    def _load_market_data(self, holding_days: int) -> tuple[dict[tuple[str, str], float], dict[tuple[str, str], dict]]:
+    def _load_market_data(
+        self,
+        holding_days: int,
+        *,
+        tickers: set[str] | None = None,
+        markets: list[str] | None = None,
+    ) -> tuple[dict[tuple[str, str], float], dict[tuple[str, str], dict]]:
         rows_by_symbol: dict[str, list[dict]] = defaultdict(list)
         forward_returns: dict[tuple[str, str], float] = {}
         tradeability: dict[tuple[str, str], dict] = {}
         holding_days = max(1, int(holding_days))
+        normalized_tickers = {str(ticker or "").strip().upper() for ticker in (tickers or set()) if str(ticker or "").strip()}
+        normalized_markets = [
+            str(market or "").strip().upper()
+            for market in (markets or [])
+            if str(market or "").strip().upper() in {"CN", "US"}
+        ]
 
         for csv_path in sorted(self.settings.normalized_data_dir.glob("*.csv")):
             with csv_path.open("r", newline="", encoding="utf-8") as input_file:
@@ -31,7 +43,7 @@ class BacktestRunner:
                 for row in reader:
                     self._append_market_row(rows_by_symbol, row)
         if not rows_by_symbol:
-            for row in load_lake_rows():
+            for row in load_lake_rows(markets=normalized_markets or None, tickers=normalized_tickers or None):
                 self._append_market_row(rows_by_symbol, row)
 
         for symbol, items in rows_by_symbol.items():
@@ -387,11 +399,6 @@ class BacktestRunner:
         max_gap_pct = float(max_gap_pct if max_gap_pct is not None else self.settings.backtest_max_gap_pct)
         rebalance_threshold = float(rebalance_threshold if rebalance_threshold is not None else self.settings.backtest_rebalance_threshold)
 
-        forward_returns, tradeability = self._load_market_data(holding_days)
-        if not forward_returns:
-            raise RuntimeError("No local market data available for backtest. Refresh the Parquet market lake or rebuild normalized CSVs first.")
-        benchmark_returns, benchmark_label = self._build_benchmark_returns(forward_returns, benchmark_symbol=benchmark_symbol)
-
         with SessionLocal() as db:
             model_repo = ModelRunRepository(db)
             symbol_repo = SymbolRepository(db)
@@ -409,6 +416,20 @@ class BacktestRunner:
             symbols = symbol_repo.list_symbols()
             ticker_by_id = {symbol.id: symbol.ticker for symbol in symbols}
             sector_by_ticker = {symbol.ticker: (symbol.sector or "UNKNOWN") for symbol in symbols}
+            prediction_tickers = {
+                ticker_by_id[prediction.symbol_id]
+                for prediction in predictions
+                if prediction.symbol_id in ticker_by_id
+            }
+            market_filters = [str(model_run.market or "").strip().upper()] if str(model_run.market or "").strip().upper() in {"CN", "US"} else []
+            forward_returns, tradeability = self._load_market_data(
+                holding_days,
+                tickers=prediction_tickers,
+                markets=market_filters,
+            )
+            if not forward_returns:
+                raise RuntimeError("No local market data available for backtest. Refresh the Parquet market lake or rebuild normalized CSVs first.")
+            benchmark_returns, benchmark_label = self._build_benchmark_returns(forward_returns, benchmark_symbol=benchmark_symbol)
             grouped: dict[str, list] = defaultdict(list)
             for prediction in predictions:
                 grouped[prediction.trade_date].append(prediction)

@@ -46,6 +46,17 @@ class SocialSignalSchedulerService:
     def run_now(self) -> dict:
         with SessionLocal() as db:
             repo = DataJobRepository(db)
+            repo.complete_stale_running_jobs(
+                job_types=[SOCIAL_POLL_JOB_TYPE],
+                stale_after_hours=2,
+                message_prefix="Social scheduler closed a stale social poll job.",
+            )
+            if repo.has_running_job(SOCIAL_POLL_JOB_TYPE):
+                return {
+                    "job_id": None,
+                    "status": "skipped",
+                    "message": "A social signal poll job is already running.",
+                }
             job = repo.create_job(
                 job_type=SOCIAL_POLL_JOB_TYPE,
                 status="running",
@@ -76,6 +87,13 @@ class SocialSignalSchedulerService:
     def run_now_async(self) -> dict:
         with SessionLocal() as db:
             repo = DataJobRepository(db)
+            repo.complete_stale_running_jobs(
+                job_types=[SOCIAL_POLL_JOB_TYPE],
+                stale_after_hours=2,
+                message_prefix="Social scheduler closed a stale social poll job.",
+            )
+            if repo.has_running_job(SOCIAL_POLL_JOB_TYPE):
+                return {"job_id": None, "status": "skipped", "message": "A social signal poll job is already running."}
             job = repo.create_job(
                 job_type=SOCIAL_POLL_JOB_TYPE,
                 status="running",

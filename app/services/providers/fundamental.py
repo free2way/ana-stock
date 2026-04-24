@@ -17,6 +17,14 @@ class BaseFundamentalProvider(ABC):
     def fetch_snapshot(self, ticker: str) -> dict | None:
         raise NotImplementedError
 
+    def fetch_snapshots(self, tickers: list[str], metadata: dict[str, dict] | None = None) -> list[dict]:
+        rows: list[dict] = []
+        for ticker in tickers:
+            snapshot = self.fetch_snapshot(ticker)
+            if snapshot:
+                rows.append(snapshot)
+        return rows
+
 
 class OpenBBFundamentalProvider(BaseFundamentalProvider):
     name = "openbb_fundamentals"
@@ -45,8 +53,24 @@ class TushareFundamentalProvider(BaseFundamentalProvider):
         rows = self.client.fetch_cn_growth_value_candidates([normalize_ticker_for_market(ticker, "CN")])
         if not rows:
             return None
-        row = rows[0]
         self.last_source_used = self.name
+        return self._row_to_snapshot(rows[0])
+
+    def fetch_snapshots(self, tickers: list[str], metadata: dict[str, dict] | None = None) -> list[dict]:
+        if not self.client.is_configured():
+            self.last_source_used = "tushare_unavailable"
+            return []
+        normalized = [normalize_ticker_for_market(ticker, "CN") for ticker in tickers if str(ticker or "").strip()]
+        if not normalized:
+            return []
+        rows = self.client.fetch_cn_growth_value_candidates(
+            normalized,
+            stock_meta_by_ticker=metadata or None,
+        )
+        self.last_source_used = self.name if rows else self.last_source_used
+        return [self._row_to_snapshot(row) for row in rows]
+
+    def _row_to_snapshot(self, row) -> dict:
         return {
             "ticker": normalize_ticker_for_market(row.ticker, "CN"),
             "report_date": row.report_date,

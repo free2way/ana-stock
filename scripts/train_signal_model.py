@@ -13,8 +13,8 @@ from app.services.trainer import SignalTrainer
 def main() -> None:
     trainer = SignalTrainer()
     try:
-        count = trainer.train()
-        print(f"Stored {count} predictions from the baseline trainer.")
+        count = trainer.train(model_type="lightgbm")
+        print(f"Stored {count} predictions from the LightGBM trainer.")
     except Exception as exc:
         print(exc)
 

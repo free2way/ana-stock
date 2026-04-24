@@ -3,7 +3,6 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 from app.core.db import SessionLocal
 
-from app.services.ai_daily_report import build_close_review_action_feed, load_ai_daily_report
 from app.services.model_signal_summary import build_signal_label, model_confidence
 from app.services.nlp_snapshots import (
     SNAPSHOT_DASHBOARD_NLP,
@@ -12,6 +11,7 @@ from app.services.nlp_snapshots import (
     build_dashboard_nlp_snapshot,
     build_portfolio_nlp_snapshot as build_portfolio_news_snapshot,
     build_watchlist_nlp_snapshot,
+    summarize_news_rows,
 )
 from app.services.portfolio_intelligence import (
     build_position_management_fields,
@@ -48,6 +48,14 @@ SNAPSHOT_MARKET_WORKSPACE_PREMARKET = "market_workspace:premarket"
 SNAPSHOT_MARKET_WORKSPACE_MONITOR = "market_workspace:monitor"
 SNAPSHOT_MARKET_WORKSPACE_POSTMARKET = "market_workspace:postmarket"
 SNAPSHOT_MARKET_HEATMAP_WORKSPACE = "market_heatmap_workspace"
+
+
+MARKET_HEATMAP_TEMPLATE_LABELS = {
+    "technical_momentum": "技术动量",
+    "cn_bollinger_squeeze_watch": "布林带收口",
+    "cn_three_white_soldiers": "三连阳",
+    "cn_volume_breakout": "底部放量突破",
+}
 
 
 def _snapshot_now_iso() -> str:
@@ -505,6 +513,35 @@ def _load_market_board_rows(db: Session, *, template: str, market: str = "CN") -
     return rows if isinstance(rows, list) else []
 
 
+def _market_heatmap_fallback_label(row: dict, template: str) -> str:
+    template_label = MARKET_HEATMAP_TEMPLATE_LABELS.get(template, template)
+    if template == "technical_momentum":
+        momentum_20 = float(row.get("momentum_20") or 0.0)
+        momentum_5 = float(row.get("momentum_5") or 0.0)
+        volume_ratio = float(row.get("volume_ratio") or 0.0)
+        if momentum_20 >= 1.0:
+            return "翻倍动量"
+        if momentum_5 >= 0.25:
+            return "短线加速"
+        if volume_ratio >= 1.5:
+            return "量能放大"
+        return template_label
+    if template == "cn_volume_breakout":
+        volume_ratio = float(row.get("volume_ratio") or 0.0)
+        if volume_ratio >= 2.0:
+            return "强量突破"
+        return template_label
+    if template == "cn_bollinger_squeeze_watch":
+        distance = row.get("distance_to_breakout_pct")
+        try:
+            if distance is not None and float(distance) <= 3.0:
+                return "临界突破"
+        except (TypeError, ValueError):
+            pass
+        return template_label
+    return template_label
+
+
 def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> dict:
     del lang
     owns_db = db is None
@@ -529,7 +566,10 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
             overview = overviews.get(ticker) or {}
             market = str(overview.get("market") or row.get("market") or "CN").upper()
             market_counts[market] = market_counts.get(market, 0) + 1
-            label = str(overview.get("sector") or overview.get("industry") or "其他").strip() or "其他"
+            template = str(row.get("_template") or "").strip()
+            label = str(overview.get("sector") or overview.get("industry") or "").strip()
+            if not label or label == "其他":
+                label = _market_heatmap_fallback_label(row, template)
             item = sector_map.setdefault(
                 label,
                 {
@@ -537,6 +577,9 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
                     "slug": label.lower().replace(" ", "-").replace("/", "-"),
                     "hits": 0,
                     "score_total": 0.0,
+                    "move_5d_total": 0.0,
+                    "move_5d_count": 0,
+                    "positive_5d_count": 0,
                     "max_signal_strength": 0,
                     "buy_signal_count": 0,
                     "execution_tags": {},
@@ -544,11 +587,24 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
                 },
             )
             item["hits"] += 1
-            item["score_total"] += float(row.get("trend_score") or 0.0)
-            item["max_signal_strength"] = max(item["max_signal_strength"], int(row.get("model_signal_strength") or 0))
-            if str(row.get("model_signal_label") or "").strip().upper() == "BUY":
+            trend_score = float(row.get("trend_score") or row.get("model_signal_strength") or 0.0)
+            item["score_total"] += trend_score
+            item["max_signal_strength"] = max(item["max_signal_strength"], int(row.get("model_signal_strength") or trend_score or 0))
+            momentum_5 = row.get("momentum_5")
+            if momentum_5 is not None:
+                try:
+                    move_5d = float(momentum_5) * 100.0
+                    item["move_5d_total"] += move_5d
+                    item["move_5d_count"] += 1
+                    if move_5d > 0:
+                        item["positive_5d_count"] += 1
+                except (TypeError, ValueError):
+                    pass
+            signal_label = str(row.get("model_signal_label") or row.get("signal_label") or row.get("action_label") or "").strip().upper()
+            if signal_label == "BUY":
                 item["buy_signal_count"] += 1
-            for tag in row.get("model_execution_tags") or row.get("execution_tags") or []:
+            fallback_tags = [MARKET_HEATMAP_TEMPLATE_LABELS.get(template, template)] if template else []
+            for tag in row.get("model_execution_tags") or row.get("execution_tags") or fallback_tags:
                 normalized = str(tag).strip()
                 if normalized:
                     item["execution_tags"][normalized] = item["execution_tags"].get(normalized, 0) + 1
@@ -556,7 +612,7 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
                 {
                     "ticker": ticker,
                     "name": row.get("name") or overview.get("name"),
-                    "score": float(row.get("trend_score") or 0.0),
+                    "score": trend_score,
                     "state": row.get("model_state"),
                     "confidence": row.get("model_confidence"),
                     "percentile": row.get("model_percentile"),
@@ -566,14 +622,24 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
                     "position_size_hint": row.get("model_position_size_hint"),
                     "entry_style": row.get("model_entry_style"),
                     "execution_tags": row.get("model_execution_tags") or row.get("execution_tags") or [],
-                    "signal_label": row.get("model_signal_label") or row.get("signal_label"),
-                    "signal_strength": int(row.get("model_signal_strength") or 0),
+                    "signal_label": signal_label,
+                    "signal_strength": int(row.get("model_signal_strength") or trend_score or 0),
                 }
             )
         heatmap_rows: list[dict] = []
         for item in sector_map.values():
             hits = int(item["hits"] or 0)
             avg_score = round(float(item["score_total"] or 0.0) / max(hits, 1), 3)
+            avg_move_5d = (
+                round(float(item["move_5d_total"] or 0.0) / max(int(item["move_5d_count"] or 0), 1), 2)
+                if int(item["move_5d_count"] or 0) > 0
+                else None
+            )
+            breadth_pct = (
+                round((int(item["positive_5d_count"] or 0) / max(int(item["move_5d_count"] or 0), 1)) * 100.0, 1)
+                if int(item["move_5d_count"] or 0) > 0
+                else None
+            )
             tags = [tag for tag, _count in sorted(item["execution_tags"].items(), key=lambda pair: (-pair[1], pair[0]))[:3]]
             intensity = min(100, 18 + hits * 12 + int(avg_score * 0.7) + int(item["max_signal_strength"] * 0.25))
             heatmap_rows.append(
@@ -582,8 +648,8 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
                     "slug": item["slug"],
                     "hits": hits,
                     "avg_score": avg_score,
-                    "avg_move_5d": None,
-                    "breadth_pct": None,
+                    "avg_move_5d": avg_move_5d,
+                    "breadth_pct": breadth_pct,
                     "max_signal_strength": item["max_signal_strength"],
                     "buy_signal_count": item["buy_signal_count"],
                     "execution_tags": tags,
@@ -599,6 +665,7 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
         tracked_signal_count = len(combined_rows)
         resonance_score = round((heatmap_rows[0]["hits"] / max(tracked_signal_count, 1)) * 100.0, 1) if heatmap_rows else 0.0
         return {
+            "as_of_date": app_today_iso(),
             "sector_heatmap": heatmap_rows[:24],
             "market_distribution": market_distribution,
             "tracked_signal_count": tracked_signal_count,
@@ -689,6 +756,8 @@ def build_market_workspace_snapshot(db: Session, *, lang: str = "zh") -> dict:
 
 
 def build_pipeline_status_snapshot(db: Session, *, lang: str = "zh") -> dict:
+    from app.services.ai_daily_report import build_close_review_action_feed, load_ai_daily_report
+
     summary = DashboardReadRepository(db).load_summary_snapshot()
     recent_jobs = summary["recent_jobs"]
     latest_model = ModelRunRepository(db).get_latest_run_summary() or {}
@@ -698,6 +767,54 @@ def build_pipeline_status_snapshot(db: Session, *, lang: str = "zh") -> dict:
     refresh_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "cn_close_review"), None)
     analysis_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "watchlist_auto_analysis"), None)
     news_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "news_enrichment"), None)
+    us_train_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "us_signal_train"), None)
+    latest_dashboard_nlp = WorkspaceSnapshotRepository(db).get_latest_snapshot(SNAPSHOT_DASHBOARD_NLP) or {}
+    latest_watchlist_nlp = WorkspaceSnapshotRepository(db).get_latest_snapshot(SNAPSHOT_WATCHLIST_NLP) or {}
+    nlp_payload = (latest_dashboard_nlp.get("payload") or {}) if isinstance(latest_dashboard_nlp, dict) else {}
+    watchlist_nlp_payload = (latest_watchlist_nlp.get("payload") or {}) if isinstance(latest_watchlist_nlp, dict) else {}
+    watchlist_nlp_rows = (watchlist_nlp_payload.get("rows") or []) if isinstance(watchlist_nlp_payload, dict) else []
+    news_meta = (
+        (nlp_payload.get("meta") if isinstance(nlp_payload, dict) else None)
+        or (watchlist_nlp_payload.get("meta") if isinstance(watchlist_nlp_payload, dict) else None)
+        or summarize_news_rows(watchlist_nlp_rows)
+    )
+    news_market_meta = {
+        market: summarize_news_rows([row for row in watchlist_nlp_rows if str(row.get("market") or "").strip().upper() == market])
+        for market in ("CN", "US")
+    }
+    for market, meta in news_market_meta.items():
+        top_sources_list = meta.get("top_sources") or []
+        primary_source = str(top_sources_list[0].get("source") or "").strip() if top_sources_list else ""
+        if primary_source.startswith("TuShare:"):
+            provider_label = "TuShare"
+        elif primary_source in {"东方财富Choice数据", "东方财富"} or any(
+            token in primary_source for token in ("证券时报", "界面新闻", "每日经济新闻", "财联社", "央广财经", "财中社")
+        ):
+            provider_label = "东方财富/中文财经源" if lang == "zh" else "Eastmoney/CN finance"
+        elif "Polygon" in primary_source:
+            provider_label = "Polygon News"
+        elif primary_source:
+            provider_label = "RSS fallback"
+        else:
+            provider_label = "No provider" if lang != "zh" else "暂无来源"
+        meta["primary_provider"] = provider_label
+    top_sources = ", ".join(
+        f"{item.get('source')}({item.get('count')})"
+        for item in (news_meta.get("top_sources") or [])[:3]
+        if item.get("source")
+    )
+    market_summary_text = " ".join(
+        (
+            (
+                f"{('A股' if market == 'CN' else '美股')} {meta.get('matched_ticker_count', 0)}/{meta.get('ticker_count', 0)}，{meta.get('headline_total', 0)} 条；"
+                if lang == "zh"
+                else f"{market} {meta.get('matched_ticker_count', 0)}/{meta.get('ticker_count', 0)}, {meta.get('headline_total', 0)} headlines;"
+            )
+            if meta.get("ticker_count")
+            else ""
+        )
+        for market, meta in news_market_meta.items()
+    ).strip()
     sync_success_count = sum(1 for item in sync_states if str(item.get("status") or "").lower() == "success")
     sync_total = len(sync_states)
     latest_model_at = latest_model.get("finished_at") or latest_model.get("created_at")
@@ -717,6 +834,11 @@ def build_pipeline_status_snapshot(db: Session, *, lang: str = "zh") -> dict:
             "label": "最近回测" if lang == "zh" else "Latest Backtest",
             "value": latest_backtest.get("status") or ("待运行" if lang == "zh" else "Idle"),
             "meta": latest_backtest_at or (latest_backtest.get("name") or "-"),
+        },
+        {
+            "label": "美股训练" if lang == "zh" else "US Training",
+            "value": (us_train_job or {}).get("status") or ("待运行" if lang == "zh" else "Idle"),
+            "meta": (us_train_job or {}).get("message") or ("美股收盘后训练 LightGBM 多因子信号" if lang == "zh" else "Train LightGBM U.S. multifactor signals after the U.S. close."),
         },
         {
             "label": "数据完整度" if lang == "zh" else "Data Coverage",
@@ -792,6 +914,13 @@ def build_pipeline_status_snapshot(db: Session, *, lang: str = "zh") -> dict:
             "message": latest_backtest.get("name") or ("暂无回测" if lang == "zh" else "No backtest yet"),
         },
         {
+            "step": "us_training",
+            "label": "美股训练" if lang == "zh" else "US Signal Training",
+            "status": (us_train_job or {}).get("status") or "idle",
+            "timestamp": (us_train_job or {}).get("finished_at") or (us_train_job or {}).get("started_at"),
+            "message": (us_train_job or {}).get("message") or ("美股收盘后会把 US lake 写入统一模型结果层。" if lang == "zh" else "After the U.S. close, U.S. lake symbols are written into the unified model-output layer."),
+        },
+        {
             "step": "ai_report",
             "label": "AI 日报" if lang == "zh" else "AI Report",
             "status": (analysis_job or {}).get("status") or "idle",
@@ -803,7 +932,24 @@ def build_pipeline_status_snapshot(db: Session, *, lang: str = "zh") -> dict:
             "label": "新闻增强" if lang == "zh" else "News Enrichment",
             "status": (news_job or {}).get("status") or "idle",
             "timestamp": (news_job or {}).get("finished_at") or (news_job or {}).get("started_at"),
-            "message": (news_job or {}).get("message") or ("收盘后刷新自选和持仓的新闻情绪与摘要。" if lang == "zh" else "Refreshes watchlist and portfolio news sentiment after close."),
+            "message": (news_job or {}).get("message")
+            or (
+                (
+                    f"命中 {news_meta.get('matched_ticker_count', 0)}/{news_meta.get('ticker_count', 0)} 只股票，"
+                    f"累计 {news_meta.get('headline_total', 0)} 条新闻。"
+                    + (f" {market_summary_text}" if market_summary_text else "")
+                    + (f" 主要来源：{top_sources}。" if top_sources else "")
+                )
+                if lang == "zh" and news_meta
+                else (
+                    f"Matched {news_meta.get('matched_ticker_count', 0)}/{news_meta.get('ticker_count', 0)} names with "
+                    f"{news_meta.get('headline_total', 0)} total headlines."
+                    + (f" {market_summary_text}" if market_summary_text else "")
+                    + (f" Top sources: {top_sources}." if top_sources else "")
+                )
+                if news_meta
+                else ("收盘后刷新自选和持仓的新闻情绪与摘要。" if lang == "zh" else "Refreshes watchlist and portfolio news sentiment after close.")
+            ),
         },
     ]
     trust_score = max(
@@ -825,6 +971,8 @@ def build_pipeline_status_snapshot(db: Session, *, lang: str = "zh") -> dict:
         "trust_score": trust_score,
         "anomalies": anomalies[:4],
         "close_review_action_feed": close_review_action_feed,
+        "news_meta": news_meta,
+        "news_market_meta": news_market_meta,
         "updated_at": _snapshot_now_iso(),
     }
 

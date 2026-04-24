@@ -122,6 +122,7 @@ Use `--truncate-target` if you want to overwrite an existing PostgreSQL copy.
 
 For a production-style home-lab deployment on an internal Mac mini with external access through Cloudflare Tunnel, see:
 
+- `docs/amateur-quant-workbench-roadmap-zh.md`
 - `docs/macmini-cloudflare-tunnel.md`
 
 ## Run With Docker

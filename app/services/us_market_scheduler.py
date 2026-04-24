@@ -5,15 +5,20 @@ import threading
 from datetime import datetime, timedelta
 
 from app.core.db import SessionLocal
+from app.services.backtester import BacktestRunner
+from app.services.market_lake import list_lake_symbols
 from app.services.repository import AppSettingRepository, DataJobRepository
 from app.services.screener_snapshots import refresh_precomputed_screener_snapshots
+from app.services.trainer import SignalTrainer
 from app.services.time_utils import app_now
 from app.services.us_market_universe import refresh_us_grouped_daily
+from app.services.workspace_snapshots import refresh_workspace_snapshots
 
 
 US_MARKET_SCHEDULER_CONFIG_KEY = "us_market_scheduler_config"
 US_MARKET_REFRESH_JOB_TYPE = "us_market_close_refresh"
 US_SCREENER_PRECOMPUTE_JOB_TYPE = "us_screener_precompute"
+US_SIGNAL_TRAIN_JOB_TYPE = "us_signal_train"
 
 DEFAULT_US_MARKET_SCHEDULER_CONFIG = {
     "enabled": True,
@@ -147,6 +152,7 @@ class USMarketSchedulerService:
                 if status == "success":
                     self._persist_last_run(db, trade_date=str(result.get("trade_date") or ""))
             if status == "success":
+                self._run_signal_training(source_job_id=job_id, trade_date=str(result.get("trade_date") or ""))
                 self._run_screener_precompute(source_job_id=job_id)
             return {"status": status, "job_id": job_id, "refresh_result": result}
         except Exception as exc:
@@ -154,9 +160,73 @@ class USMarketSchedulerService:
                 DataJobRepository(db).complete_job(job_id, status="failed", message=str(exc))
             raise
 
+    def _run_signal_training(self, *, source_job_id: int, trade_date: str) -> None:
+        us_tickers = sorted(list_lake_symbols(market="US"))
+        if not us_tickers:
+            return
+        with SessionLocal() as db:
+            job_repo = DataJobRepository(db)
+            job_repo.complete_stale_running_jobs(
+                job_types=[US_SIGNAL_TRAIN_JOB_TYPE],
+                stale_after_hours=1,
+                message_prefix="U.S. scheduler cleanup closed a stale U.S. signal train job.",
+            )
+            if job_repo.has_running_job(US_SIGNAL_TRAIN_JOB_TYPE):
+                return
+            job = job_repo.create_job(
+                job_type=US_SIGNAL_TRAIN_JOB_TYPE,
+                status="running",
+                params={
+                    "source_job_id": source_job_id,
+                    "trade_date": trade_date,
+                    "ticker_count": len(us_tickers),
+                    "market": "US",
+                    "model_type": "lightgbm",
+                },
+                message="Training U.S. LightGBM signals after U.S. close refresh.",
+            )
+        trainer = SignalTrainer()
+        runner = BacktestRunner()
+        try:
+            predictions_written = trainer.train(
+                run_name=f"us_close_{trade_date or app_now().date().isoformat()}",
+                model_type="lightgbm",
+                signal_type="momentum",
+                lookback_days=3,
+                tickers=us_tickers,
+                market="US",
+                universe="full_market_us_lake",
+            )
+            daily_rows_written = runner.run(top_n=5)
+            with SessionLocal() as db:
+                refresh_workspace_snapshots(db, source_job_id=job.id)
+                DataJobRepository(db).complete_job(
+                    job.id,
+                    status="success",
+                    message=(
+                        f"Trained {len(us_tickers)} U.S. symbols, wrote {predictions_written} predictions "
+                        f"and {daily_rows_written} backtest rows."
+                    ),
+                    result={
+                        "market": "US",
+                        "trade_date": trade_date,
+                        "ticker_count": len(us_tickers),
+                        "predictions_written": predictions_written,
+                        "daily_rows_written": daily_rows_written,
+                    },
+                )
+        except Exception as exc:
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(job.id, status="failed", message=str(exc))
+
     def _run_screener_precompute(self, *, source_job_id: int) -> None:
         with SessionLocal() as db:
             job_repo = DataJobRepository(db)
+            job_repo.complete_stale_running_jobs(
+                job_types=[US_SCREENER_PRECOMPUTE_JOB_TYPE],
+                stale_after_hours=1,
+                message_prefix="U.S. scheduler cleanup closed a stale U.S. screener precompute job.",
+            )
             if job_repo.has_running_job(US_SCREENER_PRECOMPUTE_JOB_TYPE):
                 return
             job = job_repo.create_job(

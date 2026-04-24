@@ -13,6 +13,7 @@ from app.services.ticker_format import market_ticker_candidates
 class TechnicalPatternSnapshot:
     ticker: str
     as_of_date: str | None
+    limit_up_today: bool = False
     limit_up_yesterday: bool = False
     volume_breakout: bool = False
     ma_cluster: bool = False
@@ -39,15 +40,17 @@ class TechnicalPatternService:
         previous = enriched.iloc[-2] if len(enriched) >= 2 else None
         matched: list[str] = []
 
-        limit_up_yesterday = self._is_limit_up_yesterday(enriched)
-        if limit_up_yesterday:
-            matched.append("昨日涨停")
+        limit_up_today = self._is_limit_up_today(enriched)
+        if limit_up_today:
+            matched.append("今日涨停")
 
         volume_breakout = self._is_volume_breakout(enriched)
         if volume_breakout:
             matched.append("底部放量突破")
 
-        ma_cluster = self._is_ma_cluster(latest)
+        limit_up_yesterday = self._is_limit_up_yesterday(enriched)
+
+        ma_cluster = self._is_ma_cluster(enriched)
         if ma_cluster:
             matched.append("均线密集缠绕")
 
@@ -78,6 +81,7 @@ class TechnicalPatternService:
         return TechnicalPatternSnapshot(
             ticker=ticker,
             as_of_date=str(latest.get("date") or latest.name),
+            limit_up_today=limit_up_today,
             limit_up_yesterday=limit_up_yesterday,
             volume_breakout=volume_breakout,
             ma_cluster=ma_cluster,
@@ -224,16 +228,28 @@ class TechnicalPatternService:
         data["macd_hist"] = (data["dif"] - data["dea"]) * 2
         return data
 
+    def _is_limit_up_today(self, frame: pd.DataFrame) -> bool:
+        if len(frame) < 2:
+            return False
+        latest = frame.iloc[-1]
+        previous = frame.iloc[-2]
+        previous_close = float(previous.get("close") or 0)
+        current_close = float(latest.get("close") or 0)
+        if previous_close <= 0:
+            return False
+        pct = (current_close / previous_close - 1.0) * 100.0
+        return pct >= 9.8
+
     def _is_limit_up_yesterday(self, frame: pd.DataFrame) -> bool:
         if len(frame) < 3:
             return False
-        prev = frame.iloc[-2]
-        prev_prev = frame.iloc[-3]
-        prev_close = float(prev_prev.get("close") or 0)
-        current_close = float(prev.get("close") or 0)
-        if prev_close <= 0:
+        previous = frame.iloc[-2]
+        prev_previous = frame.iloc[-3]
+        prev_previous_close = float(prev_previous.get("close") or 0)
+        previous_close = float(previous.get("close") or 0)
+        if prev_previous_close <= 0:
             return False
-        pct = (current_close / prev_close - 1.0) * 100.0
+        pct = (previous_close / prev_previous_close - 1.0) * 100.0
         return pct >= 9.8
 
     def _is_volume_breakout(self, frame: pd.DataFrame) -> bool:
@@ -252,14 +268,35 @@ class TechnicalPatternService:
         base_not_extended = close <= low_60 * 1.35
         return is_breakout and volume_expansion and base_not_extended
 
-    def _is_ma_cluster(self, latest: pd.Series) -> bool:
+    def _is_ma_cluster(self, frame: pd.DataFrame) -> bool:
+        if len(frame) < 25:
+            return False
+        latest = frame.iloc[-1]
         values = [latest.get("ma5"), latest.get("ma10"), latest.get("ma20")]
-        if any(pd.isna(value) for value in values):
+        close = latest.get("close")
+        ma20 = latest.get("ma20")
+        high_20_prev = latest.get("high_20_prev")
+        volume = latest.get("volume")
+        vol_ma20 = latest.get("vol_ma20")
+        if any(pd.isna(value) for value in values + [close, ma20, high_20_prev, volume, vol_ma20]):
             return False
         ma_values = [float(value) for value in values]
         spread = max(ma_values) - min(ma_values)
         baseline = max(sum(ma_values) / len(ma_values), 1e-9)
-        return (spread / baseline) <= 0.03
+        close_value = float(close)
+        ma20_value = float(ma20)
+        high_20_prev_value = float(high_20_prev)
+        volume_value = float(volume)
+        vol_ma20_value = float(vol_ma20)
+        cluster_tight = (spread / baseline) <= 0.03
+        if not cluster_tight:
+            return False
+        if ma20_value <= 0 or high_20_prev_value <= 0 or vol_ma20_value <= 0:
+            return False
+        near_breakout = close_value >= high_20_prev_value * 0.95
+        structure_not_broken = close_value >= ma20_value * 0.98
+        volume_not_dead = volume_value >= vol_ma20_value * 0.7
+        return near_breakout and structure_not_broken and volume_not_dead
 
     def _is_bullish_ma_stack(self, frame: pd.DataFrame) -> bool:
         if len(frame) < 65:
@@ -337,7 +374,7 @@ class TechnicalPatternService:
         return True
 
     def _is_bullish_engulfing(self, frame: pd.DataFrame) -> bool:
-        if len(frame) < 3:
+        if len(frame) < 6:
             return False
         previous = frame.iloc[-2]
         latest = frame.iloc[-1]
@@ -358,7 +395,13 @@ class TechnicalPatternService:
             return False
         latest_body = float(latest.get("candle_body") or 0)
         previous_body = float(previous.get("candle_body") or 0)
-        return latest_body >= max(previous_body * 1.05, 0.01)
+        recent_closes = [float(value) for value in frame["close"].tail(6).tolist()]
+        if len(recent_closes) < 6:
+            return False
+        prior_weakness = recent_closes[-2] <= min(recent_closes[:-2])
+        previous_ma10 = previous.get("ma10")
+        below_mid_trend = (not pd.isna(previous_ma10)) and prev_close <= float(previous_ma10) * 0.995
+        return latest_body >= max(previous_body * 1.05, 0.01) and (prior_weakness or below_mid_trend)
 
     def _is_hammer_reversal(self, frame: pd.DataFrame) -> bool:
         if len(frame) < 6:
@@ -380,10 +423,21 @@ class TechnicalPatternService:
         range_numeric = float(candle_range)
         if range_numeric <= 0 or body_numeric <= 0:
             return False
+        if close_numeric < open_numeric:
+            return False
         lower_shadow = min(open_numeric, close_numeric) - low_numeric
         upper_shadow = high_numeric - max(open_numeric, close_numeric)
         recent_closes = [float(value) for value in frame["close"].tail(5).tolist()]
         if len(recent_closes) < 5:
             return False
         prior_weakness = recent_closes[-2] <= min(recent_closes[:-2])
-        return lower_shadow >= body_numeric * 2.0 and upper_shadow <= body_numeric * 0.5 and prior_weakness
+        latest_ma10 = latest.get("ma10")
+        below_mid_trend = (not pd.isna(latest_ma10)) and close_numeric <= float(latest_ma10) * 1.02
+        body_in_upper_half = close_numeric >= low_numeric + range_numeric * 0.55
+        return (
+            lower_shadow >= body_numeric * 2.0
+            and upper_shadow <= body_numeric * 0.5
+            and body_in_upper_half
+            and prior_weakness
+            and below_mid_trend
+        )

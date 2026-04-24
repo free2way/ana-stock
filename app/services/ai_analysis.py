@@ -71,6 +71,7 @@ class AIAnalysisService:
             news_items = MarketNewsService().fetch_symbol_headlines(
                 ticker=overview["ticker"],
                 name=overview.get("name"),
+                market=overview.get("market"),
                 limit=3,
             )
         except Exception:

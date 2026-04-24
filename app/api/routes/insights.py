@@ -20,7 +20,7 @@ from app.services.repository import (
 )
 from app.services.runtime_cache import get_or_set
 from app.services.ui_lang import resolve_request_lang
-from app.services.workspace_nav import WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
+from app.services.workspace_nav import WORKSPACE_COMPACT_STYLE, WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
 
 
 router = APIRouter(prefix="/insights", tags=["insights"])
@@ -1102,10 +1102,10 @@ def insight_page(
             radial-gradient(circle at top left, rgba(82,168,255,0.14) 0, transparent 28%),
             radial-gradient(circle at top right, rgba(61,217,182,0.10) 0, transparent 26%),
             var(--bg); }}
-          .app {{ display:grid; grid-template-columns:280px minmax(0, 1fr); min-height:100vh; }}
+          .app {{ display:grid; grid-template-columns:260px minmax(0, 1fr); min-height:100vh; }}
           {WORKSPACE_SIDEBAR_STYLE}
-          .content {{ padding:28px; }}
-          .wrap {{ max-width: 1160px; margin: 0 auto; padding: 0 0 56px; }}
+          .content {{ padding:20px 18px 28px; }}
+          .wrap {{ max-width: 1120px; margin: 0 auto; padding: 0 0 36px; }}
           .topbar {{ display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:16px; }}
           .topbar a {{ color: var(--accent); text-decoration:none; }}
           .search {{ display:flex; gap:8px; flex-wrap:wrap; }}

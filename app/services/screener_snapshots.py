@@ -9,17 +9,18 @@ from app.core.db import SessionLocal
 from app.services.repository import (
     PredictionRepository,
     SymbolRepository,
-    TechnicalSnapshotRepository,
     WorkspaceSnapshotRepository,
 )
 from app.services.market_lake import screen_cn_lake_momentum, screen_us_lake_momentum
 from app.services.screener import MODEL_TEMPLATES, ScreenerService
+from app.services.technical_patterns import TechnicalPatternService
 from app.services.time_utils import app_now_iso
 
 
 SCREENER_SNAPSHOT_TYPE_PREFIX = "screener_result:"
 
 WATCHLIST_PRECOMPUTE_TEMPLATES = [
+    "lightgbm_top_picks",
     "next_tesla_swing",
     "technical_momentum",
     "cn_limit_up_watch",
@@ -39,6 +40,7 @@ WATCHLIST_PRECOMPUTE_TEMPLATES = [
 ]
 
 FULL_MARKET_CN_PRECOMPUTE_TEMPLATES = [
+    "lightgbm_top_picks",
     "next_tesla_swing",
     "technical_momentum",
     "cn_limit_up_watch",
@@ -50,11 +52,24 @@ FULL_MARKET_CN_PRECOMPUTE_TEMPLATES = [
     "cn_three_white_soldiers",
     "cn_bullish_engulfing_reversal",
     "cn_hammer_reversal",
+    "cn_growth_value",
+    "cn_high_roe_steady_growth",
+    "cn_low_valuation_high_dividend",
 ]
 
 FULL_MARKET_US_PRECOMPUTE_TEMPLATES = [
+    "lightgbm_top_picks",
     "next_tesla_swing",
     "technical_momentum",
+    "global_growth_value",
+    "global_income_quality",
+]
+
+FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES = [
+    "next_tesla_swing",
+    "technical_momentum",
+    "global_growth_value",
+    "global_income_quality",
 ]
 
 SNAPSHOT_ROW_FIELDS = {
@@ -167,6 +182,9 @@ def build_precompute_screener_params(*, markets: list[str] | None = None, includ
     if "CN" in market_set:
         for template_key in FULL_MARKET_CN_PRECOMPUTE_TEMPLATES:
             params.append(_build_default_params(template_key, universe="full_market", market="CN"))
+    if market_set.intersection({"CN", "US"}):
+        for template_key in FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES:
+            params.append(_build_default_params(template_key, universe="full_market", market="ALL"))
     if "US" in market_set:
         for template_key in FULL_MARKET_US_PRECOMPUTE_TEMPLATES:
             params.append(_build_default_params(template_key, universe="full_market", market="US"))
@@ -197,6 +215,8 @@ def refresh_precomputed_screener_snapshots(
     markets: list[str] | None = None,
     include_watchlist: bool = True,
     lake_only: bool = False,
+    template_keys: list[str] | None = None,
+    universes: list[str] | None = None,
 ) -> dict:
     created: list[dict] = []
     failed: list[dict] = []
@@ -206,6 +226,24 @@ def refresh_precomputed_screener_snapshots(
         if lake_only
         else build_precompute_screener_params(markets=markets, include_watchlist=include_watchlist)
     )
+    normalized_templates = {
+        str(item).strip()
+        for item in (template_keys or [])
+        if str(item).strip()
+    }
+    normalized_universes = {
+        str(item).strip()
+        for item in (universes or [])
+        if str(item).strip()
+    }
+    if normalized_templates:
+        precompute_params = [
+            params for params in precompute_params if str(params.get("model_template") or "") in normalized_templates
+        ]
+    if normalized_universes:
+        precompute_params = [
+            params for params in precompute_params if str(params.get("universe") or "") in normalized_universes
+        ]
 
     for params in precompute_params:
         try:
@@ -257,7 +295,7 @@ def _screen_with_lake_preferred(params: dict) -> list[dict]:
     if (
         str(params.get("market") or "").upper() == "CN"
         and str(params.get("universe") or "") == "full_market"
-        and str(params.get("model_template") or "") in {"technical_momentum", "next_tesla_swing"}
+        and str(params.get("model_template") or "") == "technical_momentum"
     ):
         rows = screen_cn_lake_momentum(limit=int(params.get("limit", 160)))
         if rows:
@@ -265,7 +303,7 @@ def _screen_with_lake_preferred(params: dict) -> list[dict]:
     if (
         str(params.get("market") or "").upper() == "US"
         and str(params.get("universe") or "") == "full_market"
-        and str(params.get("model_template") or "") in {"technical_momentum", "next_tesla_swing"}
+        and str(params.get("model_template") or "") == "technical_momentum"
     ):
         rows = screen_us_lake_momentum(limit=int(params.get("limit", 160)))
         if rows:
@@ -274,12 +312,29 @@ def _screen_with_lake_preferred(params: dict) -> list[dict]:
 
 
 def _build_limit_up_watch_snapshot_rows(db: Session) -> list[dict]:
-    snapshot_repo = TechnicalSnapshotRepository(db)
     symbol_repo = SymbolRepository(db)
     prediction_repo = PredictionRepository(db)
-
-    snapshots = snapshot_repo.list_latest_for_market(market="CN")
-    filtered = [item for item in snapshots if item.get("limit_up_yesterday")]
+    technical_service = TechnicalPatternService()
+    symbols = [item for item in symbol_repo.list_symbols() if str(item.market or "").upper() == "CN"]
+    filtered: list[dict] = []
+    for symbol in symbols:
+        snapshot = technical_service.evaluate_ticker(symbol.ticker)
+        if snapshot is None:
+            continue
+        matched_patterns = [str(pattern).strip() for pattern in (snapshot.matched_patterns or []) if str(pattern).strip()]
+        if "今日涨停" not in matched_patterns:
+            continue
+        filtered.append(
+            {
+                "ticker": symbol.ticker,
+                "name": symbol.name,
+                "market": symbol.market,
+                "as_of_date": snapshot.as_of_date,
+                "matched_patterns": matched_patterns,
+                "volume_breakout": bool(snapshot.volume_breakout),
+                "bullish_ma_stack": bool(snapshot.bullish_ma_stack),
+            }
+        )
     filtered.sort(
         key=lambda item: (
             -int(bool(item.get("volume_breakout"))),
@@ -319,7 +374,7 @@ def _build_limit_up_watch_snapshot_rows(db: Session) -> list[dict]:
                 "snapshot_hits": 0,
                 "snapshot_runs": 0,
                 "matched_patterns": matched_patterns,
-                "selection_reason": ", ".join(matched_patterns or ["昨日涨停"]),
+                "selection_reason": ", ".join(matched_patterns or ["今日涨停"]),
                 "model_summary": decision.get("summary_text"),
                 "model_highlights": [],
                 "model_state": decision.get("action_bucket"),

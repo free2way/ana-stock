@@ -8,6 +8,7 @@ from app.services.insight_engine import InsightEngine
 from app.services.runtime_cache import get_or_set
 from app.services.repository import (
     FundamentalSnapshotRepository,
+    ModelRunRepository,
     PredictionExplanationRepository,
     PredictionRepository,
     PredictionTradePlanRepository,
@@ -17,12 +18,23 @@ from app.services.repository import (
     WatchlistRepository,
 )
 from app.services.model_signal_summary import build_model_state, enrich_model_output, summarize_explanations
+from app.services.price_snapshot import load_latest_closes
 from app.services.technical_patterns import TechnicalPatternService
 from app.services.tradingview_client import TradingViewClient
 from app.services.tushare_client import TushareClient
 
 
 MODEL_TEMPLATES = {
+    "lightgbm_top_picks": {
+        "label": "LightGBM Top Picks",
+        "description": "使用最新 LightGBM 多因子训练结果，直接按模型分数、信号强度和交易可执行性挑出优先候选。",
+        "market": "ALL",
+        "mode": "model_ranking",
+        "defaults": {
+            "min_trend_score": 55,
+            "min_volume_ratio": 0.0,
+        },
+    },
     "next_tesla_swing": {
         "label": "Next Tesla Swing",
         "description": "强趋势二次启动模板：寻找处于强趋势中、回踩支撑或接近干净突破位的领涨股。",
@@ -40,11 +52,11 @@ MODEL_TEMPLATES = {
         "mode": "technical",
     },
     "cn_limit_up_watch": {
-        "label": "昨日涨停观察",
-        "description": "A-share tactical template for names that hit limit-up yesterday and still deserve today's attention.",
+        "label": "今日涨停观察",
+        "description": "A-share tactical template for names that close at limit-up today and deserve immediate next-session review.",
         "market": "CN",
         "mode": "technical_pattern",
-        "required_patterns": ["limit_up_yesterday"],
+        "required_patterns": ["limit_up_today"],
     },
     "cn_volume_breakout": {
         "label": "底部放量突破",
@@ -211,6 +223,7 @@ SIGNAL_FILTER_MAP = {
 }
 
 PATTERN_MATCH_LABELS = {
+    "limit_up_today": "今日涨停",
     "limit_up_yesterday": "昨日涨停",
     "volume_breakout": "底部放量突破",
     "ma_cluster": "均线密集缠绕",
@@ -330,6 +343,15 @@ class ScreenerService:
                 exclude_bottom_market_cap_pct=exclude_bottom_market_cap_pct,
                 recent_snapshot_runs=recent_snapshot_runs,
                 min_snapshot_hits=min_snapshot_hits,
+            )
+        elif template["mode"] == "model_ranking":
+            fixed_market = template.get("market")
+            effective_market = fixed_market if fixed_market and fixed_market != "ALL" else market
+            results = self._screen_model_ranking(
+                universe=universe,
+                market=effective_market,
+                min_trend_score=min_trend_score,
+                action_filter=action_filter,
             )
         elif template["mode"] == "technical_pattern":
             fixed_market = template.get("market")
@@ -464,6 +486,106 @@ class ScreenerService:
             return snapshot
 
         return get_or_set("market_snapshot", cache_key, ttl_seconds=90.0, loader=_load)
+
+    def _screen_model_ranking(
+        self,
+        *,
+        universe: str,
+        market: str,
+        min_trend_score: int,
+        action_filter: str,
+    ) -> list[dict]:
+        tickers = self._load_universe(universe=universe, market=market)
+        if not tickers:
+            return []
+
+        universe_scope = ["local_watchlist"] if universe == "watchlist" else ["full_market", "full_market_us_lake", "full_dataset"]
+
+        with SessionLocal() as db:
+            run_repo = ModelRunRepository(db)
+            prediction_repo = PredictionRepository(db)
+            run = run_repo.get_latest_successful_run(
+                market=market,
+                model_types=["lightgbm_multifactor"],
+                universe_like=universe_scope,
+            )
+            if run is None:
+                return []
+            candidates = prediction_repo.list_predictions_for_run(
+                run.id,
+                market=market,
+                tickers=tickers,
+                limit=500 if universe == "full_market" else 240,
+            )
+            if not candidates:
+                return []
+            decisions = [prediction_repo._build_signal_decision(candidate) for candidate in candidates]
+
+        latest_close_map = load_latest_closes([item["ticker"] for item in decisions])
+        results: list[dict] = []
+        for item in decisions:
+            signal_strength = float(item.get("signal_strength") or item.get("percentile") or 0.0)
+            if signal_strength < float(min_trend_score or 0):
+                continue
+            entry_style = _normalize_action_value(item.get("entry_style"))
+            if action_filter != "ALL" and entry_style != _normalize_action_value(action_filter):
+                continue
+            action_label = item.get("entry_style") or item.get("action_label") or item.get("signal_label") or "monitor_only"
+            ticker = str(item.get("ticker") or "").upper()
+            selection_bits = []
+            if item.get("signal_label"):
+                selection_bits.append(f"signal {item.get('signal_label')}")
+            if item.get("expected_return_5d") is not None:
+                selection_bits.append(f"pred 5D {float(item.get('expected_return_5d') or 0.0):.2f}%")
+            if item.get("expected_return_20d") is not None:
+                selection_bits.append(f"pred 20D {float(item.get('expected_return_20d') or 0.0):.2f}%")
+            if item.get("model_reward_risk_ratio") is not None:
+                selection_bits.append(f"RR {float(item.get('model_reward_risk_ratio') or 0.0):.2f}")
+            if item.get("conviction_bucket"):
+                selection_bits.append(str(item.get("conviction_bucket")))
+            results.append(
+                {
+                    "ticker": ticker,
+                    "name": item.get("name") or ticker,
+                    "market": item.get("market") or self._infer_market(ticker),
+                    "as_of_date": item.get("trade_date"),
+                    "trend_score": signal_strength,
+                    "action_label": action_label,
+                    "action_summary": item.get("summary_text") or item.get("execution_note") or "Ranked by LightGBM multifactor score.",
+                    "latest_close": latest_close_map.get(ticker),
+                    "momentum_5": item.get("expected_return_5d"),
+                    "momentum_20": item.get("expected_return_20d"),
+                    "volume_ratio": None,
+                    "distance_to_breakout_pct": None,
+                    "snapshot_hits": 0,
+                    "snapshot_runs": 0,
+                    "model_summary": item.get("summary_text"),
+                    "model_highlights": [],
+                    "model_state": item.get("action_bucket"),
+                    "model_confidence": item.get("confidence"),
+                    "model_signal_label": item.get("signal_label"),
+                    "model_signal_strength": item.get("signal_strength"),
+                    "model_conviction_bucket": item.get("conviction_bucket"),
+                    "model_position_size_hint": item.get("position_size_hint"),
+                    "model_entry_style": item.get("entry_style"),
+                    "model_execution_tags": list(item.get("risk_flags") or []),
+                    "model_percentile": item.get("percentile"),
+                    "model_horizon_days": 5,
+                    "model_reward_risk_ratio": item.get("model_reward_risk_ratio"),
+                    "model_expected_drawdown_20d": item.get("expected_drawdown_20d"),
+                    "matched_patterns": [],
+                    "selection_reason": ", ".join(selection_bits) if selection_bits else "LightGBM multifactor top pick.",
+                }
+            )
+
+        results.sort(
+            key=lambda item: (
+                -(item.get("model_signal_strength") or 0),
+                -(item.get("model_percentile") or 0),
+                item.get("ticker", ""),
+            )
+        )
+        return results
 
     def _market_snapshot_score(self, board_key: str, row: dict, mode: str = "monitor") -> int:
         trend_score = max(0.0, min(100.0, float(row.get("trend_score") or 0.0)))
@@ -869,20 +991,20 @@ class ScreenerService:
         with SessionLocal() as db:
             repo = FundamentalSnapshotRepository(db)
             fundamentals = repo.list_latest_for_market(market, tickers=tickers)
+            if not fundamentals:
+                return []
             model_repo = PredictionRepository(db)
             explanation_repo = PredictionExplanationRepository(db)
             trade_plan_repo = PredictionTradePlanRepository(db)
+            fundamental_tickers = [str(item.get("ticker") or "").upper() for item in fundamentals if item.get("ticker")]
             model_context_by_ticker = {
                 ticker: self._build_model_highlights(
                     model_repo.get_latest_model_output_for_ticker(ticker),
                     explanation_repo.get_latest_for_ticker(ticker),
                     trade_plan_repo.get_latest_for_ticker(ticker),
                 )
-                for ticker in tickers
+                for ticker in fundamental_tickers
             }
-
-        if not fundamentals:
-            return []
 
         threshold = self._compute_market_cap_threshold(fundamentals, exclude_bottom_market_cap_pct)
         results: list[dict] = []
@@ -964,7 +1086,7 @@ class ScreenerService:
         momentum_20 = float(insight.get("momentum_20") or 0.0)
         momentum_5 = float(insight.get("momentum_5") or 0.0)
         breakout_distance = float(insight.get("distance_to_breakout_pct") or 0.0)
-        action_label = str(insight.get("action_label") or "").strip().lower()
+        action_label = _normalize_action_value(insight.get("action_label"))
         setup_label = str(insight.get("setup_label") or "").strip().lower()
         distance_to_52w_high = float(setup_context.get("distance_to_52w_high_pct") or 999.0)
         pullback_depth = float(setup_context.get("pullback_depth_pct") or 0.0)
@@ -1189,6 +1311,8 @@ class ScreenerService:
                     name=row.get("name"),
                     market="CN",
                     exchange=row.get("exchange"),
+                    sector=row.get("sector"),
+                    industry=row.get("industry"),
                 )
             )
             tickers.append(ticker)

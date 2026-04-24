@@ -39,7 +39,12 @@ class TushareClient:
     def is_configured(self) -> bool:
         return bool(self.token)
 
-    def fetch_cn_growth_value_candidates(self, tickers: list[str] | None = None) -> list[CNFundamentalRow]:
+    def fetch_cn_growth_value_candidates(
+        self,
+        tickers: list[str] | None = None,
+        *,
+        stock_meta_by_ticker: dict[str, dict] | None = None,
+    ) -> list[CNFundamentalRow]:
         if not self.token:
             return []
 
@@ -55,14 +60,34 @@ class TushareClient:
         if not normalized:
             return []
 
-        rows: list[CNFundamentalRow] = []
-        for ts_code in normalized:
+        stock_meta_by_code: dict[str, dict] = {}
+        for ticker, meta in (stock_meta_by_ticker or {}).items():
+            ts_code = self._to_ts_code(ticker)
+            if ts_code:
+                stock_meta_by_code[ts_code] = {
+                    "ts_code": ts_code,
+                    "name": meta.get("name"),
+                    "exchange": meta.get("exchange"),
+                    "list_date": str(meta.get("listing_date") or "").replace("-", "") or None,
+                }
+
+        if len(stock_meta_by_code) < len(normalized):
             stock_df = pro.stock_basic(
-                ts_code=ts_code,
+                exchange="",
                 list_status="L",
                 fields="ts_code,name,exchange,list_date",
             )
-            if stock_df is None or stock_df.empty:
+            if stock_df is not None and not stock_df.empty:
+                for _, stock_row in stock_df.iterrows():
+                    row_dict = stock_row.to_dict()
+                    row_ts_code = str(row_dict.get("ts_code") or "").strip().upper()
+                    if row_ts_code and row_ts_code not in stock_meta_by_code:
+                        stock_meta_by_code[row_ts_code] = row_dict
+
+        rows: list[CNFundamentalRow] = []
+        for ts_code in normalized:
+            stock_row = stock_meta_by_code.get(ts_code)
+            if not stock_row:
                 continue
 
             price_start = (date.today() - timedelta(days=45)).strftime("%Y%m%d")
@@ -78,7 +103,6 @@ class TushareClient:
                 fields="ts_code,end_date,roe,roe_avg,netprofit_yoy,q_netprofit_yoy,q_dtprofit_yoy,q_sales_yoy,tr_yoy,debt_asset_ratio",
             )
 
-            stock_row = stock_df.iloc[0].to_dict()
             latest_daily = self._latest_row_by_date(daily_df, "trade_date")
             latest_fina = self._latest_row_by_date(fina_df, "end_date")
             if latest_daily is None and latest_fina is None:
@@ -144,7 +168,7 @@ class TushareClient:
         stock_df = pro.stock_basic(
             exchange="",
             list_status="L",
-            fields="ts_code,symbol,name,exchange,list_date",
+            fields="ts_code,symbol,name,exchange,industry,list_date",
         )
         if stock_df is None or stock_df.empty:
             return []
@@ -155,15 +179,39 @@ class TushareClient:
             ts_code = str(row_dict.get("ts_code") or "").strip().upper()
             if not ts_code:
                 continue
+            industry = str(row_dict.get("industry") or "").strip() or None
             rows.append(
                 {
                     "ticker": self._to_app_ticker(ts_code),
                     "name": row_dict.get("name"),
                     "exchange": row_dict.get("exchange"),
+                    "sector": self._industry_to_sector(industry),
+                    "industry": industry,
                     "listing_date": self._normalize_date(row_dict.get("list_date")),
                 }
             )
         return rows
+
+    @staticmethod
+    def _industry_to_sector(industry: str | None) -> str | None:
+        text = str(industry or "").strip()
+        if not text:
+            return None
+        sector_rules = [
+            ("金融地产", ("银行", "保险", "证券", "多元金融", "房地产")),
+            ("科技成长", ("半导体", "元器件", "软件", "互联网", "通信", "IT", "电脑", "电子")),
+            ("新能源", ("电气设备", "电源设备", "光伏", "电池", "新能源")),
+            ("医药医疗", ("医疗", "医药", "生物制药", "中成药", "化学制药")),
+            ("汽车产业链", ("汽车", "汽车配件", "摩托车")),
+            ("消费", ("食品", "饮料", "白酒", "家居", "纺织", "服饰", "商业", "旅游", "酒店", "农林牧渔")),
+            ("周期资源", ("煤炭", "石油", "有色", "钢铁", "化工", "矿物", "矿产")),
+            ("基建制造", ("建筑", "建材", "水泥", "机械", "工程机械", "船舶", "航空", "军工")),
+            ("公用交通", ("电力", "水务", "环保", "环境保护", "机场", "港口", "铁路", "公路", "运输")),
+        ]
+        for sector, keywords in sector_rules:
+            if any(keyword in text for keyword in keywords):
+                return sector
+        return text
 
     def fetch_cn_daily_history(
         self,
