@@ -21,6 +21,16 @@ class CNFundamentalRow:
     raw_data: dict | None = None
 
 
+@dataclass(slots=True)
+class CNConceptRow:
+    ticker: str
+    concept_name: str
+    report_date: str
+    concept_code: str | None = None
+    name: str | None = None
+    raw_data: dict | None = None
+
+
 class TushareClient:
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -29,7 +39,12 @@ class TushareClient:
     def is_configured(self) -> bool:
         return bool(self.token)
 
-    def fetch_cn_growth_value_candidates(self, tickers: list[str] | None = None) -> list[CNFundamentalRow]:
+    def fetch_cn_growth_value_candidates(
+        self,
+        tickers: list[str] | None = None,
+        *,
+        stock_meta_by_ticker: dict[str, dict] | None = None,
+    ) -> list[CNFundamentalRow]:
         if not self.token:
             return []
 
@@ -45,14 +60,34 @@ class TushareClient:
         if not normalized:
             return []
 
-        rows: list[CNFundamentalRow] = []
-        for ts_code in normalized:
+        stock_meta_by_code: dict[str, dict] = {}
+        for ticker, meta in (stock_meta_by_ticker or {}).items():
+            ts_code = self._to_ts_code(ticker)
+            if ts_code:
+                stock_meta_by_code[ts_code] = {
+                    "ts_code": ts_code,
+                    "name": meta.get("name"),
+                    "exchange": meta.get("exchange"),
+                    "list_date": str(meta.get("listing_date") or "").replace("-", "") or None,
+                }
+
+        if len(stock_meta_by_code) < len(normalized):
             stock_df = pro.stock_basic(
-                ts_code=ts_code,
+                exchange="",
                 list_status="L",
                 fields="ts_code,name,exchange,list_date",
             )
-            if stock_df is None or stock_df.empty:
+            if stock_df is not None and not stock_df.empty:
+                for _, stock_row in stock_df.iterrows():
+                    row_dict = stock_row.to_dict()
+                    row_ts_code = str(row_dict.get("ts_code") or "").strip().upper()
+                    if row_ts_code and row_ts_code not in stock_meta_by_code:
+                        stock_meta_by_code[row_ts_code] = row_dict
+
+        rows: list[CNFundamentalRow] = []
+        for ts_code in normalized:
+            stock_row = stock_meta_by_code.get(ts_code)
+            if not stock_row:
                 continue
 
             price_start = (date.today() - timedelta(days=45)).strftime("%Y%m%d")
@@ -68,7 +103,6 @@ class TushareClient:
                 fields="ts_code,end_date,roe,roe_avg,netprofit_yoy,q_netprofit_yoy,q_dtprofit_yoy,q_sales_yoy,tr_yoy,debt_asset_ratio",
             )
 
-            stock_row = stock_df.iloc[0].to_dict()
             latest_daily = self._latest_row_by_date(daily_df, "trade_date")
             latest_fina = self._latest_row_by_date(fina_df, "end_date")
             if latest_daily is None and latest_fina is None:
@@ -119,6 +153,249 @@ class TushareClient:
             )
         return rows
 
+    def fetch_cn_symbol_universe(self) -> list[dict]:
+        if not self.token:
+            return []
+
+        try:
+            import tushare as ts  # type: ignore
+        except ImportError:
+            return []
+
+        pro = ts.pro_api(self.token)
+        if pro is None:
+            return []
+        stock_df = pro.stock_basic(
+            exchange="",
+            list_status="L",
+            fields="ts_code,symbol,name,exchange,industry,list_date",
+        )
+        if stock_df is None or stock_df.empty:
+            return []
+
+        rows: list[dict] = []
+        for _, row in stock_df.iterrows():
+            row_dict = row.to_dict()
+            ts_code = str(row_dict.get("ts_code") or "").strip().upper()
+            if not ts_code:
+                continue
+            industry = str(row_dict.get("industry") or "").strip() or None
+            rows.append(
+                {
+                    "ticker": self._to_app_ticker(ts_code),
+                    "name": row_dict.get("name"),
+                    "exchange": row_dict.get("exchange"),
+                    "sector": self._industry_to_sector(industry),
+                    "industry": industry,
+                    "listing_date": self._normalize_date(row_dict.get("list_date")),
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _industry_to_sector(industry: str | None) -> str | None:
+        text = str(industry or "").strip()
+        if not text:
+            return None
+        sector_rules = [
+            ("金融地产", ("银行", "保险", "证券", "多元金融", "房地产")),
+            ("科技成长", ("半导体", "元器件", "软件", "互联网", "通信", "IT", "电脑", "电子")),
+            ("新能源", ("电气设备", "电源设备", "光伏", "电池", "新能源")),
+            ("医药医疗", ("医疗", "医药", "生物制药", "中成药", "化学制药")),
+            ("汽车产业链", ("汽车", "汽车配件", "摩托车")),
+            ("消费", ("食品", "饮料", "白酒", "家居", "纺织", "服饰", "商业", "旅游", "酒店", "农林牧渔")),
+            ("周期资源", ("煤炭", "石油", "有色", "钢铁", "化工", "矿物", "矿产")),
+            ("基建制造", ("建筑", "建材", "水泥", "机械", "工程机械", "船舶", "航空", "军工")),
+            ("公用交通", ("电力", "水务", "环保", "环境保护", "机场", "港口", "铁路", "公路", "运输")),
+        ]
+        for sector, keywords in sector_rules:
+            if any(keyword in text for keyword in keywords):
+                return sector
+        return text
+
+    def fetch_cn_daily_history(
+        self,
+        ticker: str,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> list[dict]:
+        if not self.token:
+            return []
+
+        try:
+            import tushare as ts  # type: ignore
+        except ImportError:
+            return []
+
+        pro = ts.pro_api(self.token)
+        if pro is None:
+            return []
+
+        ts_code = self._to_ts_code(ticker)
+        try:
+            daily_df = pro.daily(
+                ts_code=ts_code,
+                start_date=(start_date or "19700101").replace("-", ""),
+                end_date=(end_date or date.today().strftime("%Y%m%d")).replace("-", ""),
+                fields="ts_code,trade_date,open,high,low,close,vol,amount",
+            )
+        except Exception:
+            return []
+
+        if daily_df is None or daily_df.empty:
+            return []
+
+        rows: list[dict] = []
+        for _, row in daily_df.iterrows():
+            row_dict = row.to_dict()
+            volume = self._to_float(row_dict.get("vol"))
+            if volume is not None:
+                volume *= 100.0
+            rows.append(
+                {
+                    "date": self._normalize_date(row_dict.get("trade_date")),
+                    "symbol": ticker.strip().upper(),
+                    "open": self._to_float(row_dict.get("open")),
+                    "high": self._to_float(row_dict.get("high")),
+                    "low": self._to_float(row_dict.get("low")),
+                    "close": self._to_float(row_dict.get("close")),
+                    "volume": volume,
+                    "adj_close": self._to_float(row_dict.get("close")),
+                    "dividend": None,
+                    "split_ratio": None,
+                }
+            )
+
+        rows.sort(key=lambda item: item["date"] or "")
+        return rows
+
+    def fetch_cn_daily_history_bulk(
+        self,
+        tickers: list[str],
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict[str, list[dict]]:
+        if not self.token:
+            return {}
+
+        try:
+            import tushare as ts  # type: ignore
+        except ImportError:
+            return {}
+
+        pro = ts.pro_api(self.token)
+        if pro is None:
+            return {}
+
+        normalized_tickers = {
+            str(ticker or "").strip().upper()
+            for ticker in tickers
+            if str(ticker or "").strip()
+        }
+        if not normalized_tickers:
+            return {}
+
+        start = self._parse_iso_date(start_date) or (date.today() - timedelta(days=10))
+        end = self._parse_iso_date(end_date) or date.today()
+        if end < start:
+            start, end = end, start
+
+        rows_by_ticker: dict[str, list[dict]] = {ticker: [] for ticker in normalized_tickers}
+        current = start
+        page_size = 2000
+        while current <= end:
+            trade_date = current.strftime("%Y%m%d")
+            offset = 0
+            while True:
+                try:
+                    daily_df = pro.daily(
+                        trade_date=trade_date,
+                        fields="ts_code,trade_date,open,high,low,close,vol,amount",
+                        offset=offset,
+                        limit=page_size,
+                    )
+                except Exception:
+                    daily_df = None
+                if daily_df is None or daily_df.empty:
+                    break
+
+                for _, row in daily_df.iterrows():
+                    row_dict = row.to_dict()
+                    app_ticker = self._to_app_ticker(str(row_dict.get("ts_code") or ""))
+                    if app_ticker not in normalized_tickers:
+                        continue
+                    volume = self._to_float(row_dict.get("vol"))
+                    if volume is not None:
+                        volume *= 100.0
+                    rows_by_ticker.setdefault(app_ticker, []).append(
+                        {
+                            "date": self._normalize_date(row_dict.get("trade_date")),
+                            "symbol": app_ticker,
+                            "open": self._to_float(row_dict.get("open")),
+                            "high": self._to_float(row_dict.get("high")),
+                            "low": self._to_float(row_dict.get("low")),
+                            "close": self._to_float(row_dict.get("close")),
+                            "volume": volume,
+                            "adj_close": self._to_float(row_dict.get("close")),
+                            "dividend": None,
+                            "split_ratio": None,
+                        }
+                    )
+
+                if len(daily_df) < page_size:
+                    break
+                offset += page_size
+            current += timedelta(days=1)
+
+        for ticker, rows in rows_by_ticker.items():
+            rows.sort(key=lambda item: item["date"] or "")
+            rows_by_ticker[ticker] = rows
+        return rows_by_ticker
+
+    def fetch_cn_concepts(self, tickers: list[str] | None = None) -> list[CNConceptRow]:
+        if not self.token:
+            return []
+
+        try:
+            import tushare as ts  # type: ignore
+        except ImportError:
+            return []
+
+        pro = ts.pro_api(self.token)
+        if pro is None:
+            return []
+        normalized = [self._to_ts_code(ticker) for ticker in (tickers or []) if ticker]
+        if not normalized:
+            return []
+
+        rows: list[CNConceptRow] = []
+        report_date = date.today().isoformat()
+        for ts_code in normalized:
+            detail_df = pro.concept_detail(
+                ts_code=ts_code,
+                fields="id,concept_name,ts_code,name,in_date,out_date",
+            )
+            if detail_df is None or detail_df.empty:
+                continue
+            for _, row in detail_df.iterrows():
+                row_dict = row.to_dict()
+                concept_name = str(row_dict.get("concept_name") or "").strip()
+                if not concept_name:
+                    continue
+                rows.append(
+                    CNConceptRow(
+                        ticker=self._to_app_ticker(ts_code),
+                        concept_name=concept_name,
+                        concept_code=str(row_dict.get("id") or "").strip() or None,
+                        report_date=report_date,
+                        name=row_dict.get("name"),
+                        raw_data=row_dict,
+                    )
+                )
+        return rows
+
     def _to_ts_code(self, ticker: str) -> str:
         upper = ticker.strip().upper()
         if upper.endswith(".SS"):
@@ -138,6 +415,15 @@ class TushareClient:
         if len(raw) == 8 and raw.isdigit():
             return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
         return raw
+
+    def _parse_iso_date(self, value: str | None) -> date | None:
+        normalized = self._normalize_date(value)
+        if not normalized:
+            return None
+        try:
+            return date.fromisoformat(normalized)
+        except ValueError:
+            return None
 
     def _latest_row_by_date(self, dataframe, date_column: str) -> dict | None:
         if dataframe is None or dataframe.empty or date_column not in dataframe.columns:

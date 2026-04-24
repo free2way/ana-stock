@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.pqw.ana-app</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/Users/YOUR_USER/YOUR_PROJECT_PATH/.venv/bin/python</string>
+      <string>-m</string>
+      <string>uvicorn</string>
+      <string>app.api.main:app</string>
+      <string>--host</string>
+      <string>127.0.0.1</string>
+      <string>--port</string>
+      <string>8000</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USER/YOUR_PROJECT_PATH</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USER/YOUR_PROJECT_PATH/storage/ana-app.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USER/YOUR_PROJECT_PATH/storage/ana-app.err.log</string>
+  </dict>
+</plist>

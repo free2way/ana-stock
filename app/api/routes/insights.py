@@ -1,3 +1,4 @@
+import json
 from html import escape
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -7,13 +8,19 @@ from sqlalchemy.orm import Session
 from app.core.db import get_db_session
 from app.services.auth import is_authenticated, login_redirect
 from app.services.insight_engine import InsightEngine
+from app.services.model_signal_summary import build_signal_label, enrich_model_output, model_confidence, summarize_model_output
 from app.services.repository import (
     FundamentalSnapshotRepository,
+    ModelChartSignalRepository,
     PredictionExplanationRepository,
     PredictionRepository,
+    PredictionTradePlanRepository,
     PriceSyncStateRepository,
     SymbolRepository,
 )
+from app.services.runtime_cache import get_or_set
+from app.services.ui_lang import resolve_request_lang
+from app.services.workspace_nav import WORKSPACE_COMPACT_STYLE, WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
 
 
 router = APIRouter(prefix="/insights", tags=["insights"])
@@ -76,12 +83,34 @@ TEXT = {
         "bearish_probability": "Bearish Probability",
         "expected_return_5d": "Expected 5D Return",
         "expected_return_20d": "Expected 20D Return",
+        "expected_drawdown_20d": "Expected 20D Drawdown",
+        "model_reward_risk_ratio": "Model Reward / Risk",
         "probability_help": "A score-derived probability proxy until full Qlib probability outputs are wired in.",
         "expected_return_help": "A score-derived return estimate for this MVP view. Later this can be replaced by direct model forecasts.",
+        "expected_drawdown_help": "A model-side estimate of how much pullback this setup may tolerate over the same horizon.",
+        "model_reward_risk_help": "Expected 20D return divided by model-side drawdown estimate. Higher is more attractive.",
         "regime": "Regime",
         "risk_score": "Risk Score",
         "regime_help": "A simple market state label derived from score, trend structure, and volatility context.",
         "risk_score_help": "Higher means more setup risk from weak structure, thin volume, or elevated volatility.",
+        "model_percentile": "Model Percentile",
+        "model_percentile_help": "Where this stock sits inside the latest model universe. Higher means stronger relative positioning.",
+        "model_horizon": "Model Horizon",
+        "model_horizon_help": "Approximate holding window implied by the current model setup.",
+        "conviction": "Conviction",
+        "conviction_help": "A lightweight execution bucket showing how strongly the current model wants to lean into this idea.",
+        "position_size_hint": "Position Size Hint",
+        "position_size_hint_help": "A lightweight execution hint derived from signal strength, reward/risk, and conviction. Use it as sizing guidance, not a fixed rule.",
+        "entry_style": "Entry Style",
+        "entry_style_help": "A lightweight execution style showing whether this setup looks more like a breakout, pullback, waiting setup, or something to avoid.",
+        "stop_type": "Stop Type",
+        "stop_type_help": "Execution-level stop discipline supplied by the model trade plan when available.",
+        "trailing_stop_pct": "Trailing Stop",
+        "trailing_stop_pct_help": "Trailing stop percentage from the model trade plan when available.",
+        "invalidation_reason": "Invalidation",
+        "invalidation_reason_help": "Why the current setup would be considered broken.",
+        "execution_tags": "Execution Tags",
+        "execution_tags_help": "Execution reminders supplied by the model plan, such as gap risk or earnings timing.",
         "top_drivers": "Top Drivers",
         "feature_contributions": "Feature Contributions",
         "model_positive_factors": "Model Positive Factors",
@@ -148,12 +177,34 @@ TEXT = {
         "bearish_probability": "看空概率",
         "expected_return_5d": "预期 5 日收益",
         "expected_return_20d": "预期 20 日收益",
+        "expected_drawdown_20d": "预期 20 日回撤",
+        "model_reward_risk_ratio": "模型盈亏比",
         "probability_help": "当前是基于分数推导的概率近似值，后续可以替换成完整 Qlib 概率输出。",
         "expected_return_help": "当前是基于分数推导的预期收益占位结果，后续可替换成模型直接预测值。",
+        "expected_drawdown_help": "这是模型侧推导的同周期潜在回撤估计，用来帮助判断承受空间。",
+        "model_reward_risk_help": "预期 20 日收益与模型侧回撤估计的比值，越高通常越有吸引力。",
         "regime": "市场状态",
         "risk_score": "风险评分",
         "regime_help": "基于分数、趋势结构和波动环境推导出的简化状态标签。",
         "risk_score_help": "分数越高，表示当前结构、量能或波动带来的执行风险越高。",
+        "model_percentile": "模型分位",
+        "model_percentile_help": "表示这只股票在最新模型股票池里的相对位置，越高说明相对更强。",
+        "model_horizon": "模型观察周期",
+        "model_horizon_help": "表示当前模型更偏向用多长时间窗口来评估这笔交易。",
+        "conviction": "信念等级",
+        "conviction_help": "这是轻量执行分层，用来表示模型当前对这笔交易的主观强度。",
+        "position_size_hint": "仓位建议",
+        "position_size_hint_help": "这是根据当前信号强度、模型盈亏比和信念等级推导出的轻量仓位提示，适合作为执行参考，不是固定规则。",
+        "entry_style": "进场方式",
+        "entry_style_help": "这是轻量执行风格提示，用来说明当前更像突破跟进、回踩吸纳、等待确认，还是应当回避。",
+        "stop_type": "止损类型",
+        "stop_type_help": "如果外部模型提供了交易计划，这里会显示对应的止损方式。",
+        "trailing_stop_pct": "追踪止损",
+        "trailing_stop_pct_help": "如果外部模型提供了追踪止损百分比，会显示在这里。",
+        "invalidation_reason": "失效条件",
+        "invalidation_reason_help": "这笔交易在什么条件下应视为逻辑失效。",
+        "execution_tags": "执行提醒",
+        "execution_tags_help": "由模型交易计划提供的执行提醒，例如跳空风险或财报临近。",
         "top_drivers": "核心驱动因子",
         "feature_contributions": "特征贡献",
         "model_positive_factors": "模型正向因子",
@@ -293,64 +344,248 @@ def _candles_svg(history: list[dict], insight: dict) -> str:
     """
 
 
+def _build_chart_payload(*, insight: dict, prediction_history: list[dict], chart_signal_history: list[dict], lang: str) -> dict:
+    candles = [
+        {
+            "date": row.get("date"),
+            "open": row.get("open"),
+            "high": row.get("high"),
+            "low": row.get("low"),
+            "close": row.get("close"),
+            "volume": row.get("volume"),
+        }
+        for row in insight.get("history", [])[-90:]
+    ]
+    signals = []
+    candle_dates = {row["date"] for row in candles if row.get("date")}
+    seen_dates: set[str] = set()
+    for row in sorted((chart_signal_history or prediction_history), key=lambda item: item["trade_date"]):
+        trade_date = row.get("trade_date")
+        if not trade_date or trade_date not in candle_dates or trade_date in seen_dates:
+            continue
+        label = row.get("signal_label") or build_signal_label(row.get("score"), lang=lang)
+        if not label:
+            continue
+        seen_dates.add(trade_date)
+        normalized_label = str(label).strip().lower()
+        signals.append(
+            {
+                "date": trade_date,
+                "score": row.get("score"),
+                "rank": row.get("rank_value"),
+                "label": label,
+                "direction": "buy" if normalized_label in {"buy", "买点", "watch", "观察", "breakout", "pullback"} else "sell",
+                "strength": row.get("signal_strength"),
+                "note": row.get("note"),
+            }
+        )
+    return {
+        "ticker": insight["ticker"],
+        "candles": candles,
+        "signals": signals,
+        "levels": {
+            "entry_low": insight["entry_zone"]["low"],
+            "entry_high": insight["entry_zone"]["high"],
+            "breakout": insight["breakout_level"],
+            "take_profit_low": insight["take_profit_zone"]["low"],
+            "take_profit_high": insight["take_profit_zone"]["high"],
+            "risk": insight["risk_level"],
+            "support": insight["support_level"],
+            "resistance": insight["resistance_level"],
+        },
+        "meta": {
+            "volume_label": tr(lang, "volume"),
+            "breakout_label": tr(lang, "breakout"),
+            "risk_label": tr(lang, "risk"),
+        },
+    }
+
+
+def _interactive_chart_html(*, chart_id: str, payload: dict, lang: str) -> str:
+    payload_json = json.dumps(payload, ensure_ascii=False)
+    empty_text = tr(lang, "not_enough_data")
+    return f"""
+    <div class="interactive-chart-shell">
+      <div id="{chart_id}" class="interactive-chart"></div>
+      <div id="{chart_id}-tooltip" class="chart-tooltip" hidden></div>
+    </div>
+    <script>
+      (() => {{
+        const payload = {payload_json};
+        const root = document.getElementById("{chart_id}");
+        const tooltip = document.getElementById("{chart_id}-tooltip");
+        if (!root) return;
+        const candles = payload.candles || [];
+        if (!candles.length) {{
+          root.innerHTML = "<p class='muted'>{escape(empty_text)}</p>";
+          return;
+        }}
+
+        const width = 1040;
+        const height = 430;
+        const leftPad = 54;
+        const rightPad = 84;
+        const topPad = 22;
+        const bottomPad = 44;
+        const volumeHeight = 86;
+        const plotHeight = height - topPad - bottomPad - volumeHeight - 18;
+        const volumeTop = topPad + plotHeight + 18;
+        const lows = candles.map(c => c.low).filter(v => typeof v === "number");
+        const highs = candles.map(c => c.high).filter(v => typeof v === "number");
+        const volumes = candles.map(c => c.volume || 0);
+        const minPrice = Math.min(...lows, payload.levels.risk, payload.levels.entry_low) * 0.985;
+        const maxPrice = Math.max(...highs, payload.levels.breakout, payload.levels.take_profit_high) * 1.015;
+        const priceSpan = Math.max(maxPrice - minPrice, 0.01);
+        const maxVolume = Math.max(...volumes, 1);
+        const step = (width - leftPad - rightPad) / Math.max(candles.length, 1);
+        const candleWidth = Math.max(5, step * 0.58);
+        const xOf = (index) => leftPad + index * step + step / 2;
+        const yOf = (price) => topPad + plotHeight * (1 - ((price - minPrice) / priceSpan));
+        const volumeY = (volume) => volumeTop + volumeHeight - (volume / maxVolume) * volumeHeight;
+        const signalMap = new Map((payload.signals || []).map(signal => [signal.date, signal]));
+
+        const make = (tag, attrs = {{}}, text) => {{
+          const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+          for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, String(value));
+          if (text !== undefined) el.textContent = text;
+          return el;
+        }};
+
+        const svg = make("svg", {{
+          viewBox: `0 0 ${{width}} ${{height}}`,
+          width: "100%",
+          height: "430",
+          role: "img",
+          "aria-label": "Interactive candlestick chart"
+        }});
+        svg.appendChild(make("rect", {{ x: 0, y: 0, width, height, rx: 18, fill: "#fffdf7" }}));
+
+        const band = (low, high, fill) => svg.appendChild(make("rect", {{
+          x: leftPad,
+          y: yOf(high),
+          width: width - leftPad - rightPad,
+          height: Math.max(4, yOf(low) - yOf(high)),
+          fill,
+          opacity: 0.42
+        }}));
+        band(payload.levels.entry_low, payload.levels.entry_high, "#dff5ef");
+        band(payload.levels.take_profit_low, payload.levels.take_profit_high, "#fef3c7");
+
+        svg.appendChild(make("line", {{ x1: leftPad, y1: topPad + plotHeight, x2: width - rightPad, y2: topPad + plotHeight, stroke: "#d6cfc2" }}));
+        svg.appendChild(make("line", {{ x1: leftPad, y1: topPad, x2: leftPad, y2: topPad + plotHeight, stroke: "#d6cfc2" }}));
+
+        const ma20Points = [];
+        const ma20Window = [];
+        candles.forEach((row, index) => {{
+          if (typeof row.close === "number") {{
+            ma20Window.push(row.close);
+            const sample = ma20Window.slice(-20);
+            const ma20 = sample.reduce((sum, value) => sum + value, 0) / sample.length;
+            ma20Points.push(`${{xOf(index)}},${{yOf(ma20)}}`);
+          }}
+        }});
+        if (ma20Points.length > 1) {{
+          svg.appendChild(make("polyline", {{
+            points: ma20Points.join(" "),
+            fill: "none",
+            stroke: "#0f766e",
+            "stroke-width": 3
+          }}));
+        }}
+
+        const drawLevel = (label, price, color) => {{
+          const y = yOf(price);
+          svg.appendChild(make("line", {{
+            x1: leftPad, y1: y, x2: width - rightPad, y2: y, stroke: color, "stroke-dasharray": "7 5"
+          }}));
+          svg.appendChild(make("text", {{
+            x: width - rightPad + 6, y: y + 4, "font-size": 11, fill: color
+          }}, `${{label}} ${{price.toFixed(2)}}`));
+        }};
+        drawLevel(payload.meta.breakout_label, payload.levels.breakout, "#1d4ed8");
+        drawLevel(payload.meta.risk_label, payload.levels.risk, "#b91c1c");
+
+        svg.appendChild(make("rect", {{
+          x: leftPad, y: volumeTop, width: width - leftPad - rightPad, height: volumeHeight, rx: 10, fill: "#f7f2e8"
+        }}));
+        svg.appendChild(make("text", {{
+          x: leftPad, y: volumeTop - 5, "font-size": 11, fill: "#6b7280"
+        }}, payload.meta.volume_label));
+
+        const overlays = [];
+        candles.forEach((row, index) => {{
+          const x = xOf(index);
+          const up = row.close >= row.open;
+          const color = up ? "#0f766e" : "#b91c1c";
+          svg.appendChild(make("line", {{
+            x1: x, y1: yOf(row.high), x2: x, y2: yOf(row.low), stroke: color, "stroke-width": 2
+          }}));
+          svg.appendChild(make("rect", {{
+            x: x - candleWidth / 2, y: yOf(Math.max(row.open, row.close)),
+            width: candleWidth, height: Math.max(2, yOf(Math.min(row.open, row.close)) - yOf(Math.max(row.open, row.close))),
+            rx: 2, fill: color, opacity: 0.88
+          }}));
+          svg.appendChild(make("rect", {{
+            x: x - candleWidth / 2,
+            y: volumeY(row.volume || 0),
+            width: candleWidth,
+            height: Math.max(2, volumeTop + volumeHeight - volumeY(row.volume || 0)),
+            rx: 1.5,
+            fill: color,
+            opacity: 0.36
+          }}));
+
+          const signal = signalMap.get(row.date);
+          if (signal) {{
+            const markerY = signal.direction === "buy" ? yOf(row.low) + 18 : yOf(row.high) - 18;
+            const markerColor = signal.direction === "buy" ? "#15803d" : "#b91c1c";
+            svg.appendChild(make("circle", {{
+              cx: x, cy: markerY, r: 8, fill: markerColor, opacity: 0.9
+            }}));
+            svg.appendChild(make("text", {{
+              x, y: markerY + 3, "font-size": 9, fill: "#fff", "text-anchor": "middle", "font-weight": "700"
+            }}, signal.direction === "buy" ? "B" : "S"));
+          }}
+
+          if (index % Math.max(1, Math.floor(candles.length / 6)) === 0) {{
+            svg.appendChild(make("text", {{
+              x, y: height - 10, "font-size": 10, fill: "#6b7280", "text-anchor": "middle"
+            }}, row.date.slice(5)));
+          }}
+
+          const overlay = make("rect", {{
+            x: x - step / 2, y: topPad, width: step, height: plotHeight + volumeHeight + 18,
+            fill: "transparent", cursor: "crosshair"
+          }});
+          overlay.addEventListener("mousemove", (event) => {{
+            const signalText = signal ? `<br/>${{signal.label}} · score ${{Number(signal.score || 0).toFixed(3)}}` : "";
+            tooltip.hidden = false;
+            tooltip.innerHTML = `${{row.date}}<br/>O ${{row.open?.toFixed?.(2) ?? row.open}} H ${{row.high?.toFixed?.(2) ?? row.high}}<br/>L ${{row.low?.toFixed?.(2) ?? row.low}} C ${{row.close?.toFixed?.(2) ?? row.close}}${{signalText}}`;
+            const rect = root.getBoundingClientRect();
+            tooltip.style.left = `${{event.clientX - rect.left + 14}}px`;
+            tooltip.style.top = `${{event.clientY - rect.top - 10}}px`;
+          }});
+          overlay.addEventListener("mouseleave", () => {{
+            tooltip.hidden = true;
+          }});
+          overlays.push(overlay);
+        }});
+
+        overlays.forEach(overlay => svg.appendChild(overlay));
+        root.innerHTML = "";
+        root.appendChild(svg);
+      }})();
+    </script>
+    """
+
+
 def _model_output_summary(model_output: dict | None, *, lang: str) -> str:
-    if not model_output:
-        return tr(lang, "model_summary_empty")
-    score = model_output.get("score")
-    percentile = model_output.get("percentile")
-    run_name = model_output.get("model_run", {}).get("name") or "-"
-    if score is None:
-        return tr(lang, "model_summary_empty")
-    confidence = min(92, max(38, int(45 + abs(float(score)) * 18)))
-    if lang == "zh":
-        stance = "偏多" if score >= 0 else "偏谨慎"
-        percentile_text = f"市场前 {100 - percentile:.1f}% 左右" if percentile is not None else "市场相对位置暂无"
-        return f"最新模型运行 {run_name} 对这只股票给出 {score:.3f} 分，结论整体{stance}，置信度约 {confidence}% 。当前大致处于 {percentile_text}。"
-    stance = "bullish" if score >= 0 else "cautious"
-    percentile_text = f"roughly top {100 - percentile:.1f}% of its universe" if percentile is not None else "without a percentile reading yet"
-    return f"The latest model run {run_name} scores this stock at {score:.3f}, which reads as {stance} with about {confidence}% confidence, landing {percentile_text}."
-
-
-def _model_confidence(score: float | None) -> int | None:
-    if score is None:
-        return None
-    return min(92, max(38, int(45 + abs(float(score)) * 18)))
-
-
-def _enrich_model_output(model_output: dict | None, *, lang: str) -> dict | None:
-    if model_output is None:
-        return None
-
-    score = model_output.get("score")
-    confidence = _model_confidence(score)
-    if score is None:
-        model_output["confidence"] = confidence
-        model_output["summary_text"] = _model_output_summary(model_output, lang=lang)
-        return model_output
-
-    bounded = max(-1.5, min(1.5, float(score) * 8))
-    bullish_prob = max(0.05, min(0.95, 0.5 + (bounded / 3.5) * 0.25))
-    bearish_prob = max(0.05, min(0.95, 1.0 - bullish_prob))
-    expected_return_5d = max(-0.25, min(0.25, float(score) * 0.35))
-    expected_return_20d = max(-0.45, min(0.45, float(score) * 0.8))
-
-    if bullish_prob >= 0.64:
-        regime_label = "bullish_trend" if lang == "en" else "偏多趋势"
-    elif bearish_prob >= 0.6:
-        regime_label = "cautious_range" if lang == "en" else "谨慎震荡"
-    else:
-        regime_label = "balanced_range" if lang == "en" else "中性震荡"
-    risk_score = max(8.0, min(92.0, 50.0 - float(score) * 55.0))
-
-    model_output["confidence"] = confidence
-    model_output["bullish_prob"] = round(bullish_prob * 100, 1)
-    model_output["bearish_prob"] = round(bearish_prob * 100, 1)
-    model_output["expected_return_5d"] = round(expected_return_5d * 100, 2)
-    model_output["expected_return_20d"] = round(expected_return_20d * 100, 2)
-    model_output["regime_label"] = regime_label
-    model_output["risk_score"] = round(risk_score, 1)
-    model_output["summary_text"] = _model_output_summary(model_output, lang=lang)
-    return model_output
+    if model_output and model_output.get("summary_text"):
+        return str(model_output["summary_text"])
+    summary = summarize_model_output(model_output, lang=lang)
+    if summary:
+        return summary
+    return tr(lang, "model_summary_empty")
 
 
 def _format_driver(text_en: str, text_zh: str, *, lang: str) -> str:
@@ -612,29 +847,86 @@ def _serialize_feature_contributions(rows: list[dict], *, lang: str) -> dict:
 
 
 def _build_model_context(*, ticker: str, lang: str, db: Session) -> dict:
-    fundamentals_repo = FundamentalSnapshotRepository(db)
-    explanation_repo = PredictionExplanationRepository(db)
-    model_output = _enrich_model_output(
-        PredictionRepository(db).get_latest_model_output_for_ticker(ticker),
-        lang=lang,
-    )
-    insight = InsightEngine().get_insight(ticker, lang=lang)
-    fundamentals = fundamentals_repo.get_latest_for_ticker(ticker)
-    feature_contributions = _serialize_feature_contributions(explanation_repo.get_latest_for_ticker(ticker), lang=lang)
-    drivers = _build_model_drivers(
-        insight=insight or {},
-        model_output=model_output,
-        fundamentals=fundamentals,
-        lang=lang,
-    )
-    return {
-        "model_output": model_output,
-        "insight": insight,
-        "fundamentals": fundamentals,
-        "fundamental_summary": _fundamental_summary(fundamentals),
-        "feature_contributions": feature_contributions,
-        "drivers": drivers,
-    }
+    cache_key = json.dumps({"ticker": ticker.upper(), "lang": lang}, sort_keys=True, ensure_ascii=False)
+
+    def _load() -> dict:
+        fundamentals_repo = FundamentalSnapshotRepository(db)
+        explanation_repo = PredictionExplanationRepository(db)
+        trade_plan_repo = PredictionTradePlanRepository(db)
+        model_output = enrich_model_output(
+            PredictionRepository(db).get_latest_model_output_for_ticker(ticker),
+            lang=lang,
+        )
+        insight = InsightEngine().get_insight(ticker, lang=lang)
+        trade_plan = trade_plan_repo.get_latest_for_ticker(ticker)
+        if insight is not None and trade_plan:
+            entry_low = trade_plan.get("entry_low")
+            entry_high = trade_plan.get("entry_high")
+            breakout_level = trade_plan.get("breakout_level")
+            take_profit_low = trade_plan.get("take_profit_low")
+            take_profit_high = trade_plan.get("take_profit_high")
+            risk_level = trade_plan.get("risk_level")
+            support_level = trade_plan.get("support_level")
+            resistance_level = trade_plan.get("resistance_level")
+
+            if entry_low is not None or entry_high is not None:
+                insight["entry_zone"] = {
+                    "low": entry_low if entry_low is not None else insight["entry_zone"]["low"],
+                    "high": entry_high if entry_high is not None else insight["entry_zone"]["high"],
+                }
+            if breakout_level is not None:
+                insight["breakout_level"] = breakout_level
+            if take_profit_low is not None or take_profit_high is not None:
+                insight["take_profit_zone"] = {
+                    "low": take_profit_low if take_profit_low is not None else insight["take_profit_zone"]["low"],
+                    "high": take_profit_high if take_profit_high is not None else insight["take_profit_zone"]["high"],
+                }
+            if risk_level is not None:
+                insight["risk_level"] = risk_level
+            if support_level is not None:
+                insight["support_level"] = support_level
+            if resistance_level is not None:
+                insight["resistance_level"] = resistance_level
+
+            latest_close = insight.get("latest_close") or 0.0
+            if latest_close:
+                insight["distance_to_entry_pct"] = round(((insight["entry_zone"]["high"] / latest_close) - 1.0) * 100, 2)
+                insight["distance_to_breakout_pct"] = round(((insight["breakout_level"] / latest_close) - 1.0) * 100, 2)
+                upside = max(0.0, insight["take_profit_zone"]["high"] - latest_close)
+                downside = max(0.01, latest_close - insight["risk_level"])
+                insight["reward_risk_ratio"] = round(upside / downside, 2) if downside else None
+        fundamentals = fundamentals_repo.get_latest_for_ticker(ticker)
+        feature_contributions = _serialize_feature_contributions(explanation_repo.get_latest_for_ticker(ticker), lang=lang)
+        drivers = _build_model_drivers(
+            insight=insight or {},
+            model_output=model_output,
+            fundamentals=fundamentals,
+            lang=lang,
+        )
+        return {
+            "model_output": model_output,
+            "insight": insight,
+            "fundamentals": fundamentals,
+            "fundamental_summary": _fundamental_summary(fundamentals),
+            "feature_contributions": feature_contributions,
+            "drivers": drivers,
+            "trade_plan": trade_plan,
+        }
+
+    return get_or_set("insight_model_context", cache_key, ttl_seconds=90.0, loader=_load)
+
+
+def _load_chart_histories(*, ticker: str, db: Session) -> tuple[list[dict], list[dict]]:
+    cache_key = json.dumps({"ticker": ticker.upper()}, sort_keys=True, ensure_ascii=False)
+
+    def _load() -> dict:
+        return {
+            "prediction_history": PredictionRepository(db).list_symbol_predictions(ticker, limit=180, latest_run_only=True),
+            "chart_signal_history": ModelChartSignalRepository(db).get_latest_for_ticker(ticker, limit=180),
+        }
+
+    payload = get_or_set("insight_chart_histories", cache_key, ttl_seconds=90.0, loader=_load)
+    return (payload or {}).get("prediction_history") or [], (payload or {}).get("chart_signal_history") or []
 
 
 @router.get("/open")
@@ -650,25 +942,50 @@ def open_insight(
 
 
 @router.get("/{ticker}/summary")
-def insight_summary(ticker: str, lang: str = Query("en")) -> dict:
-    insight = InsightEngine().get_insight(ticker, lang=lang)
+def insight_summary(request: Request, ticker: str, lang: str = Query("en"), db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect(f"/insights/{ticker.strip().upper()}?lang={'zh' if lang == 'zh' else 'en'}")
+    lang = "zh" if lang == "zh" else "en"
+    context = _build_model_context(ticker=ticker, lang=lang, db=db)
+    insight = context["insight"]
     if insight is None:
         raise HTTPException(status_code=404, detail="Ticker not found in local dataset.")
     return insight
 
 
 @router.get("/{ticker}/model-output")
-def insight_model_output(ticker: str, lang: str = Query("en"), db: Session = Depends(get_db_session)) -> dict:
+def insight_model_output(request: Request, ticker: str, lang: str = Query("en"), db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect(f"/insights/{ticker.strip().upper()}?lang={'zh' if lang == 'zh' else 'en'}")
     lang = "zh" if lang == "zh" else "en"
     context = _build_model_context(ticker=ticker, lang=lang, db=db)
     model_output = context["model_output"]
     if model_output is None:
         raise HTTPException(status_code=404, detail="Model output not found for ticker.")
     payload = dict(model_output)
+    payload["summary_text"] = _model_output_summary(model_output, lang=lang)
     payload["drivers"] = context["drivers"]
     payload["fundamentals"] = context["fundamental_summary"]
     payload["feature_contributions"] = context["feature_contributions"]
+    payload["trade_plan"] = context["trade_plan"]
     return payload
+
+
+@router.get("/{ticker}/chart-data")
+def insight_chart_data(request: Request, ticker: str, lang: str = Query("en"), db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect(f"/insights/{ticker.strip().upper()}?lang={'zh' if lang == 'zh' else 'en'}")
+    lang = "zh" if lang == "zh" else "en"
+    insight = InsightEngine().get_insight(ticker, lang=lang)
+    if insight is None:
+        raise HTTPException(status_code=404, detail="Ticker not found in local dataset.")
+    prediction_history, chart_signal_history = _load_chart_histories(ticker=ticker, db=db)
+    return _build_chart_payload(
+        insight=insight,
+        prediction_history=prediction_history,
+        chart_signal_history=chart_signal_history,
+        lang=lang,
+    )
 
 
 @router.get("/{ticker}", response_class=HTMLResponse)
@@ -678,10 +995,10 @@ def insight_page(
     lang: str = Query("en"),
     db: Session = Depends(get_db_session),
 ) -> str:
+    lang = resolve_request_lang(request)
     if not is_authenticated(request):
         target = f"/insights/{ticker.strip().upper()}?lang={'zh' if lang == 'zh' else 'en'}"
         return login_redirect(target)
-    lang = "zh" if lang == "zh" else "en"
     context = _build_model_context(ticker=ticker, lang=lang, db=db)
     insight = context["insight"]
     if insight is None:
@@ -694,11 +1011,24 @@ def insight_page(
     fundamentals = context["fundamentals"]
     model_output = context["model_output"]
     feature_contributions = context["feature_contributions"]
+    trade_plan = context["trade_plan"] or {}
+    prediction_history, chart_signal_history = _load_chart_histories(ticker=ticker, db=db)
     sync_text = sync_state["last_synced_date"] if sync_state else "not synced"
     bullets = "".join(f"<li>{escape(item)}</li>" for item in insight["explanation"])
-    chart = _candles_svg(insight["history"], insight)
+    execution_tag_items = "".join(
+        f"<span class='pill' style='margin:4px 8px 0 0; background:#fff7ed; color:#9a3412;'>{escape(str(tag))}</span>"
+        for tag in (trade_plan.get("execution_tags") or [])
+    )
+    chart_payload = _build_chart_payload(
+        insight=insight,
+        prediction_history=prediction_history,
+        chart_signal_history=chart_signal_history,
+        lang=lang,
+    )
+    chart = _interactive_chart_html(chart_id=f"chart-{escape(insight['ticker']).replace('.', '-')}", payload=chart_payload, lang=lang)
     model_summary = _model_output_summary(model_output, lang=lang)
     model_confidence = model_output.get("confidence") if model_output else None
+    model_state = (model_output or {}).get("state")
     model_run_name = "-"
     if model_output:
         model_run_name = model_output.get("model_run", {}).get("name") or "-"
@@ -747,6 +1077,7 @@ def insight_page(
         f"<a href='/insights/{insight['ticker']}?lang=en'>{tr(lang, 'lang_en')}</a> | "
         f"<a href='/insights/{insight['ticker']}?lang=zh'>{tr(lang, 'lang_zh')}</a>"
     )
+    nav_html = render_workspace_nav_html(lang=lang, active_key="watchlist")
 
     return f"""
     <!DOCTYPE html>
@@ -757,25 +1088,48 @@ def insight_page(
         <title>{insight['ticker']} Insight</title>
         <style>
           :root {{
-            --bg: #f5efe2;
-            --panel: #fffdf7;
-            --ink: #1f2937;
-            --muted: #6b7280;
-            --line: #d6cfc2;
-            --accent: #0f766e;
-            --accent-soft: #dff5ef;
+            --bg: #071018;
+            --panel: #111c28;
+            --panel-2: #152231;
+            --ink: #e6edf3;
+            --muted: #90a3b8;
+            --line: #223246;
+            --accent: #3dd9b6;
+            --accent-soft: rgba(61,217,182,0.12);
           }}
           * {{ box-sizing: border-box; }}
           body {{ margin: 0; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--ink); background:
-            radial-gradient(circle at top left, #fff6d8 0, transparent 30%),
-            radial-gradient(circle at top right, #d9f3ee 0, transparent 35%),
+            radial-gradient(circle at top left, rgba(82,168,255,0.14) 0, transparent 28%),
+            radial-gradient(circle at top right, rgba(61,217,182,0.10) 0, transparent 26%),
             var(--bg); }}
-          .wrap {{ max-width: 1160px; margin: 0 auto; padding: 28px 20px 56px; }}
+          .app {{ display:grid; grid-template-columns:260px minmax(0, 1fr); min-height:100vh; }}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .content {{ padding:20px 18px 28px; }}
+          .wrap {{ max-width: 1120px; margin: 0 auto; padding: 0 0 36px; }}
           .topbar {{ display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:16px; }}
           .topbar a {{ color: var(--accent); text-decoration:none; }}
           .search {{ display:flex; gap:8px; flex-wrap:wrap; }}
+          .nav-grid {{ display:grid; gap:16px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-bottom:16px; }}
+          .nav-card {{
+            display:block;
+            text-decoration:none;
+            color:inherit;
+            background:linear-gradient(180deg, rgba(17,28,40,0.98) 0%, rgba(21,34,49,0.98) 100%);
+            border:1px solid var(--line);
+            border-radius:18px;
+            padding:18px;
+            box-shadow:0 12px 30px rgba(0,0,0,0.12);
+          }}
+          .nav-card:hover {{ border-color:var(--accent); box-shadow:0 12px 28px rgba(61,217,182,0.08); }}
+          .nav-head {{ display:flex; align-items:center; gap:12px; margin-bottom:10px; }}
+          .nav-icon {{
+            width:42px; height:42px; border-radius:14px; display:inline-flex; align-items:center; justify-content:center;
+            background:rgba(61,217,182,0.10); color:var(--accent); font-size:12px; font-weight:900; letter-spacing:0.04em; border:1px solid rgba(61,217,182,0.18); flex:0 0 auto;
+          }}
+          .nav-title {{ font-size:18px; font-weight:800; color:var(--ink); }}
+          .nav-kicker {{ color:var(--muted); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; }}
           .grid {{ display:grid; gap:16px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); margin-bottom:16px; }}
-          .card {{ background: var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow: 0 8px 24px rgba(31,41,55,0.05); }}
+          .card {{ background: linear-gradient(180deg, rgba(21,34,49,0.98), rgba(17,28,40,0.98)); border:1px solid var(--line); border-radius:22px; padding:18px; box-shadow: 0 24px 48px rgba(0,0,0,0.18); }}
           .hero {{ display:grid; gap:16px; grid-template-columns: minmax(280px, 2fr) minmax(240px, 1fr); margin-bottom:16px; }}
           .eyebrow {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
           h1 {{ margin:0 0 8px; font-size:42px; }}
@@ -790,21 +1144,54 @@ def insight_page(
             border: 1px solid var(--line);
             padding: 10px 12px;
             font: inherit;
-            background: #fff;
+            background: #0f1823;
+            color: var(--ink);
           }}
           button {{ background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 700; }}
-          .pill {{ display:inline-block; padding:8px 12px; border-radius:999px; font-weight:700; background:#eef8f5; color:#0f766e; }}
+          .pill {{ display:inline-block; padding:8px 12px; border-radius:999px; font-weight:700; background:rgba(61,217,182,0.10); color:var(--accent); }}
           .chart-card {{ margin-bottom:16px; }}
+          .interactive-chart-shell {{ position:relative; }}
+          .interactive-chart {{ width:100%; min-height:430px; }}
+          .chart-tooltip {{
+            position:absolute;
+            z-index:20;
+            min-width:180px;
+            max-width:240px;
+            padding:10px 12px;
+            border-radius:12px;
+            background:rgba(15, 23, 42, 0.92);
+            color:#fff;
+            font-size:12px;
+            line-height:1.5;
+            pointer-events:none;
+            box-shadow:0 10px 28px rgba(15,23,42,0.2);
+            transform:translateY(-100%);
+          }}
           .actions {{ display:grid; gap:12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }}
           .label {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:0.04em; }}
           .signal-hero {{ display:grid; gap:16px; grid-template-columns: minmax(260px, 1.4fr) repeat(3, minmax(180px, 1fr)); margin-bottom:16px; }}
+          @media (max-width: 1120px) {{
+            .app {{ grid-template-columns:1fr; }}
+            .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }}
+          }}
         </style>
       </head>
       <body>
-        <main class="wrap">
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{'洞察页' if lang == 'zh' else 'Insight View'}</h1>
+              <p>{'这里保留更完整的模型解释、交互图表和驱动因子，适合做单票深看。' if lang == 'zh' else 'This page keeps the deeper model explanation, interactive charting, and driver context for single-name deep dives.'}</p>
+            </div>
+            <nav class="side-nav">{nav_html}</nav>
+            <div class="sidebar-foot">{'如果你已经知道这只股票值得跟踪，就在这里看模型驱动、执行提醒和关键价位。' if lang == 'zh' else 'If this name already deserves attention, use this page for model drivers, execution reminders, and key levels.'}</div>
+          </aside>
+          <main class="content">
+        <div class="wrap">
           <div class="topbar">
-            <a href="/dashboard">← {tr(lang, 'back_dashboard')}</a>
-            <a href="/symbols/{insight['ticker']}">{tr(lang, 'classic_detail')}</a>
+            <a href="/dashboard?lang={lang}">← {tr(lang, 'back_dashboard')}</a>
+            <a href="/symbols/{insight['ticker']}?lang={lang}">{tr(lang, 'classic_detail')}</a>
             <form class="search" action="/insights/open" method="get">
               <input type="hidden" name="lang" value="{lang}" />
               <input type="text" name="ticker" value="{insight['ticker']}" placeholder="{tr(lang, 'search_placeholder')}" />
@@ -812,6 +1199,38 @@ def insight_page(
             </form>
             <span class="muted">{lang_switch}</span>
           </div>
+          <section class="nav-grid">
+            <a class="nav-card" href="/dashboard?lang={lang}">
+              <div class="nav-head">
+                <span class="nav-icon">HOME</span>
+                <div>
+                  <div class="nav-kicker">{'总览' if lang == 'zh' else 'Overview'}</div>
+                  <div class="nav-title">Dashboard</div>
+                </div>
+              </div>
+              <div class="muted">{'返回首页，看系统状态和主要入口。' if lang == 'zh' else 'Return to the main hub for system status and primary navigation.'}</div>
+            </a>
+            <a class="nav-card" href="/watchlist?lang={lang}">
+              <div class="nav-head">
+                <span class="nav-icon">LIST</span>
+                <div>
+                  <div class="nav-kicker">{'跟踪' if lang == 'zh' else 'Tracking'}</div>
+                  <div class="nav-title">{'自选股' if lang == 'zh' else 'Watchlist'}</div>
+                </div>
+              </div>
+              <div class="muted">{'把当前关注股票加入自选并统一管理同步。' if lang == 'zh' else 'Move this name into your watchlist and manage sync from one place.'}</div>
+            </a>
+            <a class="nav-card" href="/screeners?lang={lang}">
+              <div class="nav-head">
+                <span class="nav-icon">SCAN</span>
+                <div>
+                  <div class="nav-kicker">{'发现' if lang == 'zh' else 'Discovery'}</div>
+                  <div class="nav-title">{'量化选股器' if lang == 'zh' else 'Screeners'}</div>
+                </div>
+              </div>
+              <div class="muted">{'回到选股器，继续筛同类机会或保存策略。' if lang == 'zh' else 'Jump back to screeners to find similar candidates or save a strategy.'}</div>
+            </a>
+          </section>
 
           <section class="hero">
             <article class="card">
@@ -857,6 +1276,7 @@ def insight_page(
             <article class="card">
               <div class="eyebrow">{tr(lang, 'model_output')}</div>
               <div class="metric">{f"{model_output['score']:.3f}" if model_output and model_output.get('score') is not None else '-'}</div>
+              {f"<div class='pill' style='margin-top:8px;background:{model_state['bg']};color:{model_state['fg']};'>{escape(model_state['label'])}</div>" if model_state else ""}
               <div class="muted">{tr(lang, 'model_score_help')}</div>
             </article>
             <article class="card">
@@ -898,6 +1318,16 @@ def insight_page(
               <div class="muted">{tr(lang, 'expected_return_help')}</div>
             </article>
             <article class="card">
+              <div class="eyebrow">{tr(lang, 'expected_drawdown_20d')}</div>
+              <div class="metric">{f"{model_output['expected_drawdown_20d']:.2f}%" if model_output and model_output.get('expected_drawdown_20d') is not None else '-'}</div>
+              <div class="muted">{tr(lang, 'expected_drawdown_help')}</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{tr(lang, 'model_reward_risk_ratio')}</div>
+              <div class="metric">{f"{model_output['model_reward_risk_ratio']:.2f}" if model_output and model_output.get('model_reward_risk_ratio') is not None else '-'}</div>
+              <div class="muted">{tr(lang, 'model_reward_risk_help')}</div>
+            </article>
+            <article class="card">
               <div class="eyebrow">{tr(lang, 'regime')}</div>
               <div class="metric" style="font-size:24px;">{escape(model_output.get('regime_label') or '-') if model_output else '-'}</div>
               <div class="muted">{tr(lang, 'regime_help')}</div>
@@ -906,6 +1336,51 @@ def insight_page(
               <div class="eyebrow">{tr(lang, 'risk_score')}</div>
               <div class="metric">{f"{model_output['risk_score']:.1f}" if model_output and model_output.get('risk_score') is not None else '-'}</div>
               <div class="muted">{tr(lang, 'risk_score_help')}</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{tr(lang, 'model_percentile')}</div>
+              <div class="metric">{f"{model_output['percentile']:.1f}%" if model_output and model_output.get('percentile') is not None else '-'}</div>
+              <div class="muted">{tr(lang, 'model_percentile_help')}</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{tr(lang, 'model_horizon')}</div>
+              <div class="metric">{f"{int(model_output['target_horizon_days'])}d" if model_output and model_output.get('target_horizon_days') is not None else '-'}</div>
+              <div class="muted">{tr(lang, 'model_horizon_help')}</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{tr(lang, 'conviction')}</div>
+              <div class="metric" style="font-size:24px;">{escape(model_output.get('conviction_bucket') or '-') if model_output else '-'}</div>
+              <div class="muted">{tr(lang, 'conviction_help')}</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{tr(lang, 'position_size_hint')}</div>
+              <div class="metric" style="font-size:24px;">{escape(model_output.get('position_size_hint') or '-') if model_output else '-'}</div>
+              <div class="muted">{tr(lang, 'position_size_hint_help')}</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{tr(lang, 'entry_style')}</div>
+              <div class="metric" style="font-size:24px;">{escape(model_output.get('entry_style') or '-') if model_output else '-'}</div>
+              <div class="muted">{tr(lang, 'entry_style_help')}</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{tr(lang, 'stop_type')}</div>
+              <div class="metric" style="font-size:24px;">{escape(trade_plan.get('stop_type') or '-')}</div>
+              <div class="muted">{tr(lang, 'stop_type_help')}</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{tr(lang, 'trailing_stop_pct')}</div>
+              <div class="metric">{f"{trade_plan['trailing_stop_pct']:.2f}%" if trade_plan.get('trailing_stop_pct') is not None else '-'}</div>
+              <div class="muted">{tr(lang, 'trailing_stop_pct_help')}</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{tr(lang, 'invalidation_reason')}</div>
+              <div class="metric" style="font-size:18px; line-height:1.4;">{escape(trade_plan.get('invalidation_reason') or '-')}</div>
+              <div class="muted">{tr(lang, 'invalidation_reason_help')}</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{tr(lang, 'execution_tags')}</div>
+              <div>{execution_tag_items or "<span class='muted'>-</span>"}</div>
+              <div class="muted" style="margin-top:10px;">{tr(lang, 'execution_tags_help')}</div>
             </article>
           </section>
 
@@ -989,7 +1464,9 @@ def insight_page(
               {"<ul>" + negative_feature_items + "</ul>" if negative_feature_items else f"<div class='muted'>{tr(lang, 'feature_contrib_empty')}</div>"}
             </article>
           </section>
-        </main>
+        </div>
+          </main>
+        </div>
       </body>
     </html>
     """

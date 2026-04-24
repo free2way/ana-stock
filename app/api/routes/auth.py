@@ -1,26 +1,41 @@
-from fastapi import APIRouter, Form, Query
+from html import escape
+from urllib.parse import quote
+
+from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from app.services.auth import AUTH_COOKIE_NAME, DEFAULT_PASSWORD, DEFAULT_USERNAME
+from app.core.config import get_settings
+from app.services.auth import AUTH_COOKIE_NAME, build_auth_cookie_value, sanitize_next_path, verify_credentials
+from app.services.ui_lang import resolve_request_lang
 
 
 router = APIRouter(tags=["auth"])
 
 
 @router.get("/login", response_class=HTMLResponse)
-def login_page(next: str = Query("/watchlist"), error: str | None = None) -> str:
+def login_page(request: Request, next: str = Query("/dashboard"), error: str | None = None) -> str:
+    lang = resolve_request_lang(request)
+    settings = get_settings()
+    configured = bool(settings.auth_password and settings.auth_secret)
     error_html = (
-        f"<div class='error'>{error}</div>"
+        f"<div class='error'>{escape(error)}</div>"
         if error
         else ""
     )
+    hint_html = (
+        ("<div class='hint'>请在本地环境中设置 <code>PQW_AUTH_USERNAME</code>、<code>PQW_AUTH_PASSWORD</code> 和 <code>PQW_AUTH_SECRET</code> 后再启用登录。</div>"
+        if lang == "zh"
+        else "<div class='hint'>Set <code>PQW_AUTH_USERNAME</code>, <code>PQW_AUTH_PASSWORD</code>, and <code>PQW_AUTH_SECRET</code> in your local environment to enable sign-in.</div>")
+        if not configured
+        else ("<div class='hint'>使用当前部署配置好的账号密码登录。</div>" if lang == "zh" else "<div class='hint'>Use your configured account credentials to access the app.</div>")
+    )
     return f"""
     <!DOCTYPE html>
-    <html lang="en">
+    <html lang="{lang}">
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>Login</title>
+        <title>{'登录' if lang == 'zh' else 'Login'}</title>
         <style>
           :root {{
             --bg: #f5efe2;
@@ -93,17 +108,17 @@ def login_page(next: str = Query("/watchlist"), error: str | None = None) -> str
       </head>
       <body>
         <main class="card">
-          <div class="eyebrow">Secure Access</div>
-          <h1>Sign In</h1>
-          <p>Use the default credentials to access the local app.</p>
+          <div class="eyebrow">{'安全访问' if lang == 'zh' else 'Secure Access'}</div>
+          <h1>{'登录' if lang == 'zh' else 'Sign In'}</h1>
+          <p>{'使用当前部署配置的账号密码登录。' if lang == 'zh' else 'Sign in with the credentials configured for this deployment.'}</p>
           {error_html}
           <form class="stack" action="/login" method="post">
-            <input type="hidden" name="next" value="{next}" />
-            <input type="text" name="username" placeholder="Username" value="{DEFAULT_USERNAME}" required />
-            <input type="password" name="password" placeholder="Password" value="{DEFAULT_PASSWORD}" required />
-            <button type="submit">Login</button>
+            <input type="hidden" name="next" value="{escape(next, quote=True)}" />
+            <input type="text" name="username" placeholder="{'用户名' if lang == 'zh' else 'Username'}" autocomplete="username" required />
+            <input type="password" name="password" placeholder="{'密码' if lang == 'zh' else 'Password'}" autocomplete="current-password" required />
+            <button type="submit">{'登录' if lang == 'zh' else 'Login'}</button>
           </form>
-          <div class="hint">Default credentials: <strong>{DEFAULT_USERNAME}</strong> / <strong>{DEFAULT_PASSWORD}</strong></div>
+          {hint_html}
         </main>
       </body>
     </html>
@@ -114,13 +129,29 @@ def login_page(next: str = Query("/watchlist"), error: str | None = None) -> str
 def login_submit(
     username: str = Form(...),
     password: str = Form(...),
-    next: str = Form("/watchlist"),
+    next: str = Form("/dashboard"),
 ) -> RedirectResponse:
-    if username == DEFAULT_USERNAME and password == DEFAULT_PASSWORD:
-        response = RedirectResponse(url=next or "/dashboard", status_code=303)
-        response.set_cookie(AUTH_COOKIE_NAME, DEFAULT_USERNAME, httponly=True, samesite="lax")
+    settings = get_settings()
+    safe_next = sanitize_next_path(next)
+    if not settings.auth_password or not settings.auth_secret:
+        return RedirectResponse(
+            url=f"/login?next={quote(safe_next, safe='/?=&')}&error=Authentication+is+not+configured",
+            status_code=303,
+        )
+    if verify_credentials(username, password):
+        response = RedirectResponse(url=safe_next, status_code=303)
+        response.set_cookie(
+            AUTH_COOKIE_NAME,
+            build_auth_cookie_value(settings.auth_username),
+            httponly=True,
+            samesite="lax",
+            max_age=max(60, int(settings.auth_cookie_max_age_seconds)),
+        )
         return response
-    return RedirectResponse(url=f"/login?next={next}&error=Invalid+username+or+password", status_code=303)
+    return RedirectResponse(
+        url=f"/login?next={quote(safe_next, safe='/?=&')}&error=Invalid+username+or+password",
+        status_code=303,
+    )
 
 
 @router.get("/logout")

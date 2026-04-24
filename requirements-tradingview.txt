@@ -1,0 +1,3 @@
+-r requirements.txt
+tradingview-ta>=3.3,<4
+tradingview-screener>=1,<4

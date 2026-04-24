@@ -1,10 +1,13 @@
 from dataclasses import dataclass
 from datetime import date, datetime
 from io import StringIO
+import json
 from typing import Any
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from app.services.ticker_format import provider_ticker_candidates
+from app.services.tushare_client import TushareClient
 
 
 def _to_iso_date(value: Any) -> str | None:
@@ -32,6 +35,13 @@ class OpenBBClient:
     def __init__(self) -> None:
         self.last_source_used = "unknown"
 
+    def _load_openbb(self):
+        try:
+            from openbb import obb
+        except Exception:
+            return None
+        return obb
+
     def fetch_symbol_profile(self, ticker: str) -> dict:
         self.last_source_used = "unknown"
         market = "HK" if ticker.upper().endswith(".HK") else None
@@ -47,9 +57,8 @@ class OpenBBClient:
         return last_result
 
     def _fetch_single_symbol_profile(self, ticker: str) -> dict:
-        try:
-            from openbb import obb
-        except ImportError:
+        obb = self._load_openbb()
+        if obb is None:
             return self._fetch_profile_with_yfinance(ticker)
 
         try:
@@ -73,15 +82,21 @@ class OpenBBClient:
     def fetch_historical_prices(self, request: HistoricalPriceRequest) -> list[dict]:
         self.last_source_used = "unknown"
         market = self._infer_market(request.ticker)
-        try:
-            from openbb import obb
-        except ImportError:
+        if market == "CN":
+            return self._fetch_cn_history_with_fallbacks(request)
+        obb = self._load_openbb()
+        if obb is None:
             rows = self._fetch_with_yfinance(request)
             if market in {"HK", "CN"} and len(rows) <= 1:
                 ak_rows = self._fetch_with_akshare(request)
                 if len(ak_rows) > len(rows):
                     self.last_source_used = "akshare"
                     return ak_rows
+                if market == "CN":
+                    baostock_rows = self._fetch_with_baostock(request)
+                    if len(baostock_rows) > len(rows):
+                        self.last_source_used = "baostock"
+                        return baostock_rows
                 if market == "HK":
                     stockanalysis_rows = self._fetch_with_stockanalysis(request)
                     if len(stockanalysis_rows) > len(rows):
@@ -106,6 +121,11 @@ class OpenBBClient:
                     if len(ak_rows) > len(rows):
                         self.last_source_used = "akshare"
                         return ak_rows
+                    if market == "CN":
+                        baostock_rows = self._fetch_with_baostock(request)
+                        if len(baostock_rows) > len(rows):
+                            self.last_source_used = "baostock"
+                            return baostock_rows
                     if market == "HK":
                         stockanalysis_rows = self._fetch_with_stockanalysis(request)
                         if len(stockanalysis_rows) > len(rows):
@@ -135,6 +155,36 @@ class OpenBBClient:
         normalized.sort(key=lambda row: row["date"] or "")
         self.last_source_used = "openbb"
         return normalized
+
+    def _fetch_cn_history_with_fallbacks(self, request: HistoricalPriceRequest) -> list[dict]:
+        tushare_rows = TushareClient().fetch_cn_daily_history(
+            request.ticker,
+            start_date=request.start_date,
+            end_date=request.end_date,
+        )
+        if tushare_rows:
+            self.last_source_used = "tushare"
+            return tushare_rows
+
+        eastmoney_rows = self._fetch_with_eastmoney_cn(request)
+        if eastmoney_rows:
+            self.last_source_used = "eastmoney"
+            return eastmoney_rows
+
+        ak_rows = self._fetch_with_akshare(request)
+        if ak_rows:
+            self.last_source_used = "akshare"
+            return ak_rows
+
+        baostock_rows = self._fetch_with_baostock(request)
+        if baostock_rows:
+            self.last_source_used = "baostock"
+            return baostock_rows
+
+        yfinance_rows = self._fetch_with_yfinance(request)
+        if yfinance_rows:
+            self.last_source_used = "yfinance"
+        return yfinance_rows
 
     def fetch_fundamental_snapshot(self, ticker: str) -> dict | None:
         self.last_source_used = "unknown"
@@ -193,6 +243,8 @@ class OpenBBClient:
             end=request.end_date,
             auto_adjust=False,
             progress=False,
+            timeout=15,
+            threads=False,
         )
         if data is None or data.empty:
             return []
@@ -372,6 +424,133 @@ class OpenBBClient:
         normalized.sort(key=lambda row: row["date"] or "")
         return normalized
 
+    def _fetch_with_eastmoney_cn(self, request: HistoricalPriceRequest) -> list[dict]:
+        market = self._infer_market(request.ticker)
+        if market != "CN":
+            return []
+
+        code = request.ticker.upper().replace(".SS", "").replace(".SH", "").replace(".SZ", "")
+        if not code.isdigit() or len(code) != 6:
+            return []
+
+        market_code = "1" if code.startswith("6") else "0"
+        params = {
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
+            "ut": "7eea3edcaed734bea9cbfc24409ed989",
+            "klt": "101",
+            "fqt": "0",
+            "secid": f"{market_code}.{code}",
+            "beg": (request.start_date or "1970-01-01").replace("-", ""),
+            "end": (request.end_date or "2050-01-01").replace("-", ""),
+        }
+        url = f"https://push2his.eastmoney.com/api/qt/stock/kline/get?{urlencode(params)}"
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://quote.eastmoney.com/",
+        }
+        try:
+            payload = urlopen(Request(url, headers=headers), timeout=15).read().decode("utf-8")
+            data_json = json.loads(payload)
+        except Exception:
+            return []
+
+        klines = ((data_json or {}).get("data") or {}).get("klines") or []
+        if not klines:
+            return []
+
+        normalized: list[dict] = []
+        for item in klines:
+            parts = str(item).split(",")
+            if len(parts) < 6:
+                continue
+            normalized.append(
+                {
+                    "date": parts[0],
+                    "symbol": request.ticker.upper(),
+                    "open": self._to_float(parts[1]),
+                    "close": self._to_float(parts[2]),
+                    "high": self._to_float(parts[3]),
+                    "low": self._to_float(parts[4]),
+                    "volume": self._to_float(parts[5]),
+                    "adj_close": self._to_float(parts[2]),
+                    "dividend": None,
+                    "split_ratio": None,
+                }
+            )
+
+        normalized.sort(key=lambda row: row["date"] or "")
+        return normalized
+
+    def _fetch_with_baostock(self, request: HistoricalPriceRequest) -> list[dict]:
+        market = self._infer_market(request.ticker)
+        if market != "CN":
+            return []
+
+        try:
+            import baostock as bs
+        except ImportError:
+            return []
+
+        code = self._to_baostock_code(request.ticker)
+        if code is None:
+            return []
+
+        try:
+            login_result = bs.login()
+        except Exception:
+            return []
+        if getattr(login_result, "error_code", "0") not in {"0", 0, None}:
+            return []
+
+        try:
+            query_result = bs.query_history_k_data_plus(
+                code,
+                "date,open,high,low,close,volume",
+                start_date=request.start_date or "1990-01-01",
+                end_date=request.end_date or date.today().isoformat(),
+                frequency="d",
+                adjustflag="3",
+            )
+        except Exception:
+            try:
+                bs.logout()
+            except Exception:
+                pass
+            return []
+
+        rows: list[dict] = []
+        try:
+            if getattr(query_result, "error_code", "0") not in {"0", 0, None}:
+                return []
+            while query_result.next():
+                record = query_result.get_row_data()
+                if not record or len(record) < 6:
+                    continue
+                rows.append(
+                    {
+                        "date": record[0],
+                        "symbol": request.ticker.upper(),
+                        "open": self._to_float(record[1]),
+                        "high": self._to_float(record[2]),
+                        "low": self._to_float(record[3]),
+                        "close": self._to_float(record[4]),
+                        "volume": self._to_float(record[5]),
+                        "adj_close": self._to_float(record[4]),
+                        "dividend": None,
+                        "split_ratio": None,
+                    }
+                )
+        finally:
+            try:
+                bs.logout()
+            except Exception:
+                pass
+
+        rows.sort(key=lambda row: row["date"] or "")
+        return rows
+
     def _fetch_with_stockanalysis(self, request: HistoricalPriceRequest) -> list[dict]:
         market = self._infer_market(request.ticker)
         if market != "HK":
@@ -435,8 +614,16 @@ class OpenBBClient:
         upper = ticker.upper()
         if upper.endswith(".HK"):
             return "HK"
-        if upper.endswith(".SS") or upper.endswith(".SZ") or upper.endswith(".SH"):
+        if upper.endswith(".SS") or upper.endswith(".SZ") or upper.endswith(".SH") or upper.endswith(".BJ"):
             return "CN"
+        return None
+
+    def _to_baostock_code(self, ticker: str) -> str | None:
+        upper = ticker.strip().upper()
+        if upper.endswith(".SS") or upper.endswith(".SH"):
+            return f"sh.{upper.split('.')[0]}"
+        if upper.endswith(".SZ"):
+            return f"sz.{upper.split('.')[0]}"
         return None
 
     def _normalize_percent(self, value: Any) -> float | None:
