@@ -4,6 +4,10 @@ Personal Quant Workbench is a local-first daily review and model screening platf
 
 It focuses on one thing: after the market close, refresh the data, run the models, generate actionable review output, and let the user make better next-day decisions from one place.
 
+## English UI Preview
+
+![English homepage UI](docs/assets/dashboard-home-en.png)
+
 ## Positioning
 
 - Not a broker
