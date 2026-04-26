@@ -1,8 +1,19 @@
 # Personal Quant Workbench
 
+Local-first post-close research, screening, and review workspace for amateur stock traders.
+
 Personal Quant Workbench is a local-first daily review and model screening platform for amateur stock traders.
 
 It focuses on one thing: after the market close, refresh the data, run the models, generate actionable review output, and let the user make better next-day decisions from one place.
+
+## Highlights
+
+- Action-first dashboard for watchlist, holdings, jobs, and next-day candidates
+- LightGBM multifactor scoring plus template-driven and multi-model screening
+- Watchlist and portfolio review flows with `HOLD`, `REVIEW`, `TRIM`, and `EXIT` suggestions
+- Precomputed snapshots and background jobs instead of heavy page-time calculations
+- AI daily reports with portfolio review, full-market ideas, and social signal cross-validation
+- A-share and U.S. market support on one local-first workflow
 
 ## English UI Preview
 
