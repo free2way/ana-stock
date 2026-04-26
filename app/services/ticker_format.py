@@ -61,4 +61,11 @@ def market_ticker_candidates(ticker: str, market: str | None) -> list[str]:
 
 
 def provider_ticker_candidates(ticker: str, market: str | None) -> list[str]:
-    return market_ticker_candidates(ticker, market)
+    candidates = market_ticker_candidates(ticker, market)
+    market_value = (market or "").strip().upper()
+    normalized = candidates[0] if candidates else normalize_ticker_for_market(ticker, market)
+    if market_value == "US" and "." in normalized:
+        dashed = normalized.replace(".", "-")
+        if dashed not in candidates:
+            candidates.append(dashed)
+    return candidates

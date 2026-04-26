@@ -158,8 +158,6 @@ http://127.0.0.1:8000/dashboard
 - [项目介绍（中文）](docs/project-introduction-zh.md)
 - [产品目标方案（中文）](docs/amateur-quant-workbench-roadmap-zh.md)
 - [验收清单（中文）](docs/amateur-quant-workbench-acceptance-checklist-zh.md)
-- [PostgreSQL 迁移说明（中文）](docs/postgresql-migration-zh.md)
-- [Mac mini + Cloudflare Tunnel 部署说明](docs/macmini-cloudflare-tunnel.md)
 
 ## Current Status
 

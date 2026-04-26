@@ -40,8 +40,12 @@ def refresh_watchlist_metadata() -> dict:
                 name=record.get("name"),
                 market=record.get("market"),
                 exchange=record.get("exchange"),
+                sector=record.get("sector"),
+                industry=record.get("industry"),
                 overwrite_name=live_name_found or (fallback_record is not None and (symbol.market or "") in {"HK", "CN"}),
                 overwrite_exchange=live_exchange_found or (fallback_record is not None and (symbol.market or "") in {"HK", "CN"}),
+                overwrite_sector=bool(record.get("sector")),
+                overwrite_industry=bool(record.get("industry")),
             )
             if updated_symbol is None:
                 continue

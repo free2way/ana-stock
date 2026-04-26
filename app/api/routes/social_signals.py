@@ -118,6 +118,51 @@ def social_signals_page(
         f"<option value='{_h(item.get('handle'), quote=True)}' {'selected' if hot_handle == str(item.get('handle') or '') else ''}>{_h(item.get('handle') or '-')}</option>"
         for item in summary.get("accounts", [])
     )
+    tracked_account_count = len(summary.get("accounts") or [])
+    poll_button_label = (
+        (f"立即检查 {tracked_account_count} 个账号" if tracked_account_count > 0 else "立即检查已追踪账号")
+        if lang == "zh"
+        else (f"Check {tracked_account_count} accounts now" if tracked_account_count > 0 else "Check tracked accounts now")
+    )
+    hot_mentions_count = len(summary.get("hot_mentions_24h") or [])
+    resonance_count = len(summary.get("resonance_24h") or [])
+    actionable_count = len(summary.get("actionable") or [])
+    mention_count = len(summary.get("mentions") or [])
+    social_overview_html = (
+        f"""
+          <section class="card" style="margin-bottom:16px;padding:18px 18px 14px;">
+            <div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;">
+              <div>
+                <div class="eyebrow">{'社交总览' if lang == 'zh' else 'Social Overview'}</div>
+                <div style="font-size:28px;font-weight:900;letter-spacing:-0.03em;">{tracked_account_count}</div>
+                <div class="muted">{(f'已追踪账号 {tracked_account_count} · 近 24 小时提及 {mention_count}' if lang == 'zh' else f'Tracked accounts {tracked_account_count} · 24h mentions {mention_count}')}</div>
+              </div>
+              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;flex:1;min-width:min(100%,760px);">
+                <article style="border:1px solid var(--line);border-radius:16px;padding:14px 15px;background:rgba(15,24,35,0.58);">
+                  <div class="eyebrow">{'热点候选' if lang == 'zh' else 'Hot Candidates'}</div>
+                  <div style="margin-top:6px;font-size:22px;font-weight:900;">{hot_mentions_count}</div>
+                  <div class="muted">{'近 24 小时可聚焦股票' if lang == 'zh' else 'Focused names in the last 24h'}</div>
+                </article>
+                <article style="border:1px solid var(--line);border-radius:16px;padding:14px 15px;background:rgba(15,24,35,0.58);">
+                  <div class="eyebrow">{'社交共振' if lang == 'zh' else 'Resonance'}</div>
+                  <div style="margin-top:6px;font-size:22px;font-weight:900;">{resonance_count}</div>
+                  <div class="muted">{'多账号同时提及的股票' if lang == 'zh' else 'Names mentioned by multiple accounts'}</div>
+                </article>
+                <article style="border:1px solid var(--line);border-radius:16px;padding:14px 15px;background:rgba(15,24,35,0.58);">
+                  <div class="eyebrow">{'高优先级' if lang == 'zh' else 'High Priority'}</div>
+                  <div style="margin-top:6px;font-size:22px;font-weight:900;">{actionable_count}</div>
+                  <div class="muted">{'已通过模型验证的社交信号' if lang == 'zh' else 'Social ideas validated by the model'}</div>
+                </article>
+                <article style="border:1px solid var(--line);border-radius:16px;padding:14px 15px;background:rgba(15,24,35,0.58);">
+                  <div class="eyebrow">{'轮询状态' if lang == 'zh' else 'Polling Status'}</div>
+                  <div style="margin-top:6px;font-size:22px;font-weight:900;">{int(poll_status.get('last_new_mentions') or 0)}</div>
+                  <div class="muted">{(f'上次新增提及 {int(poll_status.get("last_new_mentions") or 0)} · 每 30 分钟自动检查' if lang == 'zh' else f'Last new mentions {int(poll_status.get("last_new_mentions") or 0)} · Auto-check every 30 min')}</div>
+                </article>
+              </div>
+            </div>
+          </section>
+        """
+    )
     hot_mentions_html = "".join(
         "<div class='list-row'>"
         f"<div><div class='ticker'><a href='/insights/{_h(item.get('ticker'), quote=True)}?lang={lang}'>{_h(item.get('ticker'))}</a> · {_h(item.get('name') or item.get('ticker'))}</div>"
@@ -200,13 +245,14 @@ def social_signals_page(
           <main class="main"><div class="wrap">
             {banner}
             <section class="hero">
-              <article class="card"><span class="eyebrow">X Signal Desk</span><h1>{'X 账户自动验证台' if lang == 'zh' else 'X Account Auto Validation'}</h1><p class="lead">{'已追踪账号：' if lang == 'zh' else 'Tracked account: '} {_h(tracked_handles)}</p><p class="lead">{'系统每 30 分钟检查追踪账号，自动抽取帖子里的股票，判断账号观点方向，再和模型信号、自选股、持仓股交叉验证。美股 cashtag 如 $TSLA 会自动按 US 股票处理。' if lang == 'zh' else 'The system checks tracked accounts every 30 minutes, extracts ticker mentions, infers account view, then validates against model signals, watchlist, and portfolio. US cashtags such as $TSLA are treated as US stocks automatically.'}</p></article>
+              <article class="card"><span class="eyebrow">X Signal Desk</span><h1>{'X 账户自动验证台' if lang == 'zh' else 'X Account Auto Validation'}</h1><p class="lead">{('已追踪账号' if lang == 'zh' else 'Tracked accounts')} {tracked_account_count} · {_h(tracked_handles)}</p><p class="lead">{'系统每 30 分钟检查追踪账号，自动抽取帖子里的股票，判断账号观点方向，再和模型信号、自选股、持仓股交叉验证。美股 cashtag 如 $TSLA 会自动按 US 股票处理。' if lang == 'zh' else 'The system checks tracked accounts every 30 minutes, extracts ticker mentions, infers account view, then validates against model signals, watchlist, and portfolio. US cashtags such as $TSLA are treated as US stocks automatically.'}</p></article>
               <article class="card"><span class="eyebrow">{'自动轮询状态' if lang == 'zh' else 'Auto Poll Status'}</span><div class="stack">
                 <div class="list-row"><div><div class="ticker">{'状态' if lang == 'zh' else 'Status'}</div><div class="muted">{_poll_status_text(poll_status, lang)}</div></div><div class="score">{int(poll_status.get('last_new_mentions') or 0)}</div></div>
                 <div class="muted">{'上次运行' if lang == 'zh' else 'Last run'}: {_h(poll_status.get('last_run_at') or '-')}</div>
-                <form action="/social-signals/poll/run" method="post"><input type="hidden" name="lang" value="{lang}" /><button type="submit">{'立即检查 3 个账号' if lang == 'zh' else 'Check accounts now'}</button></form>
+                <form action="/social-signals/poll/run" method="post"><input type="hidden" name="lang" value="{lang}" /><button type="submit">{poll_button_label}</button></form>
               </div></article>
             </section>
+            {social_overview_html}
             <section class="grid">
               <article class="card">
                 <span class="eyebrow">{'追踪账号' if lang == 'zh' else 'Tracked Accounts'}</span>

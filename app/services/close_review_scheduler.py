@@ -10,12 +10,16 @@ from app.services.auto_analysis import auto_analysis_service
 from app.services.cn_market_universe import refresh_cn_market_data_daily, refresh_cn_market_data_lake_only
 from app.services.focus_pool import load_today_focus_pool
 from app.services.market_lake import list_lake_symbols
+from app.services.model_selection_guidance import save_model_selection_guidance_snapshots
 from app.services.nlp_snapshots import NEWS_ENRICHMENT_JOB_TYPE, refresh_nlp_snapshots
 from app.services.repository import AppSettingRepository, DataJobRepository, PredictionRepository, WatchlistRepository
 from app.services.screener_snapshots import (
+    CORE_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
     FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES,
     FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
+    REST_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
     WATCHLIST_PRECOMPUTE_TEMPLATES,
+    refresh_precomputed_multi_screener_snapshots,
     refresh_precomputed_screener_snapshots,
 )
 from app.services.technical_snapshot_cache import rebuild_technical_snapshots
@@ -40,13 +44,17 @@ CN_SIGNAL_TRAIN_JOB_TYPE = "train_cn_signals"
 CN_FUNDAMENTAL_SYNC_JOB_TYPE = "sync_cn_fundamentals"
 CN_CONCEPT_SYNC_JOB_TYPE = "sync_cn_concepts"
 SCREENER_PRECOMPUTE_JOB_TYPE = "screener_precompute"
+SCREENER_PRECOMPUTE_CORE_JOB_TYPE = "screener_precompute_core"
+SCREENER_PRECOMPUTE_COMBO_JOB_TYPE = "screener_precompute_combos"
+SCREENER_PRECOMPUTE_REST_JOB_TYPE = "screener_precompute_rest"
+MODEL_SELECTION_GUIDANCE_JOB_TYPE = "model_selection_guidance_snapshot"
 MARKET_SNAPSHOT_JOB_TYPE = "market_snapshot_refresh"
 SH_TZ = ZoneInfo("Asia/Shanghai")
 
 DEFAULT_CLOSE_REVIEW_CONFIG = {
     "enabled": False,
-    "run_hour": 18,
-    "run_minute": 0,
+    "run_hour": 20,
+    "run_minute": 30,
     "provider": "auto",
     "days_back": 7,
     "overlap_days": 3,
@@ -341,7 +349,12 @@ class CloseReviewSchedulerService:
             with SessionLocal() as db:
                 job_repo = DataJobRepository(db)
                 job_repo.complete_stale_running_jobs(
-                    job_types=[SCREENER_PRECOMPUTE_JOB_TYPE],
+                    job_types=[
+                        SCREENER_PRECOMPUTE_JOB_TYPE,
+                        SCREENER_PRECOMPUTE_CORE_JOB_TYPE,
+                        SCREENER_PRECOMPUTE_COMBO_JOB_TYPE,
+                        SCREENER_PRECOMPUTE_REST_JOB_TYPE,
+                    ],
                     stale_after_hours=1,
                     message_prefix="Close-review cleanup closed a stale screener precompute job.",
                 )
@@ -354,61 +367,31 @@ class CloseReviewSchedulerService:
                     message="Precomputing screener model results after close review.",
                 )
                 precompute_job_id = job.id
-            core_cn_templates = ["lightgbm_top_picks", "next_tesla_swing", "technical_momentum"]
-            remaining_cn_templates = [
-                template for template in FULL_MARKET_CN_PRECOMPUTE_TEMPLATES if template not in core_cn_templates
-            ]
-            batch_plan = [
-                {
-                    "label": "cn_full_market_core",
-                    "template_keys": core_cn_templates,
-                    "universes": ["full_market"],
-                    "include_watchlist": False,
-                },
-                {
-                    "label": "cn_full_market_rest",
-                    "template_keys": remaining_cn_templates,
-                    "universes": ["full_market"],
-                    "include_watchlist": False,
-                },
-                {
-                    "label": "watchlist",
-                    "template_keys": WATCHLIST_PRECOMPUTE_TEMPLATES,
-                    "universes": ["watchlist"],
-                    "include_watchlist": True,
-                },
-                {
-                    "label": "full_market_all",
-                    "template_keys": FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES,
-                    "universes": ["full_market"],
-                    "include_watchlist": False,
-                },
-            ]
             batch_results: list[dict] = []
             total_created = 0
             total_failed = 0
-            for batch in batch_plan:
-                template_keys = [key for key in (batch.get("template_keys") or []) if key]
-                if not template_keys:
+            snapshots_created: list[dict] = []
+            failed_items: list[dict] = []
+            for runner in (
+                self._run_screener_precompute_core_job_safe,
+                self._run_screener_precompute_combo_job_safe,
+                self._run_screener_precompute_rest_job_safe,
+            ):
+                batch_result = runner(source_job_id=source_job_id, parent_job_id=precompute_job_id)
+                if not batch_result:
                     continue
-                with SessionLocal() as db:
-                    batch_result = refresh_precomputed_screener_snapshots(
-                        db,
-                        source_job_id=source_job_id,
-                        markets=["CN"],
-                        include_watchlist=bool(batch.get("include_watchlist")),
-                        lake_only=False,
-                        template_keys=template_keys,
-                        universes=batch.get("universes") or None,
-                    )
-                batch_result["batch"] = batch["label"]
                 batch_results.append(batch_result)
                 total_created += int(batch_result.get("count", 0) or 0)
                 total_failed += int(batch_result.get("failed_count", 0) or 0)
+                snapshots_created.extend(list(batch_result.get("snapshots_created") or []))
+                failed_items.extend(list(batch_result.get("failed_templates") or []))
+                failed_items.extend(list(batch_result.get("failed_presets") or []))
             result = {
                 "status": "success" if total_created > 0 else "failed",
                 "count": total_created,
                 "failed_count": total_failed,
+                "snapshots_created": snapshots_created,
+                "failed_templates": failed_items,
                 "batches": batch_results,
             }
             with SessionLocal() as db:
@@ -439,16 +422,217 @@ class CloseReviewSchedulerService:
                 pass
             return
 
+    def _run_screener_precompute_core_job_safe(self, *, source_job_id: int, parent_job_id: int | None = None) -> dict:
+        def _runner() -> dict:
+            with SessionLocal() as db:
+                return refresh_precomputed_screener_snapshots(
+                    db,
+                    source_job_id=source_job_id,
+                    markets=["CN"],
+                    include_watchlist=False,
+                    lake_only=False,
+                    template_keys=CORE_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
+                    universes=["full_market"],
+                )
+
+        return self._run_named_screener_precompute_job(
+            job_type=SCREENER_PRECOMPUTE_CORE_JOB_TYPE,
+            source_job_id=source_job_id,
+            parent_job_id=parent_job_id,
+            message="Precomputing core CN screener templates after close review.",
+            runner=_runner,
+        )
+
+    def _run_screener_precompute_combo_job_safe(self, *, source_job_id: int, parent_job_id: int | None = None) -> dict:
+        def _runner() -> dict:
+            with SessionLocal() as db:
+                return refresh_precomputed_multi_screener_snapshots(
+                    db,
+                    source_job_id=source_job_id,
+                    markets=["CN"],
+                )
+
+        return self._run_named_screener_precompute_job(
+            job_type=SCREENER_PRECOMPUTE_COMBO_JOB_TYPE,
+            source_job_id=source_job_id,
+            parent_job_id=parent_job_id,
+            message="Precomputing multi-model CN confluence snapshots after close review.",
+            runner=_runner,
+        )
+
+    def _run_screener_precompute_rest_job_safe(self, *, source_job_id: int, parent_job_id: int | None = None) -> dict:
+        batch_results: list[dict] = []
+        total_created = 0
+        total_failed = 0
+        batch_plan = [
+            {
+                "label": "cn_full_market_rest",
+                "template_keys": REST_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
+                "universes": ["full_market"],
+                "include_watchlist": False,
+            },
+            {
+                "label": "watchlist",
+                "template_keys": WATCHLIST_PRECOMPUTE_TEMPLATES,
+                "universes": ["watchlist"],
+                "include_watchlist": True,
+            },
+            {
+                "label": "full_market_all",
+                "template_keys": FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES,
+                "universes": ["full_market"],
+                "include_watchlist": False,
+            },
+        ]
+
+        def _runner() -> dict:
+            nonlocal total_created, total_failed
+            for batch in batch_plan:
+                template_keys = [key for key in (batch.get("template_keys") or []) if key]
+                if not template_keys:
+                    continue
+                with SessionLocal() as db:
+                    batch_result = refresh_precomputed_screener_snapshots(
+                        db,
+                        source_job_id=source_job_id,
+                        markets=["CN"],
+                        include_watchlist=bool(batch.get("include_watchlist")),
+                        lake_only=False,
+                        template_keys=template_keys,
+                        universes=batch.get("universes") or None,
+                    )
+                batch_result["batch"] = batch["label"]
+                batch_results.append(batch_result)
+                total_created += int(batch_result.get("count", 0) or 0)
+                total_failed += int(batch_result.get("failed_count", 0) or 0)
+            return {
+                "status": "success" if total_created > 0 else "failed",
+                "count": total_created,
+                "failed_count": total_failed,
+                "batches": batch_results,
+            }
+
+        return self._run_named_screener_precompute_job(
+            job_type=SCREENER_PRECOMPUTE_REST_JOB_TYPE,
+            source_job_id=source_job_id,
+            parent_job_id=parent_job_id,
+            message="Precomputing secondary CN screener templates after close review.",
+            runner=_runner,
+        )
+
+    def _run_named_screener_precompute_job(
+        self,
+        *,
+        job_type: str,
+        source_job_id: int,
+        parent_job_id: int | None,
+        message: str,
+        runner,
+    ) -> dict:
+        child_job_id: int | None = None
+        try:
+            with SessionLocal() as db:
+                job_repo = DataJobRepository(db)
+                job_repo.complete_stale_running_jobs(
+                    job_types=[job_type],
+                    stale_after_hours=1,
+                    message_prefix="Close-review cleanup closed a stale screener child precompute job.",
+                )
+                if job_repo.has_running_job(job_type):
+                    return {"status": "skipped", "count": 0, "failed_count": 0, "job_type": job_type}
+                job = job_repo.create_job(
+                    job_type=job_type,
+                    status="running",
+                    params={
+                        "source_job_id": source_job_id,
+                        "depends_on": [parent_job_id] if parent_job_id is not None else [],
+                        "pipeline_step": job_type,
+                    },
+                    message=message,
+                )
+                child_job_id = job.id
+            result = runner()
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(
+                    child_job_id,
+                    status="success" if int(result.get("count", 0) or 0) > 0 else "failed",
+                    message=message,
+                    result=result,
+                )
+            return {"job_type": job_type, **result}
+        except Exception as exc:
+            try:
+                if child_job_id is not None:
+                    with SessionLocal() as db:
+                        DataJobRepository(db).complete_job(
+                            child_job_id,
+                            status="failed",
+                            message=f"{message} ({exc})",
+                        )
+            except Exception:
+                pass
+            return {"job_type": job_type, "status": "failed", "count": 0, "failed_count": 1, "error": str(exc)}
+
     def _run_post_close_followups_safe(self, source_job_id: int) -> None:
         try:
             self._run_cn_signal_training_job_safe(source_job_id)
-            self._refresh_workspace_snapshots_safe(source_job_id)
             self._run_cn_fundamental_sync_job_safe(source_job_id)
             self._run_cn_concept_sync_job_safe(source_job_id)
             self._run_news_enrichment_job_safe(source_job_id)
             self._run_screener_precompute_job_safe(source_job_id)
+            self._run_model_selection_guidance_job_safe(source_job_id)
+            self._refresh_workspace_snapshots_safe(source_job_id)
             self._run_market_snapshot_job_safe(source_job_id)
         except Exception:
+            return
+
+    def _run_model_selection_guidance_job_safe(self, source_job_id: int) -> None:
+        guidance_job_id: int | None = None
+        try:
+            with SessionLocal() as db:
+                job_repo = DataJobRepository(db)
+                job_repo.complete_stale_running_jobs(
+                    job_types=[MODEL_SELECTION_GUIDANCE_JOB_TYPE],
+                    stale_after_hours=2,
+                    message_prefix="Close-review cleanup closed a stale model selection guidance job.",
+                )
+                if job_repo.has_running_job(MODEL_SELECTION_GUIDANCE_JOB_TYPE):
+                    return
+                job = job_repo.create_job(
+                    job_type=MODEL_SELECTION_GUIDANCE_JOB_TYPE,
+                    status="running",
+                    params={
+                        "source_job_id": source_job_id,
+                        "markets": ["CN"],
+                        "pipeline_step": "model_selection_guidance_snapshot",
+                    },
+                    message="Saving model selection guidance snapshot after screener precompute.",
+                )
+                guidance_job_id = job.id
+            with SessionLocal() as db:
+                snapshots = save_model_selection_guidance_snapshots(
+                    db,
+                    source_job_id=guidance_job_id,
+                    markets=["CN"],
+                )
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(
+                    guidance_job_id,
+                    status="success" if snapshots else "failed",
+                    message=f"Saved {len(snapshots)} model selection guidance snapshot(s) after close review.",
+                    result={"snapshots": snapshots, "count": len(snapshots), "markets": list(snapshots.keys())},
+                )
+        except Exception as exc:
+            try:
+                if guidance_job_id is not None:
+                    with SessionLocal() as db:
+                        DataJobRepository(db).complete_job(
+                            guidance_job_id,
+                            status="failed",
+                            message=f"Model selection guidance snapshot failed: {exc}",
+                        )
+            except Exception:
+                pass
             return
 
     def _run_cn_signal_training_job_safe(self, source_job_id: int) -> None:

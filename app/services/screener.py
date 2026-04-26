@@ -20,6 +20,7 @@ from app.services.repository import (
 from app.services.model_signal_summary import build_model_state, enrich_model_output, summarize_explanations
 from app.services.price_snapshot import load_latest_closes
 from app.services.technical_patterns import TechnicalPatternService
+from app.services.tradability_filter import evaluate_candidate_tradability
 from app.services.tradingview_client import TradingViewClient
 from app.services.tushare_client import TushareClient
 
@@ -397,6 +398,7 @@ class ScreenerService:
                 recent_snapshot_runs=recent_snapshot_runs,
                 min_snapshot_hits=min_snapshot_hits,
             )
+        results = self._apply_trade_readiness(results)
         results = self._apply_model_signal_filter(
             results,
             model_signal_filter=model_signal_filter,
@@ -515,7 +517,7 @@ class ScreenerService:
                 run.id,
                 market=market,
                 tickers=tickers,
-                limit=500 if universe == "full_market" else 240,
+                limit=2500 if universe == "full_market" else 240,
             )
             if not candidates:
                 return []
@@ -909,7 +911,7 @@ class ScreenerService:
                 )
             }
             if universe == "full_market" and market == "CN":
-                tickers = self._rank_cn_snapshot_candidates(tickers, cached_snapshot_map, limit=90)
+                tickers = self._rank_cn_snapshot_candidates(tickers, cached_snapshot_map, limit=180)
             model_repo = PredictionRepository(db)
             explanation_repo = PredictionExplanationRepository(db)
             trade_plan_repo = PredictionTradePlanRepository(db)
@@ -1212,6 +1214,7 @@ class ScreenerService:
             "debt_to_assets",
             "snapshot_hits",
             "model_signal_strength",
+            "trade_readiness_score",
         }
         if sort_by in numeric_fields:
             return sorted(
@@ -1256,14 +1259,41 @@ class ScreenerService:
             filtered.append(row)
         return filtered
 
+    def _apply_trade_readiness(self, results: list[dict]) -> list[dict]:
+        for row in results:
+            candidate = {
+                **row,
+                "score": row.get("score") or row.get("model_score") or row.get("model_confidence"),
+                "signal_label": row.get("model_signal_label") or row.get("signal_label"),
+                "signal_strength": row.get("model_signal_strength") or row.get("trend_score"),
+                "expected_drawdown_20d": row.get("model_expected_drawdown_20d") or row.get("expected_drawdown_20d"),
+                "entry_style": row.get("model_entry_style") or row.get("entry_style") or row.get("action_label"),
+                "risk_flags": row.get("risk_flags") or row.get("model_execution_tags") or [],
+            }
+            decision = evaluate_candidate_tradability(candidate)
+            decision_payload = asdict(decision)
+            diagnostics = decision_payload.pop("diagnostics", None)
+            for key, value in decision_payload.items():
+                if value is None:
+                    continue
+                if key == "risk_flags" and not value:
+                    continue
+                row[key] = value
+            if diagnostics:
+                row["tradability_diagnostics"] = diagnostics
+            if row.get("risk_flags") and not row.get("model_execution_tags"):
+                row["model_execution_tags"] = list(row.get("risk_flags") or [])
+        return results
+
     def _default_sort_key(self, row: dict) -> tuple:
+        readiness = -(row.get("trade_readiness_score") or 0)
         if row.get("dividend_yield") is not None:
             primary = -(row.get("dividend_yield") or 0)
         else:
             primary = -(row.get("roe_avg_3y") or row.get("trend_score") or 0)
         secondary = -(row.get("net_profit_yoy") or row.get("volume_ratio") or 0)
         market_rank = MARKET_SORT_ORDER.get(str(row.get("market") or "").upper(), 9)
-        return (market_rank, primary, secondary, row.get("ticker", ""))
+        return (market_rank, readiness, primary, secondary, row.get("ticker", ""))
 
     def _sortable_number(self, value) -> float:
         if value is None:

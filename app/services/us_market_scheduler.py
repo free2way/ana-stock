@@ -12,7 +12,7 @@ from app.services.screener_snapshots import refresh_precomputed_screener_snapsho
 from app.services.trainer import SignalTrainer
 from app.services.time_utils import app_now
 from app.services.us_market_universe import refresh_us_grouped_daily
-from app.services.workspace_snapshots import refresh_workspace_snapshots
+from app.services.workspace_snapshots import refresh_workspace_snapshots, save_market_workspace_snapshots
 
 
 US_MARKET_SCHEDULER_CONFIG_KEY = "us_market_scheduler_config"
@@ -250,6 +250,9 @@ class USMarketSchedulerService:
                 message=f"Precomputed {result.get('count', 0)} U.S. screener snapshot(s) after U.S. close refresh.",
                 result=result,
             )
+        if result.get("count", 0) > 0:
+            with SessionLocal() as db:
+                save_market_workspace_snapshots(db, source_job_id=job.id)
 
     def _prepare_run(self, trigger: str) -> tuple[dict, int]:
         with SessionLocal() as db:

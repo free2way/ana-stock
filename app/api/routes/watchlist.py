@@ -958,6 +958,63 @@ def watchlist_page(
             if source
         )
     _ensure_watchlist_execution_tags(items)
+    total_watchlist_names = len(items)
+    buy_ready_count = sum(
+        1
+        for item in items
+        if str((item.get("combined_analysis") or {}).get("decision") or "").upper() in {"BUY", "STRONG BUY"}
+    )
+    review_count = sum(
+        1
+        for item in items
+        if str((item.get("combined_analysis") or {}).get("decision") or "").upper() == "WATCH"
+    )
+    risk_tagged_count = sum(
+        1 for item in items if [str(tag).strip() for tag in (item.get("execution_tags") or []) if str(tag).strip()]
+    )
+    news_covered_count = sum(1 for item in items if int(item.get("news_headline_count") or 0) > 0)
+    synced_ready_count = sum(
+        1 for item in items if bool(item.get("sync_enabled")) and str(item.get("sync_status") or "").lower() == "success"
+    )
+    tracked_markets = " / ".join(
+        label for code, label in (("CN", "A股"), ("US", "美股"), ("HK", "港股"))
+        if any(str(item.get("market") or "").upper() == code for item in items)
+    ) or ("暂无市场" if lang == "zh" else "No active markets")
+    watchlist_overview_html = (
+        f"""
+          <section class="card" style="margin-bottom:16px;padding:18px 18px 14px;">
+            <div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;">
+              <div>
+                <div class="eyebrow">{'自选总览' if lang == 'zh' else 'Watchlist Overview'}</div>
+                <div style="font-size:28px;font-weight:900;letter-spacing:-0.03em;">{total_watchlist_names}</div>
+                <div class="muted">{'已跟踪股票' if lang == 'zh' else 'tracked names'} · {tracked_markets}</div>
+              </div>
+              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;flex:1;min-width:min(100%,760px);">
+                <article style="border:1px solid var(--line);border-radius:16px;padding:14px 15px;background:rgba(15,24,35,0.58);">
+                  <div class="eyebrow">{'处理队列' if lang == 'zh' else 'Action Queue'}</div>
+                  <div style="margin-top:6px;font-size:22px;font-weight:900;">{buy_ready_count + review_count}</div>
+                  <div class="muted">{f'优先复核 {buy_ready_count} · 继续观察 {review_count}' if lang == 'zh' else f'Review first {buy_ready_count} · Keep watching {review_count}'}</div>
+                </article>
+                <article style="border:1px solid var(--line);border-radius:16px;padding:14px 15px;background:rgba(15,24,35,0.58);">
+                  <div class="eyebrow">{'同步状态' if lang == 'zh' else 'Sync Status'}</div>
+                  <div style="margin-top:6px;font-size:22px;font-weight:900;">{synced_ready_count}</div>
+                  <div class="muted">{f'已就绪同步 {synced_ready_count} / {total_watchlist_names}' if lang == 'zh' else f'Sync ready {synced_ready_count} / {total_watchlist_names}'}</div>
+                </article>
+                <article style="border:1px solid var(--line);border-radius:16px;padding:14px 15px;background:rgba(15,24,35,0.58);">
+                  <div class="eyebrow">{'风险标记' if lang == 'zh' else 'Risk Tags'}</div>
+                  <div style="margin-top:6px;font-size:22px;font-weight:900;">{risk_tagged_count}</div>
+                  <div class="muted">{'带执行提醒的自选股票' if lang == 'zh' else 'Names carrying execution warnings'}</div>
+                </article>
+                <article style="border:1px solid var(--line);border-radius:16px;padding:14px 15px;background:rgba(15,24,35,0.58);">
+                  <div class="eyebrow">{'新闻覆盖' if lang == 'zh' else 'News Coverage'}</div>
+                  <div style="margin-top:6px;font-size:22px;font-weight:900;">{news_covered_count}</div>
+                  <div class="muted">{f'有新闻覆盖 {news_covered_count} / {total_watchlist_names}' if lang == 'zh' else f'News covered {news_covered_count} / {total_watchlist_names}'}</div>
+                </article>
+              </div>
+            </div>
+          </section>
+        """
+    )
     if news_view == "risk":
         display_items = [item for item in items if _is_news_risk_item(item)]
     elif news_view == "opportunity":
@@ -1335,6 +1392,8 @@ def watchlist_page(
               </div>
             </article>
           </section>
+
+          {watchlist_overview_html}
 
           <section class="card" style="margin-bottom:16px;">
             <div class="eyebrow">{'数据同步' if lang == 'zh' else 'Data Sync'}</div>

@@ -32,11 +32,19 @@ from app.services.job_response import build_job_payload, complete_job_and_build_
 from app.services.market_sync import sync_market_data
 from app.services.market_lake import list_lake_symbols, query_us_daily_summary
 from app.services.market_csv_cleanup import cleanup_market_csv_files
+from app.services.model_selection_guidance import save_model_selection_guidance_snapshots
 from app.services.model_output_importer import ExternalModelOutputImporter
 from app.services.push_notifications import PushNotificationService
 from app.services.repository import DataJobRepository, PriceSyncStateRepository
 from app.services.sample_data import seed_sample_data
-from app.services.screener_snapshots import refresh_precomputed_screener_snapshots
+from app.services.screener_snapshots import (
+    CORE_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
+    FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES,
+    REST_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
+    WATCHLIST_PRECOMPUTE_TEMPLATES,
+    refresh_precomputed_multi_screener_snapshots,
+    refresh_precomputed_screener_snapshots,
+)
 from app.services.technical_snapshot_cache import rebuild_technical_snapshots
 from app.services.trainer import SignalTrainer
 from app.services.us_market_universe import refresh_us_grouped_daily
@@ -142,6 +150,26 @@ def _result_status(result: dict, *, partial_default: bool = True) -> str:
     return "partial" if partial_default else "success"
 
 
+def _combine_screener_precompute_batches(*batch_results: dict) -> dict:
+    valid_batches = [batch for batch in batch_results if batch]
+    total_created = sum(int(batch.get("count", 0) or 0) for batch in valid_batches)
+    total_failed = sum(int(batch.get("failed_count", 0) or 0) for batch in valid_batches)
+    snapshots_created: list[dict] = []
+    failed_items: list[dict] = []
+    for batch in valid_batches:
+        snapshots_created.extend(list(batch.get("snapshots_created") or []))
+        failed_items.extend(list(batch.get("failed_templates") or []))
+        failed_items.extend(list(batch.get("failed_presets") or []))
+    return {
+        "status": "success" if total_created > 0 and total_failed == 0 else "partial" if total_created > 0 else "failed",
+        "count": total_created,
+        "failed_count": total_failed,
+        "snapshots_created": snapshots_created,
+        "failed_templates": failed_items,
+        "batches": valid_batches,
+    }
+
+
 @router.get("/templates")
 def job_templates(request: Request):
     if not is_authenticated(request):
@@ -155,12 +183,17 @@ def job_templates(request: Request):
         {"job_type": "refresh_cn_market_data_lake_only", "description": "Refresh A-share market prices directly into Parquet lake without generating CSV files."},
         {"job_type": "cn_close_review", "description": "Run the post-close CN incremental refresh, rebuild, AI review, and recommendations pipeline."},
         {"job_type": "train_cn_signals", "description": "Train the LightGBM A-share multifactor signal model from the local CN Parquet market lake and write predictions."},
+        {"job_type": "screener_precompute", "description": "Run the full staged A-share screener precompute pipeline after CN close review."},
+        {"job_type": "screener_precompute_core", "description": "Precompute the core A-share screener templates used by the dashboard and model screens first."},
+        {"job_type": "screener_precompute_combos", "description": "Precompute the core multi-model A-share confluence presets after the base templates are ready."},
+        {"job_type": "screener_precompute_rest", "description": "Precompute the remaining A-share screener templates and watchlist snapshots in the background."},
+        {"job_type": "model_selection_guidance_snapshot", "description": "Persist the latest model-usage guidance snapshot so Dashboard and Model Performance can read it without full-market recompute."},
         {"job_type": "social_signal_poll", "description": "Poll tracked X accounts every 30 minutes and parse ticker mentions automatically."},
         {"job_type": "social_us_price_sync", "description": "Automatically sync Alpaca-backed U.S. prices for tickers mentioned in imported X posts."},
         {"job_type": "precompute_us_screeners", "description": "Precompute U.S. screener snapshots after U.S. close using the locally synced U.S. symbol pool."},
         {"job_type": "refresh_us_grouped_daily", "description": "Refresh U.S. grouped daily EOD bars from Polygon for full-market U.S. scans."},
         {"job_type": "refresh_us_grouped_daily_range", "description": "Refresh a U.S. grouped daily date range directly into Parquet lake without per-symbol CSV files."},
-        {"job_type": "train_us_signals", "description": "Train the LightGBM U.S. multifactor signal model from the local U.S. Parquet market lake and write predictions."},
+        {"job_type": "us_signal_train", "description": "Train the LightGBM U.S. multifactor signal model from the local U.S. Parquet market lake and write predictions."},
         {"job_type": "cleanup_market_csv", "description": "Dry-run or delete market CSV files that are already covered by Parquet market lake."},
         {"job_type": "rebuild_technical_snapshots", "description": "Cache technical pattern snapshots for faster full-market scans."},
         {"job_type": "sync_cn_fundamentals", "description": "Fetch and persist A-share fundamentals through the unified fundamental provider layer."},
@@ -388,6 +421,244 @@ async def run_precompute_us_screeners(request: Request, db: Session = Depends(ge
         return _maybe_redirect(redirect_to, payload)
 
 
+@router.post("/precompute-cn-screeners")
+async def run_precompute_cn_screeners(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type="screener_precompute",
+        status="running",
+        params={"markets": ["CN"], "universes": ["full_market", "watchlist"], "mode": "staged"},
+    )
+    try:
+        result_core = refresh_precomputed_screener_snapshots(
+            db,
+            source_job_id=job.id,
+            markets=["CN"],
+            include_watchlist=False,
+            lake_only=False,
+            template_keys=CORE_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
+            universes=["full_market"],
+        )
+        result_combos = refresh_precomputed_multi_screener_snapshots(
+            db,
+            source_job_id=job.id,
+            markets=["CN"],
+        )
+        result_full = refresh_precomputed_screener_snapshots(
+            db,
+            source_job_id=job.id,
+            markets=["CN"],
+            include_watchlist=False,
+            lake_only=False,
+            template_keys=REST_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES + FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES,
+            universes=["full_market"],
+        )
+        result_watchlist = refresh_precomputed_screener_snapshots(
+            db,
+            source_job_id=job.id,
+            markets=["CN"],
+            include_watchlist=True,
+            lake_only=False,
+            template_keys=WATCHLIST_PRECOMPUTE_TEMPLATES,
+            universes=["watchlist"],
+        )
+        result_rest = {
+            "status": "success"
+            if int(result_full.get("count", 0) or 0) + int(result_watchlist.get("count", 0) or 0) > 0
+            else "failed",
+            "count": int(result_full.get("count", 0) or 0) + int(result_watchlist.get("count", 0) or 0),
+            "failed_count": int(result_full.get("failed_count", 0) or 0) + int(result_watchlist.get("failed_count", 0) or 0),
+            "snapshots_created": list(result_full.get("snapshots_created") or []) + list(result_watchlist.get("snapshots_created") or []),
+            "failed_templates": list(result_full.get("failed_templates") or []) + list(result_watchlist.get("failed_templates") or []),
+            "batches": [
+                {"batch": "cn_full_market_rest", **result_full},
+                {"batch": "watchlist", **result_watchlist},
+            ],
+        }
+        result = _combine_screener_precompute_batches(
+            {"batch": "core", **result_core},
+            {"batch": "combos", **result_combos},
+            {"batch": "rest", **result_rest},
+        )
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status=_result_status(result),
+            message=(
+                f"Staged CN screener precompute finished: {result.get('count', 0)} snapshot(s)"
+                + (f", {result.get('failed_count', 0)} failure(s)." if result.get("failed_count", 0) else ".")
+            ),
+            **{key: value for key, value in result.items() if key not in {"status", "message"}},
+        )
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
+        return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/precompute-cn-screeners-core")
+async def run_precompute_cn_screeners_core(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type="screener_precompute_core",
+        status="running",
+        params={"markets": ["CN"], "universes": ["full_market"]},
+    )
+    try:
+        result = refresh_precomputed_screener_snapshots(
+            db,
+            source_job_id=job.id,
+            markets=["CN"],
+            include_watchlist=False,
+            lake_only=False,
+            template_keys=CORE_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
+            universes=["full_market"],
+        )
+        status = _result_status(result)
+        extra = {key: value for key, value in result.items() if key not in {"status", "message"}}
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status=status,
+            message=f"Precomputed {result.get('count', 0)} core CN screener snapshot(s).",
+            **extra,
+        )
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
+        return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/precompute-cn-screeners-combos")
+async def run_precompute_cn_screeners_combos(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type="screener_precompute_combos",
+        status="running",
+        params={"markets": ["CN"], "universes": ["full_market"]},
+    )
+    try:
+        result = refresh_precomputed_multi_screener_snapshots(
+            db,
+            source_job_id=job.id,
+            markets=["CN"],
+        )
+        status = _result_status(result)
+        extra = {key: value for key, value in result.items() if key not in {"status", "message"}}
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status=status,
+            message=f"Precomputed {result.get('count', 0)} CN multi-model screener snapshot(s).",
+            **extra,
+        )
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
+        return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/precompute-cn-screeners-rest")
+async def run_precompute_cn_screeners_rest(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type="screener_precompute_rest",
+        status="running",
+        params={"markets": ["CN"], "universes": ["full_market", "watchlist"]},
+    )
+    try:
+        result_full = refresh_precomputed_screener_snapshots(
+            db,
+            source_job_id=job.id,
+            markets=["CN"],
+            include_watchlist=False,
+            lake_only=False,
+            template_keys=REST_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES + FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES,
+            universes=["full_market"],
+        )
+        result_watchlist = refresh_precomputed_screener_snapshots(
+            db,
+            source_job_id=job.id,
+            markets=["CN"],
+            include_watchlist=True,
+            lake_only=False,
+            template_keys=WATCHLIST_PRECOMPUTE_TEMPLATES,
+            universes=["watchlist"],
+        )
+        result = {
+            "status": "success" if int(result_full.get("count", 0) or 0) + int(result_watchlist.get("count", 0) or 0) > 0 else "failed",
+            "count": int(result_full.get("count", 0) or 0) + int(result_watchlist.get("count", 0) or 0),
+            "failed_count": int(result_full.get("failed_count", 0) or 0) + int(result_watchlist.get("failed_count", 0) or 0),
+            "batches": [
+                {"batch": "cn_full_market_rest", **result_full},
+                {"batch": "watchlist", **result_watchlist},
+            ],
+        }
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status=_result_status(result),
+            message=f"Precomputed {result.get('count', 0)} secondary CN screener snapshot(s).",
+            **result,
+        )
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
+        return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/model-selection-guidance-snapshot")
+async def run_model_selection_guidance_snapshot(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    markets_raw = str(await _request_value(request, "markets", "")).strip()
+    market_raw = str(await _request_value(request, "market", "")).strip()
+    requested_markets = [
+        item.strip().upper()
+        for item in (markets_raw or market_raw or "CN").split(",")
+        if item.strip()
+    ] or ["CN"]
+    markets = [item for item in requested_markets if item in {"CN", "US", "ALL"}] or ["CN"]
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type="model_selection_guidance_snapshot",
+        status="running",
+        params={"markets": markets},
+    )
+    try:
+        snapshots = save_model_selection_guidance_snapshots(
+            db,
+            source_job_id=job.id,
+            markets=markets,
+        )
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status="success" if snapshots else "failed",
+            message=f"Saved {len(snapshots)} model selection guidance snapshot(s).",
+            markets=list(snapshots.keys()),
+            snapshots=snapshots,
+            count=len(snapshots),
+        )
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
+        return _maybe_redirect(redirect_to, payload)
+
+
 @router.post("/train-us-signals")
 async def run_train_us_signals(request: Request, db: Session = Depends(get_db_session)):
     if not is_authenticated(request):
@@ -401,7 +672,7 @@ async def run_train_us_signals(request: Request, db: Session = Depends(get_db_se
     us_tickers = sorted(list_lake_symbols(market="US"))
     job_repo = DataJobRepository(db)
     job = job_repo.create_job(
-        job_type="train_us_signals",
+        job_type="us_signal_train",
         status="running",
         params={
             "run_name": run_name,

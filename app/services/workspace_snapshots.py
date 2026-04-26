@@ -22,6 +22,7 @@ from app.services.portfolio_book import load_portfolio_positions
 from app.services.price_snapshot import load_latest_close, load_latest_closes
 from app.services.repository import (
     BacktestRepository,
+    DataJobRepository,
     DashboardReadRepository,
     ModelRunRepository,
     PredictionRepository,
@@ -33,6 +34,7 @@ from app.services.repository import (
 )
 from app.services.screener import ScreenerService
 from app.services.screener_snapshots import build_base_precompute_params, screener_snapshot_type
+from app.services.template_evaluation import resolve_template_group_label
 from app.services.time_utils import app_now_iso, app_today_iso
 
 
@@ -55,7 +57,130 @@ MARKET_HEATMAP_TEMPLATE_LABELS = {
     "cn_bollinger_squeeze_watch": "布林带收口",
     "cn_three_white_soldiers": "三连阳",
     "cn_volume_breakout": "底部放量突破",
+    "lightgbm_top_picks": "AI优选",
+    "next_tesla_swing": "成长爆发",
+    "global_growth_value": "成长价值",
+    "global_income_quality": "收益质量",
 }
+
+MARKET_HEATMAP_TEMPLATE_PREFIX = {
+    "technical_momentum": "动量",
+    "cn_bollinger_squeeze_watch": "收口",
+    "cn_three_white_soldiers": "连阳",
+    "cn_volume_breakout": "放量",
+    "lightgbm_top_picks": "模型",
+    "next_tesla_swing": "成长",
+    "global_growth_value": "价值",
+    "global_income_quality": "收益",
+}
+
+MARKET_HEATMAP_LABEL_ALIASES = {
+    "北交所 / BSE": "北交所",
+    "科创板 / STAR": "科创板",
+    "创业板 / ChiNext": "创业板",
+    "深主板 / SZSE Main": "深主板",
+    "沪主板 / SSE Main": "沪主板",
+    "A股其他 / CN Other": "A股其他",
+    "美股 ETF / US ETF": "美股ETF",
+    "美股医药 / US Healthcare": "美股医药",
+    "美股金融 / US Financials": "美股金融",
+    "美股能源材料 / US Energy & Materials": "美股能源材料",
+    "美股消费出行 / US Consumer & Mobility": "美股消费出行",
+    "美股科技 / US Tech": "美股科技",
+    "美股综合 / US General": "美股综合",
+    "Unclassified": "未分类",
+}
+
+MARKET_HEATMAP_TEMPLATE_PLAN = {
+    "CN": [
+        "technical_momentum",
+        "cn_bollinger_squeeze_watch",
+        "cn_three_white_soldiers",
+        "cn_volume_breakout",
+    ],
+    "US": [
+        "lightgbm_top_picks",
+        "next_tesla_swing",
+        "technical_momentum",
+        "global_growth_value",
+        "global_income_quality",
+    ],
+}
+
+MARKET_SNAPSHOT_BOARD_DEFS = [
+    {
+        "key": "leaders",
+        "market": "CN",
+        "template": "technical_momentum",
+        "title_en": "A-Share Momentum Leaders",
+        "title_zh": "A股强势榜",
+        "description_en": "Trend and volume leaders from the latest A-share close.",
+        "description_zh": "基于 A 股最新收盘数据筛出的趋势强股。",
+    },
+    {
+        "key": "squeeze",
+        "market": "CN",
+        "template": "cn_bollinger_squeeze_watch",
+        "title_en": "A-Share Squeeze Watch",
+        "title_zh": "A股收口榜",
+        "description_en": "A-share names with compressed Bollinger Bands and coiled price action.",
+        "description_zh": "A股里波动率收缩、价格待选择方向的候选股。",
+    },
+    {
+        "key": "three_white_soldiers",
+        "market": "CN",
+        "template": "cn_three_white_soldiers",
+        "title_en": "A-Share Three White Soldiers",
+        "title_zh": "A股连阳榜",
+        "description_en": "A-share stocks showing three consecutive strong bullish candles.",
+        "description_zh": "A股里连续三根强势阳线、收盘逐步抬高的股票。",
+    },
+    {
+        "key": "volume_breakout",
+        "market": "CN",
+        "template": "cn_volume_breakout",
+        "title_en": "A-Share Volume Breakout",
+        "title_zh": "A股放量榜",
+        "description_en": "A-share base breakouts supported by expanding turnover.",
+        "description_zh": "A股底部放量突破、量能确认更充分的候选股。",
+    },
+    {
+        "key": "us_ai_leaders",
+        "market": "US",
+        "template": "lightgbm_top_picks",
+        "title_en": "U.S. AI Leaders",
+        "title_zh": "美股AI优选",
+        "description_en": "Top U.S. names from the latest LightGBM multifactor ranking.",
+        "description_zh": "来自最新 LightGBM 多因子排序的美股优选候选。",
+    },
+    {
+        "key": "us_growth_breakout",
+        "market": "US",
+        "template": "next_tesla_swing",
+        "title_en": "U.S. Growth Breakout",
+        "title_zh": "美股成长爆发",
+        "description_en": "U.S. growth setups with fast acceleration and expansion potential.",
+        "description_zh": "美股里具备加速特征和扩张潜力的成长型 setup。",
+    },
+    {
+        "key": "us_momentum",
+        "market": "US",
+        "template": "technical_momentum",
+        "title_en": "U.S. Momentum Leaders",
+        "title_zh": "美股动量强势",
+        "description_en": "U.S. momentum leaders backed by price trend and volume.",
+        "description_zh": "由价格趋势和量能支持的美股动量强股。",
+    },
+    {
+        "key": "us_growth_value",
+        "market": "US",
+        "template": "global_growth_value",
+        "title_en": "U.S. Growth + Value",
+        "title_zh": "美股成长价值",
+        "description_en": "Balanced U.S. names combining growth quality with valuation discipline.",
+        "description_zh": "兼顾成长质量与估值纪律的美股候选。",
+    },
+]
 
 
 def _snapshot_now_iso() -> str:
@@ -515,10 +640,25 @@ def _load_market_board_rows(db: Session, *, template: str, market: str = "CN") -
 
 def _market_heatmap_fallback_label(row: dict, template: str) -> str:
     template_label = MARKET_HEATMAP_TEMPLATE_LABELS.get(template, template)
+    market = str(row.get("market") or "").strip().upper()
     if template == "technical_momentum":
         momentum_20 = float(row.get("momentum_20") or 0.0)
         momentum_5 = float(row.get("momentum_5") or 0.0)
         volume_ratio = float(row.get("volume_ratio") or 0.0)
+        if market == "US":
+            if momentum_20 >= 1.0:
+                return "翻倍动量"
+            if momentum_20 >= 0.45:
+                return "高弹性趋势"
+            if momentum_5 >= 0.6 and volume_ratio >= 4.0:
+                return "放量加速"
+            if momentum_5 >= 0.3:
+                return "趋势延续"
+            if volume_ratio >= 4.0:
+                return "量价共振"
+            if volume_ratio >= 1.5:
+                return "活跃放量"
+            return "技术动量"
         if momentum_20 >= 1.0:
             return "翻倍动量"
         if momentum_5 >= 0.25:
@@ -539,7 +679,43 @@ def _market_heatmap_fallback_label(row: dict, template: str) -> str:
         except (TypeError, ValueError):
             pass
         return template_label
+    if template == "next_tesla_swing":
+        momentum_20 = float(row.get("momentum_20") or 0.0)
+        momentum_5 = float(row.get("momentum_5") or 0.0)
+        volume_ratio = float(row.get("volume_ratio") or 0.0)
+        if market == "US":
+            if momentum_5 >= 1.0 and volume_ratio >= 2.0:
+                return "高弹性加速"
+            if momentum_5 >= 0.6 and volume_ratio >= 3.0:
+                return "放量突破"
+            if momentum_5 >= 0.45:
+                return "强势延续"
+            if volume_ratio >= 2.0:
+                return "量价共振"
+            if volume_ratio >= 1.0:
+                return "回踩转强"
+            return "趋势蓄势"
+        if momentum_20 >= 0.35:
+            return "成长加速"
+        return template_label
+    if template == "lightgbm_top_picks":
+        signal_strength = float(row.get("model_signal_strength") or 0.0)
+        if signal_strength >= 80:
+            return "模型高置信"
+        return template_label
     return template_label
+
+
+def _market_heatmap_display_label(*, label: str, market: str, template: str, used_fallback: bool) -> str:
+    normalized = str(label or "").strip()
+    if not normalized:
+        return normalized
+    normalized = MARKET_HEATMAP_LABEL_ALIASES.get(normalized, normalized)
+    if market == "US" and used_fallback:
+        prefix = MARKET_HEATMAP_TEMPLATE_PREFIX.get(template, "")
+        if prefix and not normalized.startswith(f"{prefix}·"):
+            return f"{prefix}·{normalized}"
+    return normalized
 
 
 def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> dict:
@@ -547,19 +723,14 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
     owns_db = db is None
     db = db or SessionLocal()
     try:
-        templates = [
-            "technical_momentum",
-            "cn_bollinger_squeeze_watch",
-            "cn_three_white_soldiers",
-            "cn_volume_breakout",
-        ]
         combined_rows: list[dict] = []
-        for template in templates:
-            for row in _load_market_board_rows(db, template=template, market="CN"):
-                combined_rows.append(dict(row, _template=template))
+        for market, templates in MARKET_HEATMAP_TEMPLATE_PLAN.items():
+            for template in templates:
+                for row in _load_market_board_rows(db, template=template, market=market):
+                    combined_rows.append(dict(row, _template=template, market=market))
         tickers = [str(row.get("ticker") or "").strip().upper() for row in combined_rows if row.get("ticker")]
         overviews = SymbolRepository(db).list_overviews_for_tickers(tickers)
-        sector_map: dict[str, dict] = {}
+        sector_map: dict[tuple[str, str], dict] = {}
         market_counts: dict[str, int] = {}
         for row in combined_rows:
             ticker = str(row.get("ticker") or "").strip().upper()
@@ -567,12 +738,25 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
             market = str(overview.get("market") or row.get("market") or "CN").upper()
             market_counts[market] = market_counts.get(market, 0) + 1
             template = str(row.get("_template") or "").strip()
-            label = str(overview.get("sector") or overview.get("industry") or "").strip()
-            if not label or label == "其他":
+            label = resolve_template_group_label(
+                meta=overview,
+                ticker=ticker,
+                market_code=market,
+                name=row.get("name") or overview.get("name"),
+            )
+            used_fallback_label = not label or label in {"其他", "Unclassified", "美股综合 / US General", "A股其他 / CN Other"}
+            if used_fallback_label:
                 label = _market_heatmap_fallback_label(row, template)
+            label = _market_heatmap_display_label(
+                label=label,
+                market=market,
+                template=template,
+                used_fallback=used_fallback_label,
+            )
             item = sector_map.setdefault(
-                label,
+                (market, label),
                 {
+                    "market": market,
                     "label": label,
                     "slug": label.lower().replace(" ", "-").replace("/", "-"),
                     "hits": 0,
@@ -611,6 +795,7 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
             item["ticker_details"].append(
                 {
                     "ticker": ticker,
+                    "market": market,
                     "name": row.get("name") or overview.get("name"),
                     "score": trend_score,
                     "state": row.get("model_state"),
@@ -644,6 +829,7 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
             intensity = min(100, 18 + hits * 12 + int(avg_score * 0.7) + int(item["max_signal_strength"] * 0.25))
             heatmap_rows.append(
                 {
+                    "market": item["market"],
                     "label": item["label"],
                     "slug": item["slug"],
                     "hits": hits,
@@ -657,7 +843,14 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
                     "intensity": intensity,
                 }
             )
-        heatmap_rows.sort(key=lambda item: (-int(item.get("hits") or 0), -float(item.get("avg_score") or 0.0), item.get("label") or ""))
+        heatmap_rows.sort(
+            key=lambda item: (
+                -int(item.get("hits") or 0),
+                -float(item.get("avg_score") or 0.0),
+                str(item.get("market") or ""),
+                item.get("label") or "",
+            )
+        )
         market_distribution = [
             {"market": market, "count": count}
             for market, count in sorted(market_counts.items(), key=lambda pair: (-pair[1], pair[0]))
@@ -686,43 +879,12 @@ def build_market_mode_snapshot(mode: str, *, lang: str = "zh", db: Session | Non
     db = db or SessionLocal()
     try:
         service = ScreenerService()
-        board_defs = [
-            {
-                "key": "leaders",
-                "template": "technical_momentum",
-                "title_en": "Momentum Leaders",
-                "title_zh": "强势榜",
-                "description_en": "Trend and volume leaders from the latest local market data.",
-                "description_zh": "基于本地行情与量价结构筛出的趋势强股。",
-            },
-            {
-                "key": "squeeze",
-                "template": "cn_bollinger_squeeze_watch",
-                "title_en": "Squeeze Watch",
-                "title_zh": "收口榜",
-                "description_en": "Names with compressed Bollinger Bands and coiled price action.",
-                "description_zh": "波动率收缩、价格待选择方向的候选股。",
-            },
-            {
-                "key": "three_white_soldiers",
-                "template": "cn_three_white_soldiers",
-                "title_en": "Three White Soldiers",
-                "title_zh": "连阳榜",
-                "description_en": "Stocks showing three consecutive strong bullish candles.",
-                "description_zh": "连续三根强势阳线、收盘逐步抬高的股票。",
-            },
-            {
-                "key": "volume_breakout",
-                "template": "cn_volume_breakout",
-                "title_en": "Volume Breakout",
-                "title_zh": "放量榜",
-                "description_en": "Base breakouts supported by expanding turnover and confirmation volume.",
-                "description_zh": "底部放量突破、量能确认更充分的候选股。",
-            },
-        ]
         boards: list[dict] = []
-        for board in board_defs:
-            rows = [dict(row) for row in _load_market_board_rows(db, template=board["template"], market="CN")]
+        for board in MARKET_SNAPSHOT_BOARD_DEFS:
+            rows = [
+                dict(row, market=str(row.get("market") or board["market"]).upper())
+                for row in _load_market_board_rows(db, template=board["template"], market=board["market"])
+            ]
             for row in rows:
                 row["snapshot_score"] = service._market_snapshot_score(board["key"], row, normalized_mode)
                 row["snapshot_score_breakdown"] = service._market_snapshot_score_breakdown(board["key"], row, normalized_mode)
@@ -746,13 +908,50 @@ def build_market_mode_snapshot(mode: str, *, lang: str = "zh", db: Session | Non
 
 
 def build_market_workspace_snapshot(db: Session, *, lang: str = "zh") -> dict:
-    del db, lang
-    monitor_payload = build_market_mode_snapshot("monitor")
+    del lang
+    monitor_payload = build_market_mode_snapshot("monitor", db=db)
     boards = monitor_payload.get("boards") or []
     return {
         "rows": [dict(board, rows=(board.get("rows") or [])[:4]) for board in boards],
         "updated_at": _snapshot_now_iso(),
     }
+
+
+def save_market_workspace_snapshots(
+    db: Session | None = None,
+    *,
+    source_job_id: int | None = None,
+    lang: str = "zh",
+) -> dict[str, dict]:
+    owns_db = db is None
+    db = db or SessionLocal()
+    try:
+        repo = WorkspaceSnapshotRepository(db)
+        snapshot_date = app_today_iso()
+        payloads = {
+            SNAPSHOT_MARKET_WORKSPACE: build_market_workspace_snapshot(db, lang=lang),
+            SNAPSHOT_MARKET_WORKSPACE_PREMARKET: build_market_mode_snapshot("premarket", lang=lang, db=db),
+            SNAPSHOT_MARKET_WORKSPACE_MONITOR: build_market_mode_snapshot("monitor", lang=lang, db=db),
+            SNAPSHOT_MARKET_WORKSPACE_POSTMARKET: build_market_mode_snapshot("postmarket", lang=lang, db=db),
+            SNAPSHOT_MARKET_HEATMAP_WORKSPACE: build_market_heatmap_snapshot(db, lang=lang),
+        }
+        created: dict[str, dict] = {}
+        for snapshot_type, payload in payloads.items():
+            row = repo.create_snapshot(
+                snapshot_type=snapshot_type,
+                snapshot_date=snapshot_date,
+                payload=payload,
+                source_job_id=source_job_id,
+            )
+            created[snapshot_type] = {
+                "id": row.id,
+                "snapshot_date": row.snapshot_date,
+                "created_at": row.created_at,
+            }
+        return created
+    finally:
+        if owns_db:
+            db.close()
 
 
 def build_pipeline_status_snapshot(db: Session, *, lang: str = "zh") -> dict:
@@ -767,7 +966,22 @@ def build_pipeline_status_snapshot(db: Session, *, lang: str = "zh") -> dict:
     refresh_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "cn_close_review"), None)
     analysis_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "watchlist_auto_analysis"), None)
     news_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "news_enrichment"), None)
-    us_train_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "us_signal_train"), None)
+    us_train_job = next(
+        (
+            item
+            for item in recent_jobs
+            if str(item.get("job_type") or "").lower() in {"us_signal_train", "train_us_signals"}
+        ),
+        None,
+    ) or DataJobRepository(db).get_latest_job({"us_signal_train", "train_us_signals"})
+    guidance_job = next(
+        (
+            item
+            for item in recent_jobs
+            if str(item.get("job_type") or "").lower() == "model_selection_guidance_snapshot"
+        ),
+        None,
+    ) or DataJobRepository(db).get_latest_job("model_selection_guidance_snapshot")
     latest_dashboard_nlp = WorkspaceSnapshotRepository(db).get_latest_snapshot(SNAPSHOT_DASHBOARD_NLP) or {}
     latest_watchlist_nlp = WorkspaceSnapshotRepository(db).get_latest_snapshot(SNAPSHOT_WATCHLIST_NLP) or {}
     nlp_payload = (latest_dashboard_nlp.get("payload") or {}) if isinstance(latest_dashboard_nlp, dict) else {}
@@ -919,6 +1133,13 @@ def build_pipeline_status_snapshot(db: Session, *, lang: str = "zh") -> dict:
             "status": (us_train_job or {}).get("status") or "idle",
             "timestamp": (us_train_job or {}).get("finished_at") or (us_train_job or {}).get("started_at"),
             "message": (us_train_job or {}).get("message") or ("美股收盘后会把 US lake 写入统一模型结果层。" if lang == "zh" else "After the U.S. close, U.S. lake symbols are written into the unified model-output layer."),
+        },
+        {
+            "step": "model_selection_guidance",
+            "label": "模型使用指导" if lang == "zh" else "Model Selection Guidance",
+            "status": (guidance_job or {}).get("status") or "idle",
+            "timestamp": (guidance_job or {}).get("finished_at") or (guidance_job or {}).get("started_at"),
+            "message": (guidance_job or {}).get("message") or ("收盘后把优先模型、优先组合和强票反向归因写入快照。" if lang == "zh" else "Persist priority models, priority combos, and winner traceback after the close."),
         },
         {
             "step": "ai_report",

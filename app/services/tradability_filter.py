@@ -17,6 +17,11 @@ class TradabilityDecision:
     is_tradable: bool
     tradability_status: str
     block_reason: str | None = None
+    trade_readiness_score: float | None = None
+    readiness_bucket: str | None = None
+    readiness_reason: str | None = None
+    preferred_entry_style: str | None = None
+    suggested_watch_action: str | None = None
     risk_flags: list[str] = field(default_factory=list)
     liquidity_bucket: str | None = None
     suggested_participation_rate: float | None = None
@@ -38,6 +43,29 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _safe_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        return [item.strip() for item in text.replace(";", ",").split(",") if item.strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _normalize_score(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return value / 100.0 if value > 1.5 else value
+
+
+def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
+    return max(low, min(high, value))
+
+
 def _infer_liquidity_bucket(candidate: dict[str, Any]) -> str | None:
     market = str(candidate.get("market") or "").upper()
     ticker = str(candidate.get("ticker") or "").upper()
@@ -50,8 +78,115 @@ def _infer_liquidity_bucket(candidate: dict[str, Any]) -> str | None:
     return None
 
 
+def _infer_entry_style(candidate: dict[str, Any]) -> str | None:
+    for key in ("entry_style", "model_entry_style", "action_label", "setup_bucket"):
+        value = str(candidate.get(key) or "").strip().lower()
+        if value:
+            return value
+    return None
+
+
+def _readiness_bucket(score: float, status: str) -> str:
+    if status == "BLOCKED" or score < 35:
+        return "BLOCKED"
+    if score >= 72:
+        return "HIGH"
+    if score >= 55:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _suggested_watch_action(bucket: str, status: str, entry_style: str | None) -> str:
+    if bucket == "BLOCKED" or status == "BLOCKED":
+        return "avoid"
+    if bucket == "HIGH":
+        return "prioritize"
+    if entry_style in {"pullback", "buy_the_dip", "pullback_reentry", "support_hold"}:
+        return "watch_pullback"
+    if entry_style in {"breakout", "momentum", "breakout_ready", "wait_for_breakout"}:
+        return "wait_confirmation"
+    return "continue_to_watch"
+
+
+def _calculate_readiness_score(
+    candidate: dict[str, Any],
+    *,
+    score: float | None,
+    signal_strength: float | None,
+    expected_drawdown_20d: float | None,
+    status: str,
+    risk_flags: list[str],
+    entry_style: str | None,
+) -> tuple[float, str]:
+    trend_score = _safe_float(candidate.get("trend_score"))
+    percentile = _safe_float(candidate.get("model_percentile") or candidate.get("percentile"))
+    confidence = _safe_float(candidate.get("model_confidence") or candidate.get("confidence"))
+    reward_risk = _safe_float(candidate.get("model_reward_risk_ratio") or candidate.get("reward_risk_ratio"))
+    volume_ratio = _safe_float(candidate.get("volume_ratio"))
+    momentum_5 = _safe_float(candidate.get("momentum_5"))
+    distance_to_breakout = _safe_float(candidate.get("distance_to_breakout_pct"))
+    snapshot_hits = _safe_float(candidate.get("snapshot_hits"))
+    model_hits = _safe_float(candidate.get("model_hit_count") or candidate.get("confluence_alignment_count"))
+    latest_close = _safe_float(candidate.get("latest_close"))
+
+    readiness = 38.0
+    reasons: list[str] = []
+    if score is not None:
+        readiness += _clamp(score * 100.0, 0, 100) * 0.22
+        reasons.append("model_score")
+    if signal_strength is not None:
+        readiness += _clamp(signal_strength, 0, 100) * 0.20
+        reasons.append("signal_strength")
+    if trend_score is not None:
+        readiness += _clamp(trend_score, 0, 100) * 0.18
+        reasons.append("trend")
+    if percentile is not None:
+        readiness += _clamp(percentile, 0, 100) * 0.06
+    if confidence is not None:
+        readiness += _clamp(confidence, 0, 100) * 0.05
+    if reward_risk is not None:
+        readiness += min(4.0, max(0.0, reward_risk)) * 4.0
+        reasons.append("reward_risk")
+    if volume_ratio is not None:
+        readiness += min(8.0, max(0.0, volume_ratio)) * 1.4
+    if snapshot_hits is not None:
+        readiness += min(4.0, max(0.0, snapshot_hits)) * 2.0
+    if model_hits is not None:
+        readiness += min(5.0, max(0.0, model_hits)) * 3.0
+        reasons.append("model_confluence")
+
+    if latest_close is None:
+        readiness -= 8.0
+        reasons.append("missing_price")
+    if expected_drawdown_20d is not None:
+        drawdown_pct = expected_drawdown_20d * 100.0 if expected_drawdown_20d <= 1.5 else expected_drawdown_20d
+        if drawdown_pct >= 12:
+            readiness -= min(28.0, (drawdown_pct - 10.0) * 1.7)
+            reasons.append("drawdown_risk")
+    if momentum_5 is not None and momentum_5 >= 18 and entry_style not in {"pullback", "buy_the_dip", "support_hold"}:
+        readiness -= min(18.0, (momentum_5 - 16.0) * 1.2)
+        reasons.append("chase_risk")
+    if distance_to_breakout is not None and distance_to_breakout > 10:
+        readiness -= min(18.0, (distance_to_breakout - 10.0) * 1.1)
+        reasons.append("far_from_trigger")
+    readiness -= min(28.0, len(set(risk_flags)) * 5.0)
+
+    if status == "READY":
+        readiness += 8.0
+    elif status == "DEFER":
+        readiness -= 4.0
+    elif status == "REVIEW":
+        readiness -= 10.0
+    elif status == "BLOCKED":
+        readiness -= 45.0
+
+    readable_reasons = [item for item in reasons if item]
+    reason = ", ".join(readable_reasons[:4]) if readable_reasons else "balanced_setup"
+    return round(_clamp(readiness), 1), reason
+
+
 def _infer_time_horizon(candidate: dict[str, Any], status: str) -> str:
-    entry_style = str(candidate.get("entry_style") or "").strip().lower()
+    entry_style = _infer_entry_style(candidate) or ""
     if status == "BLOCKED":
         return "no-trade"
     if entry_style in {"breakout", "momentum"}:
@@ -78,7 +213,7 @@ def _infer_max_slippage_bps(candidate: dict[str, Any], liquidity_bucket: str | N
 def _build_entry_trigger(candidate: dict[str, Any], status: str) -> str:
     if status == "BLOCKED":
         return "No entry until signal requalifies"
-    entry_style = str(candidate.get("entry_style") or "").strip().lower()
+    entry_style = _infer_entry_style(candidate) or ""
     signal_strength = _safe_float(candidate.get("signal_strength"))
     if entry_style == "breakout":
         return "Enter only on confirmed breakout with volume support"
@@ -104,7 +239,7 @@ def _build_invalidation_condition(candidate: dict[str, Any], status: str) -> str
 def _build_stop_loss_type(candidate: dict[str, Any], status: str) -> str:
     if status == "BLOCKED":
         return "none"
-    entry_style = str(candidate.get("entry_style") or "").strip().lower()
+    entry_style = _infer_entry_style(candidate) or ""
     if entry_style in {"breakout", "momentum"}:
         return "breakout-failure"
     if entry_style in {"pullback", "buy_the_dip"}:
@@ -144,19 +279,26 @@ def evaluate_candidate_tradability(
     del market_snapshot, portfolio_state
 
     rules = config or TradabilityRuleConfig()
-    score = _safe_float(candidate.get("score"))
+    score = _normalize_score(_safe_float(candidate.get("score") or candidate.get("model_score")))
     signal_strength = _safe_float(candidate.get("signal_strength"))
+    if signal_strength is None:
+        signal_strength = _safe_float(candidate.get("model_signal_strength") or candidate.get("trend_score"))
     expected_drawdown_20d = _safe_float(candidate.get("expected_drawdown_20d"))
+    if expected_drawdown_20d is None:
+        expected_drawdown_20d = _safe_float(candidate.get("model_expected_drawdown_20d"))
     signal_label = str(candidate.get("signal_label") or "").upper()
-    entry_style = candidate.get("entry_style")
+    if not signal_label:
+        signal_label = str(candidate.get("model_signal_label") or "").upper()
+    entry_style = _infer_entry_style(candidate)
 
-    risk_flags: list[str] = []
+    risk_flags: list[str] = _safe_list(candidate.get("risk_flags")) + _safe_list(candidate.get("model_execution_tags"))
     block_reason: str | None = None
     status = "READY"
 
     if score is None:
-        status = "REVIEW"
-        risk_flags.append("missing-score")
+        risk_flags.append("missing-model-score")
+        if signal_strength is None or signal_strength < 70:
+            status = "REVIEW"
     elif score < rules.min_score or signal_label in {"SELL", "STRONG_SELL"}:
         status = "BLOCKED"
         block_reason = "signal_not_actionable"
@@ -177,6 +319,31 @@ def evaluate_candidate_tradability(
             status = "REVIEW"
         risk_flags.append("weak-signal-strength")
 
+    latest_close = _safe_float(candidate.get("latest_close"))
+    if latest_close is None:
+        if status == "READY":
+            status = "REVIEW"
+        risk_flags.append("missing-latest-price")
+
+    momentum_5 = _safe_float(candidate.get("momentum_5"))
+    if momentum_5 is not None and momentum_5 >= 25 and entry_style not in {"pullback", "buy_the_dip", "support_hold"}:
+        if status in {"READY", "DEFER"}:
+            status = "REVIEW"
+        risk_flags.append("chase-risk")
+
+    risk_flags = sorted(set(risk_flags))
+    readiness_score, readiness_reason = _calculate_readiness_score(
+        candidate,
+        score=score,
+        signal_strength=signal_strength,
+        expected_drawdown_20d=expected_drawdown_20d,
+        status=status,
+        risk_flags=risk_flags,
+        entry_style=entry_style,
+    )
+    bucket = _readiness_bucket(readiness_score, status)
+    suggested_watch_action = _suggested_watch_action(bucket, status, entry_style)
+
     liquidity_bucket = _infer_liquidity_bucket(candidate)
     participation_rate = 0.03 if liquidity_bucket == "A" else 0.02 if liquidity_bucket == "B" else 0.01
     time_horizon = _infer_time_horizon(candidate, status)
@@ -189,7 +356,12 @@ def evaluate_candidate_tradability(
         is_tradable=status in {"READY", "REVIEW", "DEFER"},
         tradability_status=status,
         block_reason=block_reason,
-        risk_flags=sorted(set(risk_flags)),
+        trade_readiness_score=readiness_score,
+        readiness_bucket=bucket,
+        readiness_reason=readiness_reason,
+        preferred_entry_style=entry_style,
+        suggested_watch_action=suggested_watch_action,
+        risk_flags=risk_flags,
         liquidity_bucket=liquidity_bucket,
         suggested_participation_rate=participation_rate,
         entry_trigger=entry_trigger,
@@ -209,6 +381,8 @@ def evaluate_candidate_tradability(
             "score": score,
             "signal_strength": signal_strength,
             "expected_drawdown_20d": expected_drawdown_20d,
+            "trade_readiness_score": readiness_score,
+            "readiness_bucket": bucket,
             "time_horizon": time_horizon,
             "max_slippage_bps": max_slippage_bps,
         },

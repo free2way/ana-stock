@@ -91,6 +91,72 @@ def query_us_daily_summary(*, trade_date: str | None = None, limit: int = 10) ->
     }
 
 
+def query_lake_daily_movers(
+    *,
+    market: str,
+    lookback_dates: int = 12,
+    top_n_per_date: int = 20,
+    min_return_pct: float = 3.0,
+    min_dollar_volume: float = 0.0,
+) -> list[dict]:
+    market_code = str(market or "").strip().upper()
+    parquet_files = _recent_parquet_files(market_code, limit=max(40, int(lookback_dates) + 8))
+    if market_code not in {"CN", "US"} or not parquet_files:
+        return []
+    sql = f"""
+        WITH base AS (
+            SELECT
+                CAST(date AS DATE) AS trade_date,
+                symbol,
+                close,
+                volume,
+                close * volume AS dollar_volume,
+                LAG(close) OVER (PARTITION BY symbol ORDER BY CAST(date AS DATE)) AS prev_close
+            FROM read_parquet(?, hive_partitioning = true)
+            WHERE close IS NOT NULL
+        ),
+        enriched AS (
+            SELECT
+                trade_date,
+                symbol,
+                close,
+                volume,
+                dollar_volume,
+                ((close / NULLIF(prev_close, 0)) - 1.0) * 100.0 AS return_pct
+            FROM base
+            WHERE prev_close IS NOT NULL
+              AND close IS NOT NULL
+              AND (? <= 0 OR COALESCE(dollar_volume, 0) >= ?)
+        ),
+        ranked AS (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY trade_date
+                    ORDER BY return_pct DESC NULLS LAST, dollar_volume DESC NULLS LAST, symbol ASC
+                ) AS rn
+            FROM enriched
+            WHERE return_pct >= ?
+        )
+        SELECT
+            CAST(trade_date AS VARCHAR) AS trade_date,
+            symbol,
+            close,
+            volume,
+            dollar_volume,
+            return_pct
+        FROM ranked
+        WHERE rn <= {max(1, int(top_n_per_date))}
+        ORDER BY trade_date DESC, return_pct DESC NULLS LAST, dollar_volume DESC NULLS LAST
+        LIMIT {max(1, int(lookback_dates) * max(1, int(top_n_per_date)))}
+    """
+    rows, columns = _duckdb_fetchall(
+        sql,
+        [parquet_files, float(min_dollar_volume), float(min_dollar_volume), float(min_return_pct)],
+    )
+    return [_json_ready_row(dict(zip(columns, row, strict=False))) for row in rows]
+
+
 def load_lake_price_history(*, market: str, ticker: str, limit: int = 120) -> list[dict]:
     market_code = str(market or "").strip().upper()
     symbol = str(ticker or "").strip().upper()

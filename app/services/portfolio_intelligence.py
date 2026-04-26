@@ -371,6 +371,14 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
         top_sector = max(sector_totals.items(), key=lambda item: item[1], default=((("未分类" if lang == "zh" else "Unclassified")), 0.0))
         top_market = max(market_totals.items(), key=lambda item: item[1], default=(("-", 0.0)))
         concentration_pct = round((top_sector[1] / total_market_value) * 100, 1) if total_market_value else 0.0
+        market_rankings = [
+            {
+                "market": market,
+                "market_value": value,
+                "weight_pct": round((value / total_market_value) * 100.0, 1) if total_market_value else 0.0,
+            }
+            for market, value in sorted(market_totals.items(), key=lambda item: (-item[1], item[0]))
+        ]
         sector_rankings = [
             {
                 "sector": sector,
@@ -441,26 +449,76 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
                 action_mix["medium"] += 1
             else:
                 action_mix["low"] += 1
+        top_position = max(row_actions, key=lambda item: float(item.get("market_value") or 0.0), default=None)
+        drawdown_count = sum(1 for row in row_actions if float(row.get("pnl_pct") or 0.0) <= -8.0)
+        profit_protection_count = sum(1 for row in row_actions if float(row.get("pnl_pct") or 0.0) >= 15.0)
+        trim_candidates = sum(
+            1
+            for row in row_actions
+            if float(row.get("weight_pct") or 0.0) >= 15.0 or float(row.get("pnl_pct") or 0.0) >= 30.0
+        )
+        exit_candidates = sum(
+            1
+            for row in row_actions
+            if float(row.get("pnl_pct") or 0.0) <= -8.0
+            or str(row.get("signal_label") or "").strip().lower() in {"卖点", "sell"}
+        )
+        review_candidates = sum(
+            1
+            for row in row_actions
+            if str(row.get("action_priority") or "").lower() in {"高", "high"}
+        )
+        if drawdown_count >= 2 or concentration_pct >= 45.0 or (top_position and float(top_position.get("weight_pct") or 0.0) >= 25.0):
+            risk_posture = "防守" if lang == "zh" else "Defensive"
+        elif profit_protection_count >= 2 or trim_candidates >= 2:
+            risk_posture = "均衡偏防守" if lang == "zh" else "Balanced / defensive"
+        else:
+            risk_posture = "均衡" if lang == "zh" else "Balanced"
+        if lang == "zh":
+            risk_summary = f"最大行业暴露 {top_sector[0]}，约占组合 {concentration_pct}%"
+            posture_summary = (
+                f"当前更偏{risk_posture}，优先处理 {review_candidates} 只高优先级仓位。"
+                if row_actions
+                else "当前没有持仓。"
+            )
+        else:
+            risk_summary = f"Largest sector exposure is {top_sector[0]}, about {concentration_pct}% of the portfolio"
+            posture_summary = (
+                f"Current posture is {risk_posture}; {review_candidates} positions deserve priority review."
+                if row_actions
+                else "There are no portfolio positions."
+            )
 
         return {
+            "total_market_value": round(total_market_value, 2),
             "total_positions": len(positions),
             "top_sector": top_sector[0],
             "top_market": top_market[0],
             "concentration_pct": concentration_pct,
+            "market_rankings": market_rankings[:5],
             "sector_rankings": sector_rankings[:5],
             "all_items": row_actions,
             "watch_items": row_actions[:5],
             "action_mix": action_mix,
+            "top_position": {
+                "ticker": top_position.get("ticker"),
+                "name": top_position.get("name"),
+                "weight_pct": round(float(top_position.get("weight_pct") or 0.0), 1),
+                "market_value": round(float(top_position.get("market_value") or 0.0), 2),
+            } if top_position else None,
             "rebalance_alerts": sum(
                 1
                 for row in row_actions
                 if abs(float(row.get("rebalance_gap_pct") or 0.0)) >= 5.0
             ),
-            "risk_summary": (
-                f"最大行业暴露 {top_sector[0]}，约占组合 {concentration_pct}%"
-                if lang == "zh"
-                else f"Largest sector exposure is {top_sector[0]}, about {concentration_pct}% of the portfolio"
-            ),
+            "drawdown_count": drawdown_count,
+            "profit_protection_count": profit_protection_count,
+            "trim_candidates": trim_candidates,
+            "exit_candidates": exit_candidates,
+            "review_candidates": review_candidates,
+            "risk_posture": risk_posture,
+            "risk_summary": risk_summary,
+            "posture_summary": posture_summary,
         }
 
     return get_or_set("portfolio_intelligence", cache_key, ttl_seconds=30.0, loader=_load)

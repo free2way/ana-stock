@@ -16,8 +16,11 @@ from app.core.db import get_db_session
 from app.models.tables import ModelRun, Prediction, PredictionDetail, Symbol
 from app.models.schema import SymbolCreate
 from app.services.ai_daily_report import (
+    build_trade_explain_text,
     build_ai_daily_report,
     build_close_review_action_feed,
+    format_trade_gate_reason,
+    format_trade_status,
     list_ai_daily_report_history,
     load_ai_daily_report,
     load_ai_daily_report_history_item,
@@ -30,9 +33,14 @@ from app.services.close_review_scheduler import close_review_scheduler_service
 from app.services.focus_pool import enrich_focus_pool_with_symbols, load_today_focus_pool
 from app.services.dashboard_summary import load_dashboard_summary, load_recent_jobs_summary
 from app.services.market_intelligence import build_market_narrative_brief
-from app.services.market_lake import lake_file_health_summary, load_lake_price_history
+from app.services.market_lake import lake_file_health_summary, load_lake_price_history, load_lake_rows
 from app.services.market_news import MarketNewsService
 from app.services.market_sync import sync_market_data
+from app.services.model_selection_guidance import (
+    ACTION_BUCKET_LABELS,
+    load_model_selection_guidance_snapshot,
+    summarize_model_selection_guidance,
+)
 from app.services.model_signal_summary import build_model_state, build_signal_label, enrich_model_output, model_confidence
 from app.services.nlp_snapshots import summarize_news_rows
 from app.services.portfolio_book import (
@@ -94,6 +102,124 @@ from app.services.workspace_snapshots import (
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
+def _reason_screen_params(*, reason: str | None, status: str | None, market: str | None, lang: str) -> dict[str, object]:
+    normalized_reason = str(reason or "").strip().lower()
+    normalized_status = str(status or "").strip().lower()
+    market_code = str(market or "CN").strip().upper()
+    if market_code not in {"CN", "US", "HK", "ALL"}:
+        market_code = "CN"
+    cn_core_templates = [
+        "lightgbm_top_picks",
+        "next_tesla_swing",
+        "technical_momentum",
+        "cn_volume_breakout",
+        "cn_bullish_ma_stack",
+    ]
+    us_core_templates = [
+        "lightgbm_top_picks",
+        "next_tesla_swing",
+        "technical_momentum",
+        "tv_multi_timeframe_bullish",
+        "global_growth_value",
+    ]
+    market_templates = cn_core_templates if market_code == "CN" else us_core_templates
+    params: dict[str, object] = {
+        "lang": lang,
+        "run": 1,
+        "model_template": "lightgbm_top_picks" if market_code in {"CN", "US", "ALL"} else "technical_momentum",
+        "universe": "full_market",
+        "market": market_code,
+        "min_trend_score": 0,
+        "sort_by": "trade_readiness_score",
+        "sort_order": "asc",
+    }
+    key = normalized_reason or normalized_status
+    if key in {"extended_after_sharp_move", "do_not_chase"}:
+        params.update(
+            {
+                "model_template": "next_tesla_swing",
+                "multi_model_templates": market_templates[:3],
+                "min_multi_model_hits": 2,
+                "confluence_action_filter": "breakout_confirmation",
+                "sort_by": "momentum_5",
+                "sort_order": "desc",
+                "action_filter": "wait_for_breakout",
+            }
+        )
+    elif key == "too_far_from_pullback_zone":
+        params.update(
+            {
+                "model_template": "next_tesla_swing",
+                "multi_model_templates": market_templates[:3],
+                "min_multi_model_hits": 2,
+                "confluence_action_filter": "buy_the_dip",
+                "sort_by": "trade_readiness_score",
+                "sort_order": "asc",
+                "action_filter": "buy_the_dip",
+            }
+        )
+    elif key == "signal_not_actionable":
+        params.update(
+            {
+                "model_template": "technical_momentum",
+                "multi_model_templates": market_templates[:3],
+                "min_multi_model_hits": 2,
+                "confluence_action_filter": "watchlist",
+                "sort_by": "model_signal_strength",
+                "sort_order": "asc",
+                "action_filter": "hold_and_watch",
+            }
+        )
+    elif key == "missing_latest_price":
+        params.update(
+            {
+                "sort_by": "trade_readiness_score",
+                "sort_order": "asc",
+            }
+        )
+    elif key == "too_many_risk_flags":
+        params.update(
+            {
+                "model_template": "lightgbm_top_picks",
+                "multi_model_templates": market_templates,
+                "min_multi_model_hits": 2,
+                "confluence_action_filter": "ALL",
+                "sort_by": "trade_readiness_score",
+                "sort_order": "asc",
+            }
+        )
+    elif key == "low_trade_readiness":
+        params.update(
+            {
+                "model_template": "lightgbm_top_picks",
+                "multi_model_templates": market_templates[:3],
+                "min_multi_model_hits": 2,
+                "confluence_action_filter": "ALL",
+                "sort_by": "trade_readiness_score",
+                "sort_order": "asc",
+            }
+        )
+    return params
+
+
+def _reason_screen_href(*, reason: str | None, status: str | None, market: str | None, lang: str) -> str:
+    return f"/screeners?{urlencode(_reason_screen_params(reason=reason, status=status, market=market, lang=lang), doseq=True)}"
+
+
+def _reason_screen_link(
+    label: str,
+    *,
+    reason: str | None,
+    status: str | None,
+    market: str | None,
+    lang: str,
+    css_class: str = "",
+) -> str:
+    href = html.escape(_reason_screen_href(reason=reason, status=status, market=market, lang=lang), quote=True)
+    class_attr = f" class='{css_class}'" if css_class else ""
+    return f"<a{class_attr} href='{href}'>{html.escape(label)}</a>"
+
+
 def _provider_strategy_view(lang: str) -> dict:
     if lang == "zh":
         return {
@@ -118,6 +244,44 @@ def _provider_strategy_view(lang: str) -> dict:
         "ops_title": "Current provider policy",
         "ops_copy": "Job configuration now prefers `auto` or a market-aware default provider.",
     }
+
+
+def _recent_market_heat_history(db: Session, *, limit: int = 6) -> dict[str, list[int]]:
+    snapshots = WorkspaceSnapshotRepository(db).list_snapshots(
+        SNAPSHOT_MARKET_HEATMAP_WORKSPACE,
+        limit=max(limit * 3, limit),
+    )
+    points: list[dict[str, int]] = []
+    for snapshot in reversed(snapshots):
+        payload = snapshot.get("payload") or {}
+        distribution = payload.get("market_distribution") or []
+        if not isinstance(distribution, list) or not distribution:
+            continue
+        point = {
+            str(item.get("market") or "").upper(): int(item.get("count") or 0)
+            for item in distribution
+            if str(item.get("market") or "").strip()
+        }
+        if point:
+            points.append(point)
+    points = points[-limit:]
+    return {
+        market: [int(point.get(market, 0)) for point in points]
+        for market in ("CN", "US")
+    }
+
+
+def _mini_trend_bars(values: list[int], *, lang: str) -> str:
+    normalized = [max(0, int(value)) for value in values]
+    if not normalized:
+        label = "暂无趋势" if lang == "zh" else "No trend"
+        return f"<div class='mini-trend empty'><span>{label}</span></div>"
+    top = max(normalized) or 1
+    bars = "".join(
+        f"<span style='height:{max(16, int((value / top) * 100))}%;'></span>"
+        for value in normalized
+    )
+    return f"<div class='mini-trend'>{bars}</div>"
 
 
 def _dashboard_home_panels(
@@ -203,19 +367,30 @@ def _dashboard_signal_action_sets(latest_signals: list[dict]) -> dict[str, list[
     for item in latest_signals:
         status = str(item.get("tradability_status") or "").upper()
         score = float(item.get("score") or 0.0)
+        readiness = float(item.get("trade_readiness_score") or 0.0)
+        risk_flags = [str(flag).strip() for flag in (item.get("risk_flags") or []) if str(flag).strip()]
         priority = item.get("priority") if item.get("priority") is not None else 99
+        block_reason = str(item.get("block_reason") or "")
+        if not block_reason:
+            if "missing-latest-price" in risk_flags:
+                block_reason = "missing_latest_price"
+            elif len(risk_flags) >= 3:
+                block_reason = "too_many_risk_flags"
+            elif readiness and readiness < 55:
+                block_reason = "low_trade_readiness"
         enriched = {
             **item,
             "status_tone": _signal_status_tone(status),
             "status_label": status or "UNKNOWN",
             "target_weight_pct": round(float(item.get("target_weight") or 0.0) * 100.0, 1) if item.get("target_weight") is not None else None,
-            "risk_flags_text": "/".join((item.get("risk_flags") or [])[:2]) or "-",
-            "sort_key": (priority, -score, item.get("ticker") or ""),
+            "risk_flags_text": "/".join(risk_flags[:2]) or "-",
+            "block_reason": block_reason or "-",
+            "sort_key": (priority, -(readiness or 0.0), -score, item.get("ticker") or ""),
         }
-        if status == "READY":
+        if status == "BLOCKED" or block_reason:
+            blocked.append({**enriched, "status_tone": _signal_status_tone("BLOCKED"), "status_label": "BLOCKED"})
+        elif status == "READY":
             actionable.append(enriched)
-        elif status == "BLOCKED":
-            blocked.append(enriched)
         elif status in {"REVIEW", "DEFER"}:
             trim_review.append(enriched)
     actionable.sort(key=lambda item: item["sort_key"])
@@ -407,8 +582,8 @@ def _render_dashboard_home_panels_fragment(
     ) or f"<div class='muted'>{'暂无可执行候选' if lang == 'zh' else 'No actionable candidates yet'}</div>"
     blocked_rows = "".join(
         "<div style='display:flex;justify-content:space-between;gap:8px;padding:10px 0;border-top:1px solid var(--line);'>"
-        f"<div><div style='font-weight:800'>{item.get('ticker')}</div><div class='muted'>{item.get('name') or item.get('ticker')}</div><div class='muted'>{item.get('block_reason') or item.get('execution_note') or '-'}</div></div>"
-        f"<div style='text-align:right;'><span class='signal {item.get('status_tone')}'>{item.get('status_label')}</span><div class='muted'>{item.get('risk_flags_text')}</div></div>"
+        f"<div><div style='font-weight:800'>{item.get('ticker')}</div><div class='muted'>{item.get('name') or item.get('ticker')}</div><div class='muted'>{_reason_screen_link(format_trade_gate_reason(item.get('block_reason'), lang=lang), reason=item.get('block_reason'), status=item.get('status_label'), market=item.get('market'), lang=lang)}</div><div class='muted'>{_reason_screen_link('查看同类筛选' if lang == 'zh' else 'Open screener', reason=item.get('block_reason'), status=item.get('status_label'), market=item.get('market'), lang=lang)}</div></div>"
+        f"<div style='text-align:right;'><span class='signal {item.get('status_tone')}'>{html.escape(format_trade_status(item.get('status_label'), lang=lang))}</span><div class='muted'>{item.get('risk_flags_text')}</div></div>"
         "</div>"
         for item in signal_sets["blocked"]
     ) or f"<div class='muted'>{'暂无受阻候选' if lang == 'zh' else 'No blocked candidates'}</div>"
@@ -495,7 +670,26 @@ def _render_dashboard_top_fragment(
     latest_signals: list[dict],
     latest_model: dict | None,
     risk_overview: dict,
+    selection_guidance_summary: dict | None = None,
 ) -> str:
+    guidance_summary = selection_guidance_summary or {}
+    snapshot_meta = guidance_summary.get("snapshot_meta") or {}
+    top_model_href = str(guidance_summary.get("top_model_href") or f"/dashboard/model-performance?lang={lang}")
+    top_combo_href = str(guidance_summary.get("top_combo_href") or "/screeners?lang=" + lang)
+    top_model_title = html.escape(str(guidance_summary.get("top_model_title") or ("样本继续沉淀" if lang == "zh" else "Still collecting samples")))
+    top_combo_title = html.escape(str(guidance_summary.get("top_combo_title") or ("组合样本继续沉淀" if lang == "zh" else "Combo samples still accumulating")))
+    top_model_copy = html.escape(str(guidance_summary.get("top_model_summary") or ("当前还没有足够样本。" if lang == "zh" else "Not enough samples yet.")))
+    top_combo_copy = html.escape(str(guidance_summary.get("top_combo_summary") or ("当前还没有足够组合样本。" if lang == "zh" else "Not enough combo samples yet.")))
+    source_label = (
+        "来源：后台快照"
+        if str(snapshot_meta.get("source") or "") == "snapshot" and lang == "zh"
+        else "来源：实时回退"
+        if lang == "zh"
+        else "Source: snapshot"
+        if str(snapshot_meta.get("source") or "") == "snapshot"
+        else "Source: live fallback"
+    )
+    source_time = html.escape(str(snapshot_meta.get("snapshot_date") or snapshot_meta.get("generated_at") or "-"))
     signal_items = "".join(
         "<article class='signal-card'>"
         f"<div class='signal-top'><a class='signal-ticker' href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a><span class='signal-rank'>#{int(item['rank_value'])}</span></div>"
@@ -518,6 +712,29 @@ def _render_dashboard_top_fragment(
         for item in risk_overview.get("examples", [])
     )
     return f"""
+      <section class="card" style="margin-bottom:16px;">
+        <div class="eyebrow">{'今日模型使用指导' if lang == 'zh' else "Today's Model Guidance"}</div>
+        <div class="grid" style="margin-bottom:0;">
+          <article class="card" style="margin-bottom:0;background:#f9f7f0;">
+            <div class="eyebrow">{'优先模型' if lang == 'zh' else 'Priority Model'}</div>
+            <div style="font-size:22px;font-weight:800;line-height:1.25;margin:4px 0 8px;">{top_model_title}</div>
+            <div class="muted">{top_model_copy}</div>
+            <div class="muted" style="margin-top:8px;">{source_label} · {source_time}</div>
+            <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
+              <a class='pill' href='{html.escape(top_model_href, quote=True)}'>{'用这套模型去筛股' if lang == 'zh' else 'Screen with this model'}</a>
+            </div>
+          </article>
+          <article class="card" style="margin-bottom:0;background:#f9f7f0;">
+            <div class="eyebrow">{'优先组合' if lang == 'zh' else 'Priority Combo'}</div>
+            <div style="font-size:22px;font-weight:800;line-height:1.25;margin:4px 0 8px;">{top_combo_title}</div>
+            <div class="muted">{top_combo_copy}</div>
+            <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
+              <a class='pill' href='{html.escape(top_combo_href, quote=True)}'>{'用这套组合去筛股' if lang == 'zh' else 'Screen with this combo'}</a>
+              <a class='pill' href='/dashboard/model-performance?lang={lang}'>{'打开模型评测' if lang == 'zh' else 'Open Model Performance'}</a>
+            </div>
+          </article>
+        </div>
+      </section>
       <section class="card" style="margin-bottom:16px;">
         <div class="eyebrow">{_dt(lang, 'risk_overview')}</div>
         <div class="grid" style="margin-bottom:0;">
@@ -983,6 +1200,11 @@ DASHBOARD_TEXT = {
     },
 }
 
+MARKET_PULSE_SOFT_RISK_TAGS = {
+    "low-conviction",
+    "drawdown-risk",
+}
+
 
 def _dt(lang: str, key: str, **kwargs) -> str:
     value = DASHBOARD_TEXT["zh" if lang == "zh" else "en"][key]
@@ -1125,7 +1347,7 @@ def _load_ops_summary(db: Session) -> dict:
             "latest_model": model_repo.get_latest_run_summary() or {},
             "recent_model_runs": model_repo.list_recent_runs(limit=8),
             "latest_backtest": backtest_repo.get_latest_backtest_summary() or {},
-            "recent_jobs": job_repo.list_recent_jobs(limit=8),
+            "recent_jobs": job_repo.list_recent_jobs(limit=20),
             "sync_overview": sync_repo.get_status_overview(),
             "recent_sync_states": sync_repo.list_recent_states_with_symbols(limit=5),
             "lake_health": lake_file_health_summary(),
@@ -1239,6 +1461,126 @@ def _aggregate_window_stats(values: list[float]) -> dict:
     }
 
 
+def _build_recommendation_validation_summary(
+    db: Session,
+    *,
+    market: str,
+    lang: str,
+    selection_guidance: dict | None,
+    selection_guidance_summary: dict | None = None,
+    report_limit: int = 30,
+) -> dict:
+    windows = (1, 3, 5, 10)
+    market_code = str(market or "CN").strip().upper()
+    target_market = market_code if market_code in {"CN", "US"} else None
+    guidance = selection_guidance or {}
+    recommendations = list(guidance.get("recommendations") or [])
+    combos = list(guidance.get("combos") or [])
+    top_model = recommendations[0] if recommendations else {}
+    top_combo = combos[0] if combos else {}
+    guidance_summary = selection_guidance_summary or summarize_model_selection_guidance(selection_guidance, lang=lang)
+
+    def _stats_for(item: dict, window: int) -> dict:
+        return dict(item.get(f"stats_{window}d") or {})
+
+    def _sample_count(item: dict) -> int:
+        return max(int(_stats_for(item, window).get("count") or 0) for window in windows)
+
+    rows: list[dict] = []
+    if top_model:
+        model_label = str(top_model.get("template_label") or top_model.get("template") or "-")
+        action_bucket = str(top_model.get("action_bucket") or "").strip()
+        if action_bucket and action_bucket not in {"ALL", "unclassified"}:
+            action_label = ACTION_BUCKET_LABELS.get(action_bucket, {}).get(lang, action_bucket)
+            model_label = f"{model_label} · {action_label}"
+        rows.append(
+            {
+                "key": "priority_model",
+                "label": "今日优先模型" if lang == "zh" else "Priority Model",
+                "title": model_label,
+                "count": _sample_count(top_model),
+                "windows": {window: _stats_for(top_model, window) for window in windows},
+                "note": (
+                    f"强票提前覆盖 {int(top_model.get('winner_capture_count') or 0)} 只"
+                    if lang == "zh"
+                    else f"Captured {int(top_model.get('winner_capture_count') or 0)} strong movers"
+                ),
+                "href": guidance_summary.get("top_model_href"),
+            }
+        )
+    if top_combo:
+        combo_label = (top_combo.get("label") or {}).get(lang) or (top_combo.get("label") or {}).get("zh") or "-"
+        rows.append(
+            {
+                "key": "priority_combo",
+                "label": "今日优先组合" if lang == "zh" else "Priority Combo",
+                "title": combo_label,
+                "count": _sample_count(top_combo),
+                "windows": {window: _stats_for(top_combo, window) for window in windows},
+                "note": (
+                    f"强票覆盖率 {_fmt_optional_float(top_combo.get('winner_capture_rate'), suffix='%', digits=1)}"
+                    if lang == "zh"
+                    else f"Winner capture {_fmt_optional_float(top_combo.get('winner_capture_rate'), suffix='%', digits=1)}"
+                ),
+                "href": top_combo.get("screener_href"),
+            }
+        )
+
+    report_values: dict[int, list[float]] = {window: [] for window in windows}
+    measured_rows = 0
+    report_count = 0
+    for item in list_ai_daily_report_history(limit=max(5, int(report_limit)), db=db):
+        payload = item.get("payload") or {}
+        report_date = str(item.get("snapshot_date") or payload.get("report_date") or "")[:10]
+        if not report_date:
+            continue
+        rows_payload = payload.get("market_recommendations") or payload.get("rows") or []
+        report_has_measurement = False
+        for row in rows_payload[:5]:
+            ticker = str(row.get("ticker") or "").strip().upper()
+            if not ticker:
+                continue
+            row_market = str(row.get("market") or "").strip().upper()
+            if not row_market:
+                row_market = "CN" if ticker.endswith((".SS", ".SZ", ".SH", ".BJ")) else "US"
+            if target_market and row_market != target_market:
+                continue
+            history = load_lake_price_history(market=row_market, ticker=ticker, limit=260)
+            measured = False
+            for window in windows:
+                value = _forward_return_from_history(history, trade_date=report_date, sessions=window)
+                if value is None:
+                    continue
+                report_values[window].append(float(value))
+                measured = True
+            if measured:
+                measured_rows += 1
+                report_has_measurement = True
+        if report_has_measurement:
+            report_count += 1
+    rows.append(
+        {
+            "key": "ai_report_top5",
+            "label": "AI 日报 Top 5" if lang == "zh" else "AI Report Top 5",
+            "title": "历史日报推荐留档" if lang == "zh" else "Archived Daily Recommendations",
+            "count": measured_rows,
+            "windows": {window: _aggregate_window_stats(report_values[window]) for window in windows},
+            "note": (
+                f"已纳入 {report_count} 期日报归档"
+                if lang == "zh"
+                else f"Based on {report_count} archived reports"
+            ),
+            "href": f"/dashboard/ai-daily-report/history?lang={lang}",
+        }
+    )
+    return {
+        "rows": rows,
+        "windows": windows,
+        "report_count": report_count,
+        "measured_rows": measured_rows,
+    }
+
+
 def _return_since_history_start(history: list[dict], *, trade_date: str) -> float | None:
     if not history:
         return None
@@ -1324,6 +1666,14 @@ def _build_weekly_review_summary(db: Session, *, lang: str) -> dict:
     cache_key = json.dumps({"week_start": week_start_iso, "lang": lang}, sort_keys=True, ensure_ascii=False)
 
     def _loader() -> dict:
+        price_history_cache: dict[tuple[str, str], list[dict]] = {}
+
+        def _cached_price_history(*, market_code: str, ticker: str) -> list[dict]:
+            cache_key = (market_code, ticker)
+            if cache_key not in price_history_cache:
+                price_history_cache[cache_key] = load_lake_price_history(market=market_code, ticker=ticker, limit=260)
+            return price_history_cache.get(cache_key) or []
+
         report_history = [
             item
             for item in list_ai_daily_report_history(limit=20, db=db)
@@ -1331,10 +1681,13 @@ def _build_weekly_review_summary(db: Session, *, lang: str) -> dict:
         ]
         top_ticker_counts: dict[str, dict] = {}
         mood_counts: dict[str, int] = {}
+        report_window_values: dict[int, list[float]] = {1: [], 3: [], 5: [], 10: []}
+        measured_report_rows = 0
         for item in report_history:
             payload = item.get("payload") or {}
             mood = str(payload.get("mood") or "").strip() or ("未标记" if lang == "zh" else "Unlabeled")
             mood_counts[mood] = mood_counts.get(mood, 0) + 1
+            report_date = str(item.get("snapshot_date") or payload.get("report_date") or "")[:10]
             for row in (payload.get("market_recommendations") or payload.get("rows") or [])[:5]:
                 ticker = str(row.get("ticker") or "").strip().upper()
                 if not ticker:
@@ -1349,10 +1702,80 @@ def _build_weekly_review_summary(db: Session, *, lang: str) -> dict:
                     },
                 )
                 bucket["count"] += 1
+                market_code = str(row.get("market") or "").strip().upper() or ("CN" if ticker.endswith((".SS", ".SZ", ".SH", ".BJ")) else "US")
+                history = _cached_price_history(market_code=market_code, ticker=ticker)
+                row_measured = False
+                for window in (1, 3, 5, 10):
+                    value = _forward_return_from_history(history, trade_date=report_date, sessions=window)
+                    if value is None:
+                        continue
+                    report_window_values[window].append(float(value))
+                    row_measured = True
+                if row_measured:
+                    measured_report_rows += 1
         repeated_top_tickers = sorted(
             top_ticker_counts.values(),
             key=lambda item: (-int(item.get("count") or 0), str(item.get("ticker") or "")),
         )[:8]
+        report_window_summary = {window: _aggregate_window_stats(values) for window, values in report_window_values.items()}
+
+        selection_guidance = load_model_selection_guidance_snapshot(db, market="CN", allow_fallback=True)
+        selection_guidance_summary = summarize_model_selection_guidance(selection_guidance, lang=lang)
+        top_model = dict(selection_guidance_summary.get("top_model") or {})
+        top_combo = dict(selection_guidance_summary.get("top_combo") or {})
+        recommendation_validation_rows: list[dict] = []
+        if top_model:
+            recommendation_validation_rows.append(
+                {
+                    "label": "今日优先模型" if lang == "zh" else "Priority Model",
+                    "title": selection_guidance_summary.get("top_model_title") or "-",
+                    "href": selection_guidance_summary.get("top_model_href") or f"/dashboard/model-performance?lang={lang}",
+                    "windows": {
+                        1: top_model.get("stats_1d") or {},
+                        3: top_model.get("stats_3d") or {},
+                        5: top_model.get("stats_5d") or {},
+                        10: top_model.get("stats_10d") or {},
+                    },
+                    "note": (
+                        f"强票提前覆盖 {int(top_model.get('winner_capture_count') or 0)} 只"
+                        if lang == "zh"
+                        else f"Captured {int(top_model.get('winner_capture_count') or 0)} strong movers"
+                    ),
+                }
+            )
+        if top_combo:
+            combo_label = (top_combo.get("label") or {}).get(lang) or (top_combo.get("label") or {}).get("zh") or "-"
+            recommendation_validation_rows.append(
+                {
+                    "label": "今日优先组合" if lang == "zh" else "Priority Combo",
+                    "title": combo_label,
+                    "href": top_combo.get("screener_href") or f"/screeners?lang={lang}",
+                    "windows": {
+                        1: top_combo.get("stats_1d") or {},
+                        3: top_combo.get("stats_3d") or {},
+                        5: top_combo.get("stats_5d") or {},
+                        10: top_combo.get("stats_10d") or {},
+                    },
+                    "note": (
+                        f"强票覆盖率 {_fmt_optional_float(top_combo.get('winner_capture_rate'), suffix='%', digits=1)}"
+                        if lang == "zh"
+                        else f"Winner capture {_fmt_optional_float(top_combo.get('winner_capture_rate'), suffix='%', digits=1)}"
+                    ),
+                }
+            )
+        recommendation_validation_rows.append(
+            {
+                "label": "本周 AI 日报 Top 5" if lang == "zh" else "Weekly AI Report Top 5",
+                "title": "日报归档自动验证" if lang == "zh" else "Archived Daily Recommendations",
+                "href": f"/dashboard/ai-daily-report/history?lang={lang}",
+                "windows": report_window_summary,
+                "note": (
+                    f"{len(report_history)} 期日报，{measured_report_rows} 个可测样本"
+                    if lang == "zh"
+                    else f"{len(report_history)} reports, {measured_report_rows} measurable rows"
+                ),
+            }
+        )
 
         recent_jobs = DataJobRepository(db).list_recent_jobs(limit=180)
         weekly_jobs = [item for item in recent_jobs if str(item.get("started_at") or "")[:10] >= week_start_iso]
@@ -1400,17 +1823,13 @@ def _build_weekly_review_summary(db: Session, *, lang: str) -> dict:
             item for item in load_portfolio_trades()
             if str(item.get("trade_date") or "") >= week_start_iso
         ]
-        trade_history_cache: dict[tuple[str, str], list[dict]] = {}
         enriched_weekly_trades: list[dict] = []
         for item in weekly_trades:
             item_market = str(item.get("market") or "").strip().upper() or (
                 "CN" if str(item.get("ticker") or "").upper().endswith((".SS", ".SZ", ".SH", ".BJ")) else "US"
             )
             ticker = str(item.get("ticker") or "").strip().upper()
-            cache_key = (item_market, ticker)
-            if cache_key not in trade_history_cache:
-                trade_history_cache[cache_key] = load_lake_price_history(market=item_market, ticker=ticker, limit=260)
-            history = trade_history_cache[cache_key]
+            history = _cached_price_history(market_code=item_market, ticker=ticker)
             enriched_weekly_trades.append(
                 {
                     **item,
@@ -1480,6 +1899,9 @@ def _build_weekly_review_summary(db: Session, *, lang: str) -> dict:
             "report_count": len(report_history),
             "mood_counts": mood_counts,
             "repeated_top_tickers": repeated_top_tickers,
+            "report_window_summary": report_window_summary,
+            "measured_report_rows": measured_report_rows,
+            "recommendation_validation_rows": recommendation_validation_rows,
             "job_status_counts": job_status_counts,
             "partial_or_failed_jobs": partial_or_failed_jobs[:10],
             "run_rows": run_rows,
@@ -1663,11 +2085,41 @@ def _build_model_run_performance_summary(
             derived = str(enriched.get("regime_label") or "").strip()
             return derived or None
 
+        date_stmt = (
+            select(Prediction.trade_date)
+            .join(Symbol, Symbol.id == Prediction.symbol_id)
+            .where(Prediction.model_run_id == run_id)
+            .distinct()
+            .order_by(Prediction.trade_date.desc())
+            .limit(max_trade_dates)
+        )
+        if normalized_market != "ALL":
+            date_stmt = date_stmt.where(Symbol.market == normalized_market)
+        selected_dates = [str(value) for value in db.scalars(date_stmt).all()]
+        if not selected_dates:
+            return {
+                "run": {
+                    "id": run.id,
+                    "name": run.name,
+                    "market": run.market,
+                    "universe": run.universe,
+                    "status": run.status,
+                    "created_at": run.created_at,
+                    "finished_at": run.finished_at,
+                },
+                "windows": {3: _aggregate_window_stats([]), 5: _aggregate_window_stats([]), 10: _aggregate_window_stats([])},
+                "trade_dates": 0,
+                "pick_count": 0,
+                "latest_trade_date": None,
+                "rows": [],
+            }
+
         stmt = (
             select(Prediction, Symbol, PredictionDetail)
             .join(Symbol, Symbol.id == Prediction.symbol_id)
             .outerjoin(PredictionDetail, PredictionDetail.prediction_id == Prediction.id)
             .where(Prediction.model_run_id == run_id)
+            .where(Prediction.trade_date.in_(selected_dates))
             .order_by(Prediction.trade_date.desc(), Prediction.score.desc(), Symbol.ticker.asc())
         )
         if normalized_market != "ALL":
@@ -1694,52 +2146,57 @@ def _build_model_run_performance_summary(
         grouped: dict[str, list[tuple[Prediction, Symbol, PredictionDetail | None]]] = {}
         for prediction, symbol, detail in rows:
             grouped.setdefault(str(prediction.trade_date), []).append((prediction, symbol, detail))
-        selected_dates = sorted(grouped.keys(), reverse=True)[:max_trade_dates]
-        history_cache: dict[str, list[dict]] = {}
+        selected_items: list[tuple[str, Prediction, Symbol, PredictionDetail | None, str, str]] = []
+        tickers_by_market: dict[str, set[str]] = {}
+        for trade_date in selected_dates:
+            for prediction, symbol, detail in grouped.get(trade_date, [])[:top_n]:
+                ticker = str(symbol.ticker or "").upper()
+                market_code = str(symbol.market or run.market or "").upper() or "CN"
+                selected_items.append((trade_date, prediction, symbol, detail, market_code, ticker))
+                tickers_by_market.setdefault(market_code, set()).add(ticker)
+        history_cache: dict[tuple[str, str], list[dict]] = {}
+        for market_code, tickers in tickers_by_market.items():
+            for row in load_lake_rows(markets=[market_code], tickers=tickers, limit_per_symbol=260):
+                ticker = str(row.get("symbol") or "").strip().upper()
+                if ticker:
+                    history_cache.setdefault((market_code, ticker), []).append(row)
+        for key in list(history_cache.keys()):
+            history_cache[key].sort(key=lambda item: str(item.get("date") or ""))
         window_values: dict[int, list[float]] = {3: [], 5: [], 10: []}
         pick_rows: list[dict] = []
-        for trade_date in selected_dates:
-            daily_rows = grouped[trade_date][:top_n]
-            for prediction, symbol, detail in daily_rows:
-                ticker = str(symbol.ticker or "").upper()
-                if ticker not in history_cache:
-                    history_cache[ticker] = load_lake_price_history(
-                        market=str(symbol.market or run.market or "").upper() or "CN",
-                        ticker=ticker,
-                        limit=260,
-                    )
-                history = history_cache[ticker]
-                row_payload = {
-                    "trade_date": trade_date,
-                    "ticker": ticker,
-                    "name": symbol.name or ticker,
-                    "market": symbol.market,
-                    "sector": symbol.sector,
-                    "industry": symbol.industry,
-                    "sector_group": resolve_template_group_label(
-                        meta={
-                            "sector": symbol.sector,
-                            "industry": symbol.industry,
-                            "exchange": symbol.exchange,
-                            "name": symbol.name,
-                        },
-                        ticker=ticker,
-                        market_code=str(symbol.market or run.market or "").upper() or "CN",
-                        name=symbol.name,
-                    ),
-                    "regime_label": _resolved_regime_label(detail, prediction.score),
-                    "score": prediction.score,
-                    "signal_label": detail.signal_label if detail is not None else None,
-                    "signal_strength": detail.signal_strength if detail is not None else None,
-                    "return_3d": _forward_return_from_history(history, trade_date=trade_date, sessions=3),
-                    "return_5d": _forward_return_from_history(history, trade_date=trade_date, sessions=5),
-                    "return_10d": _forward_return_from_history(history, trade_date=trade_date, sessions=10),
-                }
-                for window, key in ((3, "return_3d"), (5, "return_5d"), (10, "return_10d")):
-                    value = row_payload.get(key)
-                    if value is not None:
-                        window_values[window].append(float(value))
-                pick_rows.append(row_payload)
+        for trade_date, prediction, symbol, detail, market_code, ticker in selected_items:
+            history = history_cache.get((market_code, ticker), [])
+            row_payload = {
+                "trade_date": trade_date,
+                "ticker": ticker,
+                "name": symbol.name or ticker,
+                "market": symbol.market,
+                "sector": symbol.sector,
+                "industry": symbol.industry,
+                "sector_group": resolve_template_group_label(
+                    meta={
+                        "sector": symbol.sector,
+                        "industry": symbol.industry,
+                        "exchange": symbol.exchange,
+                        "name": symbol.name,
+                    },
+                    ticker=ticker,
+                    market_code=market_code,
+                    name=symbol.name,
+                ),
+                "regime_label": _resolved_regime_label(detail, prediction.score),
+                "score": prediction.score,
+                "signal_label": detail.signal_label if detail is not None else None,
+                "signal_strength": detail.signal_strength if detail is not None else None,
+                "return_3d": _forward_return_from_history(history, trade_date=trade_date, sessions=3),
+                "return_5d": _forward_return_from_history(history, trade_date=trade_date, sessions=5),
+                "return_10d": _forward_return_from_history(history, trade_date=trade_date, sessions=10),
+            }
+            for window, key in ((3, "return_3d"), (5, "return_5d"), (10, "return_10d")):
+                value = row_payload.get(key)
+                if value is not None:
+                    window_values[window].append(float(value))
+            pick_rows.append(row_payload)
         return {
             "run": {
                 "id": run.id,
@@ -2042,6 +2499,7 @@ def _compact_job_type(value: str | None, limit: int = 22) -> str:
         "watchlist_auto_analysis": "watchlist_analysis",
         "cn_close_review": "close_review",
         "us_signal_train": "us_signal_train",
+        "train_us_signals": "us_signal_train",
         "sync_cn_symbol_universe": "cn_universe_sync",
         "init_cn_market_data": "cn_market_init",
         "refresh_cn_market_data": "cn_market_refresh",
@@ -2059,6 +2517,238 @@ def _compact_json_summary(value: object, limit: int = 56) -> str:
     except TypeError:
         text = str(value)
     return _compact_label(text, limit=limit)
+
+
+SCREENER_PRECOMPUTE_STAGE_CONFIG = [
+    ("screener_precompute", "总控预计算", "Staged Precompute"),
+    ("screener_precompute_core", "核心模型预计算", "Core Precompute"),
+    ("screener_precompute_combos", "组合预计算", "Combo Precompute"),
+    ("screener_precompute_rest", "补全预计算", "Rest Precompute"),
+]
+
+US_SIGNAL_TRAIN_JOB_TYPES = ("us_signal_train", "train_us_signals")
+
+
+def _job_status_text(status: str | None, lang: str = "zh") -> str:
+    normalized = str(status or "").strip().lower() or "idle"
+    labels_zh = {
+        "success": "成功",
+        "failed": "失败",
+        "partial": "部分完成",
+        "running": "运行中",
+        "enabled": "已开启",
+        "disabled": "已关闭",
+        "idle": "待运行",
+    }
+    labels_en = {
+        "success": "Success",
+        "failed": "Failed",
+        "partial": "Partial",
+        "running": "Running",
+        "enabled": "Enabled",
+        "disabled": "Disabled",
+        "idle": "Idle",
+    }
+    labels = labels_zh if lang == "zh" else labels_en
+    return labels.get(normalized, normalized)
+
+
+def _find_latest_job_by_type(recent_jobs: list[dict], job_type: str | list[str] | tuple[str, ...]) -> dict | None:
+    if isinstance(job_type, (list, tuple, set)):
+        keys = {str(item or "").strip().lower() for item in job_type if str(item or "").strip()}
+    else:
+        keys = {str(job_type or "").strip().lower()}
+    return next((item for item in recent_jobs if str(item.get("job_type") or "").strip().lower() in keys), None)
+
+
+def _summarize_screener_precompute_job(job: dict | None, *, lang: str = "zh") -> dict:
+    if not isinstance(job, dict):
+        return {
+            "summary": "待运行" if lang == "zh" else "Pending",
+            "detail": "还没有任务记录。" if lang == "zh" else "No job record yet.",
+            "status": "idle",
+        }
+    status = str(job.get("status") or "").strip().lower() or "idle"
+    result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    created = list(result.get("snapshots_created") or [])
+    failed_templates = list(result.get("failed_templates") or [])
+    failed_presets = list(result.get("failed_presets") or [])
+    failed_total = int(result.get("failed_count") or 0)
+    total = int(result.get("count") or 0) + failed_total
+    depends_on = [str(item) for item in (job.get("depends_on") or []) if str(item).strip()]
+    pipeline_step = str(job.get("pipeline_step") or "").strip()
+    if total > 0:
+        summary = (
+            f"{int(result.get('count') or 0)}/{total} 完成"
+            if lang == "zh"
+            else f"{int(result.get('count') or 0)}/{total} completed"
+        )
+    elif status == "running":
+        summary = "运行中" if lang == "zh" else "Running"
+    else:
+        summary = "待运行" if lang == "zh" else "Pending"
+    detail_parts: list[str] = []
+    if created:
+        if created[0].get("preset_key"):
+            created_names = [str(item.get("preset_label") or item.get("preset_key") or "-") for item in created[:3]]
+        else:
+            created_names = [str(item.get("model_template") or "-") for item in created[:3]]
+        detail_parts.append(
+            (
+                f"已生成 {len(created)} 项：{', '.join(created_names)}"
+                if lang == "zh"
+                else f"Generated {len(created)} item(s): {', '.join(created_names)}"
+            )
+        )
+    failed_items = failed_templates + failed_presets
+    if failed_items:
+        labels = [
+            str(item.get("preset_label") or item.get("preset_key") or item.get("model_template") or "-")
+            for item in failed_items[:3]
+        ]
+        detail_parts.append(
+            (
+                f"失败 {len(failed_items)} 项：{', '.join(labels)}"
+                if lang == "zh"
+                else f"Failed {len(failed_items)} item(s): {', '.join(labels)}"
+            )
+        )
+    if pipeline_step:
+        detail_parts.append(
+            (f"阶段：{pipeline_step}" if lang == "zh" else f"Step: {pipeline_step}")
+        )
+    if depends_on:
+        detail_parts.append(
+            (
+                f"依赖：{', '.join(depends_on)}"
+                if lang == "zh"
+                else f"Depends on: {', '.join(depends_on)}"
+            )
+        )
+    if not detail_parts:
+        detail_parts.append(job.get("message") or ("暂无附加说明" if lang == "zh" else "No additional note"))
+    return {
+        "summary": summary,
+        "detail": " · ".join(detail_parts),
+        "status": status,
+    }
+
+
+def _build_screener_precompute_stage_rows(recent_jobs: list[dict], *, lang: str = "zh") -> list[dict]:
+    rows: list[dict] = []
+    for job_type, label_zh, label_en in SCREENER_PRECOMPUTE_STAGE_CONFIG:
+        job = _find_latest_job_by_type(recent_jobs, job_type)
+        summary = _summarize_screener_precompute_job(job, lang=lang)
+        rows.append(
+            {
+                "job_type": job_type,
+                "label": label_zh if lang == "zh" else label_en,
+                "job": job,
+                "summary": summary["summary"],
+                "detail": summary["detail"],
+                "status": summary["status"],
+            }
+        )
+    return rows
+
+
+def _render_screener_precompute_action_forms(
+    *,
+    lang: str = "zh",
+    redirect_to: str,
+    compact: bool = False,
+    stage_rows: list[dict] | None = None,
+) -> str:
+    labels = {
+        "run_all": "运行整条预计算链" if lang == "zh" else "Run Full Precompute Chain",
+        "run_core": "只跑核心" if lang == "zh" else "Run Core Only",
+        "run_combos": "只跑组合" if lang == "zh" else "Run Combos Only",
+        "run_rest": "只跑补全" if lang == "zh" else "Run Rest Only",
+    }
+    actions = [
+        ("/jobs/precompute-cn-screeners", labels["run_all"], True, "screener_precompute"),
+        ("/jobs/precompute-cn-screeners-core", labels["run_core"], False, "screener_precompute_core"),
+        ("/jobs/precompute-cn-screeners-combos", labels["run_combos"], False, "screener_precompute_combos"),
+        ("/jobs/precompute-cn-screeners-rest", labels["run_rest"], False, "screener_precompute_rest"),
+    ]
+    stage_map = {str(item.get("job_type") or ""): item for item in (stage_rows or [])}
+    forms = "".join(
+        "<div class='action-with-note'>"
+        "<form action='{action}' method='post' class='inline-form'>"
+        "<input type='hidden' name='redirect_to' value='{redirect_to}' />"
+        "<button class='{button_class}' type='submit'>{label}</button>"
+        "</form>"
+        "<div class='subtle action-receipt'>{receipt}</div>"
+        "</div>".format(
+            action=action,
+            redirect_to=html.escape(redirect_to, quote=True),
+            button_class=("cta compact primary" if compact and is_primary else "cta compact" if compact else "cta primary" if is_primary else "cta"),
+            label=html.escape(label),
+            receipt=html.escape(
+                (
+                    f"最近：{stage_map.get(job_type, {}).get('summary') or ('待运行' if lang == 'zh' else 'Pending')}"
+                    + " · "
+                    + (stage_map.get(job_type, {}).get("detail") or ("还没有任务记录。" if lang == "zh" else "No job record yet."))
+                )
+                if lang == "zh"
+                else (
+                    f"Latest: {stage_map.get(job_type, {}).get('summary') or 'Pending'}"
+                    + " · "
+                    + (stage_map.get(job_type, {}).get("detail") or "No job record yet.")
+                )
+            ),
+        )
+        for action, label, is_primary, job_type in actions
+    )
+    note = (
+        "组合预计算依赖核心快照；如果组合失败，先补跑核心。"
+        if lang == "zh"
+        else "Combo precompute depends on core snapshots; rerun core first if combos fail."
+    )
+    return forms + f"<div class='subtle precompute-note'>{html.escape(note)}</div>"
+
+
+def _render_model_selection_guidance_action_form(
+    *,
+    lang: str = "zh",
+    redirect_to: str,
+    job: dict | None = None,
+    compact: bool = False,
+) -> str:
+    status = str((job or {}).get("status") or "idle").strip().lower()
+    if lang == "zh":
+        status_label = {
+            "success": "成功",
+            "failed": "失败",
+            "partial": "部分完成",
+            "running": "运行中",
+            "idle": "待运行",
+        }.get(status, status or "待运行")
+        receipt = f"最近：{status_label} · {((job or {}).get('message') or '还没有任务记录。')}"
+        note = "这条 job 会把今日优先模型、优先组合和强票反向归因写入快照，供首页、模型评测和 AI 日报直接读取。"
+        label = "刷新模型使用指导"
+    else:
+        status_label = {
+            "success": "Success",
+            "failed": "Failed",
+            "partial": "Partial",
+            "running": "Running",
+            "idle": "Pending",
+        }.get(status, status or "Pending")
+        receipt = f"Latest: {status_label} · {((job or {}).get('message') or 'No job record yet.')}"
+        note = "This job persists the priority model, priority combo, and winner traceback snapshot for Dashboard, Model Performance, and AI Daily Report."
+        label = "Refresh Model Guidance"
+    return (
+        "<div class='action-with-note'>"
+        f"<form action='/jobs/model-selection-guidance-snapshot' method='post' class='inline-form'>"
+        f"<input type='hidden' name='redirect_to' value='{html.escape(redirect_to, quote=True)}' />"
+        "<input type='hidden' name='markets' value='CN' />"
+        f"<button class='{('cta compact' if compact else 'cta')}' type='submit'>{html.escape(label)}</button>"
+        "</form>"
+        f"<div class='subtle action-receipt'>{html.escape(receipt)}</div>"
+        f"<div class='subtle precompute-note'>{html.escape(note)}</div>"
+        "</div>"
+    )
 
 
 def _latest_cn_refresh_summary(db: Session, recent_jobs: list[dict] | None = None, *, lang: str = "zh") -> dict:
@@ -2265,8 +2955,8 @@ def _render_dashboard_workspace(
     ) or f"<div class='empty'>{'暂无可执行候选' if lang == 'zh' else 'No actionable candidates yet'}</div>"
     blocked_html = "".join(
         "<article class='signal-row'>"
-        f"<div><a class='ticker' href='/insights/{item.get('ticker')}?lang={lang}'>{item.get('ticker')}</a><div class='subtle'>{item.get('name') or item.get('ticker')}</div><div class='subtle'>{item.get('block_reason') or '-'}</div></div>"
-        f"<div class='row-right'><span class='signal {item.get('status_tone')}'>{item.get('status_label')}</span><div class='mini-metric'>{item.get('risk_flags_text')}</div></div>"
+        f"<div><a class='ticker' href='/insights/{item.get('ticker')}?lang={lang}'>{item.get('ticker')}</a><div class='subtle'>{item.get('name') or item.get('ticker')}</div><div class='subtle'>{_reason_screen_link(format_trade_gate_reason(item.get('block_reason'), lang=lang), reason=item.get('block_reason'), status=item.get('status_label'), market=item.get('market'), lang=lang)}</div><div class='subtle'>{_reason_screen_link('查看同类筛选' if lang == 'zh' else 'Open screener', reason=item.get('block_reason'), status=item.get('status_label'), market=item.get('market'), lang=lang)}</div></div>"
+        f"<div class='row-right'><span class='signal {item.get('status_tone')}'>{html.escape(format_trade_status(item.get('status_label'), lang=lang))}</span><div class='mini-metric'>{item.get('risk_flags_text')}</div></div>"
         "</article>"
         for item in signal_sets["blocked"][:3]
     ) or f"<div class='empty'>{'暂无受阻候选' if lang == 'zh' else 'No blocked candidates'}</div>"
@@ -5234,7 +5924,7 @@ def dashboard_continuous_leaders_page(
 def dashboard_model_performance(
     request: Request,
     run_id: int | None = None,
-    market: str = "ALL",
+    market: str = "CN",
     top_n: int = 10,
     max_trade_dates: int = 20,
     db: Session = Depends(get_db_session),
@@ -5245,7 +5935,7 @@ def dashboard_model_performance(
     nav_html = render_workspace_nav_html(lang=lang, active_key="ops")
     run_repo = ModelRunRepository(db)
     recent_runs = [item for item in run_repo.list_recent_runs(limit=8) if str(item.get("status") or "").lower() == "success"]
-    aggregate_runs = [item for item in run_repo.list_recent_runs(limit=24) if str(item.get("status") or "").lower() == "success"]
+    aggregate_runs = [item for item in run_repo.list_recent_runs(limit=8) if str(item.get("status") or "").lower() == "success"]
     aggregate_by_model: dict[tuple[str, str], dict] = {}
     for item in aggregate_runs:
         model_key = (str(item.get("name") or "-"), str(item.get("market") or "-"))
@@ -5307,6 +5997,8 @@ def dashboard_model_performance(
     lightgbm_eval = build_lightgbm_evaluation(market=market, lookback_snapshots=15, top_n=40)
     lightgbm_maturity_state = lightgbm_maturity(lightgbm_eval, lang=lang)
     lightgbm_prediction_eval = build_lightgbm_prediction_evaluation(market=market, recent_runs=8, top_n=40)
+    selection_guidance = load_model_selection_guidance_snapshot(db, market=market, allow_fallback=True)
+    selection_guidance_summary = summarize_model_selection_guidance(selection_guidance, lang=lang)
     summary_cards_html = ""
     if selected_summary is not None:
         windows = selected_summary.get("windows") or {}
@@ -5333,6 +6025,179 @@ def dashboard_model_performance(
         f"<option value='{value}' {'selected' if market == value else ''}>{label}</option>"
         for value, label in (("ALL", "全部市场" if lang == "zh" else "All markets"), ("CN", "A股" if lang == "zh" else "CN"), ("US", "美股" if lang == "zh" else "US"))
     )
+    reason_jump_html = "".join(
+        _reason_screen_link(
+            format_trade_gate_reason(reason, lang=lang),
+            reason=reason,
+            status=None,
+            market=market,
+            lang=lang,
+            css_class="pill",
+        )
+        for reason in (
+            "low_trade_readiness",
+            "extended_after_sharp_move",
+            "too_far_from_pullback_zone",
+            "too_many_risk_flags",
+            "missing_latest_price",
+        )
+    )
+    def _guidance_bucket_label(value: str | None) -> str:
+        normalized = str(value or "").strip()
+        if not normalized or normalized == "unclassified":
+            return "未归类" if lang == "zh" else "Unclassified"
+        if normalized == "ALL":
+            return "任意动作" if lang == "zh" else "Any Action"
+        return ACTION_BUCKET_LABELS.get(normalized, {}).get(lang, normalized)
+
+    def _guidance_market_label(value: str | None) -> str:
+        normalized = str(value or "").upper()
+        if normalized == "CN":
+            return "A股" if lang == "zh" else "CN"
+        if normalized == "US":
+            return "美股" if lang == "zh" else "US"
+        return normalized or "-"
+
+    guidance_recommendations = list((selection_guidance or {}).get("recommendations") or [])
+    guidance_combos = list((selection_guidance or {}).get("combos") or [])
+    guidance_winners = list((selection_guidance or {}).get("winner_attribution") or [])
+    top_guidance = guidance_recommendations[0] if guidance_recommendations else {}
+    top_combo = guidance_combos[0] if guidance_combos else {}
+    winner_total = int((selection_guidance or {}).get("winner_total") or 0)
+    guidance_snapshot_meta = selection_guidance_summary.get("snapshot_meta") or {}
+    top_guidance_href = str(selection_guidance_summary.get("top_model_href") or f"/screeners?lang={lang}&market={market}")
+    top_combo_href = str(selection_guidance_summary.get("top_combo_href") or f"/screeners?lang={lang}&market={market}")
+    if top_guidance:
+        top_guidance_title = html.escape(str(top_guidance.get("template_label") or top_guidance.get("template") or "-"))
+        if top_guidance.get("action_bucket"):
+            top_guidance_title += f" · {html.escape(_guidance_bucket_label(str(top_guidance.get('action_bucket'))))}"
+        top_guidance_copy = (
+            f"次日均值 {_fmt_optional_float((top_guidance.get('stats_1d') or {}).get('avg_return'), suffix='%', digits=2)}，"
+            f"命中率 {_fmt_optional_float((top_guidance.get('stats_1d') or {}).get('hit_rate'), suffix='%', digits=1)}，"
+            f"提前覆盖强票 {int(top_guidance.get('winner_capture_count') or 0)} 只。"
+            if lang == "zh"
+            else (
+                f"1D avg {_fmt_optional_float((top_guidance.get('stats_1d') or {}).get('avg_return'), suffix='%', digits=2)}, "
+                f"hit rate {_fmt_optional_float((top_guidance.get('stats_1d') or {}).get('hit_rate'), suffix='%', digits=1)}, "
+                f"captured {int(top_guidance.get('winner_capture_count') or 0)} strong movers."
+            )
+        )
+    else:
+        top_guidance_title = "样本继续沉淀" if lang == "zh" else "Still collecting samples"
+        top_guidance_copy = "当前还没有足够样本给出明确偏好。" if lang == "zh" else "There is not enough sample depth for a clear preference yet."
+    if top_combo:
+        combo_label = (top_combo.get("label") or {}).get(lang) or (top_combo.get("label") or {}).get("zh") or "-"
+        top_combo_title = html.escape(str(combo_label))
+        top_combo_copy = (
+            f"次日均值 {_fmt_optional_float((top_combo.get('stats_1d') or {}).get('avg_return'), suffix='%', digits=2)}，"
+            f"命中率 {_fmt_optional_float((top_combo.get('stats_1d') or {}).get('hit_rate'), suffix='%', digits=1)}，"
+            f"强票覆盖率 {_fmt_optional_float(top_combo.get('winner_capture_rate'), suffix='%', digits=1)}。"
+            if lang == "zh"
+            else (
+                f"1D avg {_fmt_optional_float((top_combo.get('stats_1d') or {}).get('avg_return'), suffix='%', digits=2)}, "
+                f"hit rate {_fmt_optional_float((top_combo.get('stats_1d') or {}).get('hit_rate'), suffix='%', digits=1)}, "
+                f"strong-mover coverage {_fmt_optional_float(top_combo.get('winner_capture_rate'), suffix='%', digits=1)}."
+            )
+        )
+    else:
+        top_combo_title = "组合样本继续沉淀" if lang == "zh" else "Combo samples are still accumulating"
+        top_combo_copy = "还没有足够组合样本。" if lang == "zh" else "Not enough confluence samples yet."
+    guidance_cards_html = (
+        "<div class='metric-grid'>"
+        f"<article class='metric-card'><div class='eyebrow'>{'当前优先模型' if lang == 'zh' else 'Priority model'}</div><div style='font-size:22px;font-weight:800;line-height:1.25;margin:6px 0 8px;'>{top_guidance_title}</div><div class='muted'>{html.escape(top_guidance_copy)}</div><div style='margin-top:12px;'><a class='pill' href='{html.escape(top_guidance_href, quote=True)}'>{'用这套模型去筛股' if lang == 'zh' else 'Screen with this model'}</a></div></article>"
+        f"<article class='metric-card'><div class='eyebrow'>{'优先模型组合' if lang == 'zh' else 'Priority combo'}</div><div style='font-size:22px;font-weight:800;line-height:1.25;margin:6px 0 8px;'>{top_combo_title}</div><div class='muted'>{html.escape(top_combo_copy)}</div><div style='margin-top:12px;'><a class='pill' href='{html.escape(top_combo_href, quote=True)}'>{'用这套组合去筛股' if lang == 'zh' else 'Screen with this combo'}</a></div></article>"
+        f"<article class='metric-card'><div class='eyebrow'>{'反向归因样本' if lang == 'zh' else 'Winner traceback'}</div><div class='metric'>{winner_total}</div><div class='muted'>{'近期次日涨幅不低于 3% 的强势样本，用来检查哪些模型前一天提前命中。' if lang == 'zh' else 'Recent 1D movers above 3%, used to trace which models caught them one session earlier.'}</div><div class='muted' style='margin-top:8px;'>{html.escape((('快照来源：后台预计算' if lang == 'zh' else 'Source: background snapshot') if str(guidance_snapshot_meta.get('source') or '') == 'snapshot' else ('快照缺失：当前为实时回退' if lang == 'zh' else 'Snapshot missing: live fallback in use')))} · {html.escape(str(guidance_snapshot_meta.get('snapshot_date') or guidance_snapshot_meta.get('generated_at') or '-'))}</div></article>"
+        "</div>"
+    )
+    guidance_rows_html = ""
+    for item in guidance_recommendations[:6]:
+        action_label = _guidance_bucket_label(str(item.get("action_bucket") or ""))
+        guidance_rows_html += (
+            "<tr>"
+            f"<td>{html.escape(str(item.get('template_label') or item.get('template') or '-'))}<div class='muted'>{html.escape(action_label)}</div></td>"
+            f"<td>{int(item.get('sample_count') or 0)}</td>"
+            f"<td>{_fmt_optional_float((item.get('stats_1d') or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float((item.get('stats_1d') or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+            f"<td>{_fmt_optional_float((item.get('stats_3d') or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float((item.get('stats_3d') or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+            f"<td>{int(item.get('winner_capture_count') or 0)}<div class='muted'>{_fmt_optional_float(item.get('winner_capture_rate'), suffix='%', digits=1)}</div></td>"
+            f"<td>{_fmt_optional_float(item.get('score'), digits=1)}</td>"
+            "</tr>"
+        )
+    if not guidance_rows_html:
+        guidance_rows_html = f"<tr><td colspan='6'>{'暂无足够样本。' if lang == 'zh' else 'Not enough samples yet.'}</td></tr>"
+    combo_rows_html = ""
+    for item in guidance_combos[:6]:
+        combo_label = (item.get("label") or {}).get(lang) or (item.get("label") or {}).get("zh") or "-"
+        template_text = " / ".join(str(value) for value in (item.get("available_templates") or [])[:4])
+        combo_rows_html += (
+            "<tr>"
+            f"<td><a href='{html.escape(str(item.get('screener_href') or '#'))}'>{html.escape(str(combo_label))}</a><div class='muted'>{html.escape(template_text)}</div></td>"
+            f"<td>{_guidance_bucket_label(str(item.get('action_bucket') or 'ALL'))}<div class='muted'>{'至少' if lang == 'zh' else 'Min'} {int(item.get('min_hits') or 2)} {'模型命中' if lang == 'zh' else 'hits'}</div></td>"
+            f"<td>{_fmt_optional_float((item.get('stats_1d') or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float((item.get('stats_1d') or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+            f"<td>{_fmt_optional_float((item.get('stats_3d') or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float((item.get('stats_3d') or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+            f"<td>{_fmt_optional_float((item.get('stats_5d') or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float((item.get('stats_5d') or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+            f"<td>{_fmt_optional_float((item.get('stats_10d') or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float((item.get('stats_10d') or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+            f"<td>{int(item.get('winner_capture_count') or 0)}<div class='muted'>{_fmt_optional_float(item.get('winner_capture_rate'), suffix='%', digits=1)}</div></td>"
+            "</tr>"
+        )
+    if not combo_rows_html:
+        combo_rows_html = f"<tr><td colspan='7'>{'暂无组合评测样本。' if lang == 'zh' else 'No combo evaluation samples yet.'}</td></tr>"
+    winner_rows_html = ""
+    for item in guidance_winners[:10]:
+        hit_labels = " / ".join(
+            str(hit.get("template_label") or hit.get("template") or "")
+            for hit in (item.get("hits") or [])[:3]
+            if str(hit.get("template_label") or hit.get("template") or "").strip()
+        ) or ("未提前命中" if lang == "zh" else "No prior hit")
+        winner_rows_html += (
+            "<tr>"
+            f"<td><a href='/insights/{html.escape(str(item.get('ticker') or ''))}?lang={lang}'>{html.escape(str(item.get('ticker') or '-'))}</a><div class='muted'>{html.escape(str(item.get('name') or '-'))}</div></td>"
+            f"<td>{_guidance_market_label(str(item.get('market') or ''))}</td>"
+            f"<td>{html.escape(str(item.get('signal_date') or '-'))}<div class='muted'>{html.escape(str(item.get('winner_date') or '-'))}</div></td>"
+            f"<td>{_fmt_optional_float(item.get('return_1d'), suffix='%', digits=2)}</td>"
+            f"<td>{int(item.get('hit_count') or 0)}<div class='muted'>{html.escape(hit_labels)}</div></td>"
+            "</tr>"
+        )
+    if not winner_rows_html:
+        winner_rows_html = f"<tr><td colspan='5'>{'暂无可归因的大涨样本。' if lang == 'zh' else 'No attributable winner samples yet.'}</td></tr>"
+    validation_summary = _build_recommendation_validation_summary(
+        db,
+        market=market,
+        lang=lang,
+        selection_guidance=selection_guidance,
+        selection_guidance_summary=selection_guidance_summary,
+        report_limit=30,
+    )
+    validation_cards_html = ""
+    validation_rows_html = ""
+    for row in validation_summary.get("rows") or []:
+        row_windows = row.get("windows") or {}
+        stats_5 = row_windows.get(5) or {}
+        stats_10 = row_windows.get(10) or {}
+        href = str(row.get("href") or "#")
+        validation_cards_html += (
+            "<article class='metric-card'>"
+            f"<div class='eyebrow'>{html.escape(str(row.get('label') or '-'))}</div>"
+            f"<div style='font-size:20px;font-weight:800;line-height:1.3;margin:4px 0 8px;'>{html.escape(str(row.get('title') or '-'))}</div>"
+            f"<div class='muted'>{html.escape(str(row.get('note') or ''))}</div>"
+            f"<div class='muted' style='margin-top:8px;'>{'5日' if lang == 'zh' else '5D'} {_fmt_optional_float(stats_5.get('avg_return'), suffix='%', digits=2)} / {_fmt_optional_float(stats_5.get('hit_rate'), suffix='%', digits=1)}"
+            f" · {'10日' if lang == 'zh' else '10D'} {_fmt_optional_float(stats_10.get('avg_return'), suffix='%', digits=2)} / {_fmt_optional_float(stats_10.get('hit_rate'), suffix='%', digits=1)}</div>"
+            f"<div style='margin-top:12px;'><a class='pill' href='{html.escape(href, quote=True)}'>{'打开明细' if lang == 'zh' else 'Open detail'}</a></div>"
+            "</article>"
+        )
+        validation_rows_html += (
+            "<tr>"
+            f"<td>{html.escape(str(row.get('label') or '-'))}<div class='muted'>{html.escape(str(row.get('title') or '-'))}</div></td>"
+            f"<td>{int(row.get('count') or 0)}<div class='muted'>{html.escape(str(row.get('note') or ''))}</div></td>"
+            f"<td>{_fmt_optional_float((row_windows.get(1) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float((row_windows.get(1) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+            f"<td>{_fmt_optional_float((row_windows.get(3) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float((row_windows.get(3) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+            f"<td>{_fmt_optional_float((row_windows.get(5) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float((row_windows.get(5) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+            f"<td>{_fmt_optional_float((row_windows.get(10) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float((row_windows.get(10) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+            "</tr>"
+        )
+    if not validation_cards_html:
+        validation_cards_html = f"<div class='muted'>{'当前还没有足够样本形成推荐历史验证。' if lang == 'zh' else 'Not enough samples yet for recommendation validation.'}</div>"
+    if not validation_rows_html:
+        validation_rows_html = f"<tr><td colspan='6'>{'当前还没有足够样本形成推荐历史验证。' if lang == 'zh' else 'Not enough samples yet for recommendation validation.'}</td></tr>"
     recent_rows_html = ""
     for item in recent_runs[:6]:
         row_summary = _build_model_run_performance_summary(
@@ -6224,6 +7089,40 @@ def dashboard_model_performance(
                 <div class="eyebrow">{'总览摘要' if lang == 'zh' else 'Overview Brief'}</div>
                 <div class="muted">{'先回答三个问题：现在更值得看哪个模板、哪个市场更有参考价值、以及当前应把这块当观察面板还是比较面板。' if lang == 'zh' else 'Answer three questions first: which template is more worth watching, which market is more informative, and whether this should be treated as an observation panel or a comparison panel right now.'}</div>
                 {overview_cards_html}
+                <div style="margin-top:14px;">
+                  <div class="muted" style="margin-bottom:8px;">{'常见阻断原因反查：直接跳回模型选股，看同类票为什么被拦。' if lang == 'zh' else 'Common block reasons: jump back into screeners to inspect why similar names were gated.'}</div>
+                  <div class="toolbar">{reason_jump_html}</div>
+                </div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{'选股指导 · 模型命中归因' if lang == 'zh' else 'Selection Guidance · Model Attribution'}</div>
+                <div class="muted">{'这块不是看模型能筛出多少股票，而是反过来看近期真正大涨的股票，前一天到底被哪些模型或模型组合提前命中。用它来决定明天优先打开哪套模型/共振模板。' if lang == 'zh' else 'This does not reward models for producing many names. It traces recent strong movers back to the prior session and checks which models or confluence presets caught them before the move.'}</div>
+                {guidance_cards_html}
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{'模型 / 动作' if lang == 'zh' else 'Model / Playbook'}</th><th>{'样本' if lang == 'zh' else 'Samples'}</th><th>1D</th><th>3D</th><th>{'强票覆盖' if lang == 'zh' else 'Winner Capture'}</th><th>{'评分' if lang == 'zh' else 'Score'}</th></tr></thead>
+                  <tbody>{guidance_rows_html}</tbody>
+                </table></div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{'建议组合' if lang == 'zh' else 'Suggested Combo'}</th><th>{'动作约束' if lang == 'zh' else 'Action Gate'}</th><th>1D</th><th>3D</th><th>5D</th><th>10D</th><th>{'强票覆盖' if lang == 'zh' else 'Winner Capture'}</th></tr></thead>
+                  <tbody>{combo_rows_html}</tbody>
+                </table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{'推荐结果历史验证' if lang == 'zh' else 'Recommendation Validation'}</div>
+                <div class="muted">{'把今天优先模型、优先组合和 AI 日报 Top 5 放到同一张表里，看它们最近 1/3/5/10 日到底准不准。这样模型使用指导就不只告诉你“今天看什么”，也会告诉你“最近这套建议有没有持续兑现”。' if lang == 'zh' else 'Put the priority model, priority combo, and AI Daily Report Top 5 onto one board and verify their 1/3/5/10-day follow-through. This turns guidance into an accountable recommendation loop instead of a one-day opinion.'}</div>
+                <div class="metric-grid">{validation_cards_html}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{'对象' if lang == 'zh' else 'Recommendation'}</th><th>{'样本 / 说明' if lang == 'zh' else 'Samples / Note'}</th><th>1D</th><th>3D</th><th>5D</th><th>10D</th></tr></thead>
+                  <tbody>{validation_rows_html}</tbody>
+                </table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{'大涨股反向归因' if lang == 'zh' else 'Strong-Mover Traceback'}</div>
+                <div class="muted">{'按近期次日涨幅较高的股票排序，展示它们前一个交易日是否被模型快照提前命中。命中数越高，说明对应组合越值得复盘。' if lang == 'zh' else 'Ranks recent high 1D movers and shows whether they were captured by model snapshots on the previous trading session.'}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{'股票' if lang == 'zh' else 'Ticker'}</th><th>{'市场' if lang == 'zh' else 'Market'}</th><th>{'信号日 / 上涨日' if lang == 'zh' else 'Signal / Move Date'}</th><th>{'次日涨幅' if lang == 'zh' else '1D Move'}</th><th>{'提前命中' if lang == 'zh' else 'Prior Hits'}</th></tr></thead>
+                  <tbody>{winner_rows_html}</tbody>
+                </table></div>
               </section>
               <section class="card">
                 <div class="eyebrow">{'模型历史胜率榜' if lang == 'zh' else 'Historical Model Win-Rate Board'}</div>
@@ -6540,6 +7439,8 @@ def dashboard_market_page(
     lang: str = "en",
     lookback_runs: int = 5,
     heatmap_sort: str = "hits",
+    market_filter: str = "CN",
+    kpi_focus: str = "ALL",
     signal_filter: str = "ALL",
     min_signal_strength: int = 0,
     min_buy_signal_count: int = 0,
@@ -6551,24 +7452,51 @@ def dashboard_market_page(
         return login_redirect("/dashboard/market")
     lang = "zh" if lang == "zh" else "en"
     lookback_runs = _clamp_lookback_runs(lookback_runs)
+    market_filter = str(market_filter or "CN").strip().upper()
+    if market_filter not in {"ALL", "CN", "US"}:
+        market_filter = "CN"
+    kpi_focus = str(kpi_focus or "ALL").strip().lower()
+    if kpi_focus not in {"all", "focused", "buy", "risk", "boards"}:
+        kpi_focus = "all"
     signal_filter = signal_filter.upper()
     execution_tag_filter = execution_tag_filter.strip()
     exclude_execution_tag_filter = exclude_execution_tag_filter.strip()
     summary = _load_home_summary(db, lookback_runs=lookback_runs)
-    latest_signals = list(summary.get("latest_signals") or [])
+    signal_repo = PredictionRepository(db)
+    latest_signals = signal_repo.list_latest_signal_decisions(
+        limit=40,
+        market=None if market_filter == "ALL" else market_filter,
+    )
+    buy_hit_counts: dict[str, int] = {}
+    if min_buy_signal_count > 0:
+        buy_hit_counts = PredictionRepository(db).count_recent_signal_hits(
+            tickers=[str(item.get("ticker") or "").strip().upper() for item in latest_signals if item.get("ticker")],
+            signal_label="BUY",
+            limit_runs=lookback_runs,
+        )
     filtered_signals = []
     for item in latest_signals:
-        label = str(item.get("signal_label") or build_signal_label(item.get("score"), lang=lang) or "").strip().upper()
+        row = dict(item)
+        ticker = str(row.get("ticker") or "").strip().upper()
+        row["snapshot_buy_hits"] = int(buy_hit_counts.get(ticker, 0))
+        row["market"] = str(row.get("market") or "OTHER").upper()
+        all_tags = [str(tag).strip() for tag in (row.get("risk_flags") or row.get("execution_tags") or []) if str(tag).strip()]
+        row["market_risk_tags"] = [tag for tag in all_tags if tag not in MARKET_PULSE_SOFT_RISK_TAGS]
+        label = str(row.get("signal_label") or build_signal_label(row.get("score"), lang=lang) or "").strip().upper()
+        if market_filter != "ALL" and row["market"] != market_filter:
+            continue
         if signal_filter != "ALL" and label != signal_filter:
             continue
-        if min_signal_strength > 0 and int(item.get("signal_strength") or 0) < min_signal_strength:
+        if min_signal_strength > 0 and int(row.get("signal_strength") or 0) < min_signal_strength:
             continue
-        tags = item.get("risk_flags") or item.get("execution_tags") or []
+        if min_buy_signal_count > 0 and int(row.get("snapshot_buy_hits") or 0) < min_buy_signal_count:
+            continue
+        tags = row.get("risk_flags") or row.get("execution_tags") or []
         if execution_tag_filter and execution_tag_filter.upper() != "ALL" and not _matches_execution_tag_filter(tags, execution_tag_filter):
             continue
         if exclude_execution_tag_filter and exclude_execution_tag_filter.upper() != "ALL" and not _excludes_execution_tag_filter(tags, exclude_execution_tag_filter):
             continue
-        filtered_signals.append(item)
+        filtered_signals.append(row)
 
     market_counts: dict[str, int] = {}
     tagged_names = 0
@@ -6577,7 +7505,7 @@ def dashboard_market_page(
     for item in filtered_signals:
         market = str(item.get("market") or "OTHER").upper()
         market_counts[market] = market_counts.get(market, 0) + 1
-        tags = [str(tag).strip() for tag in (item.get("risk_flags") or item.get("execution_tags") or []) if str(tag).strip()]
+        tags = [str(tag).strip() for tag in (item.get("market_risk_tags") or []) if str(tag).strip()]
         if tags:
             tagged_names += 1
             for tag in tags:
@@ -6612,16 +7540,57 @@ def dashboard_market_page(
     snapshot_ready = isinstance(market_monitor_snapshot, dict) and isinstance(snapshot_boards, list) and bool(snapshot_boards)
     if not snapshot_ready:
         snapshot_boards = []
+    snapshot_boards = [
+        board
+        for board in snapshot_boards
+        if market_filter == "ALL" or str(board.get("market") or "").upper() == market_filter
+    ]
     heatmap_snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_MARKET_HEATMAP_WORKSPACE)
     heatmap_payload = (heatmap_snapshot or {}).get("payload") if isinstance(heatmap_snapshot, dict) else None
-    heatmap_preview_rows = list((heatmap_payload or {}).get("sector_heatmap") or [])[:3] if isinstance(heatmap_payload, dict) else []
+    heatmap_preview_source = list((heatmap_payload or {}).get("sector_heatmap") or []) if isinstance(heatmap_payload, dict) else []
+    if market_filter != "ALL":
+        heatmap_preview_source = [
+            item for item in heatmap_preview_source if str(item.get("market") or "").upper() == market_filter
+        ]
+    if signal_filter == "BUY":
+        heatmap_preview_source = [item for item in heatmap_preview_source if int(item.get("buy_signal_count") or 0) > 0]
+    elif signal_filter != "ALL":
+        heatmap_preview_source = [
+            item
+            for item in heatmap_preview_source
+            if any(str(detail.get("signal_label") or "").strip().upper() == signal_filter for detail in item.get("ticker_details", []))
+        ]
+    if min_signal_strength > 0:
+        heatmap_preview_source = [
+            item for item in heatmap_preview_source if int(item.get("max_signal_strength") or 0) >= min_signal_strength
+        ]
+    if min_buy_signal_count > 0:
+        heatmap_preview_source = [
+            item for item in heatmap_preview_source if int(item.get("buy_signal_count") or 0) >= min_buy_signal_count
+        ]
+    if execution_tag_filter and execution_tag_filter.upper() != "ALL":
+        heatmap_preview_source = [
+            item for item in heatmap_preview_source if _matches_execution_tag_filter(item.get("execution_tags"), execution_tag_filter)
+        ]
+    if exclude_execution_tag_filter and exclude_execution_tag_filter.upper() != "ALL":
+        heatmap_preview_source = [
+            item
+            for item in heatmap_preview_source
+            if _excludes_execution_tag_filter(item.get("execution_tags"), exclude_execution_tag_filter)
+        ]
+    heatmap_preview_rows = heatmap_preview_source[:3]
     heatmap_updated_at = (
         (heatmap_payload or {}).get("updated_at")
         or (market_snapshot_payload or {}).get("updated_at")
         or (market_monitor_snapshot or {}).get("created_at")
     )
+    concept_preview_source = _load_concept_tracker_rows(db, lookback_runs=lookback_runs)
+    if min_buy_signal_count > 0:
+        concept_preview_source = [
+            item for item in concept_preview_source if int(item.get("buy_signal_count") or 0) >= min_buy_signal_count
+        ]
     concept_preview_rows = sorted(
-        _load_concept_tracker_rows(db, lookback_runs=lookback_runs),
+        concept_preview_source,
         key=lambda item: (
             int(item.get("delta_hits") or 0),
             int(item.get("streak") or 0),
@@ -6630,16 +7599,50 @@ def dashboard_market_page(
         ),
         reverse=True,
     )[:3]
+    continuous_snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_CONTINUOUS_LEADERS)
+    continuous_payload = (continuous_snapshot or {}).get("payload") if isinstance(continuous_snapshot, dict) else None
+    continuous_preview_source = list((continuous_payload or {}).get("rows") or []) if isinstance(continuous_payload, dict) else []
+    if market_filter != "ALL":
+        continuous_preview_source = [
+            item for item in continuous_preview_source if str(item.get("market") or "").upper() == market_filter
+        ]
+    if signal_filter != "ALL":
+        continuous_preview_source = [
+            item for item in continuous_preview_source if str(item.get("signal_label") or "").strip().upper() == signal_filter
+        ]
+    if min_signal_strength > 0:
+        continuous_preview_source = [
+            item for item in continuous_preview_source if int(item.get("signal_strength") or 0) >= min_signal_strength
+        ]
+    if execution_tag_filter and execution_tag_filter.upper() != "ALL":
+        continuous_preview_source = [
+            item for item in continuous_preview_source if _matches_execution_tag_filter(item.get("execution_tags"), execution_tag_filter)
+        ]
+    if exclude_execution_tag_filter and exclude_execution_tag_filter.upper() != "ALL":
+        continuous_preview_source = [
+            item
+            for item in continuous_preview_source
+            if _excludes_execution_tag_filter(item.get("execution_tags"), exclude_execution_tag_filter)
+        ]
+    continuous_preview_rows = sorted(
+        continuous_preview_source,
+        key=lambda item: (
+            int(item.get("hits") or 0),
+            float(item.get("score") or 0.0),
+            str(item.get("ticker") or ""),
+        ),
+        reverse=True,
+    )[:3]
     heatmap_preview_html = "".join(
-        "<a class='market-mini-row' href='/dashboard/concepts/{slug}?{query}'>"
+        "<a class='market-mini-row' href='/dashboard/market/heatmap?{query}'>"
         "<div><strong>{label}</strong><span>{meta}</span></div>"
         "<b>{hits}</b>"
         "</a>".format(
-            slug=item.get("slug") or _concept_slug(str(item.get("label") or "")),
             query=urlencode(
                 {
                     "lookback_runs": lookback_runs,
                     "lang": lang,
+                    "market_filter": market_filter,
                     "signal_filter": signal_filter,
                     "min_signal_strength": min_signal_strength,
                     "min_buy_signal_count": min_buy_signal_count,
@@ -6647,7 +7650,14 @@ def dashboard_market_page(
                     "exclude_execution_tag_filter": exclude_execution_tag_filter,
                 }
             ),
-            label=html.escape(_compact_label(item.get("label") or "-", 24)),
+            label=html.escape(
+                _compact_label(
+                    f"{str(item.get('market') or '').upper()} · {item.get('label')}"
+                    if market_filter == "ALL"
+                    else item.get("label") or "-",
+                    24,
+                )
+            ),
             meta=html.escape(
                 f"{'买点' if lang == 'zh' else 'Buy'} {int(item.get('buy_signal_count') or 0)} · {'强度' if lang == 'zh' else 'Strength'} {int(item.get('max_signal_strength') or 0)}"
             ),
@@ -6665,6 +7675,7 @@ def dashboard_market_page(
                 {
                     "lookback_runs": lookback_runs,
                     "lang": lang,
+                    "market_filter": market_filter,
                     "signal_filter": signal_filter,
                     "min_signal_strength": min_signal_strength,
                     "min_buy_signal_count": min_buy_signal_count,
@@ -6680,17 +7691,108 @@ def dashboard_market_page(
         )
         for item in concept_preview_rows
     ) or f"<div class='empty'>{'暂无概念追踪数据' if lang == 'zh' else 'No concept tracking data yet'}</div>"
+    continuous_preview_html = "".join(
+        "<a class='market-mini-row' href='/dashboard/continuous-leaders?{query}'>"
+        "<div><strong>{label}</strong><span>{meta}</span></div>"
+        "<b>{hits}</b>"
+        "</a>".format(
+            query=urlencode(
+                {
+                    "lang": lang,
+                    "lookback_runs": lookback_runs,
+                    "continuous_market": market_filter if market_filter != "ALL" else "US",
+                }
+            ),
+            label=html.escape(_compact_label(f"{item.get('ticker') or '-'} · {item.get('name') or '-'}", 30)),
+            meta=html.escape(
+                f"{'连续命中' if lang == 'zh' else 'Hits'} {int(item.get('hits') or 0)} · {'信号' if lang == 'zh' else 'Signal'} {item.get('signal_label') or '-'}"
+            ),
+            hits=int(item.get("hits") or 0),
+        )
+        for item in continuous_preview_rows
+    ) or f"<div class='empty'>{'暂无美股连续强势数据' if lang == 'zh' else 'No U.S. continuous leaders yet'}</div>"
+    market_scope_title = {
+        "ALL": "全部市场" if lang == "zh" else "All Markets",
+        "CN": "A股" if lang == "zh" else "A-Shares",
+        "US": "美股" if lang == "zh" else "U.S. Stocks",
+    }[market_filter]
+    market_scope_help = (
+        "口径说明：这里的热度统一表示 0-100 的平均信号强度。市场概览使用最新一批候选股的 `signal_strength` 均值。"
+        if lang == "zh"
+        else "Methodology: heat is a unified 0-100 average signal-strength score. On Market Pulse it is the mean `signal_strength` of the latest candidates."
+    )
+    market_scope_signal_rows = {
+        scope_market: signal_repo.list_latest_signal_decisions(limit=24, market=scope_market)
+        for scope_market in ("CN", "US")
+    }
+    market_scope_history = _recent_market_heat_history(db, limit=6)
+    market_scope_board_counts = {scope_market: 0 for scope_market in ("CN", "US")}
+    for board in ((market_snapshot_payload or {}).get("rows") or []) if isinstance(market_snapshot_payload, dict) else []:
+        scope_market = str(board.get("market") or "").upper()
+        if scope_market in market_scope_board_counts:
+            market_scope_board_counts[scope_market] += len(board.get("rows") or [])
+    market_scope_cards_html = ""
+    for scope_market, scope_label in (("CN", "A股" if lang == "zh" else "A-Shares"), ("US", "美股" if lang == "zh" else "U.S. Stocks")):
+        scope_rows = market_scope_signal_rows.get(scope_market) or []
+        scope_history = market_scope_history.get(scope_market) or []
+        scope_buy_count = sum(
+            1
+            for item in scope_rows
+            if str(item.get("signal_label") or build_signal_label(item.get("score"), lang=lang) or "").strip().upper() == "BUY"
+        )
+        scope_risk_count = 0
+        scope_strength_total = 0
+        for item in scope_rows:
+            tags = [
+                str(tag).strip()
+                for tag in (item.get("risk_flags") or item.get("execution_tags") or [])
+                if str(tag).strip() and str(tag).strip() not in MARKET_PULSE_SOFT_RISK_TAGS
+            ]
+            if tags:
+                scope_risk_count += 1
+            scope_strength_total += int(item.get("signal_strength") or 0)
+        scope_heat = round(scope_strength_total / max(len(scope_rows), 1), 1) if scope_rows else 0.0
+        latest_scope_date = next((str(item.get("trade_date") or "").strip() for item in scope_rows if item.get("trade_date")), "-")
+        scope_delta = (scope_history[-1] - scope_history[0]) if len(scope_history) >= 2 else 0
+        scope_delta_tone = "up" if scope_delta > 0 else "down" if scope_delta < 0 else "flat"
+        scope_delta_label = (
+            (f"+{scope_delta} {'升温' if lang == 'zh' else 'warming'}" if scope_delta > 0 else f"{scope_delta} {'降温' if lang == 'zh' else 'cooling'}")
+            if scope_delta != 0
+            else ("持平" if lang == "zh" else "Flat")
+        )
+        scope_href = f"/dashboard/market?{urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'heatmap_sort': heatmap_sort, 'market_filter': scope_market, 'kpi_focus': kpi_focus, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}"
+        market_scope_cards_html += (
+            f"<a class='market-scope-card{' active' if market_filter == scope_market else ''}' href='{scope_href}'>"
+            f"<div class='market-scope-head'><strong>{scope_label}</strong><span>{latest_scope_date}</span></div>"
+            f"<div class='market-scope-headline'><span class='market-scope-chip {scope_delta_tone}'>{scope_delta_label}</span></div>"
+            f"<div class='market-scope-stats'>"
+            f"<div><b>{len(scope_rows)}</b><span>{'命中' if lang == 'zh' else 'Hits'}</span></div>"
+            f"<div><b>{scope_buy_count}</b><span>{'买点' if lang == 'zh' else 'Buy'}</span></div>"
+            f"<div><b>{scope_heat:.1f}</b><span>{'热度' if lang == 'zh' else 'Heat'}</span></div>"
+            f"</div>"
+            f"<div class='market-scope-trend-wrap'><span>{'近6次快照热度' if lang == 'zh' else 'Last 6 snapshots'}</span>{_mini_trend_bars(scope_history, lang=lang)}</div>"
+            f"<div class='market-scope-meta'>{'行动榜' if lang == 'zh' else 'Boards'} {market_scope_board_counts.get(scope_market, 0)} · {'风险' if lang == 'zh' else 'Risk'} {scope_risk_count}</div>"
+            "</a>"
+        )
     top_signal_rows = "".join(
         "<article class='signal-row'>"
-        f"<div><a class='ticker' href='/insights/{item.get('ticker')}?lang={lang}'>{item.get('ticker')}</a><div class='subtle'>{item.get('trade_date') or '-'}</div><div class='subtle'>{_compact_label(item.get('reason_summary') or item.get('name') or '-', 72)}</div></div>"
+        f"<div><a class='ticker' href='/insights/{item.get('ticker')}?lang={lang}'>{item.get('ticker')}</a><div class='subtle'>{item.get('trade_date') or '-'} · {item.get('market') or '-'} · {int(item.get('snapshot_buy_hits') or 0)} {'次买点' if lang == 'zh' else 'buy hits'}</div><div class='subtle'>{_compact_label(item.get('reason_summary') or item.get('name') or '-', 72)}</div></div>"
         f"<div class='row-right'><span class='signal {_dashboard_home_signal(item.get('score'), lang)[1]}'>{item.get('signal_label') or _dashboard_home_signal(item.get('score'), lang)[0]}</span><div class='mini-metric'>{int(item.get('signal_strength') or 0)}</div></div>"
         "</article>"
         for item in filtered_signals[:5]
     ) or f"<div class='empty'>{'暂无符合条件的候选' if lang == 'zh' else 'No candidates match the current focus'}</div>"
 
-    lookback_pills = _lookback_pills("/dashboard/market", selected=lookback_runs, extra_params={"lang": lang, "heatmap_sort": heatmap_sort, "signal_filter": signal_filter, "min_signal_strength": min_signal_strength, "min_buy_signal_count": min_buy_signal_count, "execution_tag_filter": execution_tag_filter, "exclude_execution_tag_filter": exclude_execution_tag_filter})
+    lookback_pills = _lookback_pills("/dashboard/market", selected=lookback_runs, extra_params={"lang": lang, "heatmap_sort": heatmap_sort, "market_filter": market_filter, "kpi_focus": kpi_focus, "signal_filter": signal_filter, "min_signal_strength": min_signal_strength, "min_buy_signal_count": min_buy_signal_count, "execution_tag_filter": execution_tag_filter, "exclude_execution_tag_filter": exclude_execution_tag_filter})
+    market_pills = "".join(
+        f"<a href='/dashboard/market?{urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'heatmap_sort': heatmap_sort, 'market_filter': market, 'kpi_focus': kpi_focus, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}' class='compare-pill{' active' if market_filter == market else ''}'>{label}</a>"
+        for market, label in (
+            ("ALL", "All Markets" if lang == "en" else "全部市场"),
+            ("CN", "A-Shares" if lang == "en" else "A股"),
+            ("US", "U.S." if lang == "en" else "美股"),
+        )
+    )
     signal_pills = "".join(
-        f"<a href='/dashboard/market?{urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'heatmap_sort': heatmap_sort, 'signal_filter': mode, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}' class='compare-pill{' active' if signal_filter == mode else ''}'>{label}</a>"
+        f"<a href='/dashboard/market?{urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'heatmap_sort': heatmap_sort, 'market_filter': market_filter, 'kpi_focus': kpi_focus, 'signal_filter': mode, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}' class='compare-pill{' active' if signal_filter == mode else ''}'>{label}</a>"
         for mode, label in (
             ("ALL", "All Signals" if lang == "en" else "全部信号"),
             ("BUY", "Buy" if lang == "en" else "买点"),
@@ -6707,6 +7809,146 @@ def dashboard_market_page(
     ) or "-"
     nav_html = render_workspace_nav_html(lang=lang, active_key="market", lookback_runs=lookback_runs)
     board_count = sum(len(board.get("rows") or []) for board in snapshot_boards)
+    base_market_params = {
+        "lang": lang,
+        "lookback_runs": lookback_runs,
+        "heatmap_sort": heatmap_sort,
+        "market_filter": market_filter,
+        "signal_filter": signal_filter,
+        "min_signal_strength": min_signal_strength,
+        "min_buy_signal_count": min_buy_signal_count,
+        "execution_tag_filter": execution_tag_filter,
+        "exclude_execution_tag_filter": exclude_execution_tag_filter,
+    }
+
+    def _market_kpi_href(focus_key: str) -> str:
+        next_focus = "all" if kpi_focus == focus_key else focus_key
+        return f"/dashboard/market?{urlencode({**base_market_params, 'kpi_focus': next_focus})}#market-kpi-detail"
+
+    market_kpi_links = {
+        "focused": _market_kpi_href("focused"),
+        "buy": _market_kpi_href("buy"),
+        "risk": _market_kpi_href("risk"),
+        "boards": _market_kpi_href("boards"),
+    }
+    active_focus_classes = {
+        key: " active" if kpi_focus == key else ""
+        for key in ("focused", "buy", "risk", "boards")
+    }
+
+    focused_rows = filtered_signals
+    buy_rows = [
+        item
+        for item in filtered_signals
+        if str(item.get("signal_label") or build_signal_label(item.get("score"), lang=lang) or "").strip().upper() == "BUY"
+    ]
+    risk_rows = [
+        item
+        for item in filtered_signals
+        if [str(tag).strip() for tag in (item.get("market_risk_tags") or []) if str(tag).strip()]
+    ]
+    board_rows_flat: list[dict] = []
+    for board in snapshot_boards:
+        board_title = board.get("title_zh") if lang == "zh" else board.get("title_en")
+        for row in board.get("rows") or []:
+            board_rows_flat.append(
+                {
+                    **row,
+                    "board_title": board_title or board.get("key") or "-",
+                }
+            )
+    board_rows_flat.sort(
+        key=lambda item: (
+            -(float(item.get("snapshot_score") or 0.0)),
+            -(float(item.get("trend_score") or 0.0)),
+            str(item.get("ticker") or ""),
+        )
+    )
+
+    def _signal_detail_rows(rows: list[dict]) -> str:
+        return "".join(
+            "<tr>"
+            f"<td><a href='/insights/{html.escape(str(item.get('ticker') or ''), quote=True)}?lang={lang}'>{html.escape(str(item.get('ticker') or '-'))}</a><div class='muted'>{html.escape(str(item.get('name') or '-'))}</div></td>"
+            f"<td>{html.escape(str(item.get('trade_date') or '-'))}</td>"
+            f"<td>{html.escape(str(item.get('signal_label') or build_signal_label(item.get('score'), lang=lang) or '-'))}</td>"
+            f"<td>{int(item.get('signal_strength') or 0)}</td>"
+            f"<td>{int(item.get('snapshot_buy_hits') or 0)}</td>"
+            f"<td>{' · '.join(str(tag).strip() for tag in ((item.get('market_risk_tags') or []) if kpi_focus == 'risk' else (item.get('risk_flags') or item.get('execution_tags') or [])) if str(tag).strip()) or '-'}</td>"
+            f"<td>{html.escape(_compact_label(item.get('reason_summary') or item.get('summary_text') or item.get('name') or '-', 92))}</td>"
+            "</tr>"
+            for item in rows[:24]
+        ) or f"<tr><td colspan='7'>{'当前没有符合条件的记录。' if lang == 'zh' else 'No rows match the current focus.'}</td></tr>"
+
+    def _board_detail_rows(rows: list[dict]) -> str:
+        return "".join(
+            "<tr>"
+            f"<td>{html.escape(str(item.get('board_title') or '-'))}</td>"
+            f"<td><a href='/insights/{html.escape(str(item.get('ticker') or ''), quote=True)}?lang={lang}'>{html.escape(str(item.get('ticker') or '-'))}</a><div class='muted'>{html.escape(str(item.get('name') or '-'))}</div></td>"
+            f"<td>{html.escape(str(item.get('action_label') or item.get('action_summary') or '-'))}</td>"
+            f"<td>{float(item.get('snapshot_score') or 0.0):.2f}</td>"
+            f"<td>{float(item.get('trend_score') or 0.0):.1f}</td>"
+            f"<td>{float(item.get('volume_ratio') or 0.0):.2f}</td>"
+            f"<td>{html.escape(_compact_label(item.get('selection_reason') or '-', 92))}</td>"
+            "</tr>"
+            for item in rows[:24]
+        ) or f"<tr><td colspan='7'>{'当前没有行动榜候选。' if lang == 'zh' else 'No board candidates are available right now.'}</td></tr>"
+
+    kpi_focus_meta = {
+        "focused": {
+            "title": "焦点候选明细" if lang == "zh" else "Focused Names Detail",
+            "subtitle": "当前筛选后的市场焦点候选。" if lang == "zh" else "Market candidates remaining after the current filters.",
+        },
+        "buy": {
+            "title": "买点信号明细" if lang == "zh" else "Buy Signal Detail",
+            "subtitle": "当前筛选条件下，信号标签为 BUY 的候选。" if lang == "zh" else "Candidates whose signal label is BUY under the current filters.",
+        },
+        "risk": {
+            "title": "强风险标签明细" if lang == "zh" else "Material Risk Detail",
+            "subtitle": "当前筛选后仍带较强风险提醒的候选，不再把常见软提醒全部算进来。" if lang == "zh" else "Candidates that still carry stronger risk tags after the current filters, excluding common soft warnings.",
+        },
+        "boards": {
+            "title": "行动榜候选明细" if lang == "zh" else "Action Board Detail",
+            "subtitle": "来自今日行动榜单的预计算候选。" if lang == "zh" else "Precomputed candidates from today's action boards.",
+        },
+    }
+    kpi_detail_section = ""
+    if kpi_focus != "all":
+        if kpi_focus == "boards":
+            detail_table = (
+                "<table><thead><tr>"
+                f"<th>{'榜单' if lang == 'zh' else 'Board'}</th>"
+                f"<th>{'代码 / 名称' if lang == 'zh' else 'Ticker / Name'}</th>"
+                f"<th>{'动作' if lang == 'zh' else 'Action'}</th>"
+                f"<th>{'快照分' if lang == 'zh' else 'Snapshot Score'}</th>"
+                f"<th>{'趋势分' if lang == 'zh' else 'Trend Score'}</th>"
+                f"<th>{'量比' if lang == 'zh' else 'Volume Ratio'}</th>"
+                f"<th>{'原因' if lang == 'zh' else 'Reason'}</th>"
+                f"</tr></thead><tbody>{_board_detail_rows(board_rows_flat)}</tbody></table>"
+            )
+        else:
+            detail_rows = focused_rows if kpi_focus == "focused" else buy_rows if kpi_focus == "buy" else risk_rows
+            detail_table = (
+                "<table><thead><tr>"
+                f"<th>{'代码 / 名称' if lang == 'zh' else 'Ticker / Name'}</th>"
+                f"<th>{'日期' if lang == 'zh' else 'Date'}</th>"
+                f"<th>{'信号' if lang == 'zh' else 'Signal'}</th>"
+                f"<th>{'强度' if lang == 'zh' else 'Strength'}</th>"
+                f"<th>{'窗口 BUY 次数' if lang == 'zh' else 'Window BUY Hits'}</th>"
+                f"<th>{'风险标签' if lang == 'zh' else 'Risk Tags'}</th>"
+                f"<th>{'摘要' if lang == 'zh' else 'Summary'}</th>"
+                f"</tr></thead><tbody>{_signal_detail_rows(detail_rows)}</tbody></table>"
+            )
+        meta = kpi_focus_meta[kpi_focus]
+        close_link = f"/dashboard/market?{urlencode(base_market_params)}#market-kpi-detail"
+        kpi_detail_section = (
+            f"<section id='market-kpi-detail' class='card'>"
+            f"<div class='compare-row' style='justify-content:space-between;align-items:flex-start;'>"
+            f"<div><div class='eyebrow'>{'明细展开' if lang == 'zh' else 'Expanded Detail'}</div>"
+            f"<h2 style='margin:0 0 8px;font-size:24px;'>{meta['title']}</h2>"
+            f"<div class='muted'>{meta['subtitle']}</div></div>"
+            f"<a class='pill' href='{close_link}'>{'收起' if lang == 'zh' else 'Collapse'}</a>"
+            f"</div><div class='table-wrap' style='margin-top:14px;'>{detail_table}</div></section>"
+        )
     return f"""
     <!DOCTYPE html>
     <html lang="{lang}">
@@ -6734,6 +7976,9 @@ def dashboard_market_page(
 	          .market-hero h1 {{ font-size:42px; }}
 	          .market-kpis {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:18px; }}
 	          .market-kpi {{ padding:14px; border-radius:18px; background:rgba(11,19,29,0.7); border:1px solid rgba(61,217,182,0.11); }}
+	          .market-kpi-link {{ display:block; transition:transform .16s ease, border-color .16s ease, background .16s ease; }}
+	          .market-kpi-link:hover {{ transform:translateY(-1px); border-color:rgba(61,217,182,0.34); background:rgba(14,24,36,0.88); }}
+	          .market-kpi-link.active {{ border-color:rgba(61,217,182,0.5); background:rgba(20,36,51,0.92); box-shadow:0 12px 28px rgba(0,0,0,0.18); }}
 	          .market-kpi b {{ display:block; font-size:23px; line-height:1; margin-bottom:6px; }}
 	          .market-actions {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; margin-bottom:16px; }}
 	          .market-action {{ position:relative; overflow:hidden; display:flex; min-height:220px; flex-direction:column; justify-content:space-between; padding:20px; border-radius:24px; background:linear-gradient(180deg, rgba(17,28,40,0.98), rgba(8,16,25,0.94)); border:1px solid var(--line); box-shadow:0 18px 40px rgba(0,0,0,0.2); transition:transform .16s ease, border-color .16s ease, background .16s ease; }}
@@ -6744,10 +7989,33 @@ def dashboard_market_page(
 	          .market-action .go {{ display:inline-flex; align-items:center; align-self:flex-start; gap:6px; margin-top:14px; color:var(--accent); font-weight:900; font-size:13px; }}
 	          .market-mini-list {{ display:grid; gap:8px; margin-top:12px; }}
 	          .market-mini-row {{ display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; border-radius:14px; background:rgba(11,19,29,0.72); border:1px solid rgba(34,50,70,0.82); }}
-	          .market-mini-row strong {{ display:block; font-size:13px; }}
-	          .market-mini-row span {{ display:block; margin-top:3px; color:var(--muted); font-size:11px; }}
-	          .market-mini-row b {{ color:var(--accent); font-size:16px; }}
-	          .advanced-panel {{ background:rgba(17,28,40,0.7); border:1px solid rgba(34,50,70,0.74); border-radius:20px; padding:14px; }}
+          .market-mini-row strong {{ display:block; font-size:13px; }}
+          .market-mini-row span {{ display:block; margin-top:3px; color:var(--muted); font-size:11px; }}
+          .market-mini-row b {{ color:var(--accent); font-size:16px; }}
+          .market-scope-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }}
+          .market-scope-card {{ display:block; min-height:188px; padding:16px; border-radius:18px; background:rgba(11,19,29,0.74); border:1px solid rgba(34,50,70,0.92); transition:transform .16s ease, border-color .16s ease, background .16s ease; }}
+          .market-scope-card:hover {{ transform:translateY(-1px); border-color:rgba(61,217,182,0.36); background:rgba(15,25,37,0.92); }}
+          .market-scope-card.active {{ border-color:rgba(61,217,182,0.5); box-shadow:0 12px 28px rgba(0,0,0,0.16); }}
+          .market-scope-head {{ display:flex; justify-content:space-between; gap:12px; align-items:baseline; }}
+          .market-scope-head strong {{ font-size:16px; }}
+          .market-scope-head span {{ color:var(--muted); font-size:11px; }}
+          .market-scope-headline {{ display:flex; justify-content:flex-start; margin-top:10px; }}
+          .market-scope-chip {{ display:inline-flex; align-items:center; padding:5px 9px; border-radius:999px; font-size:11px; font-weight:800; letter-spacing:0.02em; }}
+          .market-scope-chip.up {{ background:rgba(74,222,128,0.14); color:#8af0a6; }}
+          .market-scope-chip.down {{ background:rgba(255,107,129,0.14); color:#ff93a4; }}
+          .market-scope-chip.flat {{ background:rgba(82,168,255,0.14); color:#89c2ff; }}
+          .market-scope-stats {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-top:14px; }}
+          .market-scope-stats b {{ display:block; font-size:22px; line-height:1; }}
+          .market-scope-stats span {{ display:block; margin-top:6px; color:var(--muted); font-size:11px; }}
+          .market-scope-meta {{ margin-top:10px; color:var(--muted); font-size:12px; }}
+          .market-scope-help {{ margin-top:12px; padding:11px 12px; border-radius:14px; border:1px dashed rgba(61,217,182,0.24); background:rgba(61,217,182,0.06); color:var(--muted); font-size:12px; line-height:1.55; }}
+          .market-scope-trend-wrap {{ margin-top:12px; }}
+          .market-scope-trend-wrap span {{ display:block; color:var(--muted); font-size:11px; margin-bottom:8px; }}
+          .mini-trend {{ height:34px; display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:5px; align-items:end; }}
+          .mini-trend span {{ display:block; border-radius:999px 999px 3px 3px; background:linear-gradient(180deg, rgba(61,217,182,0.96), rgba(61,217,182,0.28)); box-shadow:0 6px 12px rgba(0,0,0,0.14); }}
+          .mini-trend.empty {{ grid-template-columns:1fr; align-items:center; }}
+          .mini-trend.empty span {{ height:auto; border-radius:0; background:none; box-shadow:none; color:var(--muted); font-size:11px; }}
+          .advanced-panel {{ background:rgba(17,28,40,0.7); border:1px solid rgba(34,50,70,0.74); border-radius:20px; padding:14px; }}
 	          .advanced-panel summary {{ cursor:pointer; color:var(--ink); font-weight:900; }}
 	          .signal-row {{
 	            display:flex; justify-content:space-between; gap:12px; align-items:center;
@@ -6790,19 +8058,20 @@ def dashboard_market_page(
           <div class="toolbar">
             <a href="/dashboard?lang={lang}" class="pill">← {'返回总览' if lang == 'zh' else 'Back to dashboard'}</a>
             <a href="/dashboard/ops?lang={lang}&lookback_runs={lookback_runs}" class="pill">{'运维操作台' if lang == 'zh' else 'Operations'}</a>
-            <a href="/dashboard/market?lang=en&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}" class="pill">English</a>
-            <a href="/dashboard/market?lang=zh&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}" class="pill">中文</a>
+            <a href="/dashboard/market?lang=en&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&market_filter={market_filter}&kpi_focus={kpi_focus}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}" class="pill">English</a>
+            <a href="/dashboard/market?lang=zh&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&market_filter={market_filter}&kpi_focus={kpi_focus}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}" class="pill">中文</a>
           </div>
+          <div class="compare-row">{market_pills}</div>
 	          <section class="card market-hero">
 	            <div>
-	              <div class="eyebrow">{'市场脉冲' if lang == 'zh' else 'Market Pulse'}</div>
+	              <div class="eyebrow">{'市场脉冲' if lang == 'zh' else 'Market Pulse'} · {market_scope_title}</div>
 	              <h1>{'今天市场：' if lang == 'zh' else 'Today: '}{market_tone}</h1>
-	              <p class="muted">{market_tone_help}</p>
+	              <p class="muted">{market_tone_help} {'当前视角：' + market_scope_title if lang == 'zh' else 'Current scope: ' + market_scope_title}.</p>
 	              <div class="market-kpis">
-	                <div class="market-kpi"><b>{len(filtered_signals)}</b><span class="muted">{'焦点候选' if lang == 'zh' else 'Focused names'}</span></div>
-	                <div class="market-kpi"><b>{signal_bucket_counts['BUY']}</b><span class="muted">{'买点信号' if lang == 'zh' else 'Buy signals'}</span></div>
-	                <div class="market-kpi"><b>{tagged_names}</b><span class="muted">{'带风险标签' if lang == 'zh' else 'Risk-tagged'}</span></div>
-	                <div class="market-kpi"><b>{board_count}</b><span class="muted">{'行动榜候选' if lang == 'zh' else 'Board names'}</span></div>
+	                <a class="market-kpi market-kpi-link{active_focus_classes['focused']}" href="{market_kpi_links['focused']}"><b>{len(filtered_signals)}</b><span class="muted">{'焦点候选' if lang == 'zh' else 'Focused names'}</span></a>
+	                <a class="market-kpi market-kpi-link{active_focus_classes['buy']}" href="{market_kpi_links['buy']}"><b>{signal_bucket_counts['BUY']}</b><span class="muted">{'买点信号' if lang == 'zh' else 'Buy signals'}</span></a>
+	                <a class="market-kpi market-kpi-link{active_focus_classes['risk']}" href="{market_kpi_links['risk']}"><b>{tagged_names}</b><span class="muted">{'强风险标签' if lang == 'zh' else 'Material risk'}</span></a>
+	                <a class="market-kpi market-kpi-link{active_focus_classes['boards']}" href="{market_kpi_links['boards']}"><b>{board_count}</b><span class="muted">{'行动榜候选' if lang == 'zh' else 'Board names'}</span></a>
 	              </div>
 	            </div>
 	            <div class="advanced-panel">
@@ -6812,24 +8081,25 @@ def dashboard_market_page(
 	              <div class="muted">{'风险样例' if lang == 'zh' else 'Risk examples'}: {risk_examples_html}</div>
 	            </div>
 	          </section>
+	          {kpi_detail_section}
 	          <section class="market-actions">
 	            <article class="market-action">
 	              <div>
 	                <div class="eyebrow">{'第一步' if lang == 'zh' else 'Step 1'}</div>
-	                <h2>{_dt(lang, 'sector_heatmap')}</h2>
-	                <p>{'看资金和模型信号集中在哪些板块/概念，先确认市场主线。' if lang == 'zh' else 'See where model signals cluster and confirm the market theme first.'}</p>
+	                <h2>{'美股热力图' if lang == 'zh' and market_filter == 'US' else _dt(lang, 'sector_heatmap')}</h2>
+	                <p>{'看资金和模型信号集中在哪些行业/主题，先确认当前市场主线。' if lang == 'zh' else 'See where model signals cluster by sector/theme and confirm the current market leadership first.'}</p>
 	                <div class="market-mini-list">{heatmap_preview_html}</div>
 	              </div>
-	              <a class="go" href="/dashboard/market/heatmap?lang={lang}&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}">{'打开热力图' if lang == 'zh' else 'Open heatmap'} →</a>
+	              <a class="go" href="/dashboard/market/heatmap?lang={lang}&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&market_filter={market_filter}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}">{'打开热力图' if lang == 'zh' else 'Open heatmap'} →</a>
 	            </article>
 	            <article class="market-action">
 	              <div>
 	                <div class="eyebrow">{'第二步' if lang == 'zh' else 'Step 2'}</div>
-	                <h2>{_dt(lang, 'concept_activity_tracker')}</h2>
-	                <p>{'看概念的命中变化、连续性和扩散广度，过滤一日游题材。' if lang == 'zh' else 'Track theme delta, persistence, and breadth to avoid one-day moves.'}</p>
-	                <div class="market-mini-list">{concept_preview_html}</div>
+	                <h2>{'美股连续强势跟踪' if lang == 'zh' and market_filter == 'US' else ('U.S. Continuous Leaders' if lang == 'en' and market_filter == 'US' else _dt(lang, 'concept_activity_tracker'))}</h2>
+	                <p>{'美股先看连续命中和强势延续，A股继续看概念的命中变化、连续性和扩散广度。' if lang == 'zh' else 'For U.S. names, track persistence and repeated hits; for A-shares, keep using concept delta, streak, and breadth.'}</p>
+	                <div class="market-mini-list">{continuous_preview_html if market_filter == 'US' else concept_preview_html}</div>
 	              </div>
-	              <a class="go" href="/dashboard/market/concepts?lang={lang}&lookback_runs={lookback_runs}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}">{'打开概念追踪' if lang == 'zh' else 'Open concepts'} →</a>
+	              <a class="go" href="{('/dashboard/continuous-leaders?' + urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'continuous_market': market_filter if market_filter != 'ALL' else 'US'})) if market_filter == 'US' else ('/dashboard/market/concepts?' + urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'market_filter': market_filter, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter}))}">{'打开连续强势' if lang == 'zh' and market_filter == 'US' else ('Open continuous leaders' if lang == 'en' and market_filter == 'US' else ('打开概念追踪' if lang == 'zh' else 'Open concepts'))} →</a>
 	            </article>
 	            <article class="market-action">
 	              <div>
@@ -6845,10 +8115,8 @@ def dashboard_market_page(
 	          <section class="grid">
 	            <article class="card">
 	              <div class="eyebrow">{_dt(lang, 'signal_distribution')}</div>
-	              <table>
-	                <thead><tr><th>{_dt(lang, 'market')}</th><th>{_dt(lang, 'top_n_hits')}</th></tr></thead>
-	                <tbody>{market_rows}</tbody>
-	              </table>
+	              <div class="market-scope-grid">{market_scope_cards_html}</div>
+                <div class="market-scope-help">{market_scope_help}</div>
 	            </article>
 	            <article class="card">
 	              <div class="eyebrow">{'轻量候选预览' if lang == 'zh' else 'Candidate Preview'}</div>
@@ -6861,12 +8129,16 @@ def dashboard_market_page(
 	              <summary>{'高级筛选和窗口设置' if lang == 'zh' else 'Advanced Filters & Window'}</summary>
 	              <div class="eyebrow" style="margin-top:14px;">{_dt(lang, 'snapshot_window')}</div>
 	              <div class="compare-row">{lookback_pills}</div>
+	              <div class="eyebrow" style="margin-top:12px;">{'市场范围' if lang == 'zh' else 'Market Scope'}</div>
+	              <div class="compare-row">{market_pills}</div>
 	              <div class="eyebrow" style="margin-top:12px;">{"Signal Focus" if lang == "en" else "信号聚焦"}</div>
 	              <div class="compare-row">{signal_pills}</div>
 	              <form action="/dashboard/market" method="get" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));align-items:end;">
 	                <input type="hidden" name="lang" value="{lang}" />
 	                <input type="hidden" name="lookback_runs" value="{lookback_runs}" />
 	                <input type="hidden" name="heatmap_sort" value="{heatmap_sort}" />
+	                <input type="hidden" name="market_filter" value="{market_filter}" />
+	                <input type="hidden" name="kpi_focus" value="{kpi_focus}" />
 	                <input type="hidden" name="signal_filter" value="{signal_filter}" />
 	                <div>
 	                  <label class="muted" style="display:block;margin-bottom:6px;">{"Execution Tag" if lang == "en" else "执行提醒标签"}</label>
@@ -6877,12 +8149,15 @@ def dashboard_market_page(
 	                  <input type="text" name="exclude_execution_tag_filter" list="execution-tag-options" value="{exclude_execution_tag_filter if exclude_execution_tag_filter.upper() != 'ALL' else ''}" placeholder="gap-risk, earnings-soon" />
 	                </div>
 	                <div>
-	                  <label class="muted" style="display:block;margin-bottom:6px;">{"Min Buy Count" if lang == "en" else "最少买点数"}</label>
+	                  <label class="muted" style="display:block;margin-bottom:6px;">{"Min BUY Hits In Window" if lang == "en" else "窗口内最少 BUY 命中次数"}</label>
 	                  <input type="number" name="min_buy_signal_count" min="0" step="1" value="{min_buy_signal_count}" />
 	                </div>
 	                <div>
 	                  <label class="muted" style="display:block;margin-bottom:6px;">{"Min Strength" if lang == "en" else "最低强度"}</label>
 	                  <input type="number" name="min_signal_strength" min="0" max="100" step="1" value="{min_signal_strength}" />
+	                </div>
+	                <div style="grid-column:1 / -1;">
+	                  <div class="muted">{"This field filters homepage candidates by how many recent snapshots tagged the stock as BUY inside the current window." if lang == "en" else "这个字段会按当前快照窗口内，这只股票最近被标记为 BUY 的次数来过滤首页候选。"}</div>
 	                </div>
 	                <datalist id="execution-tag-options">
 	                  <option value="gap-risk"></option>
@@ -6932,6 +8207,7 @@ def dashboard_market_heatmap_page(
     lookback_runs: int = 5,
     heatmap_sort: str = "hits",
     heatmap_metric: str = "model",
+    market_filter: str = "CN",
     signal_filter: str = "ALL",
     min_signal_strength: int = 0,
     min_buy_signal_count: int = 0,
@@ -6943,6 +8219,9 @@ def dashboard_market_heatmap_page(
         return login_redirect("/dashboard/market/heatmap")
     lang = "zh" if lang == "zh" else "en"
     lookback_runs = _clamp_lookback_runs(lookback_runs)
+    market_filter = str(market_filter or "CN").strip().upper()
+    if market_filter not in {"ALL", "CN", "US"}:
+        market_filter = "CN"
     signal_filter = signal_filter.upper()
     heatmap_metric = (heatmap_metric or "model").strip().lower()
     if heatmap_metric not in {"model", "five_day", "breadth", "buy"}:
@@ -6953,6 +8232,8 @@ def dashboard_market_heatmap_page(
     heatmap_payload = (heatmap_snapshot or {}).get("payload") if isinstance(heatmap_snapshot, dict) else None
     heatmap_ready = isinstance(heatmap_payload, dict) and isinstance(heatmap_payload.get("sector_heatmap"), list)
     heatmap_rows = list((heatmap_payload or {}).get("sector_heatmap") or [])
+    if market_filter != "ALL":
+        heatmap_rows = [item for item in heatmap_rows if str(item.get("market") or "").upper() == market_filter]
     if signal_filter == "BUY":
         heatmap_rows = [item for item in heatmap_rows if int(item.get("buy_signal_count") or 0) > 0]
     elif signal_filter != "ALL":
@@ -7094,6 +8375,11 @@ def dashboard_market_heatmap_page(
     for item in heatmap_rows:
         avg_move = item.get("avg_move_5d")
         breadth = item.get("breadth_pct")
+        item["display_label"] = (
+            f"{str(item.get('market') or '').upper()} · {item.get('label') or '-'}"
+            if market_filter == "ALL"
+            else item.get("label") or "-"
+        )
         item["avg_move_5d_display"] = "-" if avg_move is None else f"{'+' if float(avg_move) > 0 else ''}{float(avg_move):.1f}%"
         item["breadth_display"] = "-" if breadth is None else f"{float(breadth):.0f}% {'涨' if lang == 'zh' else 'up'}"
         item["execution_tags_display"] = " · ".join(item.get("execution_tags") or [])
@@ -7103,21 +8389,72 @@ def dashboard_market_heatmap_page(
     heatmap_rows_for_map = heatmap_rows[:24]
     treemap_rows = _split_treemap(heatmap_rows_for_map, 0.0, 0.0, 100.0, 100.0)
     heatmap_tiles = "".join(
-        f"<a href='/dashboard/concepts/{item['slug']}?{urlencode({'lookback_runs': lookback_runs, 'lang': lang, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}' class='heat-tile' style='left:{item['_x']:.3f}%;top:{item['_y']:.3f}%;width:{item['_w']:.3f}%;height:{item['_h']:.3f}%;background:{item['background']};'>"
-        f"<div><div class='heat-label'>{html.escape(str(item['label']))}</div><div class='heat-meta'>{'面积=命中密度' if lang == 'zh' else 'Size = hit density'} · {'颜色=' if lang == 'zh' else 'Color = '}{html.escape(_heatmap_metric_label(lang, heatmap_metric))}</div></div>"
+        f"<a href='{('/dashboard/continuous-leaders?' + urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'continuous_market': 'US'})) if str(item.get('market') or '').upper() == 'US' else ('/dashboard/concepts/' + str(item['slug']) + '?' + urlencode({'lookback_runs': lookback_runs, 'lang': lang, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter}))}' class='heat-tile' style='left:{item['_x']:.3f}%;top:{item['_y']:.3f}%;width:{item['_w']:.3f}%;height:{item['_h']:.3f}%;background:{item['background']};'>"
+        f"<div><div class='heat-label'>{html.escape(str(item['display_label']))}</div><div class='heat-meta'>{'面积=命中密度' if lang == 'zh' else 'Size = hit density'} · {'颜色=' if lang == 'zh' else 'Color = '}{html.escape(_heatmap_metric_label(lang, heatmap_metric))}</div></div>"
         f"<div><div class='heat-metric'>{html.escape(str(item['metric_display']))}</div><div class='heat-meta'>{int(item.get('hits') or 0)} {'次命中' if lang == 'zh' else 'hit(s)'} · {'买点' if lang == 'zh' else 'Buy'} {int(item.get('buy_signal_count') or 0)} · {'最强' if lang == 'zh' else 'Max'} {int(item.get('max_signal_strength') or 0)}</div></div>"
         f"<div class='heat-meta heat-extra'>{item['avg_move_5d_display']} · {item['breadth_display']}</div>"
         f"<div class='heat-tags'>{''.join('<span>' + html.escape(str(tag)) + '</span>' for tag in (item.get('execution_tags') or [])[:3]) or ('<span>无执行提醒</span>' if lang == 'zh' else '<span>No tags</span>')}</div>"
         "</a>"
         for item in treemap_rows
-    ) or f"<div class='muted'>{'暂无概念热力图，请先同步 A 股概念。' if lang == 'zh' else 'No concept heatmap yet. Sync CN concepts first.'}</div>"
+    ) or f"<div class='muted'>{'暂无热力图数据，请先等待后台完成对应市场的预计算。' if lang == 'zh' else 'No heatmap data yet. Wait for the market precompute job to finish.'}</div>"
     market_rows = "".join(
         f"<tr><td>{item['market']}</td><td>{item['count']}</td></tr>"
-        for item in ((heatmap_payload or {}).get("market_distribution") or [])
+        for item in (
+            row for row in ((heatmap_payload or {}).get("market_distribution") or [])
+            if market_filter == "ALL" or str(row.get("market") or "").upper() == market_filter
+        )
     ) or f"<tr><td colspan='2'>{'热力图仍在后台预计算' if lang == 'zh' else 'Heatmap is still being precomputed'}</td></tr>"
-    lookback_pills = _lookback_pills("/dashboard/market/heatmap", selected=lookback_runs, extra_params={"lang": lang, "heatmap_sort": heatmap_sort, "heatmap_metric": heatmap_metric, "signal_filter": signal_filter, "min_signal_strength": min_signal_strength, "min_buy_signal_count": min_buy_signal_count, "execution_tag_filter": execution_tag_filter, "exclude_execution_tag_filter": exclude_execution_tag_filter})
+    heatmap_scope_cards_html = ""
+    all_heatmap_rows = list((heatmap_payload or {}).get("sector_heatmap") or []) if isinstance(heatmap_payload, dict) else []
+    heatmap_scope_history = _recent_market_heat_history(db, limit=6)
+    heatmap_scope_help = (
+        "口径说明：这里的热度统一表示 0-100 的平均信号强度。热力图页面使用当前市场下各板块 `max_signal_strength` 的均值。"
+        if lang == "zh"
+        else "Methodology: heat is a unified 0-100 average signal-strength score. On the heatmap it is the mean `max_signal_strength` across tiles in the selected market."
+    )
+    for scope_market, scope_label in (("CN", "A股" if lang == "zh" else "A-Shares"), ("US", "美股" if lang == "zh" else "U.S. Stocks")):
+        scope_rows = [row for row in all_heatmap_rows if str(row.get("market") or "").upper() == scope_market]
+        scope_history = heatmap_scope_history.get(scope_market) or []
+        scope_hit_total = sum(int(row.get("hits") or 0) for row in scope_rows)
+        scope_buy_total = sum(int(row.get("buy_signal_count") or 0) for row in scope_rows)
+        scope_heat = round(
+            sum(float(row.get("max_signal_strength") or 0.0) for row in scope_rows)
+            / max(len(scope_rows), 1),
+            1,
+        ) if scope_rows else 0.0
+        scope_top_label = (scope_rows[0].get("label") if scope_rows else None) or ("暂无" if lang == "zh" else "No leader")
+        scope_delta = (scope_history[-1] - scope_history[0]) if len(scope_history) >= 2 else 0
+        scope_delta_tone = "up" if scope_delta > 0 else "down" if scope_delta < 0 else "flat"
+        scope_delta_label = (
+            (f"+{scope_delta} {'升温' if lang == 'zh' else 'warming'}" if scope_delta > 0 else f"{scope_delta} {'降温' if lang == 'zh' else 'cooling'}")
+            if scope_delta != 0
+            else ("持平" if lang == "zh" else "Flat")
+        )
+        scope_href = f"/dashboard/market/heatmap?{urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'heatmap_sort': heatmap_sort, 'heatmap_metric': heatmap_metric, 'market_filter': scope_market, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}"
+        heatmap_scope_cards_html += (
+            f"<a class='market-scope-card{' active' if market_filter == scope_market else ''}' href='{scope_href}'>"
+            f"<div class='market-scope-head'><strong>{scope_label}</strong><span>{_compact_label(str(scope_top_label), 18)}</span></div>"
+            f"<div class='market-scope-headline'><span class='market-scope-chip {scope_delta_tone}'>{scope_delta_label}</span></div>"
+            f"<div class='market-scope-stats'>"
+            f"<div><b>{scope_hit_total}</b><span>{'命中' if lang == 'zh' else 'Hits'}</span></div>"
+            f"<div><b>{scope_buy_total}</b><span>{'买点' if lang == 'zh' else 'Buy'}</span></div>"
+            f"<div><b>{scope_heat:.1f}</b><span>{'热度' if lang == 'zh' else 'Heat'}</span></div>"
+            f"</div>"
+            f"<div class='market-scope-trend-wrap'><span>{'近6次快照热度' if lang == 'zh' else 'Last 6 snapshots'}</span>{_mini_trend_bars(scope_history, lang=lang)}</div>"
+            f"<div class='market-scope-meta'>{'板块数' if lang == 'zh' else 'Tiles'} {len(scope_rows)} · {'标签数' if lang == 'zh' else 'Tags'} {sum(1 for row in scope_rows if row.get('execution_tags'))}</div>"
+            "</a>"
+        )
+    lookback_pills = _lookback_pills("/dashboard/market/heatmap", selected=lookback_runs, extra_params={"lang": lang, "heatmap_sort": heatmap_sort, "heatmap_metric": heatmap_metric, "market_filter": market_filter, "signal_filter": signal_filter, "min_signal_strength": min_signal_strength, "min_buy_signal_count": min_buy_signal_count, "execution_tag_filter": execution_tag_filter, "exclude_execution_tag_filter": exclude_execution_tag_filter})
+    market_pills = "".join(
+        f"<a href='/dashboard/market/heatmap?{urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'heatmap_sort': heatmap_sort, 'heatmap_metric': heatmap_metric, 'market_filter': market, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}' class='compare-pill{' active' if market_filter == market else ''}'>{label}</a>"
+        for market, label in (
+            ("ALL", "All Markets" if lang == "en" else "全部市场"),
+            ("CN", "A-Shares" if lang == "en" else "A股"),
+            ("US", "U.S." if lang == "en" else "美股"),
+        )
+    )
     heatmap_sort_pills = "".join(
-        f"<a href='/dashboard/market/heatmap?{urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'heatmap_sort': mode, 'heatmap_metric': heatmap_metric, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}' class='compare-pill{' active' if heatmap_sort == mode else ''}'>{label}</a>"
+        f"<a href='/dashboard/market/heatmap?{urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'heatmap_sort': mode, 'heatmap_metric': heatmap_metric, 'market_filter': market_filter, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}' class='compare-pill{' active' if heatmap_sort == mode else ''}'>{label}</a>"
         for mode, label in (
             ("hits", _dt(lang, "sort_by_hits")),
             ("five_day", _dt(lang, "sort_by_5d")),
@@ -7126,11 +8463,11 @@ def dashboard_market_heatmap_page(
         )
     )
     heatmap_metric_pills = "".join(
-        f"<a href='/dashboard/market/heatmap?{urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'heatmap_sort': heatmap_sort, 'heatmap_metric': mode, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}' class='compare-pill{' active' if heatmap_metric == mode else ''}'>{_heatmap_metric_label(lang, mode)}</a>"
+        f"<a href='/dashboard/market/heatmap?{urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'heatmap_sort': heatmap_sort, 'heatmap_metric': mode, 'market_filter': market_filter, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}' class='compare-pill{' active' if heatmap_metric == mode else ''}'>{_heatmap_metric_label(lang, mode)}</a>"
         for mode in ("model", "five_day", "breadth", "buy")
     )
     signal_pills = "".join(
-        f"<a href='/dashboard/market/heatmap?{urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'heatmap_sort': heatmap_sort, 'heatmap_metric': heatmap_metric, 'signal_filter': mode, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}' class='compare-pill{' active' if signal_filter == mode else ''}'>{label}</a>"
+        f"<a href='/dashboard/market/heatmap?{urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'heatmap_sort': heatmap_sort, 'heatmap_metric': heatmap_metric, 'market_filter': market_filter, 'signal_filter': mode, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter})}' class='compare-pill{' active' if signal_filter == mode else ''}'>{label}</a>"
         for mode, label in (
             ("ALL", "All Signals" if lang == "en" else "全部信号"),
             ("BUY", "Buy" if lang == "en" else "买点"),
@@ -7186,6 +8523,29 @@ def dashboard_market_heatmap_page(
 	          .heat-legend {{ display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-top:12px; color:var(--muted); font-size:12px; }}
 	          .legend-scale {{ display:inline-grid; grid-template-columns:repeat(5,32px); gap:3px; align-items:center; }}
 	          .legend-scale span {{ height:8px; border-radius:999px; }}
+          .market-scope-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }}
+          .market-scope-card {{ display:block; min-height:188px; padding:16px; border-radius:18px; background:rgba(11,19,29,0.74); border:1px solid rgba(34,50,70,0.92); transition:transform .16s ease, border-color .16s ease, background .16s ease; }}
+          .market-scope-card:hover {{ transform:translateY(-1px); border-color:rgba(61,217,182,0.36); background:rgba(15,25,37,0.92); }}
+          .market-scope-card.active {{ border-color:rgba(61,217,182,0.5); box-shadow:0 12px 28px rgba(0,0,0,0.16); }}
+          .market-scope-head {{ display:flex; justify-content:space-between; gap:12px; align-items:baseline; }}
+          .market-scope-head strong {{ font-size:16px; }}
+          .market-scope-head span {{ color:var(--muted); font-size:11px; }}
+          .market-scope-headline {{ display:flex; justify-content:flex-start; margin-top:10px; }}
+          .market-scope-chip {{ display:inline-flex; align-items:center; padding:5px 9px; border-radius:999px; font-size:11px; font-weight:800; letter-spacing:0.02em; }}
+          .market-scope-chip.up {{ background:rgba(74,222,128,0.14); color:#8af0a6; }}
+          .market-scope-chip.down {{ background:rgba(255,107,129,0.14); color:#ff93a4; }}
+          .market-scope-chip.flat {{ background:rgba(82,168,255,0.14); color:#89c2ff; }}
+          .market-scope-stats {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-top:14px; }}
+          .market-scope-stats b {{ display:block; font-size:22px; line-height:1; }}
+          .market-scope-stats span {{ display:block; margin-top:6px; color:var(--muted); font-size:11px; }}
+          .market-scope-meta {{ margin-top:10px; color:var(--muted); font-size:12px; }}
+          .market-scope-help {{ margin-top:12px; padding:11px 12px; border-radius:14px; border:1px dashed rgba(61,217,182,0.24); background:rgba(61,217,182,0.06); color:var(--muted); font-size:12px; line-height:1.55; }}
+          .market-scope-trend-wrap {{ margin-top:12px; }}
+          .market-scope-trend-wrap span {{ display:block; color:var(--muted); font-size:11px; margin-bottom:8px; }}
+          .mini-trend {{ height:34px; display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:5px; align-items:end; }}
+          .mini-trend span {{ display:block; border-radius:999px 999px 3px 3px; background:linear-gradient(180deg, rgba(61,217,182,0.96), rgba(61,217,182,0.28)); box-shadow:0 6px 12px rgba(0,0,0,0.14); }}
+          .mini-trend.empty {{ grid-template-columns:1fr; align-items:center; }}
+          .mini-trend.empty span {{ height:auto; border-radius:0; background:none; box-shadow:none; color:var(--muted); font-size:11px; }}
           table {{ width:100%; border-collapse:collapse; font-size:14px; }}
           th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
           th {{ color:var(--muted); font-weight:600; }}
@@ -7212,20 +8572,23 @@ def dashboard_market_heatmap_page(
           <main class="main">
         <div class="wrap">
           <div class="toolbar">
-	            <a href="/dashboard/market?lang={lang}&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}" class="pill">← {'返回市场脉冲' if lang == 'zh' else 'Back to Market Pulse'}</a>
-	            <a href="/dashboard/market/concepts?lang={lang}&lookback_runs={lookback_runs}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}" class="pill">{_dt(lang, 'concept_activity_tracker')}</a>
-	            <a href="/dashboard/market/heatmap?lang=en&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&heatmap_metric={heatmap_metric}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}" class="pill">English</a>
-	            <a href="/dashboard/market/heatmap?lang=zh&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&heatmap_metric={heatmap_metric}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}" class="pill">中文</a>
+	            <a href="/dashboard/market?lang={lang}&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&market_filter={market_filter}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}" class="pill">← {'返回市场脉冲' if lang == 'zh' else 'Back to Market Pulse'}</a>
+	            <a href="{('/dashboard/continuous-leaders?' + urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'continuous_market': 'US'})) if market_filter == 'US' else ('/dashboard/market/concepts?' + urlencode({'lang': lang, 'lookback_runs': lookback_runs, 'signal_filter': signal_filter, 'min_signal_strength': min_signal_strength, 'min_buy_signal_count': min_buy_signal_count, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter}) )}" class="pill">{('连续强势跟踪' if lang == 'zh' else 'Continuous Leaders') if market_filter == 'US' else _dt(lang, 'concept_activity_tracker')}</a>
+	            <a href="/dashboard/market/heatmap?lang=en&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&heatmap_metric={heatmap_metric}&market_filter={market_filter}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}" class="pill">English</a>
+	            <a href="/dashboard/market/heatmap?lang=zh&lookback_runs={lookback_runs}&heatmap_sort={heatmap_sort}&heatmap_metric={heatmap_metric}&market_filter={market_filter}&signal_filter={signal_filter}&min_signal_strength={min_signal_strength}&min_buy_signal_count={min_buy_signal_count}&execution_tag_filter={execution_tag_filter}&exclude_execution_tag_filter={exclude_execution_tag_filter}" class="pill">中文</a>
           </div>
+          <div class="compare-row">{market_pills}</div>
           <div class="card">
-            <div class="eyebrow">{_dt(lang, 'sector_heatmap')}</div>
-            <h1 style="margin:0 0 8px;">{'板块热力图' if lang == 'zh' else 'Sector Heatmap'}</h1>
-            <p class="muted">{_dt(lang, 'sector_heatmap_help')}</p>
+            <div class="eyebrow">{('美股热力图' if lang == 'zh' else 'U.S. Heatmap') if market_filter == 'US' else _dt(lang, 'sector_heatmap')}</div>
+            <h1 style="margin:0 0 8px;">{('美股热力图' if lang == 'zh' else 'U.S. Heatmap') if market_filter == 'US' else ('板块热力图' if lang == 'zh' else 'Sector Heatmap')}</h1>
+            <p class="muted">{('聚焦美股行业分布、模型强度和持续强势名字。' if lang == 'zh' else 'Focus on U.S. sector distribution, model strength, and persistent leaders.') if market_filter == 'US' else _dt(lang, 'sector_heatmap_help')}</p>
           </div>
           {loading_hint}
 	          <section class="card">
 	            <div class="eyebrow">{_dt(lang, 'snapshot_window')}</div>
 	            <div class="compare-row">{lookback_pills}</div>
+	            <div class="eyebrow" style="margin-top:12px;">{'市场范围' if lang == 'zh' else 'Market Scope'}</div>
+	            <div class="compare-row">{market_pills}</div>
 	            <div class="eyebrow" style="margin-top:12px;">{'颜色指标' if lang == 'zh' else 'Color Metric'}</div>
 	            <div class="compare-row">{heatmap_metric_pills}</div>
 	            <div class="eyebrow" style="margin-top:12px;">{"Signal Focus" if lang == "en" else "信号聚焦"}</div>
@@ -7235,6 +8598,7 @@ def dashboard_market_heatmap_page(
 	              <input type="hidden" name="lookback_runs" value="{lookback_runs}" />
 	              <input type="hidden" name="heatmap_sort" value="{heatmap_sort}" />
 	              <input type="hidden" name="heatmap_metric" value="{heatmap_metric}" />
+	              <input type="hidden" name="market_filter" value="{market_filter}" />
 	              <input type="hidden" name="signal_filter" value="{signal_filter}" />
               <div>
                 <label class="muted" style="display:block;margin-bottom:6px;">{"Execution Tag" if lang == "en" else "执行提醒标签"}</label>
@@ -7302,10 +8666,8 @@ def dashboard_market_heatmap_page(
           <section class="grid">
             <article class="card">
               <div class="eyebrow">{_dt(lang, 'signal_distribution')}</div>
-              <table>
-                <thead><tr><th>{_dt(lang, 'market')}</th><th>{_dt(lang, 'top_n_hits')}</th></tr></thead>
-                <tbody>{market_rows}</tbody>
-              </table>
+              <div class="market-scope-grid">{heatmap_scope_cards_html}</div>
+              <div class="market-scope-help">{heatmap_scope_help}</div>
             </article>
             <article class="card">
               <div class="eyebrow">{_dt(lang, 'concept_resonance')}</div>
@@ -7806,8 +9168,17 @@ def dashboard_ops_page(request: Request, lang: str = "en", lookback_runs: int = 
     analysis_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "watchlist_auto_analysis"), None)
     cn_concept_sync_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "sync_cn_concepts"), None)
     screener_precompute_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "screener_precompute"), None)
-    us_signal_train_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "us_signal_train"), None)
+    screener_precompute_core_job = _find_latest_job_by_type(recent_jobs, "screener_precompute_core")
+    screener_precompute_combo_job = _find_latest_job_by_type(recent_jobs, "screener_precompute_combos")
+    screener_precompute_rest_job = _find_latest_job_by_type(recent_jobs, "screener_precompute_rest")
+    us_signal_train_job = _find_latest_job_by_type(recent_jobs, US_SIGNAL_TRAIN_JOB_TYPES)
+    if us_signal_train_job is None:
+        us_signal_train_job = DataJobRepository(db).get_latest_job(US_SIGNAL_TRAIN_JOB_TYPES)
+    model_selection_guidance_job = _find_latest_job_by_type(recent_jobs, "model_selection_guidance_snapshot")
+    if model_selection_guidance_job is None:
+        model_selection_guidance_job = DataJobRepository(db).get_latest_job("model_selection_guidance_snapshot")
     latest_cn_refresh = _latest_cn_refresh_summary(db, recent_jobs, lang=lang)
+    screener_stage_rows = _build_screener_precompute_stage_rows(recent_jobs, lang=lang)
 
     def _step_status_label(job: dict | None, fallback_status: str | None = None) -> tuple[str, str]:
         status = str((job or {}).get("status") or fallback_status or "").strip().lower()
@@ -7895,12 +9266,30 @@ def dashboard_ops_page(request: Request, lang: str = "en", lookback_runs: int = 
                 "status": _step_status_label(cn_concept_sync_job, "idle"),
             },
             {
-                "label": "模型预计算" if lang == "zh" else "Model Precompute",
+                "label": "预计算总控" if lang == "zh" else "Staged Precompute",
                 "detail": _display_time((screener_precompute_job or {}).get("finished_at") or (screener_precompute_job or {}).get("started_at")),
-                "message": (screener_precompute_job or {}).get("message") or (
+                "message": _summarize_screener_precompute_job(screener_precompute_job, lang=lang).get("detail") or (
                     "收盘后会把常用模型先跑一遍并缓存结果。" if lang == "zh" else "Common screener models are precomputed and cached after the close."
                 ),
                 "status": _step_status_label(screener_precompute_job, "idle"),
+            },
+            {
+                "label": "核心预计算" if lang == "zh" else "Core Precompute",
+                "detail": _display_time((screener_precompute_core_job or {}).get("finished_at") or (screener_precompute_core_job or {}).get("started_at")),
+                "message": _summarize_screener_precompute_job(screener_precompute_core_job, lang=lang).get("detail"),
+                "status": _step_status_label(screener_precompute_core_job, "idle"),
+            },
+            {
+                "label": "组合预计算" if lang == "zh" else "Combo Precompute",
+                "detail": _display_time((screener_precompute_combo_job or {}).get("finished_at") or (screener_precompute_combo_job or {}).get("started_at")),
+                "message": _summarize_screener_precompute_job(screener_precompute_combo_job, lang=lang).get("detail"),
+                "status": _step_status_label(screener_precompute_combo_job, "idle"),
+            },
+            {
+                "label": "补全预计算" if lang == "zh" else "Rest Precompute",
+                "detail": _display_time((screener_precompute_rest_job or {}).get("finished_at") or (screener_precompute_rest_job or {}).get("started_at")),
+                "message": _summarize_screener_precompute_job(screener_precompute_rest_job, lang=lang).get("detail"),
+                "status": _step_status_label(screener_precompute_rest_job, "idle"),
             },
             {
                 "label": "美股训练" if lang == "zh" else "US Training",
@@ -7909,6 +9298,14 @@ def dashboard_ops_page(request: Request, lang: str = "en", lookback_runs: int = 
                     "美股收盘后会把 U.S. lake 股票池写入统一模型结果层。" if lang == "zh" else "After the U.S. close, the U.S. lake symbol pool is written into the unified model-result layer."
                 ),
                 "status": _step_status_label(us_signal_train_job, "idle"),
+            },
+            {
+                "label": "模型使用指导" if lang == "zh" else "Model Guidance",
+                "detail": _display_time((model_selection_guidance_job or {}).get("finished_at") or (model_selection_guidance_job or {}).get("started_at")),
+                "message": (model_selection_guidance_job or {}).get("message") or (
+                    "收盘后会把优先模型、优先组合和强票反向归因写入快照。" if lang == "zh" else "After the close, priority models, priority combos, and winner traceback are saved into a snapshot."
+                ),
+                "status": _step_status_label(model_selection_guidance_job, "idle"),
             },
         ]
     pipeline_html = "".join(
@@ -8028,7 +9425,7 @@ def dashboard_ops_page(request: Request, lang: str = "en", lookback_runs: int = 
                 else ("待运行" if lang == "zh" else "Pending")
             ),
             "meta": (
-                (screener_precompute_job or {}).get("message")
+                _summarize_screener_precompute_job(screener_precompute_job, lang=lang).get("detail")
                 or ("收盘后预跑常用模型" if lang == "zh" else "Precompute common screener models after the close")
             ),
         },
@@ -8105,6 +9502,26 @@ def dashboard_ops_page(request: Request, lang: str = "en", lookback_runs: int = 
         "</article>"
         for item in (close_review_action_feed.get("actionable") or [])[:4]
     ) or f"<div class='empty'>{'暂无盘后动作建议' if lang == 'zh' else 'No close-review actions yet'}</div>"
+    screener_stage_html = "".join(
+        "<article class='list-row'>"
+        f"<div><div class='ticker'>{item['label']}</div><div class='subtle'>{_display_time((item['job'] or {}).get('finished_at') or (item['job'] or {}).get('started_at'))}</div><div class='subtle'>{html.escape(item['detail'])}</div></div>"
+        f"<div class='row-right'><span class='mini-metric'>{html.escape(item['summary'])}</span><span class='status-pill {item['status']}'>{_job_status_text(item['status'], lang)}</span></div>"
+        "</article>"
+        for item in screener_stage_rows
+    ) or f"<div class='empty'>{'暂无预计算阶段记录' if lang == 'zh' else 'No precompute stage records yet'}</div>"
+    model_selection_guidance_job = _find_latest_job_by_type(recent_jobs, "model_selection_guidance_snapshot")
+    if model_selection_guidance_job is None:
+        model_selection_guidance_job = DataJobRepository(db).get_latest_job("model_selection_guidance_snapshot")
+    screener_stage_actions_html = _render_screener_precompute_action_forms(
+        lang=lang,
+        redirect_to=dashboard_redirect,
+        stage_rows=screener_stage_rows,
+    )
+    model_selection_guidance_actions_html = _render_model_selection_guidance_action_form(
+        lang=lang,
+        redirect_to=dashboard_redirect,
+        job=model_selection_guidance_job,
+    )
     acceptance_metrics_html = "".join(
         "<article class='metric-card'>"
         f"<div class='metric-label'>{label}</div>"
@@ -8264,8 +9681,14 @@ def dashboard_ops_page(request: Request, lang: str = "en", lookback_runs: int = 
           .status-pill.enabled {{ background:rgba(61,217,182,0.16); color:#7ff0d2; }}
           .status-pill.disabled, .status-pill.idle {{ background:rgba(144,163,184,0.14); color:#b4c5d8; }}
           .action-row {{ display:flex; flex-wrap:wrap; gap:10px; margin-top:16px; }}
+          .inline-actions {{ display:flex; flex-wrap:wrap; gap:10px; margin-top:16px; }}
+          .action-with-note {{ display:grid; gap:6px; align-content:start; }}
+          .inline-form {{ display:inline-flex; margin:0; }}
           .cta {{ display:inline-flex; align-items:center; justify-content:center; padding:10px 14px; border-radius:999px; border:1px solid var(--line); background:rgba(21,34,49,0.92); color:var(--ink); font-size:13px; font-weight:800; }}
           .cta.primary {{ background:linear-gradient(135deg, rgba(61,217,182,0.28), rgba(82,168,255,0.24)); border-color:rgba(61,217,182,0.3); }}
+          .cta.compact {{ padding:8px 12px; font-size:12px; }}
+          .precompute-note {{ margin-top:10px; }}
+          .action-receipt {{ max-width:260px; }}
           .playbook {{ margin-top:12px; padding:14px; border-radius:18px; background:rgba(21,34,49,0.82); border:1px solid var(--line); }}
           .empty {{ color:var(--muted); font-size:14px; }}
           @media (max-width: 1180px) {{
@@ -8397,6 +9820,15 @@ def dashboard_ops_page(request: Request, lang: str = "en", lookback_runs: int = 
                   <span class="eyebrow">{'最近任务结果' if lang == 'zh' else 'Recent Jobs'}</span>
                   <h2 class="section-title">{'自动任务的最新回执' if lang == 'zh' else 'Latest automation receipts'}</h2>
                   <div class="list-stack">{recent_jobs_html}</div>
+                </article>
+
+                <article class="card">
+                  <span class="eyebrow">{'模型预计算分层' if lang == 'zh' else 'Precompute Stages'}</span>
+                  <h2 class="section-title">{'A 股预计算卡在哪一层' if lang == 'zh' else 'Which precompute stage is blocked?'}</h2>
+                  <p class="section-copy">{'先看总控是否跑完，再看核心模板、组合模板、补全模板分别有没有成功。这样你能马上区分是模型没训练、快照没生成，还是组合缺前置依赖。' if lang == 'zh' else 'Check the controller first, then core, combo, and rest stages. This lets you quickly tell model/training issues from missing snapshots or combo prerequisites.'}</p>
+                  <div class="list-stack">{screener_stage_html}</div>
+                  <div class="inline-actions">{screener_stage_actions_html}</div>
+                  <div class="inline-actions" style="margin-top:12px;">{model_selection_guidance_actions_html}</div>
                 </article>
 
                 <article class="card">
@@ -8842,7 +10274,7 @@ def dashboard_ops_models_page(request: Request, lang: str = "en", lookback_runs:
     ) or f"<div class='muted'>{'暂无可成交摘要' if lang == 'zh' else 'No tradability summary yet'}</div>"
     top_block_reasons = tradability_summary.get("top_block_reasons") or []
     top_block_html = "".join(
-        f"<div class='tag'>{reason}: {count}</div>"
+        f"<div class='tag'>{html.escape(format_trade_gate_reason(reason, lang=lang))}: {count}</div>"
         for reason, count in top_block_reasons[:5]
     ) or f"<div class='muted'>{'暂无阻塞原因' if lang == 'zh' else 'No block reasons yet'}</div>"
     capacity_rows = "".join(
@@ -8949,39 +10381,20 @@ def dashboard_ops_jobs_page(request: Request, lang: str = "en", lookback_runs: i
     lang = "zh" if lang == "zh" else "en"
     lookback_runs = _clamp_lookback_runs(lookback_runs)
     recent_jobs = load_recent_jobs_summary(db, limit=12)
+    screener_stage_rows = _build_screener_precompute_stage_rows(recent_jobs, lang=lang)
+    dashboard_redirect = "/dashboard/ops/jobs?" + urlencode({"lang": lang, "lookback_runs": lookback_runs})
     nav_html = render_workspace_nav_html(lang=lang, active_key="ops", lookback_runs=lookback_runs)
     def status_badge(status: str) -> str:
         tone = {"success":("#dcfce7","#166534"),"failed":("#fee2e2","#991b1b"),"partial":("#fef3c7","#92400e"),"running":("#dbeafe","#1d4ed8")}.get(status,("#e5e7eb","#374151"))
         return f"<span style='display:inline-block;padding:4px 8px;border-radius:999px;background:{tone[0]};color:{tone[1]};font-size:12px;font-weight:700;'>{status}</span>"
 
     def result_summary(job: dict) -> str:
+        if str(job.get("job_type") or "").lower().startswith("screener_precompute"):
+            summary = _summarize_screener_precompute_job(job, lang=lang)
+            return f"{summary['summary']} · {summary['detail']}"
         result = job.get("result") or {}
         if not isinstance(result, dict):
             return "-"
-        if str(job.get("job_type") or "").lower() == "screener_precompute":
-            created = list(result.get("snapshots_created") or [])
-            failed = list(result.get("failed_templates") or [])
-            total = len(created) + len(failed)
-            created_label = len(created)
-            if not total:
-                return "待写入" if lang == "zh" else "Pending"
-            prefix = (
-                f"成功 {created_label}/{total}"
-                if lang == "zh"
-                else f"{created_label}/{total} succeeded"
-            )
-            if failed:
-                failed_models = ", ".join(
-                    _compact_label(str(item.get("model_template") or "-"), 18)
-                    for item in failed[:3]
-                )
-                suffix = (
-                    f"；失败 {len(failed)} 个：{failed_models}"
-                    if lang == "zh"
-                    else f"; failed {len(failed)}: {failed_models}"
-                )
-                return prefix + suffix
-            return prefix
         if "snapshots_created" in result:
             created = list(result.get("snapshots_created") or [])
             failed_count = int(result.get("failed_count") or 0)
@@ -9004,6 +10417,20 @@ def dashboard_ops_jobs_page(request: Request, lang: str = "en", lookback_runs: i
                 )
             return base
         return _compact_json_summary(result, 48)
+
+    screener_stage_summary_html = "".join(
+        "<article style='padding:14px 0;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:16px;align-items:flex-start;'>"
+        f"<div><div style='font-weight:800;'>{item['label']}</div><div class='job-subtle'>{html.escape(item['detail'])}</div></div>"
+        f"<div style='display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end;'><span style='display:inline-flex;padding:4px 8px;border-radius:999px;background:rgba(82,168,255,0.12);color:#9acbff;font-size:12px;font-weight:700;'>{html.escape(item['summary'])}</span>{status_badge(item['status'])}</div>"
+        "</article>"
+        for item in screener_stage_rows
+    ) or f"<div class='job-subtle'>{'暂无预计算阶段记录' if lang == 'zh' else 'No precompute stage records yet'}</div>"
+    screener_stage_actions_html = _render_screener_precompute_action_forms(
+        lang=lang,
+        redirect_to=dashboard_redirect,
+        compact=True,
+        stage_rows=screener_stage_rows,
+    )
 
     recent_job_rows = "".join(
         "<tr>"
@@ -9032,6 +10459,7 @@ def dashboard_ops_jobs_page(request: Request, lang: str = "en", lookback_runs: i
         .toolbar {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }} .pill {{ display:inline-flex; align-items:center; padding:8px 12px; border-radius:999px; border:1px solid var(--line); background:rgba(17,28,40,0.7); color:var(--ink); text-decoration:none; font-size:13px; font-weight:700; }}
         .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.12); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:12px; }}
         .muted {{ color:var(--muted); font-size:14px; }} .job-subtle {{ margin-top:6px; color:var(--muted); font-size:12px; line-height:1.4; white-space:normal; }} .table-wrap {{ width:100%; overflow-x:auto; border-radius:14px; border:1px solid var(--line); background:rgba(11,19,29,0.82); }} table {{ width:100%; min-width:960px; border-collapse:collapse; font-size:14px; }} th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; white-space:nowrap; }} th {{ color:var(--muted); font-weight:600; }} code {{ white-space:pre-wrap; word-break:break-word; }}
+        .inline-actions {{ display:flex; flex-wrap:wrap; gap:10px; margin-top:16px; }} .action-with-note {{ display:grid; gap:6px; align-content:start; }} .inline-form {{ display:inline-flex; margin:0; }} .cta {{ display:inline-flex; align-items:center; justify-content:center; padding:10px 14px; border-radius:999px; border:1px solid var(--line); background:rgba(21,34,49,0.92); color:var(--ink); font-size:13px; font-weight:800; }} .cta.primary {{ background:linear-gradient(135deg, rgba(61,217,182,0.28), rgba(82,168,255,0.24)); border-color:rgba(61,217,182,0.3); }} .cta.compact {{ padding:8px 12px; font-size:12px; }} .precompute-note {{ margin-top:10px; }} .action-receipt {{ max-width:260px; }}
         h1 {{ margin:0 0 8px; font-size:36px; line-height:1.05; letter-spacing:-0.03em; }}
       </style></head>
       <body><div class="app"><aside class="sidebar"><div class="brand"><span class="brand-tag">PQW</span><h1>{'任务记录' if lang == 'zh' else 'Job History'}</h1><p>{'最近一次同步、训练、回测和失败信息，都在这里回看。' if lang == 'zh' else 'Review recent sync, training, backtest, and failure details here.'}</p></div><nav class="side-nav">{nav_html}</nav><div class="sidebar-foot">{'这页适合看参数、错误和状态，不适合承载复杂分析，所以保持轻量。' if lang == 'zh' else 'This page stays light and focuses on params, errors, and status history.'}</div></aside><main class="main"><div class="wrap">
@@ -9041,6 +10469,7 @@ def dashboard_ops_jobs_page(request: Request, lang: str = "en", lookback_runs: i
           <a href="/dashboard/ops/jobs?lang=zh&lookback_runs={lookback_runs}" class="pill">中文</a>
         </div>
         <div class="card"><div class="eyebrow">{'任务记录' if lang == 'zh' else 'Job History'}</div><h1>{'最近任务与参数' if lang == 'zh' else 'Recent Jobs and Parameters'}</h1><p class="muted">{'单独查看任务成功、失败和参数详情。' if lang == 'zh' else 'Inspect recent success, failure, and run parameters in one place.'}</p></div>
+        <section class="card"><div class="eyebrow">{'A股预计算分层' if lang == 'zh' else 'CN Precompute Stages'}</div><h1 style="font-size:26px;margin:0 0 8px;">{'先看是哪一层失败' if lang == 'zh' else 'See which stage failed first'}</h1><p class="muted">{'总控、核心、组合、补全四层结果在这里集中展开，便于快速判断是前置依赖没准备好，还是某一批模板本身失败。' if lang == 'zh' else 'Controller, core, combo, and rest stages are expanded here so you can quickly tell whether prerequisites are missing or a specific batch failed.'}</p>{screener_stage_summary_html}<div class="inline-actions">{screener_stage_actions_html}</div></section>
         <section class="card"><div class="eyebrow">{_dt(lang, 'recent_jobs')}</div><div class="table-wrap"><table><thead><tr><th>ID</th><th>{_dt(lang, 'type')}</th><th>{_dt(lang, 'status')}</th><th>{_dt(lang, 'started')}</th><th>{_dt(lang, 'finished')}</th><th>{_dt(lang, 'params')}</th><th>{_dt(lang, 'message')}</th></tr></thead><tbody>{recent_job_rows}</tbody></table></div></section>
       </div></main></div></body></html>
     """
@@ -10105,11 +11534,14 @@ def dashboard_top_fragment(
     lang = "zh" if lang == "zh" else "en"
     lookback_runs = _clamp_lookback_runs(lookback_runs)
     summary = _load_summary(db, lookback_runs=lookback_runs)
+    selection_guidance = load_model_selection_guidance_snapshot(db, market="CN", allow_fallback=True)
+    selection_guidance_summary = summarize_model_selection_guidance(selection_guidance, lang=lang)
     return _render_dashboard_top_fragment(
         lang=lang,
         latest_signals=summary["latest_signals"],
         latest_model=summary["latest_model"],
         risk_overview=summary["market_context"].get("risk_overview", {}),
+        selection_guidance_summary=selection_guidance_summary,
     )
 
 
@@ -10207,6 +11639,18 @@ def dashboard_weekly_review(request: Request, db: Session = Depends(get_db_sessi
     trade_summary = summary.get("trade_summary") or {}
     audit_summary = summary.get("audit_summary") or {}
     structured_reason_summary = summary.get("structured_reason_summary") or {}
+    report_window_summary = summary.get("report_window_summary") or {}
+    recommendation_validation_rows_html = "".join(
+        "<tr>"
+        f"<td><a href='{html.escape(str(item.get('href') or '#'), quote=True)}'>{html.escape(str(item.get('label') or '-'))}</a><div class='muted'>{html.escape(str(item.get('title') or '-'))}</div></td>"
+        f"<td>{html.escape(str(item.get('note') or '-'))}</td>"
+        f"<td>{_fmt_optional_float(((item.get('windows') or {}).get(1) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float(((item.get('windows') or {}).get(1) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+        f"<td>{_fmt_optional_float(((item.get('windows') or {}).get(3) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float(((item.get('windows') or {}).get(3) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+        f"<td>{_fmt_optional_float(((item.get('windows') or {}).get(5) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float(((item.get('windows') or {}).get(5) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+        f"<td>{_fmt_optional_float(((item.get('windows') or {}).get(10) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float(((item.get('windows') or {}).get(10) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+        "</tr>"
+        for item in (summary.get("recommendation_validation_rows") or [])
+    ) or f"<tr><td colspan='6'>{'本周还没有足够的推荐验证样本。' if lang == 'zh' else 'Not enough recommendation validation samples yet this week.'}</td></tr>"
     structured_reason_note = ""
     coverage_pct = structured_reason_summary.get("coverage_pct")
     if coverage_pct is not None and float(coverage_pct) < 60.0:
@@ -10304,6 +11748,11 @@ def dashboard_weekly_review(request: Request, db: Session = Depends(get_db_sessi
                   <div class="metric">{_fmt_optional_float(((model_windows.get(3) or {}).get('avg_return')), suffix='%', digits=2)}</div>
                   <div class="muted">{'样本数'} {int((model_windows.get(3) or {}).get('count') or 0)} · {'命中率'} {_fmt_optional_float(((model_windows.get(3) or {}).get('hit_rate')), suffix='%', digits=1)}</div>
                 </article>
+                <article class="metric-card">
+                  <div class="eyebrow">{'日报 5D 均值' if lang == 'zh' else 'Report 5D Avg'}</div>
+                  <div class="metric">{_fmt_optional_float(((report_window_summary.get(5) or {}).get('avg_return')), suffix='%', digits=2)}</div>
+                  <div class="muted">{'可测样本'} {int(summary.get('measured_report_rows') or 0)} · {'命中率'} {_fmt_optional_float(((report_window_summary.get(5) or {}).get('hit_rate')), suffix='%', digits=1)}</div>
+                </article>
               </section>
               <section class="card">
                 <div class="eyebrow">{'一、市场情绪与重复候选' if lang == 'zh' else '1. Mood and Repeated Picks'}</div>
@@ -10319,6 +11768,14 @@ def dashboard_weekly_review(request: Request, db: Session = Depends(get_db_sessi
                 <div class="table-wrap"><table>
                   <thead><tr><th>{'Run' if lang == 'zh' else 'Run'}</th><th>{'市场 / 最近交易日' if lang == 'zh' else 'Market / Latest Trade Date'}</th><th>3D</th><th>5D</th><th>10D</th></tr></thead>
                   <tbody>{run_rows_html}</tbody>
+                </table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{'二点五、推荐验证' if lang == 'zh' else '2.5 Recommendation Validation'}</div>
+                <div class="muted">{'把今天优先模型、优先组合和本周 AI 日报 Top 5 放到一张表里。主值是平均收益，小字是上涨命中率，用来回答“这周到底该更信哪套建议”。' if lang == 'zh' else 'Put the priority model, priority combo, and this week’s AI Report Top 5 onto one board. Main values are average returns and muted values are hit rates so you can judge which guidance deserved more trust this week.'}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{'对象' if lang == 'zh' else 'Recommendation'}</th><th>{'说明' if lang == 'zh' else 'Note'}</th><th>1D</th><th>3D</th><th>5D</th><th>10D</th></tr></thead>
+                  <tbody>{recommendation_validation_rows_html}</tbody>
                 </table></div>
               </section>
               <section class="card">
@@ -10421,26 +11878,31 @@ def dashboard_ai_daily_report(request: Request, db: Session = Depends(get_db_ses
         status = str(meta.get("status") or "").strip().lower()
         source = str(meta.get("source") or "").strip().lower()
         note = html.escape(str(meta.get("note") or "-"))
+        blocked_candidates = int(meta.get("blocked_candidates") or 0)
         label = {
             "ready": "今日候选已就绪",
             "fallback": "已降级到预测候选",
+            "blocked": "推荐已暂停",
             "not_ready": "今日候选未就绪",
             "empty": "当前无可用候选",
         }.get(status, "候选状态")
         source_text = {
             "fresh_snapshot": "来源：今日 screener 快照",
             "predictions_fallback": "来源：最新模型预测",
+            "snapshot_required": "来源：等待今日快照",
             "none": "来源：无",
         }.get(source, "来源：-")
         tone = {
             "ready": "rgba(61,217,182,0.12)",
             "fallback": "rgba(245,158,11,0.14)",
+            "blocked": "rgba(239,68,68,0.14)",
             "not_ready": "rgba(239,68,68,0.14)",
             "empty": "rgba(148,163,184,0.14)",
         }.get(status, "rgba(148,163,184,0.14)")
         border = {
             "ready": "rgba(61,217,182,0.28)",
             "fallback": "rgba(245,158,11,0.32)",
+            "blocked": "rgba(239,68,68,0.32)",
             "not_ready": "rgba(239,68,68,0.32)",
             "empty": "rgba(148,163,184,0.28)",
         }.get(status, "rgba(148,163,184,0.28)")
@@ -10449,6 +11911,7 @@ def dashboard_ai_daily_report(request: Request, db: Session = Depends(get_db_ses
           <div style="font-weight:800;margin-bottom:6px;">{label}</div>
           <div class="muted">{source_text}</div>
           <div class="muted" style="margin-top:6px;">{note}</div>
+          <div class="muted" style="margin-top:6px;">{'被规则拦截' if lang == 'zh' else 'Blocked by hard rules'}: {blocked_candidates}</div>
         </div>
         """
     def structure_block(title: str, structure: dict) -> str:
@@ -10533,10 +11996,10 @@ def dashboard_ai_daily_report(request: Request, db: Session = Depends(get_db_ses
         "<tr>"
         f"<td>{item.get('ticker')}</td>"
         f"<td>{item.get('name') or item.get('ticker')}</td>"
-        f"<td>{item.get('verdict') or '-'}</td>"
+        f"<td>{item.get('verdict') or '-'}<div class='muted'>{html.escape(format_trade_status(item.get('tradability_status'), lang=lang))}</div></td>"
         f"<td>{item.get('confidence') or '-'}</td>"
         f"<td>{item.get('quant_rank') or '-'}<div class='muted'>验证分: {item.get('verification_score') or '-'}</div></td>"
-        f"<td>{item.get('strategy') or '-'}<div class='muted'>仓位: {item.get('target_weight') or '-'}</div><div class='muted'>可交易性: {item.get('tradability_status') or '-'}</div></td>"
+        f"<td>{item.get('strategy') or '-'}<div class='muted'>仓位: {item.get('target_weight') or '-'}</div><div class='muted'>就绪度: {item.get('trade_readiness_score') or '-'} / {item.get('readiness_bucket') or '-'}</div><div class='muted'><a href='{html.escape(_reason_screen_href(reason=item.get('block_reason'), status=item.get('tradability_status'), market=item.get('market'), lang=lang), quote=True)}'>{html.escape(build_trade_explain_text(item, lang=lang))}</a></div><div class='muted'><a href='{html.escape(_reason_screen_href(reason=item.get('block_reason'), status=item.get('tradability_status'), market=item.get('market'), lang=lang), quote=True)}'>{'查看同类筛选' if lang == 'zh' else 'Open screener'}</a></div></td>"
         f"<td>{item.get('entry_trigger') or '-'}<div class='muted'>失效: {item.get('invalidation_condition') or '-'}</div></td>"
         f"<td>{item.get('time_horizon') or '-'}<div class='muted'>滑点: {item.get('max_slippage_bps') or '-'}bps · 流动性: {item.get('liquidity_bucket') or '-'}</div></td>"
         f"<td>{item.get('verification_note') or '-'}<div class='muted'>止损: {item.get('stop_loss', '-')} · {item.get('stop_loss_type') or '-'}</div></td>"
@@ -10767,42 +12230,45 @@ def dashboard_ai_daily_report_history(request: Request, db: Session = Depends(ge
         key: sum(1 for item in tagged_history if item.get("_bias_bucket") == key)
         for key in ("BREAKOUT", "PULLBACK", "WATCH")
     }
+    history_cache: dict[tuple[str, str], list[dict]] = {}
 
     def _bucket_stats(items: list[dict]) -> dict:
-        outcome_values: list[float] = []
-        hit_count = 0
+        window_values: dict[int, list[float]] = {1: [], 3: [], 5: [], 10: []}
         measured_count = 0
         for item in items:
             payload = item.get("payload") or {}
             report_date = str(item.get("snapshot_date") or payload.get("report_date") or "")
-            rows = _report_outcome_rows(payload, report_date=report_date)
-            for row in rows:
-                value = row.get("return_pct")
-                if value is None:
+            rows = payload.get("market_recommendations") or payload.get("rows") or []
+            for row in rows[:5]:
+                ticker = str(row.get("ticker") or "").strip().upper()
+                if not ticker:
                     continue
-                try:
-                    numeric = float(value)
-                except (TypeError, ValueError):
-                    continue
-                measured_count += 1
-                outcome_values.append(numeric)
-                if numeric > 0:
-                    hit_count += 1
-        avg_return = (sum(outcome_values) / len(outcome_values)) if outcome_values else None
-        hit_rate = (hit_count / measured_count * 100.0) if measured_count else None
+                market_code = str(row.get("market") or "").strip().upper() or ("CN" if ticker.endswith((".SS", ".SZ", ".SH", ".BJ")) else "US")
+                cache_key = (market_code, ticker)
+                if cache_key not in history_cache:
+                    history_cache[cache_key] = load_lake_price_history(market=market_code, ticker=ticker, limit=260)
+                history_rows = history_cache.get(cache_key) or []
+                row_measured = False
+                for session in (1, 3, 5, 10):
+                    value = _forward_return_from_history(history_rows, trade_date=report_date, sessions=session)
+                    if value is None:
+                        continue
+                    window_values[session].append(float(value))
+                    row_measured = True
+                if row_measured:
+                    measured_count += 1
         return {
             "report_count": len(items),
             "measured_count": measured_count,
-            "hit_count": hit_count,
-            "avg_return": avg_return,
-            "hit_rate": hit_rate,
+            "windows": {session: _aggregate_window_stats(values) for session, values in window_values.items()},
         }
 
     current_stats = _bucket_stats(history)
-    avg_return = current_stats.get("avg_return")
-    hit_rate = current_stats.get("hit_rate")
+    current_windows = current_stats.get("windows") or {}
+    avg_return = (current_windows.get(5) or {}).get("avg_return")
+    hit_rate = (current_windows.get(5) or {}).get("hit_rate")
     measured_count = int(current_stats.get("measured_count") or 0)
-    hit_count = int(current_stats.get("hit_count") or 0)
+    hit_count = int((current_windows.get(5) or {}).get("count") or 0)
     bucket_labels = {
         "BREAKOUT": "突破偏向" if lang == "zh" else "Breakout",
         "PULLBACK": "回踩偏向" if lang == "zh" else "Pullback",
@@ -10818,13 +12284,14 @@ def dashboard_ai_daily_report_history(request: Request, db: Session = Depends(ge
             f"<td><a href='{row_href}' style='font-weight:800;color:var(--ink);'>{bucket_labels[key]}</a></td>"
             f"<td>{int(bucket_stats.get('report_count') or 0)}</td>"
             f"<td>{int(bucket_stats.get('measured_count') or 0)}</td>"
-            f"<td>{_fmt_optional_float(bucket_stats.get('avg_return'), suffix='%', digits=2)}</td>"
-            f"<td>{_fmt_optional_float(bucket_stats.get('hit_rate'), suffix='%', digits=1)}</td>"
-            f"<td>{int(bucket_stats.get('hit_count') or 0)}</td>"
+            f"<td>{_fmt_optional_float(((bucket_stats.get('windows') or {}).get(1) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float(((bucket_stats.get('windows') or {}).get(1) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+            f"<td>{_fmt_optional_float(((bucket_stats.get('windows') or {}).get(3) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float(((bucket_stats.get('windows') or {}).get(3) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+            f"<td>{_fmt_optional_float(((bucket_stats.get('windows') or {}).get(5) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float(((bucket_stats.get('windows') or {}).get(5) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+            f"<td>{_fmt_optional_float(((bucket_stats.get('windows') or {}).get(10) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_optional_float(((bucket_stats.get('windows') or {}).get(10) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
             "</tr>"
         )
     if not comparison_rows:
-        comparison_rows = f"<tr><td colspan='6'>{'暂无可对照的偏向统计。' if lang == 'zh' else 'No comparable bias statistics yet.'}</td></tr>"
+        comparison_rows = f"<tr><td colspan='7'>{'暂无可对照的偏向统计。' if lang == 'zh' else 'No comparable bias statistics yet.'}</td></tr>"
 
     def _filter_pill(label: str, key: str) -> str:
         active = bias_filter == key
@@ -10869,14 +12336,14 @@ def dashboard_ai_daily_report_history(request: Request, db: Session = Depends(ge
         <div class="muted">{'历史日报条数' if lang == 'zh' else 'Reports'}: {len(history)} · {html.escape({'ALL':'全部时间','7D':'近 7 天','30D':'近 30 天'}.get(window_filter, window_filter) if lang == 'zh' else {'ALL':'All time','7D':'Last 7D','30D':'Last 30D'}.get(window_filter, window_filter))}</div>
       </div>
       <div class="card" style="padding:16px;border-radius:18px;box-shadow:none;">
-        <div class="eyebrow">{'平均收益' if lang == 'zh' else 'Avg return'}</div>
+        <div class="eyebrow">{'5日平均收益' if lang == 'zh' else '5D Avg Return'}</div>
         <div style="font-size:22px;font-weight:900;">{_fmt_optional_float(avg_return, suffix='%', digits=2) if avg_return is not None else '-'}</div>
         <div class="muted">{'基于 Top 5 可测样本' if lang == 'zh' else 'Across measurable Top 5 rows'}: {measured_count}</div>
       </div>
       <div class="card" style="padding:16px;border-radius:18px;box-shadow:none;">
-        <div class="eyebrow">{'上涨命中率' if lang == 'zh' else 'Hit rate'}</div>
+        <div class="eyebrow">{'5日上涨命中率' if lang == 'zh' else '5D Hit Rate'}</div>
         <div style="font-size:22px;font-weight:900;">{_fmt_optional_float(hit_rate, suffix='%', digits=1) if hit_rate is not None else '-'}</div>
-        <div class="muted">{'正收益样本' if lang == 'zh' else 'Winning rows'}: {hit_count}</div>
+        <div class="muted">{'5日可测样本' if lang == 'zh' else '5D measured rows'}: {hit_count}</div>
       </div>
     </div>
     """
@@ -10885,6 +12352,7 @@ def dashboard_ai_daily_report_history(request: Request, db: Session = Depends(ge
         payload = item.get("payload") or {}
         top5 = payload.get("market_recommendations") or payload.get("rows") or []
         lightgbm_execution_bias = payload.get("lightgbm_execution_bias") or {}
+        report_stats = _bucket_stats([item])
         top5_text = ", ".join(
             str(row.get("ticker") or "")
             for row in top5[:5]
@@ -10901,13 +12369,15 @@ def dashboard_ai_daily_report_history(request: Request, db: Session = Depends(ge
             f"<div class='muted'>{html.escape(str(lightgbm_execution_bias.get('summary') or '-'))}</div></td>"
             f"<td>{len(portfolio_rows)}</td>"
             f"<td>{html.escape(top5_text)}</td>"
+            f"<td>{_fmt_optional_float(((report_stats.get('windows') or {}).get(1) or {}).get('avg_return'), suffix='%', digits=2)}"
+            f"<div class='muted'>3D {_fmt_optional_float(((report_stats.get('windows') or {}).get(3) or {}).get('avg_return'), suffix='%', digits=2)}</div>"
+            f"<div class='muted'>5D {_fmt_optional_float(((report_stats.get('windows') or {}).get(5) or {}).get('avg_return'), suffix='%', digits=2)} / {_fmt_optional_float(((report_stats.get('windows') or {}).get(5) or {}).get('hit_rate'), suffix='%', digits=1)}</div>"
+            f"<div class='muted'>10D {_fmt_optional_float(((report_stats.get('windows') or {}).get(10) or {}).get('avg_return'), suffix='%', digits=2)}</div></td>"
             f"<td><a class='cta' href='/dashboard/ai-daily-report/history/{int(item.get('id'))}?lang={lang}'>{'打开' if lang == 'zh' else 'Open'}</a></td>"
             "</tr>"
         )
     if not rows_html:
-        rows_html = (
-            f"<tr><td colspan='5'>{'暂无历史日报。下一次生成或发送 AI 日报后会自动保存。' if lang == 'zh' else 'No historical reports yet. The next generated or sent AI report will be archived automatically.'}</td></tr>"
-        )
+        rows_html = f"<tr><td colspan='6'>{'暂无历史日报。下一次生成或发送 AI 日报后会自动保存。' if lang == 'zh' else 'No historical reports yet. The next generated or sent AI report will be archived automatically.'}</td></tr>"
 
     return f"""
     <!DOCTYPE html>
@@ -10962,13 +12432,13 @@ def dashboard_ai_daily_report_history(request: Request, db: Session = Depends(ge
                 <div class="toolbar" style="margin-top:14px;">{filter_pills}</div>
                 <div class="toolbar" style="margin-top:10px;">{window_pills}</div>
                 {summary_cards}
-                <div class="muted" style="margin-top:12px;">{'点击下面任一偏向行，可以直接筛出对应日报。' if lang == 'zh' else 'Click any bias row below to filter the archive directly.'}</div>
+                <div class="muted" style="margin-top:12px;">{'点击下面任一偏向行，可以直接筛出对应日报。主值是平均收益，小字是上涨命中率。' if lang == 'zh' else 'Click any bias row below to filter the archive directly. Main values are average returns and muted values are hit rates.'}</div>
                 <div class="table-wrap" style="margin-top:16px;"><table>
-                  <thead><tr><th>{'执行偏向' if lang == 'zh' else 'Bias'}</th><th>{'日报数' if lang == 'zh' else 'Reports'}</th><th>{'可测样本' if lang == 'zh' else 'Measured'}</th><th>{'平均收益' if lang == 'zh' else 'Avg return'}</th><th>{'上涨命中率' if lang == 'zh' else 'Hit rate'}</th><th>{'正收益样本' if lang == 'zh' else 'Wins'}</th></tr></thead>
+                  <thead><tr><th>{'执行偏向' if lang == 'zh' else 'Bias'}</th><th>{'日报数' if lang == 'zh' else 'Reports'}</th><th>{'可测样本' if lang == 'zh' else 'Measured'}</th><th>1D</th><th>3D</th><th>5D</th><th>10D</th></tr></thead>
                   <tbody>{comparison_rows}</tbody>
                 </table></div>
                 <div class="table-wrap"><table>
-                  <thead><tr><th>{'日期' if lang == 'zh' else 'Date'}</th><th>{'市场判断' if lang == 'zh' else 'Market View'}</th><th>{'持仓数' if lang == 'zh' else 'Holdings'}</th><th>{'Top 5' if lang == 'zh' else 'Top 5'}</th><th>{'操作' if lang == 'zh' else 'Action'}</th></tr></thead>
+                  <thead><tr><th>{'日期' if lang == 'zh' else 'Date'}</th><th>{'市场判断' if lang == 'zh' else 'Market View'}</th><th>{'持仓数' if lang == 'zh' else 'Holdings'}</th><th>{'Top 5' if lang == 'zh' else 'Top 5'}</th><th>{'历史验证' if lang == 'zh' else 'Validation'}</th><th>{'操作' if lang == 'zh' else 'Action'}</th></tr></thead>
                   <tbody>{rows_html}</tbody>
                 </table></div>
               </section>
@@ -11010,9 +12480,9 @@ def dashboard_ai_daily_report_history_detail(snapshot_id: int, request: Request,
         "<tr>"
         f"<td>{index}</td>"
         f"<td><a href='/insights/{html.escape(str(item.get('ticker') or ''), quote=True)}?lang={lang}'>{html.escape(str(item.get('ticker') or '-'))}</a><div class='muted'>{html.escape(str(item.get('name') or '-'))}</div></td>"
-        f"<td>{html.escape(str(item.get('verdict') or '-'))}</td>"
-        f"<td>{html.escape(str(item.get('quant_rank') or '-'))}<div class='muted'>验证分 {html.escape(str(item.get('verification_score') or '-'))}</div></td>"
-        f"<td>{html.escape(str(item.get('entry_trigger') or '-'))}<div class='muted'>失效: {html.escape(str(item.get('invalidation_condition') or '-'))}</div></td>"
+        f"<td>{html.escape(str(item.get('verdict') or '-'))}<div class='muted'>{html.escape(format_trade_status(item.get('tradability_status'), lang=lang))}</div></td>"
+        f"<td>{html.escape(str(item.get('quant_rank') or '-'))}<div class='muted'>验证分 {html.escape(str(item.get('verification_score') or '-'))}</div><div class='muted'>{html.escape(str(item.get('trade_readiness_score') or '-'))} / {html.escape(str(item.get('readiness_bucket') or '-'))}</div></td>"
+        f"<td>{html.escape(str(item.get('entry_trigger') or '-'))}<div class='muted'>失效: {html.escape(str(item.get('invalidation_condition') or '-'))}</div><div class='muted'><a href='{html.escape(_reason_screen_href(reason=item.get('block_reason'), status=item.get('tradability_status'), market=item.get('market'), lang=lang), quote=True)}'>{html.escape(build_trade_explain_text(item, lang=lang))}</a></div><div class='muted'><a href='{html.escape(_reason_screen_href(reason=item.get('block_reason'), status=item.get('tradability_status'), market=item.get('market'), lang=lang), quote=True)}'>{'查看同类筛选' if lang == 'zh' else 'Open screener'}</a></div></td>"
         f"<td>{html.escape(str(item.get('headline') or item.get('summary') or '-'))}</td>"
         "</tr>"
         for index, item in enumerate(top5[:5], start=1)

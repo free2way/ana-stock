@@ -6,6 +6,7 @@ from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from app.core.config import get_settings
 from app.services.ticker_format import provider_ticker_candidates
 from app.services.tushare_client import TushareClient
 
@@ -44,40 +45,83 @@ class OpenBBClient:
 
     def fetch_symbol_profile(self, ticker: str) -> dict:
         self.last_source_used = "unknown"
-        market = "HK" if ticker.upper().endswith(".HK") else None
-        last_result = {"ticker": ticker.upper(), "name": None, "exchange": None}
+        market = self._infer_market(ticker) or "US"
+        last_result = {
+            "ticker": ticker.upper(),
+            "name": None,
+            "exchange": None,
+            "sector": None,
+            "industry": None,
+            "market": market,
+        }
         for candidate in provider_ticker_candidates(ticker, market):
             result = self._fetch_single_symbol_profile(candidate)
-            if result.get("name") or result.get("exchange"):
+            if self._profile_has_meaningful_fields(result):
                 result["ticker"] = ticker.upper()
-                self.last_source_used = "openbb_or_yfinance_profile"
                 return result
             last_result = result
         last_result["ticker"] = ticker.upper()
         return last_result
 
     def _fetch_single_symbol_profile(self, ticker: str) -> dict:
-        obb = self._load_openbb()
-        if obb is None:
-            return self._fetch_profile_with_yfinance(ticker)
-
-        try:
-            output = obb.equity.profile(symbol=ticker)
-            records = output.to_dict()
-            if isinstance(records, list) and records:
-                record = records[0]
-            elif isinstance(records, dict):
-                record = records
-            else:
-                return self._fetch_profile_with_yfinance(ticker)
-        except Exception:
-            return self._fetch_profile_with_yfinance(ticker)
-
-        return {
+        merged = {
             "ticker": ticker.upper(),
-            "name": record.get("name") or record.get("company_name") or record.get("long_name"),
-            "exchange": record.get("exchange") or record.get("exchange_name"),
+            "name": None,
+            "exchange": None,
+            "sector": None,
+            "industry": None,
+            "market": self._infer_market(ticker) or "US",
         }
+        if merged["market"] == "US":
+            polygon_profile = self._fetch_profile_with_polygon(ticker)
+            if polygon_profile:
+                self._merge_profile_fields(merged, polygon_profile)
+                if self._profile_has_meaningful_fields(merged):
+                    self.last_source_used = "polygon_profile"
+            yfinance_profile = self._fetch_profile_with_yfinance(ticker)
+            if yfinance_profile:
+                self._merge_profile_fields(merged, yfinance_profile, overwrite=False)
+                if self._profile_has_meaningful_fields(merged) and self.last_source_used == "unknown":
+                    self.last_source_used = "yfinance_profile"
+            return merged
+
+        obb = self._load_openbb()
+        if obb is not None:
+            try:
+                output = obb.equity.profile(symbol=ticker)
+                records = output.to_dict()
+                if isinstance(records, list) and records:
+                    record = records[0]
+                elif isinstance(records, dict):
+                    record = records
+                else:
+                    record = {}
+            except Exception:
+                record = {}
+            if record:
+                self._merge_profile_fields(
+                    merged,
+                    {
+                        "name": record.get("name") or record.get("company_name") or record.get("long_name"),
+                        "exchange": record.get("exchange") or record.get("exchange_name"),
+                        "sector": self._normalize_profile_sector(record.get("sector")),
+                        "industry": self._normalize_profile_industry(record.get("industry")),
+                        "market": merged.get("market"),
+                    },
+                )
+                if self._profile_has_meaningful_fields(merged):
+                    self.last_source_used = "openbb_profile"
+        polygon_profile = self._fetch_profile_with_polygon(ticker)
+        if polygon_profile:
+            self._merge_profile_fields(merged, polygon_profile, overwrite=False)
+            if self._profile_has_meaningful_fields(merged):
+                self.last_source_used = "polygon_profile"
+        yfinance_profile = self._fetch_profile_with_yfinance(ticker)
+        if yfinance_profile:
+            self._merge_profile_fields(merged, yfinance_profile, overwrite=False)
+            if self._profile_has_meaningful_fields(merged):
+                self.last_source_used = "yfinance_profile"
+        return merged
 
     def fetch_historical_prices(self, request: HistoricalPriceRequest) -> list[dict]:
         self.last_source_used = "unknown"
@@ -223,10 +267,47 @@ class OpenBBClient:
             or info.get("fullExchangeName")
             or info.get("quoteType")
         )
+        sector = self._normalize_profile_sector(
+            info.get("sectorDisp")
+            or info.get("sector")
+            or info.get("category")
+        )
+        industry = self._normalize_profile_industry(
+            info.get("industryDisp")
+            or info.get("industry")
+            or info.get("industryKey")
+            or info.get("category")
+        )
         return {
             "ticker": ticker.upper(),
             "name": name,
             "exchange": exchange,
+            "sector": sector,
+            "industry": industry,
+            "market": self._infer_market(ticker) or "US",
+        }
+
+    def _fetch_profile_with_polygon(self, ticker: str) -> dict:
+        settings = get_settings()
+        if not settings.polygon_api_key or (self._infer_market(ticker) or "US") != "US":
+            return {}
+        normalized = ticker.upper().split(".", 1)[0]
+        endpoint = str(settings.polygon_endpoint or "https://api.polygon.io").rstrip("/")
+        url = f"{endpoint}/v3/reference/tickers/{normalized}?{urlencode({'apiKey': settings.polygon_api_key or ''})}"
+        try:
+            payload = json.loads(urlopen(Request(url, headers={"Accept": "application/json"}), timeout=20).read().decode("utf-8"))
+        except Exception:
+            return {}
+        record = (payload or {}).get("results") or {}
+        industry = self._normalize_profile_industry(record.get("sic_description") or record.get("description"))
+        sector = self._normalize_profile_sector(industry or record.get("market"))
+        return {
+            "ticker": normalized,
+            "name": record.get("name"),
+            "exchange": record.get("primary_exchange") or record.get("primary_exchange_code"),
+            "sector": sector,
+            "industry": industry,
+            "market": "US",
         }
 
     def _fetch_with_yfinance(self, request: HistoricalPriceRequest) -> list[dict]:
@@ -616,7 +697,56 @@ class OpenBBClient:
             return "HK"
         if upper.endswith(".SS") or upper.endswith(".SZ") or upper.endswith(".SH") or upper.endswith(".BJ"):
             return "CN"
-        return None
+        return "US"
+
+    def _merge_profile_fields(self, target: dict, incoming: dict | None, *, overwrite: bool = True) -> None:
+        if not incoming:
+            return
+        for key in ("name", "exchange", "sector", "industry", "market"):
+            value = incoming.get(key)
+            if value not in (None, "", "None") and (overwrite or target.get(key) in (None, "", "None")):
+                target[key] = value
+
+    def _profile_has_meaningful_fields(self, payload: dict | None) -> bool:
+        if not payload:
+            return False
+        return any(payload.get(key) for key in ("name", "exchange", "sector", "industry"))
+
+    def _normalize_profile_sector(self, value: Any) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        normalized = text.lower()
+        if normalized in {"stocks", "stock", "equity", "common stock", "cs"}:
+            return None
+        mapping = [
+            ("科技", ("technology", "software", "semiconductor", "information technology", "internet", "computer", "electronic computers", "prepackaged software", "data processing", "ai")),
+            ("医药健康", ("healthcare", "biotechnology", "pharma", "medical", "life sciences")),
+            ("金融", ("financial", "bank", "insurance", "capital markets", "fintech", "blank check", "shell companies")),
+            ("能源", ("energy", "oil", "gas", "renewable", "solar", "uranium")),
+            ("工业", ("industrial", "aerospace", "defense", "machinery", "transportation")),
+            ("可选消费", ("consumer cyclical", "consumer discretionary", "retail", "auto", "travel", "mobility")),
+            ("必选消费", ("consumer defensive", "consumer staples", "food", "beverage", "malt beverages", "household")),
+            ("通信服务", ("communication", "media", "entertainment", "telecom")),
+            ("公用事业", ("utilities", "water", "electric")),
+            ("房地产", ("real estate", "reit")),
+            ("原材料", ("materials", "basic materials", "chemical", "steel", "metal", "mining")),
+            ("ETF/基金", ("etf", "fund", "trust")),
+        ]
+        for label, keywords in mapping:
+            if any(keyword in normalized for keyword in keywords):
+                return label
+        if text.isupper() and " " in text:
+            return None
+        if len(text) > 48 and normalized.count(" ") >= 4:
+            return None
+        return text[:80]
+
+    def _normalize_profile_industry(self, value: Any) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        return text[:120]
 
     def _to_baostock_code(self, ticker: str) -> str | None:
         upper = ticker.strip().upper()

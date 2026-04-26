@@ -915,12 +915,52 @@ def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, t
                     },
                 }
 
+            date_stmt = (
+                select(Prediction.model_run_id, Prediction.trade_date)
+                .join(Symbol, Symbol.id == Prediction.symbol_id)
+                .where(Prediction.model_run_id.in_(run_ids))
+                .distinct()
+                .order_by(Prediction.model_run_id.desc(), Prediction.trade_date.desc())
+            )
+            if len(target_markets) == 1:
+                date_stmt = date_stmt.where(Symbol.market == target_markets[0])
+            selected_dates_by_run: dict[int, list[str]] = defaultdict(list)
+            for selected_run_id, selected_trade_date in db.execute(date_stmt).all():
+                bucket = selected_dates_by_run[int(selected_run_id)]
+                if len(bucket) < 3:
+                    bucket.append(str(selected_trade_date))
+            selected_dates = sorted(
+                {
+                    trade_date
+                    for trade_dates in selected_dates_by_run.values()
+                    for trade_date in trade_dates
+                },
+                reverse=True,
+            )
+            if not selected_dates:
+                return {
+                    "markets": target_markets,
+                    "run_count": len(run_ids),
+                    "sample_count": 0,
+                    "latest_trade_date": None,
+                    "windows": {action: {window: aggregate_window_stats([]) for window in (1, 3, 5)} for action in action_buckets},
+                    "samples": samples_by_action,
+                    "per_market": {
+                        code: {
+                            "sample_count": 0,
+                            "windows": {action: {window: aggregate_window_stats([]) for window in (1, 3, 5)} for action in action_buckets},
+                        }
+                        for code in target_markets
+                    },
+                }
+
             stmt = (
                 select(Prediction, PredictionDetail, Symbol, ModelRun)
                 .join(PredictionDetail, PredictionDetail.prediction_id == Prediction.id)
                 .join(Symbol, Symbol.id == Prediction.symbol_id)
                 .join(ModelRun, ModelRun.id == Prediction.model_run_id)
                 .where(Prediction.model_run_id.in_(run_ids))
+                .where(Prediction.trade_date.in_(selected_dates))
                 .order_by(ModelRun.id.desc(), Prediction.trade_date.desc(), Prediction.rank_value.asc(), Prediction.score.desc())
             )
             if len(target_markets) == 1:

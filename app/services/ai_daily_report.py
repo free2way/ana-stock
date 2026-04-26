@@ -11,6 +11,7 @@ from app.services.portfolio_book import load_portfolio_positions
 from app.services.portfolio_intelligence import build_portfolio_ai_summary, build_position_management_fields
 from app.services.price_snapshot import load_latest_closes
 from app.services.repository import AppSettingRepository, PredictionRepository, SymbolRepository, WatchlistRepository, WorkspaceSnapshotRepository
+from app.services.model_selection_guidance import load_model_selection_guidance_snapshot, summarize_model_selection_guidance
 from app.services.screener_snapshots import build_base_precompute_params, screener_snapshot_type
 from app.services.social_signals import social_signal_summary
 from app.services.template_evaluation import (
@@ -19,6 +20,7 @@ from app.services.template_evaluation import (
     resolve_template_group_label,
 )
 from app.services.time_utils import app_now_iso, app_today_iso
+from app.services.tradability_filter import evaluate_candidate_tradability
 
 
 AI_DAILY_REPORT_KEY = "ai_daily_report"
@@ -38,6 +40,108 @@ US_HOTSPOT_TEMPLATES = [
     "global_growth_value",
     "global_income_quality",
 ]
+RECOMMENDATION_MIN_READINESS = 55.0
+RECOMMENDATION_MAX_RISK_FLAGS = 2
+RECOMMENDATION_CHASE_MOMENTUM_5 = 18.0
+RECOMMENDATION_MAX_PULLBACK_DISTANCE = 8.0
+
+
+def _reason_label_map(lang: str) -> dict[str, str]:
+    if lang == "zh":
+        return {
+            "signal_not_actionable": "模型信号还不具备可执行性",
+            "missing_latest_price": "缺少最新行情，暂时不能推荐",
+            "low_trade_readiness": "交易就绪度偏低，先观察等待",
+            "too_many_risk_flags": "风险标记过多，先不纳入推荐",
+            "extended_after_sharp_move": "短线涨幅过大，避免追高",
+            "do_not_chase": "短线涨幅过大，避免追高",
+            "too_far_from_pullback_zone": "已经偏离理想回踩区，买点不划算",
+            "model_score": "模型分在加分",
+            "signal_strength": "信号强度在加分",
+            "trend": "趋势结构在加分",
+            "reward_risk": "盈亏比在加分",
+            "model_confluence": "多模型共振在加分",
+            "missing_price": "缺少价格信息",
+            "drawdown_risk": "回撤风险偏高",
+            "chase_risk": "追高风险偏高",
+            "far_from_trigger": "距离理想触发位偏远",
+            "balanced_setup": "形态中性，继续观察",
+        }
+    return {
+        "signal_not_actionable": "Model signal is not actionable yet",
+        "missing_latest_price": "Latest price is missing, so the idea is blocked",
+        "low_trade_readiness": "Trade readiness is too low; keep it on watch",
+        "too_many_risk_flags": "Too many risk flags; keep it out of top picks",
+        "extended_after_sharp_move": "The move is already extended; do not chase",
+        "do_not_chase": "The move is already extended; do not chase",
+        "too_far_from_pullback_zone": "Price is too far from the preferred pullback zone",
+        "model_score": "Model score is supportive",
+        "signal_strength": "Signal strength is supportive",
+        "trend": "Trend structure is supportive",
+        "reward_risk": "Reward/risk is supportive",
+        "model_confluence": "Multi-model confluence is supportive",
+        "missing_price": "Missing price context",
+        "drawdown_risk": "Drawdown risk is elevated",
+        "chase_risk": "Chasing risk is elevated",
+        "far_from_trigger": "Price is too far from the ideal trigger",
+        "balanced_setup": "Balanced setup; keep monitoring",
+    }
+
+
+def format_trade_gate_reason(reason: str | None, *, lang: str = "zh") -> str:
+    value = str(reason or "").strip()
+    if not value:
+        return "-"
+    labels = _reason_label_map(lang)
+    if "," in value:
+        parts = [labels.get(part.strip(), part.strip().replace("_", " ")) for part in value.split(",") if part.strip()]
+        return "，".join(parts[:4]) if lang == "zh" else ", ".join(parts[:4])
+    return labels.get(value, value.replace("_", " "))
+
+
+def format_trade_status(status: str | None, *, lang: str = "zh") -> str:
+    normalized = str(status or "").strip().upper()
+    if lang == "zh":
+        return {
+            "READY": "可执行",
+            "REVIEW": "待复核",
+            "DEFER": "等更好买点",
+            "BLOCKED": "禁止交易",
+            "DO_NOT_CHASE": "不要追高",
+        }.get(normalized, normalized or "-")
+    return {
+        "READY": "Ready",
+        "REVIEW": "Review",
+        "DEFER": "Wait",
+        "BLOCKED": "Blocked",
+        "DO_NOT_CHASE": "Do Not Chase",
+    }.get(normalized, normalized or "-")
+
+
+def build_trade_explain_text(candidate: dict, *, lang: str = "zh") -> str:
+    status = str(candidate.get("tradability_status") or "").strip().upper()
+    block_reason = str(candidate.get("block_reason") or "").strip()
+    readiness_reason = str(candidate.get("readiness_reason") or "").strip()
+    if status in {"BLOCKED", "DO_NOT_CHASE"} or block_reason:
+        return format_trade_gate_reason(block_reason or status.lower(), lang=lang)
+    if readiness_reason:
+        return format_trade_gate_reason(readiness_reason, lang=lang)
+    return "形态通过，可以继续跟踪" if lang == "zh" else "Setup is acceptable; keep tracking it"
+
+
+def build_trade_summary_text(candidate: dict, *, lang: str = "zh", include_execution_note: bool = False) -> str:
+    status_text = format_trade_status(candidate.get("tradability_status"), lang=lang)
+    readiness_score = candidate.get("trade_readiness_score")
+    readiness_bucket = candidate.get("readiness_bucket") or "-"
+    parts = [
+        f"{'可交易性' if lang == 'zh' else 'Tradability'}：{status_text}",
+        f"{'就绪度' if lang == 'zh' else 'Readiness'}：{readiness_score or '-'} / {readiness_bucket}",
+        f"{'原因' if lang == 'zh' else 'Reason'}：{build_trade_explain_text(candidate, lang=lang)}",
+    ]
+    if include_execution_note:
+        parts.append(f"{'执行备注' if lang == 'zh' else 'Execution'}：{candidate.get('execution_note') or '-'}")
+    separator = " | " if lang == "zh" else " | "
+    return separator.join(parts)
 
 
 def build_close_review_action_feed(report: dict | None, *, lang: str = "zh", limit: int = 5) -> dict:
@@ -58,6 +162,10 @@ def build_close_review_action_feed(report: dict | None, *, lang: str = "zh", lim
             "verdict": item.get("verdict") or "-",
             "strategy": item.get("strategy") or "-",
             "tradability_status": tradability or "-",
+            "trade_readiness_score": item.get("trade_readiness_score"),
+            "readiness_bucket": item.get("readiness_bucket"),
+            "latest_close": item.get("latest_close"),
+            "latest_price": item.get("latest_price"),
             "target_weight": item.get("target_weight"),
             "entry_trigger": item.get("entry_trigger") or "-",
             "invalidation_condition": item.get("invalidation_condition") or "-",
@@ -68,7 +176,10 @@ def build_close_review_action_feed(report: dict | None, *, lang: str = "zh", lim
             "max_slippage_bps": item.get("max_slippage_bps"),
             "quant_rank": float(item.get("quant_rank") or 0.0),
         }
-        if tradability == "BLOCKED":
+        gate = _recommendation_gate(item)
+        if not gate["allowed"]:
+            enriched["tradability_status"] = gate["status"]
+            enriched["block_reason"] = gate["reason"]
             blocked.append(enriched)
         elif verdict in {"SELL", "STRONG SELL"} or tradability in {"REVIEW", "DEFER"}:
             risk_reduction.append(enriched)
@@ -83,6 +194,10 @@ def build_close_review_action_feed(report: dict | None, *, lang: str = "zh", lim
                 "verdict": item.get("verdict") or ("BUY" if lang == "en" else "买入"),
                 "strategy": item.get("strategy") or ("Buy The Dip"),
                 "tradability_status": item.get("tradability_status") or "-",
+                "trade_readiness_score": item.get("trade_readiness_score"),
+                "readiness_bucket": item.get("readiness_bucket"),
+                "latest_close": item.get("latest_close"),
+                "latest_price": item.get("latest_price"),
                 "target_weight": item.get("target_weight"),
                 "entry_trigger": item.get("entry_trigger") or "-",
                 "invalidation_condition": item.get("invalidation_condition") or "-",
@@ -94,6 +209,17 @@ def build_close_review_action_feed(report: dict | None, *, lang: str = "zh", lim
                 "quant_rank": float(item.get("quant_rank") or 0.0),
             }
         )
+
+    filtered_actionable: list[dict] = []
+    for item in actionable:
+        gate = _recommendation_gate(item)
+        if gate["allowed"]:
+            filtered_actionable.append(item)
+        else:
+            item["tradability_status"] = gate["status"]
+            item["block_reason"] = gate["reason"]
+            blocked.append(item)
+    actionable = filtered_actionable
 
     actionable.sort(key=lambda item: (-float(item.get("quant_rank") or 0.0), item.get("ticker") or ""))
     blocked.sort(key=lambda item: (-float(item.get("quant_rank") or 0.0), item.get("ticker") or ""))
@@ -120,6 +246,63 @@ def build_close_review_action_feed(report: dict | None, *, lang: str = "zh", lim
         "risk_reduction": risk_reduction[:limit],
         "blocked": blocked[:limit],
     }
+
+
+def _entry_style_value(candidate: dict) -> str:
+    for key in ("preferred_entry_style", "entry_style", "model_entry_style", "action_label", "setup_label"):
+        value = str(candidate.get(key) or "").strip().lower()
+        if value:
+            return value
+    return ""
+
+
+def _candidate_latest_price(candidate: dict) -> float:
+    return _safe_float(
+        candidate.get("latest_close")
+        or candidate.get("latest_price")
+        or candidate.get("close")
+        or candidate.get("price")
+    )
+
+
+def _candidate_risk_flags(candidate: dict) -> list[str]:
+    raw = candidate.get("risk_flags") or candidate.get("model_execution_tags") or []
+    if isinstance(raw, (list, tuple, set)):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    return [item.strip() for item in text.replace(";", ",").split(",") if item.strip()]
+
+
+def _recommendation_gate(candidate: dict) -> dict[str, object]:
+    tradability = str(candidate.get("tradability_status") or "").upper()
+    readiness = _safe_float(candidate.get("trade_readiness_score"))
+    readiness_bucket = str(candidate.get("readiness_bucket") or "").upper()
+    risk_flags = _candidate_risk_flags(candidate)
+    entry_style = _entry_style_value(candidate)
+    latest_price = _candidate_latest_price(candidate)
+    momentum_5 = _safe_float(candidate.get("momentum_5"))
+    distance_to_breakout = _safe_float(candidate.get("distance_to_breakout_pct"))
+
+    if tradability == "BLOCKED":
+        return {"allowed": False, "status": "BLOCKED", "reason": str(candidate.get("block_reason") or "signal_not_actionable")}
+    if latest_price <= 0:
+        return {"allowed": False, "status": "BLOCKED", "reason": "missing_latest_price"}
+    if "missing-latest-price" in risk_flags:
+        return {"allowed": False, "status": "BLOCKED", "reason": "missing_latest_price"}
+    if readiness_bucket in {"LOW", "BLOCKED"} or (readiness and readiness < RECOMMENDATION_MIN_READINESS):
+        return {"allowed": False, "status": "BLOCKED", "reason": "low_trade_readiness"}
+    if len(risk_flags) > RECOMMENDATION_MAX_RISK_FLAGS:
+        return {"allowed": False, "status": "BLOCKED", "reason": "too_many_risk_flags"}
+    if momentum_5 >= RECOMMENDATION_CHASE_MOMENTUM_5 and entry_style not in {"pullback", "buy_the_dip", "support_hold", "pullback_reentry"}:
+        return {"allowed": False, "status": "DO_NOT_CHASE", "reason": "extended_after_sharp_move"}
+    if (
+        distance_to_breakout >= RECOMMENDATION_MAX_PULLBACK_DISTANCE
+        and entry_style in {"pullback", "buy_the_dip", "support_hold", "pullback_reentry"}
+    ):
+        return {"allowed": False, "status": "BLOCKED", "reason": "too_far_from_pullback_zone"}
+    return {"allowed": True, "status": tradability or "READY", "reason": ""}
 
 
 def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, markets: list[str] | None = None) -> dict:
@@ -164,6 +347,8 @@ def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, m
             if market == "CN"
             else None
         )
+        model_selection_guidance = load_model_selection_guidance_snapshot(db, market=market, allow_fallback=True)
+        model_selection_guidance_summary = summarize_model_selection_guidance(model_selection_guidance, lang="zh")
         market_structure_rows = (
             _load_full_market_report_candidates(
                 db=db,
@@ -211,6 +396,8 @@ def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, m
         "market_recommendations_meta": market_recommendation_meta,
         "market_structure": market_structure,
         "market_template_attribution": market_template_attribution,
+        "model_selection_guidance": model_selection_guidance,
+        "model_selection_guidance_summary": model_selection_guidance_summary,
         "lightgbm_execution_bias": lightgbm_execution_bias,
         "us_model_recommendations": us_model_rows,
         "us_model_recommendations_meta": us_market_recommendation_meta,
@@ -333,6 +520,7 @@ def _build_market_recommendation_rows(
         "snapshot_templates_ready": 0,
         "snapshot_rows": 0,
         "candidate_count": 0,
+        "blocked_candidates": 0,
         "note": "",
     }
     if prefer_snapshot:
@@ -359,7 +547,7 @@ def _build_market_recommendation_rows(
                     ),
                 }
             )
-    if not candidates:
+    if not candidates and not prefer_snapshot:
         fallback_candidates = [
             item
             for item in prediction_repo.list_latest_signal_decisions(limit=candidate_limit, market=market)
@@ -396,6 +584,20 @@ def _build_market_recommendation_rows(
                     ),
                 }
             )
+    elif not candidates and prefer_snapshot:
+        candidate_meta.update(
+            {
+                "source": "snapshot_required",
+                "status": "blocked",
+                "ready": False,
+                "used_today_snapshot": False,
+                "note": (
+                    "今日模型快照未就绪，已停止生成全市场推荐。"
+                    if market == "CN"
+                    else "Fresh model snapshots are not ready, so market recommendations are paused."
+                ),
+            }
+        )
     elif not prefer_snapshot:
         candidate_meta.update(
             {
@@ -416,6 +618,10 @@ def _build_market_recommendation_rows(
     for candidate in candidates:
         ticker = str(candidate.get("ticker") or "").strip().upper()
         if not ticker:
+            continue
+        gate = _recommendation_gate(candidate)
+        if not gate["allowed"]:
+            candidate_meta["blocked_candidates"] = int(candidate_meta.get("blocked_candidates") or 0) + 1
             continue
         overview = symbol_repo.get_overview(ticker)
         if overview is None:
@@ -487,6 +693,10 @@ def _build_market_recommendation_rows(
                 "model_score": (None if latest_signal is None else latest_signal.get("score")),
                 "model_signal_strength": (None if latest_signal is None else latest_signal.get("signal_strength")),
                 "tradability_status": (None if latest_signal is None else latest_signal.get("tradability_status")),
+                "trade_readiness_score": (None if latest_signal is None else latest_signal.get("trade_readiness_score")),
+                "readiness_bucket": (None if latest_signal is None else latest_signal.get("readiness_bucket")),
+                "readiness_reason": (None if latest_signal is None else latest_signal.get("readiness_reason")),
+                "suggested_watch_action": (None if latest_signal is None else latest_signal.get("suggested_watch_action")),
                 "target_weight": (None if latest_signal is None else latest_signal.get("target_weight")),
                 "suggested_participation_rate": (
                     None if latest_signal is None else latest_signal.get("suggested_participation_rate")
@@ -899,6 +1109,7 @@ def render_ai_daily_report_message(report: dict | None) -> str:
     market_meta = payload.get("market_recommendations_meta") or {}
     market_structure = payload.get("market_structure") or {}
     market_template_attribution = payload.get("market_template_attribution") or {}
+    guidance_summary = payload.get("model_selection_guidance_summary") or {}
     lightgbm_execution_bias = payload.get("lightgbm_execution_bias") or {}
     us_model_rows = payload.get("us_model_recommendations") or []
     us_market_meta = payload.get("us_model_recommendations_meta") or {}
@@ -937,6 +1148,8 @@ def render_ai_daily_report_message(report: dict | None) -> str:
         "",
         f"策略主线：{strategy.get('headline') or '-'}",
         f"执行建议：{strategy.get('playbook') or '-'}",
+        f"{guidance_summary.get('top_model_summary') or '优先模型：当前样本还不够，先继续观察。'}",
+        f"{guidance_summary.get('top_combo_summary') or '优先组合：组合样本还不够，暂不强推。'}",
         f"{lightgbm_execution_bias.get('title') or 'LightGBM：今天先观察'}",
         f"{lightgbm_execution_bias.get('summary') or '-'}",
         "",
@@ -962,7 +1175,7 @@ def render_ai_daily_report_message(report: dict | None) -> str:
                 f"{index}. {item.get('ticker')} {item.get('name') or ''}".strip(),
                 f"量化分：{item.get('quant_rank') or '-'} | 验证分：{item.get('verification_score') or '-'} | 模型分：{_fmt_number(item.get('model_score'))} | 趋势分：{item.get('trend_score') or '-'}",
                 f"结论：{item.get('verdict') or '-'} | 置信度：{item.get('confidence') or '-'} | 策略：{item.get('strategy') or '-'}",
-                f"可交易性：{item.get('tradability_status') or '-'} | 建议仓位：{item.get('target_weight') or '-'} | 执行备注：{item.get('execution_note') or '-'}",
+                build_trade_summary_text(item, lang="zh", include_execution_note=True) + f" | 建议仓位：{item.get('target_weight') or '-'}",
                 f"验证依据：{item.get('verification_note') or '-'}",
                 f"触发条件：{item.get('entry_trigger') or '-'}",
                 f"失效条件：{item.get('invalidation_condition') or '-'}",
@@ -994,7 +1207,7 @@ def render_ai_daily_report_message(report: dict | None) -> str:
                     f"{index}. {item.get('ticker')} {item.get('name') or ''}".strip(),
                     f"量化分：{item.get('quant_rank') or '-'} | 验证分：{item.get('verification_score') or '-'} | 模型分：{_fmt_number(item.get('model_score'))} | 趋势分：{item.get('trend_score') or '-'}",
                     f"结论：{item.get('verdict') or '-'} | 置信度：{item.get('confidence') or '-'} | 策略：{item.get('strategy') or '-'}",
-                    f"可交易性：{item.get('tradability_status') or '-'} | 建议仓位：{item.get('target_weight') or '-'} | 执行备注：{item.get('execution_note') or '-'}",
+                    build_trade_summary_text(item, lang="zh", include_execution_note=True) + f" | 建议仓位：{item.get('target_weight') or '-'}",
                     f"验证依据：{item.get('verification_note') or '-'}",
                     f"触发条件：{item.get('entry_trigger') or '-'}",
                     f"失效条件：{item.get('invalidation_condition') or '-'}",
@@ -1104,6 +1317,7 @@ def _render_market_top5_push_message(payload: dict) -> str:
     market_meta = payload.get("market_recommendations_meta") or {}
     market_structure = payload.get("market_structure") or {}
     market_template_attribution = payload.get("market_template_attribution") or {}
+    guidance_summary = payload.get("model_selection_guidance_summary") or {}
     lightgbm_execution_bias = payload.get("lightgbm_execution_bias") or {}
     lines = [
         "二、明日推荐购买 Top 5",
@@ -1113,6 +1327,8 @@ def _render_market_top5_push_message(payload: dict) -> str:
         f"市场状态：{payload.get('mood') or '-'}",
         f"策略主线：{strategy.get('headline') or '-'}",
         f"执行建议：{strategy.get('playbook') or '-'}",
+        f"{guidance_summary.get('top_model_summary') or '优先模型：当前样本还不够，先继续观察。'}",
+        f"{guidance_summary.get('top_combo_summary') or '优先组合：组合样本还不够，暂不强推。'}",
         f"{lightgbm_execution_bias.get('title') or 'LightGBM：今天先观察'}",
         f"{lightgbm_execution_bias.get('summary') or '-'}",
         "",
@@ -1139,7 +1355,7 @@ def _render_market_top5_push_message(payload: dict) -> str:
                 f"{index}. {item.get('ticker')} {item.get('name') or ''}".strip(),
                 f"量化分：{item.get('quant_rank') or '-'} | 验证分：{item.get('verification_score') or '-'} | 趋势分：{item.get('trend_score') or '-'}",
                 f"结论：{item.get('verdict') or '-'} | 置信度：{item.get('confidence') or '-'} | 策略：{item.get('strategy') or '-'}",
-                f"可交易性：{item.get('tradability_status') or '-'} | 建议仓位：{item.get('target_weight') or '-'}",
+                build_trade_summary_text(item, lang="zh") + f" | 建议仓位：{item.get('target_weight') or '-'}",
                 f"触发条件：{item.get('entry_trigger') or '-'}",
                 f"失效条件：{item.get('invalidation_condition') or '-'}",
                 f"买入区：{buy_zone.get('low', '-')} - {buy_zone.get('high', '-')} | 止损：{item.get('stop_loss', '-')}",
@@ -1175,7 +1391,7 @@ def _render_us_market_top5_push_message(payload: dict) -> str:
                 f"{index}. {item.get('ticker')} {item.get('name') or ''}".strip(),
                 f"量化分：{item.get('quant_rank') or '-'} | 验证分：{item.get('verification_score') or '-'} | 趋势分：{item.get('trend_score') or '-'}",
                 f"结论：{item.get('verdict') or '-'} | 置信度：{item.get('confidence') or '-'} | 策略：{item.get('strategy') or '-'}",
-                f"可交易性：{item.get('tradability_status') or '-'} | 建议仓位：{item.get('target_weight') or '-'}",
+                build_trade_summary_text(item, lang="zh") + f" | 建议仓位：{item.get('target_weight') or '-'}",
                 f"触发条件：{item.get('entry_trigger') or '-'}",
                 f"失效条件：{item.get('invalidation_condition') or '-'}",
                 f"买入区：{buy_zone.get('low', '-')} - {buy_zone.get('high', '-')} | 止损：{item.get('stop_loss', '-')}",
@@ -1211,7 +1427,7 @@ def _render_legacy_ai_daily_report_message(report: dict | None) -> str:
                 f"{index}. {item.get('ticker')} {item.get('name') or ''}".strip(),
                 f"量化分：{item.get('quant_rank') or '-'} | 模型分：{_fmt_number(item.get('model_score'))} | 趋势分：{item.get('trend_score') or '-'} | Setup：{item.get('setup_label') or '-'}",
                 f"结论：{item.get('verdict') or '-'} | 置信度：{item.get('confidence') or '-'} | 策略：{item.get('strategy') or '-'}",
-                f"可交易性：{item.get('tradability_status') or '-'} | 建议仓位：{item.get('target_weight') or '-'} | 执行备注：{item.get('execution_note') or '-'}",
+                build_trade_summary_text(item, lang="zh", include_execution_note=True) + f" | 建议仓位：{item.get('target_weight') or '-'}",
                 f"参与率：{_fmt_percent(item.get('suggested_participation_rate'))} | 执行计划：{item.get('execution_plan') or '-'}",
                 f"触发条件：{item.get('entry_trigger') or '-'}",
                 f"失效条件：{item.get('invalidation_condition') or '-'}",
@@ -1236,7 +1452,7 @@ def _render_legacy_ai_daily_report_message(report: dict | None) -> str:
                     f"{index}. {item.get('ticker')} {item.get('name') or ''}".strip(),
                     f"量化分：{item.get('quant_rank') or '-'} | 模型分：{_fmt_number(item.get('model_score'))} | 趋势分：{item.get('trend_score') or '-'}",
                     f"结论：{item.get('verdict') or '-'} | Setup：{item.get('setup_label') or '-'}",
-                    f"可交易性：{item.get('tradability_status') or '-'} | 建议仓位：{item.get('target_weight') or '-'} | 风险标记：{risk_flags}",
+                    build_trade_summary_text(item, lang="zh") + f" | 建议仓位：{item.get('target_weight') or '-'} | 风险标记：{risk_flags}",
                     f"参与率：{_fmt_percent(item.get('suggested_participation_rate'))} | 执行计划：{item.get('execution_plan') or '-'}",
                     f"触发条件：{item.get('entry_trigger') or '-'} | 失效条件：{item.get('invalidation_condition') or '-'}",
                     f"持有周期：{item.get('time_horizon') or '-'} | 流动性桶：{item.get('liquidity_bucket') or '-'} | 最大滑点：{item.get('max_slippage_bps') or '-'}bps",
@@ -1356,9 +1572,19 @@ def _candidate_quant_score(candidate: dict, combined: dict) -> float:
 def _candidate_verification_score(candidate: dict, combined: dict) -> float:
     quant_rank = _candidate_quant_score(candidate, combined)
     tradability = str(candidate.get("tradability_status") or "").upper()
+    readiness = _safe_float(candidate.get("trade_readiness_score"))
+    readiness_bucket = str(candidate.get("readiness_bucket") or "").upper()
     setup_label = str((combined or {}).get("setup_label") or "")
     signal_label = str(candidate.get("signal_label") or "").upper()
     score = quant_rank
+    if readiness > 0:
+        score += readiness * 0.9
+    if readiness_bucket == "HIGH":
+        score += 18.0
+    elif readiness_bucket == "MEDIUM":
+        score += 8.0
+    elif readiness_bucket in {"LOW", "BLOCKED"}:
+        score -= 24.0
     if tradability == "READY":
         score += 28.0
     elif tradability in {"REVIEW", "DEFER"}:
@@ -1557,6 +1783,7 @@ def _load_full_market_report_candidates(
         "snapshot_templates_considered": len(FULL_MARKET_REPORT_TEMPLATES),
         "snapshot_templates_ready": 0,
         "snapshot_rows": 0,
+        "blocked_candidates": 0,
     }
     for template in FULL_MARKET_REPORT_TEMPLATES:
         params = build_base_precompute_params(model_template=template, universe="full_market", market=market)
@@ -1575,6 +1802,10 @@ def _load_full_market_report_candidates(
             if not ticker or ticker in excluded_tickers:
                 continue
             candidate = _candidate_from_full_market_row(row, template=template, market=market)
+            gate = _recommendation_gate(candidate)
+            if not gate["allowed"]:
+                meta["blocked_candidates"] = int(meta.get("blocked_candidates") or 0) + 1
+                continue
             repeat_count = int(repeat_counts.get(ticker) or 0)
             if repeat_count > 0:
                 candidate["recent_report_repeat_count"] = repeat_count
@@ -1685,6 +1916,35 @@ def _build_us_hotspot_note(*, mention: dict, snapshot: dict) -> str:
 
 
 def _candidate_from_full_market_row(row: dict, *, template: str, market: str) -> dict:
+    if row.get("trade_readiness_score") is None:
+        decision = evaluate_candidate_tradability(
+            {
+                **row,
+                "score": row.get("model_score") or row.get("model_confidence"),
+                "signal_label": row.get("model_signal_label") or row.get("signal_label"),
+                "signal_strength": row.get("model_signal_strength") or row.get("trend_score"),
+                "expected_drawdown_20d": row.get("model_expected_drawdown_20d"),
+                "entry_style": row.get("model_entry_style") or row.get("action_label"),
+                "risk_flags": row.get("risk_flags") or row.get("model_execution_tags") or [],
+            }
+        )
+        row = {
+            **row,
+            "tradability_status": decision.tradability_status,
+            "trade_readiness_score": decision.trade_readiness_score,
+            "readiness_bucket": decision.readiness_bucket,
+            "readiness_reason": decision.readiness_reason,
+            "preferred_entry_style": decision.preferred_entry_style,
+            "suggested_watch_action": decision.suggested_watch_action,
+            "risk_flags": decision.risk_flags,
+            "entry_trigger": row.get("entry_trigger") or decision.entry_trigger,
+            "invalidation_condition": row.get("invalidation_condition") or decision.invalidation_condition,
+            "time_horizon": row.get("time_horizon") or decision.time_horizon,
+            "max_slippage_bps": row.get("max_slippage_bps") or decision.max_slippage_bps,
+            "liquidity_bucket": row.get("liquidity_bucket") or decision.liquidity_bucket,
+            "stop_loss_type": row.get("stop_loss_type") or decision.stop_loss_type,
+            "execution_note": row.get("execution_note") or decision.execution_note,
+        }
     trend_score = _safe_float(row.get("trend_score"))
     model_score = row.get("model_score")
     if model_score is None:
@@ -1695,19 +1955,30 @@ def _candidate_from_full_market_row(row: dict, *, template: str, market: str) ->
     reward_risk = _safe_float(row.get("model_reward_risk_ratio"))
     volume_ratio = _safe_float(row.get("volume_ratio"))
     snapshot_score = _safe_float(row.get("snapshot_score"))
+    readiness = _safe_float(row.get("trade_readiness_score"))
+    readiness_bucket = row.get("readiness_bucket")
     rank_score = (
         snapshot_score * 1.1
         + trend_score
         + signal_strength * 0.7
         + percentile * 0.25
         + confidence * 0.25
+        + readiness * 1.05
         + min(volume_ratio, 8.0) * 2.0
         + min(reward_risk, 4.0) * 6.0
     )
-    execution_tags = row.get("model_execution_tags") or row.get("execution_tags") or []
+    execution_tags = row.get("model_execution_tags") or row.get("execution_tags") or row.get("risk_flags") or []
     tradability_status = row.get("tradability_status") or row.get("model_tradability_status")
     if not tradability_status:
         tradability_status = "REVIEW" if execution_tags else "READY"
+    if str(readiness_bucket or "").upper() == "HIGH":
+        rank_score += 18.0
+    elif str(readiness_bucket or "").upper() == "MEDIUM":
+        rank_score += 8.0
+    elif str(readiness_bucket or "").upper() in {"LOW", "BLOCKED"}:
+        rank_score -= 35.0
+    if str(tradability_status).upper() == "BLOCKED":
+        rank_score -= 80.0
     entry_trigger = row.get("entry_trigger") or row.get("model_entry_trigger") or _default_entry_trigger(row, template=template)
     invalidation = row.get("invalidation_condition") or row.get("model_invalidation_condition") or _default_invalidation_condition(row)
     return {
@@ -1726,6 +1997,11 @@ def _candidate_from_full_market_row(row: dict, *, template: str, market: str) ->
         "position_size_hint": row.get("model_position_size_hint"),
         "entry_style": row.get("model_entry_style"),
         "tradability_status": tradability_status,
+        "trade_readiness_score": readiness or None,
+        "readiness_bucket": readiness_bucket,
+        "readiness_reason": row.get("readiness_reason"),
+        "preferred_entry_style": row.get("preferred_entry_style"),
+        "suggested_watch_action": row.get("suggested_watch_action"),
         "target_weight": row.get("target_weight") or row.get("model_target_weight"),
         "suggested_participation_rate": row.get("suggested_participation_rate"),
         "entry_trigger": entry_trigger,
@@ -1796,10 +2072,20 @@ def _build_buy_the_dip_rows(*, rows: list[dict], markets: list[str]) -> list[dic
         ranked: list[dict] = []
         for candidate in candidates:
             ticker = str(candidate.get("ticker") or "").upper()
+            combined = service.insight_engine.get_insight(ticker, lang="zh")
+            merged_candidate = {
+                **candidate,
+                "latest_close": (combined or {}).get("latest_close"),
+                "momentum_5": (combined or {}).get("momentum_5"),
+                "distance_to_breakout_pct": (combined or {}).get("distance_to_breakout_pct"),
+                "setup_label": (combined or {}).get("setup_label"),
+            }
+            gate = _recommendation_gate(merged_candidate)
+            if not gate["allowed"]:
+                continue
             overview = symbol_repo.get_overview(ticker)
             if overview is None:
                 continue
-            combined = service.insight_engine.get_insight(ticker, lang="zh")
             if combined is None or str(combined.get("setup_label") or "") != "pullback_buy":
                 continue
             quant_rank = _candidate_quant_score(candidate, combined)
@@ -1831,6 +2117,8 @@ def _build_buy_the_dip_rows(*, rows: list[dict], markets: list[str]) -> list[dic
                     "model_score": candidate.get("score"),
                     "model_signal_strength": candidate.get("signal_strength"),
                     "tradability_status": candidate.get("tradability_status"),
+                    "trade_readiness_score": candidate.get("trade_readiness_score"),
+                    "readiness_bucket": candidate.get("readiness_bucket"),
                     "target_weight": candidate.get("target_weight"),
                     "suggested_participation_rate": candidate.get("suggested_participation_rate"),
                     "entry_trigger": candidate.get("entry_trigger"),

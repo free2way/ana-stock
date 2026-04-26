@@ -14,6 +14,7 @@ from app.services.close_review_scheduler import close_review_scheduler_service
 from app.services.social_signal_scheduler import social_signal_scheduler_service
 from app.services.ui_lang import LANG_COOKIE_NAME
 from app.services.us_market_scheduler import us_market_scheduler_service
+from app.services.us_symbol_metadata_scheduler import us_symbol_metadata_scheduler_service
 
 
 settings = get_settings()
@@ -26,9 +27,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     auto_analysis_service.start()
     close_review_scheduler_service.start()
     us_market_scheduler_service.start()
+    us_symbol_metadata_scheduler_service.start()
     social_signal_scheduler_service.start()
     yield
     social_signal_scheduler_service.stop()
+    us_symbol_metadata_scheduler_service.stop()
     us_market_scheduler_service.stop()
     auto_analysis_service.stop()
     close_review_scheduler_service.stop()

@@ -249,7 +249,16 @@ def portfolio_page(
     )
     snapshot_payload = (snapshot or {}).get("payload") if isinstance(snapshot, dict) else None
     intelligence = (snapshot_payload or {}).get("intelligence") if isinstance(snapshot_payload, dict) else None
-    if not isinstance(intelligence, dict):
+    required_intelligence_keys = {
+        "market_rankings",
+        "top_position",
+        "risk_posture",
+        "posture_summary",
+        "trim_candidates",
+        "exit_candidates",
+        "review_candidates",
+    }
+    if not isinstance(intelligence, dict) or not required_intelligence_keys.issubset(set(intelligence.keys())):
         intelligence = build_portfolio_intelligence(db, lang=lang)
     watchlist_repo = WatchlistRepository(db)
     watchlist = watchlist_repo.get_or_create_default()
@@ -484,6 +493,30 @@ def portfolio_page(
         for row in trades[:10]
     ) or f"<tr><td colspan='9'>{'暂无卖出记录' if lang == 'zh' else 'No sell records yet.'}</td></tr>"
     realized_total = sum(float(row.get("realized_pnl") or 0.0) for row in trades)
+    top_position = intelligence.get("top_position") or {}
+    total_market_value = float(intelligence.get("total_market_value") or total_market_value)
+    market_rankings_html = "".join(
+        "<article style='display:flex;justify-content:space-between;gap:12px;padding:12px 0;border-top:1px solid var(--line);'>"
+        f"<div><div style='font-weight:800'>{row['market']}</div><div class='muted'>{'市场暴露' if lang == 'zh' else 'Market exposure'}</div></div>"
+        f"<div style='text-align:right;'><div style='font-weight:700'>{row['weight_pct']:.1f}%</div><div class='muted'>{row['market_value']:.2f}</div></div>"
+        "</article>"
+        for row in intelligence.get("market_rankings", [])
+    ) or f"<div class='muted'>{'暂无市场暴露数据' if lang == 'zh' else 'No market exposure data yet'}</div>"
+    risk_posture_tone = str(intelligence.get("risk_posture") or "")
+    if risk_posture_tone in {"防守", "Defensive"}:
+        posture_style = "background:rgba(255,180,192,0.12);color:#ffb4c0;"
+    elif risk_posture_tone in {"均衡偏防守", "Balanced / defensive"}:
+        posture_style = "background:rgba(246,193,119,0.14);color:#f6c177;"
+    else:
+        posture_style = "background:rgba(61,217,182,0.12);color:var(--accent);"
+    risk_queue_html = (
+        f"<div style='display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;'>"
+        f"<span style='display:inline-flex;align-items:center;padding:7px 11px;border-radius:999px;{posture_style}font-weight:800;font-size:12px;'>{html.escape(str(intelligence.get('risk_posture') or ('均衡' if lang == 'zh' else 'Balanced')))}</span>"
+        f"<span style='display:inline-flex;align-items:center;padding:7px 11px;border-radius:999px;background:rgba(255,180,192,0.12);color:#ffb4c0;font-weight:800;font-size:12px;'>{'退出候选' if lang == 'zh' else 'Exit'} {int(intelligence.get('exit_candidates') or 0)}</span>"
+        f"<span style='display:inline-flex;align-items:center;padding:7px 11px;border-radius:999px;background:rgba(246,193,119,0.14);color:#f6c177;font-weight:800;font-size:12px;'>{'减仓候选' if lang == 'zh' else 'Trim'} {int(intelligence.get('trim_candidates') or 0)}</span>"
+        f"<span style='display:inline-flex;align-items:center;padding:7px 11px;border-radius:999px;background:rgba(159,202,255,0.14);color:#9fcaff;font-weight:800;font-size:12px;'>{'优先复核' if lang == 'zh' else 'Review'} {int(intelligence.get('review_candidates') or 0)}</span>"
+        f"</div>"
+    )
     sector_rankings_html = "".join(
         "<article style='display:flex;justify-content:space-between;gap:12px;padding:12px 0;border-top:1px solid var(--line);'>"
         f"<div><div style='font-weight:800'>{row['sector']}</div><div class='muted'>{'市值暴露' if lang == 'zh' else 'Exposure'}</div></div>"
@@ -491,6 +524,83 @@ def portfolio_page(
         "</article>"
         for row in intelligence["sector_rankings"]
     ) or f"<div class='muted'>{'暂无行业暴露数据' if lang == 'zh' else 'No sector exposure data yet'}</div>"
+    top_position_label = (
+        f"{html.escape(str(top_position.get('ticker') or '-'))} · {html.escape(str(top_position.get('name') or '-'))}"
+    )
+    queue_summary_text = (
+        f"{'退出' if lang == 'zh' else 'Exit'} {int(intelligence.get('exit_candidates') or 0)}"
+        f" / {'减仓' if lang == 'zh' else 'Trim'} {int(intelligence.get('trim_candidates') or 0)}"
+        f" / {'复核' if lang == 'zh' else 'Review'} {int(intelligence.get('review_candidates') or 0)}"
+    )
+    action_mix = intelligence.get("action_mix") or {}
+    action_mix_summary = (
+        f"HOLD {int(action_mix.get('hold') or 0)} · "
+        f"REVIEW {int(action_mix.get('review') or 0)} · "
+        f"TRIM {int(action_mix.get('trim') or 0)} · "
+        f"EXIT {int(action_mix.get('exit') or 0)}"
+    )
+    market_rankings = intelligence.get("market_rankings") or []
+    market_mix_summary = " / ".join(
+        f"{html.escape(str(row.get('market') or '-'))} {float(row.get('weight_pct') or 0.0):.1f}%"
+        for row in market_rankings[:2]
+    ) or ("暂无市场暴露" if lang == "zh" else "No market exposure yet")
+    def _priority_rank(value: object) -> int:
+        raw = str(value or "").strip()
+        mapping = {
+            "高": 1,
+            "high": 1,
+            "中": 2,
+            "medium": 2,
+            "低": 3,
+            "low": 3,
+        }
+        if not raw:
+            return 999
+        lowered = raw.lower()
+        if lowered in mapping:
+            return mapping[lowered]
+        if raw in mapping:
+            return mapping[raw]
+        try:
+            return int(float(raw))
+        except (TypeError, ValueError):
+            return 999
+
+    high_priority_count = sum(1 for row in watch_items if _priority_rank(row.get("action_priority")) <= 2)
+    negative_pnl_count = sum(1 for row in watch_items if float(row.get("pnl_pct") or 0.0) < 0)
+    risk_tagged_count = sum(1 for row in watch_items if str(row.get("risk_tag") or "").strip() and str(row.get("risk_tag") or "").strip() != "LOW")
+    action_queue_cards_html = "".join(
+        [
+            (
+                "<article style='border:1px solid var(--line);border-radius:14px;padding:12px 14px;background:rgba(15,24,35,0.58);'>"
+                f"<div class='eyebrow'>{'高优先级' if lang == 'zh' else 'High Priority'}</div>"
+                f"<div style='font-size:22px;font-weight:900;margin-top:4px;'>{high_priority_count}</div>"
+                f"<div class='muted'>{'优先级 1-2 的持仓动作' if lang == 'zh' else 'Priority 1-2 actions'}</div>"
+                "</article>"
+            ),
+            (
+                "<article style='border:1px solid var(--line);border-radius:14px;padding:12px 14px;background:rgba(15,24,35,0.58);'>"
+                f"<div class='eyebrow'>{'退出 / 减仓' if lang == 'zh' else 'Exit / Trim'}</div>"
+                f"<div style='font-size:22px;font-weight:900;margin-top:4px;'>{int(intelligence.get('exit_candidates') or 0) + int(intelligence.get('trim_candidates') or 0)}</div>"
+                f"<div class='muted'>{'需要先动手处理的仓位' if lang == 'zh' else 'Positions needing action first'}</div>"
+                "</article>"
+            ),
+            (
+                "<article style='border:1px solid var(--line);border-radius:14px;padding:12px 14px;background:rgba(15,24,35,0.58);'>"
+                f"<div class='eyebrow'>{'浮亏持仓' if lang == 'zh' else 'Underwater'}</div>"
+                f"<div style='font-size:22px;font-weight:900;margin-top:4px;'>{negative_pnl_count}</div>"
+                f"<div class='muted'>{'当前 PnL 为负的持仓' if lang == 'zh' else 'Positions with negative PnL'}</div>"
+                "</article>"
+            ),
+            (
+                "<article style='border:1px solid var(--line);border-radius:14px;padding:12px 14px;background:rgba(15,24,35,0.58);'>"
+                f"<div class='eyebrow'>{'风险标记' if lang == 'zh' else 'Risk Tags'}</div>"
+                f"<div style='font-size:22px;font-weight:900;margin-top:4px;'>{risk_tagged_count}</div>"
+                f"<div class='muted'>{'带有中高风险标签的持仓' if lang == 'zh' else 'Positions carrying medium/high risk tags'}</div>"
+                "</article>"
+            ),
+        ]
+    )
     watch_action_rows_html = "".join(
         "<tr>"
         f"<td>{row['ticker']}</td>"
@@ -1036,25 +1146,55 @@ def portfolio_page(
           </div>
           <div style="margin-bottom:16px;"><a href="/dashboard?lang={lang}">← {'返回首页' if lang == 'zh' else 'Back to dashboard'}</a></div>
           {banner}
+          <section class="card" style="margin-bottom:16px;padding:18px 18px 14px;">
+            <div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;">
+              <div>
+                <div class="eyebrow">{'组合总览' if lang == 'zh' else 'Portfolio Overview'}</div>
+                <div style="font-size:28px;font-weight:900;letter-spacing:-0.03em;">{total_market_value:.2f}</div>
+                <div class="muted">{'总盈亏' if lang == 'zh' else 'Total PnL'} {total_pnl:.2f} ({total_pnl_pct:.1f}%) · {'持仓'} {intelligence['total_positions']}</div>
+              </div>
+              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;flex:1;min-width:min(100%,760px);">
+                <article style="border:1px solid var(--line);border-radius:16px;padding:14px 15px;background:rgba(15,24,35,0.58);">
+                  <div class="eyebrow">{'风险姿态' if lang == 'zh' else 'Risk Posture'}</div>
+                  <div style="display:flex;align-items:center;gap:10px;margin-top:6px;flex-wrap:wrap;">
+                    <span style="display:inline-flex;align-items:center;padding:7px 11px;border-radius:999px;{posture_style}font-weight:800;font-size:12px;">{html.escape(str(intelligence.get('risk_posture') or ('均衡' if lang == 'zh' else 'Balanced')))}</span>
+                    <span style="font-weight:800;">{intelligence['concentration_pct']:.1f}%</span>
+                  </div>
+                  <div class="muted" style="margin-top:8px;">{html.escape(str(intelligence.get('posture_summary') or intelligence['risk_summary']))}</div>
+                </article>
+                <article style="border:1px solid var(--line);border-radius:16px;padding:14px 15px;background:rgba(15,24,35,0.58);">
+                  <div class="eyebrow">{'最大单票' if lang == 'zh' else 'Largest Position'}</div>
+                  <div style="margin-top:6px;font-size:20px;font-weight:900;">{float(top_position.get('weight_pct') or 0.0):.1f}%</div>
+                  <div class="muted">{top_position_label}</div>
+                  <div class="muted" style="margin-top:8px;">{'单票市值' if lang == 'zh' else 'Position value'} {float(top_position.get('market_value') or 0.0):.2f}</div>
+                </article>
+                <article style="border:1px solid var(--line);border-radius:16px;padding:14px 15px;background:rgba(15,24,35,0.58);">
+                  <div class="eyebrow">{'市场暴露' if lang == 'zh' else 'Market Exposure'}</div>
+                  <div style="margin-top:6px;font-size:20px;font-weight:900;">{html.escape(str(intelligence.get('top_market') or '-'))}</div>
+                  <div class="muted">{market_mix_summary}</div>
+                  <div class="muted" style="margin-top:8px;">{action_mix_summary}</div>
+                </article>
+                <article style="border:1px solid var(--line);border-radius:16px;padding:14px 15px;background:rgba(15,24,35,0.58);">
+                  <div class="eyebrow">{'处理队列' if lang == 'zh' else 'Action Queue'}</div>
+                  <div style="margin-top:6px;font-size:20px;font-weight:900;">{int(intelligence.get('exit_candidates') or 0) + int(intelligence.get('trim_candidates') or 0) + int(intelligence.get('review_candidates') or 0)}</div>
+                  <div class="muted">{queue_summary_text}</div>
+                  <div style="margin-top:10px;">{risk_queue_html}</div>
+                </article>
+              </div>
+            </div>
+          </section>
           <section class="grid">
             <article class="card">
-              <div class="eyebrow">Portfolio</div>
-              <div class="metric">{total_market_value:.2f}</div>
-              <div class="muted">总市值 | 总盈亏 {total_pnl:.2f} ({total_pnl_pct:.1f}%)</div>
+              <div class="eyebrow">{'市场暴露' if lang == 'zh' else 'Market Exposure'}</div>
+              <div class="muted">{'先看 A 股 / 美股暴露，再判断组合是不是过度偏单一市场。' if lang == 'zh' else 'Review CN/US exposure first before deciding whether the book is overly tilted to one market.'}</div>
+              <div style="margin-top:12px;">{market_rankings_html}</div>
+              <div class="muted" style="margin-top:10px;">{'当前最大单票' if lang == 'zh' else 'Largest position'}: {top_position_label} · {float(top_position.get('weight_pct') or 0.0):.1f}%</div>
+              <div class="muted" style="margin-top:6px;">{'再平衡提醒' if lang == 'zh' else 'Rebalance alerts'}: {intelligence['rebalance_alerts']}</div>
             </article>
             <article class="card">
-              <div class="eyebrow">{'组合风险' if lang == 'zh' else 'Portfolio Risk'}</div>
-              <div class="metric">{intelligence['concentration_pct']:.1f}%</div>
-              <div class="muted">{intelligence['risk_summary']}</div>
-              <div class="muted" style="margin-top:8px;">{'最大市场暴露' if lang == 'zh' else 'Largest market exposure'}: {intelligence['top_market']}</div>
-            </article>
-            <article class="card">
-              <div class="eyebrow">AI Posture</div>
-              <div class="muted">持仓页会结合当前 AI 分析，给出每只持仓的结论与策略提示。</div>
-              <div class="muted" style="margin-top:8px;">{'当前持仓数' if lang == 'zh' else 'Current positions'}: {intelligence['total_positions']}</div>
-              <div class="muted" style="margin-top:8px;">{'动作优先级' if lang == 'zh' else 'Action mix'}: {'高' if lang == 'zh' else 'H'} {intelligence['action_mix']['high']} / {'中' if lang == 'zh' else 'M'} {intelligence['action_mix']['medium']} / {'低' if lang == 'zh' else 'L'} {intelligence['action_mix']['low']}</div>
-              <div class="muted" style="margin-top:8px;">{'显著偏离目标仓位的持仓' if lang == 'zh' else 'Positions materially away from target'}: {intelligence['rebalance_alerts']}</div>
-              <div class="muted" style="margin-top:8px;">{'当前权重规则' if lang == 'zh' else 'Current weighting rule'}: {'按目标仓位为主，明显偏离时优先复核或调仓。' if lang == 'zh' else 'Target weights lead; review or rebalance when drift becomes material.'}</div>
+              <div class="eyebrow">{'行业暴露' if lang == 'zh' else 'Sector Exposure'}</div>
+              <div class="muted">{'先确认组合有没有过度集中在单一行业。' if lang == 'zh' else 'Check whether the portfolio is too concentrated in one sector first.'}</div>
+              <div style="margin-top:12px;">{sector_rankings_html}</div>
             </article>
             <article class="card">
               <div class="eyebrow">Add Position</div>
@@ -1098,15 +1238,13 @@ def portfolio_page(
                 <button type="submit">Import CSV</button>
               </form>
             </article>
-            <article class="card">
-              <div class="eyebrow">{'行业暴露' if lang == 'zh' else 'Sector Exposure'}</div>
-              <div class="muted">{'先确认组合有没有过度集中在单一行业。' if lang == 'zh' else 'Check whether the portfolio is too concentrated in one sector first.'}</div>
-              <div style="margin-top:12px;">{sector_rankings_html}</div>
-            </article>
           </section>
           <section class="card">
             <div class="eyebrow">{'动作建议' if lang == 'zh' else 'Action Board'}</div>
-            <div class="muted">{'先看高暴露持仓和模型态度变化，再决定是否加减仓。桌面端用宽表统一处理，移动端保留卡片阅读。' if lang == 'zh' else 'Review the highest-exposure positions and model posture changes first. Desktop uses a wide table while mobile keeps the card view.'}</div>
+            <div class="muted">{'先看今天必须处理的持仓数量，再下钻到宽表。桌面端用宽表统一处理，移动端保留卡片阅读。' if lang == 'zh' else 'Start with how many positions need action today, then drill into the wide table. Desktop keeps the unified grid while mobile stays card-first.'}</div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-top:12px;">
+              {action_queue_cards_html}
+            </div>
             <div class="table-wrap action-table-wrap" style="margin-top:12px;">
               <table class="action-table">
                 <thead>
