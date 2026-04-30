@@ -6,7 +6,7 @@ import time
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
 
-from app.api.routes import auth, backtests, dashboard, insights, jobs, portfolio, screener, settings as settings_routes, signals, social_signals, symbols, watchlist
+from app.api.routes import ai_chat, auth, backtests, dashboard, insights, jobs, portfolio, screener, settings as settings_routes, signals, social_signals, symbols, watchlist
 from app.core.config import get_settings
 from app.core.db import init_db
 from app.services.auto_analysis import auto_analysis_service
@@ -72,6 +72,7 @@ app.include_router(insights.router)
 app.include_router(watchlist.router)
 app.include_router(portfolio.router)
 app.include_router(settings_routes.router)
+app.include_router(ai_chat.router)
 app.include_router(screener.router)
 app.include_router(signals.router)
 app.include_router(social_signals.router)

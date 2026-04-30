@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 from app.core.db import SessionLocal
 from app.services.backtester import BacktestRunner
+from app.services.market_calendar import previous_market_open_date
 from app.services.market_lake import list_lake_symbols
 from app.services.repository import AppSettingRepository, DataJobRepository
 from app.services.screener_snapshots import refresh_precomputed_screener_snapshots
@@ -73,16 +74,21 @@ class USMarketSchedulerService:
     def get_status(self, db=None) -> dict:
         config = self.get_config(db=db)
         next_run_at = None
+        target_trade_date = None
         if config["enabled"]:
             now = app_now()
             candidate = now.replace(hour=config["run_hour"], minute=config["run_minute"], second=0)
             if candidate <= now:
                 candidate += timedelta(days=1)
-            while candidate.weekday() == 6:
+            while True:
+                session_probe = candidate.date() - timedelta(days=1)
+                target_trade_date = previous_market_open_date("US", session_probe)
+                if config.get("last_run_trade_date") != target_trade_date:
+                    break
                 candidate += timedelta(days=1)
                 candidate = candidate.replace(hour=config["run_hour"], minute=config["run_minute"], second=0)
             next_run_at = candidate.isoformat()
-        return {**config, "next_run_at": next_run_at}
+        return {**config, "next_run_at": next_run_at, "next_target_trade_date": target_trade_date}
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -109,9 +115,10 @@ class USMarketSchedulerService:
         if not config["enabled"]:
             return None
         now = app_now()
-        if now.weekday() == 6:
-            return None
         if (now.hour, now.minute) < (config["run_hour"], config["run_minute"]):
+            return None
+        target_trade_date = previous_market_open_date("US", now.date() - timedelta(days=1))
+        if config.get("last_run_trade_date") == target_trade_date:
             return None
         today = now.date().isoformat()
         if config.get("last_run_date") == today:

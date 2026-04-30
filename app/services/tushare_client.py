@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from app.core.config import get_settings
 
@@ -354,6 +354,111 @@ class TushareClient:
             rows_by_ticker[ticker] = rows
         return rows_by_ticker
 
+    def fetch_cn_intraday_bars(
+        self,
+        ticker: str,
+        *,
+        timeframe: str = "5Min",
+        lookback_hours: int = 8,
+    ) -> list[dict]:
+        if not self.token:
+            return []
+
+        try:
+            import tushare as ts  # type: ignore
+        except ImportError:
+            return []
+
+        pro = ts.pro_api(self.token)
+        if pro is None:
+            return []
+
+        ts_code = self._to_ts_code(ticker)
+        freq = self._normalize_minute_freq(timeframe)
+        end_at = datetime.now()
+        start_at = end_at - timedelta(hours=max(2, min(int(lookback_hours or 8), 48)))
+        dataframes = []
+        try:
+            dataframes.append(
+                pro.stk_mins(
+                    ts_code=ts_code,
+                    freq=freq,
+                    start_date=start_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    end_date=end_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    fields="ts_code,trade_time,open,close,high,low,vol,amount",
+                )
+            )
+        except Exception:
+            pass
+        if not dataframes or dataframes[0] is None or dataframes[0].empty:
+            try:
+                dataframes.append(
+                    pro.stk_mins(
+                        ts_code=ts_code,
+                        freq=freq,
+                        fields="ts_code,trade_time,open,close,high,low,vol,amount",
+                    )
+                )
+            except Exception:
+                pass
+        if not dataframes or dataframes[0] is None or dataframes[0].empty:
+            try:
+                dataframes.append(
+                    ts.pro_bar(
+                        ts_code=ts_code,
+                        token=self.token,
+                        freq=freq,
+                        asset="E",
+                        adj=None,
+                        start_date=start_at.strftime("%Y%m%d"),
+                        end_date=end_at.strftime("%Y%m%d"),
+                    )
+                )
+            except Exception:
+                pass
+        if not any(df is not None and not df.empty for df in dataframes):
+            try:
+                dataframes.append(
+                    ts.pro_bar(
+                        ts_code=ts_code,
+                        token=self.token,
+                        freq=freq,
+                        asset="E",
+                        adj=None,
+                    )
+                )
+            except Exception:
+                pass
+
+        minute_df = next((df for df in dataframes if df is not None and not df.empty), None)
+        if minute_df is None:
+            return []
+
+        rows: list[dict] = []
+        for _, row in minute_df.iterrows():
+            row_dict = row.to_dict()
+            trade_time = (
+                row_dict.get("trade_time")
+                or row_dict.get("trade_date")
+                or row_dict.get("datetime")
+                or row_dict.get("date")
+            )
+            try:
+                rows.append(
+                    {
+                        "t": self._normalize_trade_time(trade_time),
+                        "o": float(row_dict.get("open")),
+                        "h": float(row_dict.get("high")),
+                        "l": float(row_dict.get("low")),
+                        "c": float(row_dict.get("close")),
+                        "v": float(row_dict.get("vol") or row_dict.get("volume") or 0),
+                    }
+                )
+            except (TypeError, ValueError):
+                continue
+        rows.sort(key=lambda item: str(item.get("t") or ""))
+        return rows
+
     def fetch_cn_concepts(self, tickers: list[str] | None = None) -> list[CNConceptRow]:
         if not self.token:
             return []
@@ -407,6 +512,34 @@ class TushareClient:
         if upper.endswith(".SH"):
             return f"{upper[:-3]}.SS"
         return upper
+
+    def _normalize_minute_freq(self, timeframe: str) -> str:
+        normalized = str(timeframe or "5Min").strip().lower()
+        mapping = {
+            "1min": "1min",
+            "1m": "1min",
+            "5min": "5min",
+            "5m": "5min",
+            "15min": "15min",
+            "15m": "15min",
+            "30min": "30min",
+            "30m": "30min",
+        }
+        return mapping.get(normalized, "5min")
+
+    def _normalize_trade_time(self, value) -> str:
+        if value is None:
+            return ""
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        raw = str(value).strip()
+        if len(raw) == 14 and raw.isdigit():
+            return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}T{raw[8:10]}:{raw[10:12]}:{raw[12:14]}+08:00"
+        if len(raw) == 12 and raw.isdigit():
+            return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}T{raw[8:10]}:{raw[10:12]}:00+08:00"
+        if len(raw) == 8 and raw.isdigit():
+            return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
+        return raw.replace(" ", "T")
 
     def _normalize_date(self, value: str | None) -> str | None:
         if not value:

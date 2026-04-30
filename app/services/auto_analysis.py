@@ -7,6 +7,7 @@ from app.core.db import SessionLocal
 from app.services.ai_daily_report import build_ai_daily_report, render_ai_daily_report_push_messages, save_ai_daily_report
 from app.services.backtester import BacktestRunner
 from app.services.cn_concepts import sync_cn_concepts
+from app.services.cn_fundamentals import sync_cn_fundamentals
 from app.services.dataset_build import build_dataset
 from app.services.market_lake import load_lake_price_history
 from app.services.market_sync import sync_market_data
@@ -29,6 +30,7 @@ DEFAULT_AUTO_ANALYSIS_CONFIG = {
     "signal_type": "momentum",
     "lookback_days": 3,
     "top_n": 1,
+    "sync_cn_fundamentals": True,
     "sync_cn_concepts": False,
     "default_allowed_markets": ["CN"],
     "last_run_at": None,
@@ -77,6 +79,7 @@ class AutoAnalysisService:
         config["model_type"] = str(config.get("model_type") or "lightgbm").strip() or "lightgbm"
         config["signal_type"] = str(config.get("signal_type") or "momentum").strip() or "momentum"
         config["start_date"] = str(config.get("start_date") or "2025-01-01").strip() or "2025-01-01"
+        config["sync_cn_fundamentals"] = bool(config.get("sync_cn_fundamentals", True))
         config["sync_cn_concepts"] = bool(config.get("sync_cn_concepts", True))
         config["default_allowed_markets"] = [
             str(item).strip().upper()
@@ -183,9 +186,19 @@ class AutoAnalysisService:
                     provider=config["provider"],
                 )
                 build_result = build_dataset(normalize_only=True)
+            cn_fundamental_result = None
             cn_concept_result = None
+            cn_tickers = [ticker for ticker in tickers if ticker.upper().endswith((".SS", ".SZ", ".BJ"))]
+            if config.get("sync_cn_fundamentals") and cn_tickers:
+                try:
+                    cn_fundamental_result = sync_cn_fundamentals(tickers=cn_tickers)
+                except Exception as exc:
+                    cn_fundamental_result = {
+                        "status": "failed",
+                        "message": str(exc),
+                        "rows_written": 0,
+                    }
             if config.get("sync_cn_concepts"):
-                cn_tickers = [ticker for ticker in tickers if ticker.upper().endswith((".SS", ".SZ"))]
                 if cn_tickers:
                     try:
                         cn_concept_result = sync_cn_concepts(tickers=cn_tickers)
@@ -209,37 +222,45 @@ class AutoAnalysisService:
                 universe="local_watchlist",
             )
             daily_rows_written = BacktestRunner().run(top_n=config["top_n"])
-            ai_daily_report = build_ai_daily_report(
-                limit=min(8, max(3, len(tickers))),
-                tickers=tickers,
-                markets=sorted(normalized_markets) if normalized_markets else None,
-            )
-            save_ai_daily_report(ai_daily_report)
+            should_generate_ai_daily_report = "close_review" not in str(trigger or "").lower()
+            ai_daily_report = None
             push_result = None
-            notifier = PushNotificationService()
-            if notifier.available_channels():
-                push_messages = render_ai_daily_report_push_messages(ai_daily_report)
-                push_results = []
-                sent: list[str] = []
-                failed: list[dict] = []
-                for message_item in push_messages:
-                    result = notifier.send_text(
-                        title=message_item["title"],
-                        body=message_item["body"],
-                    )
-                    push_results.append({"title": message_item["title"], **result})
-                    sent.extend(item for item in (result.get("sent") or []) if item not in sent)
-                    failed.extend(result.get("failed") or [])
-                push_result = {
-                    "status": "success" if sent and not failed else "partial" if sent else "failed",
-                    "sent": sent,
-                    "failed": failed,
-                    "messages": push_results,
-                }
+            if should_generate_ai_daily_report:
+                ai_daily_report = build_ai_daily_report(
+                    limit=min(8, max(3, len(tickers))),
+                    tickers=tickers,
+                    markets=sorted(normalized_markets) if normalized_markets else None,
+                )
+                save_ai_daily_report(ai_daily_report)
+                notifier = PushNotificationService()
+                if notifier.available_channels():
+                    push_messages = render_ai_daily_report_push_messages(ai_daily_report)
+                    push_results = []
+                    sent: list[str] = []
+                    failed: list[dict] = []
+                    for message_item in push_messages:
+                        result = notifier.send_event(
+                            event_type="stock_recommendation",
+                            title=message_item["title"],
+                            body=message_item["body"],
+                        )
+                        push_results.append({"title": message_item["title"], **result})
+                        sent.extend(item for item in (result.get("sent") or []) if item not in sent)
+                        failed.extend(result.get("failed") or [])
+                    push_result = {
+                        "status": "success" if sent and not failed else "partial" if sent else "failed",
+                        "sent": sent,
+                        "failed": failed,
+                        "messages": push_results,
+                    }
             message = (
                 f"Auto analysis finished for {len(tickers)} watchlist stock(s): "
                 f"{predictions_written} predictions, {daily_rows_written} backtest day(s)"
             )
+            if cn_fundamental_result and cn_fundamental_result.get("rows_written"):
+                message += f", synced {cn_fundamental_result['rows_written']} fundamental row(s)"
+            elif cn_fundamental_result and cn_fundamental_result.get("status") in {"failed", "not_configured"}:
+                message += ", fundamentals sync unavailable"
             if cn_concept_result and cn_concept_result.get("rows_written"):
                 message += f", synced {cn_concept_result['rows_written']} concept row(s)"
             elif cn_concept_result and cn_concept_result.get("status") == "failed":
@@ -257,6 +278,7 @@ class AutoAnalysisService:
                 "tickers": tickers,
                 "run_name": run_name,
                 "sync_results": sync_results,
+                "cn_fundamental_result": cn_fundamental_result,
                 "cn_concept_result": cn_concept_result,
                 "build_result": build_result,
                 "predictions_written": predictions_written,

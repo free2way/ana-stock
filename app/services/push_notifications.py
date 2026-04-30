@@ -7,6 +7,14 @@ from app.core.config import get_settings
 
 class PushNotificationService:
     TELEGRAM_MAX_TEXT = 3800
+    EVENT_LABELS = {
+        "system_update": "系统更新完成",
+        "model_training": "模型训练完成",
+        "precompute": "核心预计算完成",
+        "stock_recommendation": "选股推荐完成",
+        "ai_report": "AI 日报已生成",
+        "risk_alert": "持仓风险提醒",
+    }
 
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -22,7 +30,7 @@ class PushNotificationService:
         return channels
 
     def send_text(self, *, title: str, body: str, channels: list[str] | None = None) -> dict:
-        selected = channels or self.available_channels()
+        selected = self.available_channels() if channels is None else channels
         sent: list[str] = []
         failed: list[dict] = []
         for channel in selected:
@@ -44,6 +52,19 @@ class PushNotificationService:
             "sent": sent,
             "failed": failed,
         }
+
+    def send_event(
+        self,
+        *,
+        event_type: str,
+        title: str,
+        body: str,
+        channels: list[str] | None = None,
+    ) -> dict:
+        label = self.EVENT_LABELS.get(event_type, event_type.replace("_", " ").title())
+        event_title = f"【{label}】{title}"
+        event_body = f"通知类型：{label}\n\n{body}".strip()
+        return self.send_text(title=event_title, body=event_body, channels=channels)
 
     def _send_wechat(self, *, title: str, body: str) -> None:
         webhook = self.settings.wechat_webhook_url

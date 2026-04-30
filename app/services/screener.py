@@ -5,6 +5,7 @@ import json
 from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
 from app.services.insight_engine import InsightEngine
+from app.services.market_context import load_market_context_snapshot
 from app.services.runtime_cache import get_or_set
 from app.services.repository import (
     FundamentalSnapshotRepository,
@@ -257,6 +258,32 @@ def _excludes_execution_tag_filter(tags: list[str] | None, exclude_execution_tag
         return True
     values = [str(tag).strip().lower() for tag in (tags or []) if str(tag).strip()]
     return not any(tag in values for tag in requested)
+
+
+TRANSIENT_TRADABILITY_FLAGS = {
+    "missing-model-score",
+    "low-conviction",
+    "needs-better-entry",
+    "drawdown-risk",
+    "weak-signal-strength",
+    "missing-latest-price",
+    "chase-risk",
+    "weak-market",
+    "confirmation-needed",
+    "weak-breadth",
+    "crowded-theme",
+    "portfolio-risk-budget",
+}
+
+
+def _sanitize_execution_tags(values: list[str] | None) -> list[str]:
+    cleaned: list[str] = []
+    for raw in values or []:
+        tag = str(raw or "").strip()
+        if not tag or tag in TRANSIENT_TRADABILITY_FLAGS or tag in cleaned:
+            continue
+        cleaned.append(tag)
+    return cleaned
 
 
 def _normalize_action_value(value: str | None) -> str:
@@ -517,13 +544,32 @@ class ScreenerService:
                 run.id,
                 market=market,
                 tickers=tickers,
-                limit=2500 if universe == "full_market" else 240,
+                limit=None if universe == "full_market" else 240,
             )
-            if not candidates:
-                return []
-            decisions = [prediction_repo._build_signal_decision(candidate) for candidate in candidates]
+        if not candidates:
+            return []
 
-        latest_close_map = load_latest_closes([item["ticker"] for item in decisions])
+        latest_close_map = load_latest_closes(
+            [
+                str(candidate.get("ticker") or "").strip().upper()
+                for candidate in candidates
+                if str(candidate.get("ticker") or "").strip()
+            ]
+        )
+        enriched_candidates = [
+            {
+                **candidate,
+                "latest_close": latest_close_map.get(
+                    str(candidate.get("ticker") or "").strip().upper(),
+                    candidate.get("latest_close"),
+                ),
+            }
+            for candidate in candidates
+        ]
+        with SessionLocal() as db:
+            prediction_repo = PredictionRepository(db)
+            decisions = [prediction_repo._build_signal_decision(candidate) for candidate in enriched_candidates]
+
         results: list[dict] = []
         for item in decisions:
             signal_strength = float(item.get("signal_strength") or item.get("percentile") or 0.0)
@@ -554,13 +600,14 @@ class ScreenerService:
                     "trend_score": signal_strength,
                     "action_label": action_label,
                     "action_summary": item.get("summary_text") or item.get("execution_note") or "Ranked by LightGBM multifactor score.",
-                    "latest_close": latest_close_map.get(ticker),
+                    "latest_close": item.get("latest_close"),
                     "momentum_5": item.get("expected_return_5d"),
                     "momentum_20": item.get("expected_return_20d"),
                     "volume_ratio": None,
                     "distance_to_breakout_pct": None,
                     "snapshot_hits": 0,
                     "snapshot_runs": 0,
+                    "model_score": item.get("score"),
                     "model_summary": item.get("summary_text"),
                     "model_highlights": [],
                     "model_state": item.get("action_bucket"),
@@ -570,7 +617,9 @@ class ScreenerService:
                     "model_conviction_bucket": item.get("conviction_bucket"),
                     "model_position_size_hint": item.get("position_size_hint"),
                     "model_entry_style": item.get("entry_style"),
-                    "model_execution_tags": list(item.get("risk_flags") or []),
+                    "model_execution_tags": _sanitize_execution_tags(
+                        list(item.get("model_execution_tags") or item.get("execution_tags") or [])
+                    ),
                     "model_percentile": item.get("percentile"),
                     "model_horizon_days": 5,
                     "model_reward_risk_ratio": item.get("model_reward_risk_ratio"),
@@ -663,9 +712,6 @@ class ScreenerService:
         cached_snapshot_map = {}
         results: list[dict] = []
         with SessionLocal() as db:
-            model_repo = PredictionRepository(db)
-            explanation_repo = PredictionExplanationRepository(db)
-            trade_plan_repo = PredictionTradePlanRepository(db)
             technical_snapshot_repo = TechnicalSnapshotRepository(db)
             if universe == "full_market" and market == "CN":
                 cached_snapshot_map = {
@@ -675,41 +721,33 @@ class ScreenerService:
                 tickers = self._rank_cn_snapshot_candidates(
                     tickers,
                     cached_snapshot_map,
-                    limit=80,
+                    limit=None,
                     required_patterns=required_patterns,
                 )
-            model_context_cache: dict[str, dict] = {}
+        model_context_map = self._load_model_context_map(tickers)
 
-            def _model_context_for(ticker: str) -> dict:
-                if ticker not in model_context_cache:
-                    model_context_cache[ticker] = self._build_model_highlights(
-                        model_repo.get_latest_model_output_for_ticker(ticker),
-                        explanation_repo.get_latest_for_ticker(ticker),
-                        trade_plan_repo.get_latest_for_ticker(ticker),
-                    )
-                return model_context_cache[ticker]
-
-            for ticker in tickers:
-                cached_snapshot = cached_snapshot_map.get(ticker)
-                snapshot = self._snapshot_from_cache(cached_snapshot) if cached_snapshot is not None else self.technical_patterns.evaluate_ticker(ticker)
-                if snapshot is None:
+        for ticker in tickers:
+            cached_snapshot = cached_snapshot_map.get(ticker)
+            snapshot = self._snapshot_from_cache(cached_snapshot) if cached_snapshot is not None else self.technical_patterns.evaluate_ticker(ticker)
+            if snapshot is None:
+                continue
+            if required_patterns and not self._matches_required_patterns(snapshot, required_patterns):
+                continue
+            insight = self._get_cached_insight(ticker, lang="en")
+            model_context = model_context_map.get(ticker)
+            if insight:
+                if insight["trend_score"] < min_trend_score:
                     continue
-                if required_patterns and not self._matches_required_patterns(snapshot, required_patterns):
+                if action_filter != "ALL" and _normalize_action_value(insight["action_label"]) != _normalize_action_value(action_filter):
                     continue
-                insight = self._get_cached_insight(ticker, lang="en")
-                if insight:
-                    if insight["trend_score"] < min_trend_score:
-                        continue
-                    if action_filter != "ALL" and _normalize_action_value(insight["action_label"]) != _normalize_action_value(action_filter):
-                        continue
-                    if (insight.get("volume_ratio") or 0.0) < min_volume_ratio:
-                        continue
-                    row = self._build_result_from_insight(insight, _model_context_for(ticker))
-                else:
-                    row = self._build_result_from_fallback_pattern(snapshot, _model_context_for(ticker))
-                row["matched_patterns"] = list(snapshot.matched_patterns or [])
-                row["selection_reason"] = self._build_pattern_reason(template_key, row["matched_patterns"], row)
-                results.append(row)
+                if (insight.get("volume_ratio") or 0.0) < min_volume_ratio:
+                    continue
+                row = self._build_result_from_insight(insight, model_context)
+            else:
+                row = self._build_result_from_fallback_pattern(snapshot, model_context)
+            row["matched_patterns"] = list(snapshot.matched_patterns or [])
+            row["selection_reason"] = self._build_pattern_reason(template_key, row["matched_patterns"], row)
+            results.append(row)
 
         results = self._apply_snapshot_persistence_filter(
             results,
@@ -736,11 +774,11 @@ class ScreenerService:
         tickers: list[str],
         cached_snapshot_map: dict[str, dict],
         *,
-        limit: int = 600,
+        limit: int | None = 600,
         required_patterns: list[str] | None = None,
     ) -> list[str]:
         if not cached_snapshot_map:
-            return tickers[:limit]
+            return tickers if limit is None else tickers[:limit]
         ranked: list[tuple[float, str]] = []
         for ticker in tickers:
             snapshot = cached_snapshot_map.get(ticker)
@@ -757,13 +795,14 @@ class ScreenerService:
             score += min(len(snapshot.get("matched_patterns") or []), 4) * 0.6
             ranked.append((score, ticker))
         ranked.sort(key=lambda item: (-item[0], item[1]))
-        selected = [ticker for _, ticker in ranked[:limit]]
+        selected = [ticker for _, ticker in (ranked if limit is None else ranked[:limit])]
         if required_patterns:
             return selected
-        if len(selected) < min(limit, len(tickers)):
+        resolved_limit = len(tickers) if limit is None else limit
+        if len(selected) < min(resolved_limit, len(tickers)):
             seen = set(selected)
-            selected.extend([ticker for ticker in tickers if ticker not in seen][: max(0, limit - len(selected))])
-        return selected[:limit]
+            selected.extend([ticker for ticker in tickers if ticker not in seen][: max(0, resolved_limit - len(selected))])
+        return selected[:resolved_limit]
 
     def _matches_required_patterns(self, snapshot, required_patterns: list[str]) -> bool:
         matched_patterns = {str(item).strip() for item in (getattr(snapshot, "matched_patterns", None) or []) if str(item).strip()}
@@ -790,38 +829,26 @@ class ScreenerService:
         tickers = self._load_universe(universe=universe, market=market)
         results: list[dict] = []
         with SessionLocal() as db:
-            model_repo = PredictionRepository(db)
-            explanation_repo = PredictionExplanationRepository(db)
-            trade_plan_repo = PredictionTradePlanRepository(db)
             if universe == "full_market" and market == "CN":
                 cached_snapshot_map = {
                     item["ticker"]: item
                     for item in TechnicalSnapshotRepository(db).list_latest_for_market(market=market, tickers=tickers)
                 }
-                tickers = self._rank_cn_snapshot_candidates(tickers, cached_snapshot_map, limit=120)
-            model_context_cache: dict[str, dict] = {}
+                tickers = self._rank_cn_snapshot_candidates(tickers, cached_snapshot_map, limit=None)
+        model_context_map = self._load_model_context_map(tickers)
 
-            def _model_context_for(ticker: str) -> dict:
-                if ticker not in model_context_cache:
-                    model_context_cache[ticker] = self._build_model_highlights(
-                        model_repo.get_latest_model_output_for_ticker(ticker),
-                        explanation_repo.get_latest_for_ticker(ticker),
-                        trade_plan_repo.get_latest_for_ticker(ticker),
-                    )
-                return model_context_cache[ticker]
-
-            for ticker in tickers:
-                insight = self._get_cached_insight(ticker, lang="en")
-                if not insight:
-                    continue
-                if insight["trend_score"] < min_trend_score:
-                    continue
-                if action_filter != "ALL" and _normalize_action_value(insight["action_label"]) != _normalize_action_value(action_filter):
-                    continue
-                volume_ratio = insight.get("volume_ratio") or 0.0
-                if volume_ratio < min_volume_ratio:
-                    continue
-                results.append(self._build_result_from_insight(insight, _model_context_for(ticker)))
+        for ticker in tickers:
+            insight = self._get_cached_insight(ticker, lang="en")
+            if not insight:
+                continue
+            if insight["trend_score"] < min_trend_score:
+                continue
+            if action_filter != "ALL" and _normalize_action_value(insight["action_label"]) != _normalize_action_value(action_filter):
+                continue
+            volume_ratio = insight.get("volume_ratio") or 0.0
+            if volume_ratio < min_volume_ratio:
+                continue
+            results.append(self._build_result_from_insight(insight, model_context_map.get(ticker)))
 
         results = self._apply_snapshot_persistence_filter(
             results,
@@ -911,47 +938,40 @@ class ScreenerService:
                 )
             }
             if universe == "full_market" and market == "CN":
-                tickers = self._rank_cn_snapshot_candidates(tickers, cached_snapshot_map, limit=180)
-            model_repo = PredictionRepository(db)
-            explanation_repo = PredictionExplanationRepository(db)
-            trade_plan_repo = PredictionTradePlanRepository(db)
-            model_context_cache: dict[str, dict] = {}
+                tickers = self._rank_cn_snapshot_candidates(
+                    tickers,
+                    cached_snapshot_map,
+                    limit=None,
+                    required_patterns=["bullish_ma_stack"],
+                )
+        model_context_map = self._load_model_context_map(tickers)
 
-            def _model_context_for(ticker: str) -> dict:
-                if ticker not in model_context_cache:
-                    model_context_cache[ticker] = self._build_model_highlights(
-                        model_repo.get_latest_model_output_for_ticker(ticker),
-                        explanation_repo.get_latest_for_ticker(ticker),
-                        trade_plan_repo.get_latest_for_ticker(ticker),
-                    )
-                return model_context_cache[ticker]
-
-            min_trend = max(int(min_trend_score or 0), 68)
-            min_volume = max(float(min_volume_ratio or 0.0), 0.8)
-            for ticker in tickers:
-                insight = self._get_cached_insight(ticker, limit=260, lang="en")
-                if not insight:
-                    continue
-                setup_context = self._next_tesla_context(insight)
-                if not self._matches_next_tesla_setup(
-                    insight,
-                    setup_context=setup_context,
-                    min_trend_score=min_trend,
-                    min_volume_ratio=min_volume,
-                ):
-                    continue
-                snapshot = cached_snapshot_map.get(ticker)
-                if snapshot is None:
-                    evaluated = self.technical_patterns.evaluate_ticker(ticker)
-                    snapshot = self._snapshot_from_cache(asdict(evaluated)) if evaluated is not None else None
-                row = self._build_result_from_insight(insight, _model_context_for(ticker))
-                row["matched_patterns"] = list(getattr(snapshot, "matched_patterns", None) or [])
-                row["setup_bucket"] = setup_context.get("setup_bucket")
-                row["distance_to_52w_high_pct"] = setup_context.get("distance_to_52w_high_pct")
-                row["pullback_depth_pct"] = setup_context.get("pullback_depth_pct")
-                row["selection_reason"] = self._build_next_tesla_reason(insight, setup_context, row["matched_patterns"], row)
-                row["template_score"] = self._next_tesla_score(insight, setup_context, row["matched_patterns"])
-                results.append(row)
+        min_trend = max(int(min_trend_score or 0), 68)
+        min_volume = max(float(min_volume_ratio or 0.0), 0.8)
+        for ticker in tickers:
+            insight = self._get_cached_insight(ticker, limit=260, lang="en")
+            if not insight:
+                continue
+            setup_context = self._next_tesla_context(insight)
+            if not self._matches_next_tesla_setup(
+                insight,
+                setup_context=setup_context,
+                min_trend_score=min_trend,
+                min_volume_ratio=min_volume,
+            ):
+                continue
+            snapshot = cached_snapshot_map.get(ticker)
+            if snapshot is None:
+                evaluated = self.technical_patterns.evaluate_ticker(ticker)
+                snapshot = self._snapshot_from_cache(asdict(evaluated)) if evaluated is not None else None
+            row = self._build_result_from_insight(insight, model_context_map.get(ticker))
+            row["matched_patterns"] = list(getattr(snapshot, "matched_patterns", None) or [])
+            row["setup_bucket"] = setup_context.get("setup_bucket")
+            row["distance_to_52w_high_pct"] = setup_context.get("distance_to_52w_high_pct")
+            row["pullback_depth_pct"] = setup_context.get("pullback_depth_pct")
+            row["selection_reason"] = self._build_next_tesla_reason(insight, setup_context, row["matched_patterns"], row)
+            row["template_score"] = self._next_tesla_score(insight, setup_context, row["matched_patterns"])
+            results.append(row)
 
         results = self._apply_snapshot_persistence_filter(
             results,
@@ -995,18 +1015,8 @@ class ScreenerService:
             fundamentals = repo.list_latest_for_market(market, tickers=tickers)
             if not fundamentals:
                 return []
-            model_repo = PredictionRepository(db)
-            explanation_repo = PredictionExplanationRepository(db)
-            trade_plan_repo = PredictionTradePlanRepository(db)
-            fundamental_tickers = [str(item.get("ticker") or "").upper() for item in fundamentals if item.get("ticker")]
-            model_context_by_ticker = {
-                ticker: self._build_model_highlights(
-                    model_repo.get_latest_model_output_for_ticker(ticker),
-                    explanation_repo.get_latest_for_ticker(ticker),
-                    trade_plan_repo.get_latest_for_ticker(ticker),
-                )
-                for ticker in fundamental_tickers
-            }
+        fundamental_tickers = [str(item.get("ticker") or "").upper() for item in fundamentals if item.get("ticker")]
+        model_context_by_ticker = self._load_model_context_map(fundamental_tickers)
 
         threshold = self._compute_market_cap_threshold(fundamentals, exclude_bottom_market_cap_pct)
         results: list[dict] = []
@@ -1260,6 +1270,12 @@ class ScreenerService:
         return filtered
 
     def _apply_trade_readiness(self, results: list[dict]) -> list[dict]:
+        market_context_map: dict[str, dict] = {}
+        markets = sorted({str(row.get("market") or "").strip().upper() for row in results if str(row.get("market") or "").strip()})
+        if markets:
+            with SessionLocal() as db:
+                for market_code in markets:
+                    market_context_map[market_code] = load_market_context_snapshot(db, market=market_code)
         for row in results:
             candidate = {
                 **row,
@@ -1268,9 +1284,15 @@ class ScreenerService:
                 "signal_strength": row.get("model_signal_strength") or row.get("trend_score"),
                 "expected_drawdown_20d": row.get("model_expected_drawdown_20d") or row.get("expected_drawdown_20d"),
                 "entry_style": row.get("model_entry_style") or row.get("entry_style") or row.get("action_label"),
-                "risk_flags": row.get("risk_flags") or row.get("model_execution_tags") or [],
+                "risk_flags": [],
+                "model_execution_tags": _sanitize_execution_tags(
+                    row.get("model_execution_tags") or row.get("execution_tags") or []
+                ),
             }
-            decision = evaluate_candidate_tradability(candidate)
+            decision = evaluate_candidate_tradability(
+                candidate,
+                market_snapshot=market_context_map.get(str(row.get("market") or "").strip().upper()),
+            )
             decision_payload = asdict(decision)
             diagnostics = decision_payload.pop("diagnostics", None)
             for key, value in decision_payload.items():
@@ -1425,6 +1447,7 @@ class ScreenerService:
             "distance_to_breakout_pct": insight.get("distance_to_breakout_pct"),
             "snapshot_hits": 0,
             "snapshot_runs": 0,
+            "model_score": (model_context or {}).get("score"),
             "model_summary": (model_context or {}).get("summary"),
             "model_highlights": (model_context or {}).get("highlights", []),
             "model_state": (model_context or {}).get("state"),
@@ -1459,6 +1482,7 @@ class ScreenerService:
             "distance_to_breakout_pct": None,
             "snapshot_hits": 0,
             "snapshot_runs": 0,
+            "model_score": (model_context or {}).get("score"),
             "model_summary": (model_context or {}).get("summary"),
             "model_highlights": (model_context or {}).get("highlights", []),
             "model_state": (model_context or {}).get("state"),
@@ -1494,6 +1518,7 @@ class ScreenerService:
             "distance_to_breakout_pct": None,
             "snapshot_hits": 0,
             "snapshot_runs": 0,
+            "model_score": (model_context or {}).get("score"),
             "model_summary": (model_context or {}).get("summary"),
             "model_highlights": (model_context or {}).get("highlights", []),
             "model_state": (model_context or {}).get("state"),
@@ -1672,6 +1697,26 @@ class ScreenerService:
             "target_horizon_days": enriched.get("target_horizon_days"),
             "model_reward_risk_ratio": enriched.get("model_reward_risk_ratio"),
             "expected_drawdown_20d": enriched.get("expected_drawdown_20d"),
+        }
+
+    def _load_model_context_map(self, tickers: list[str]) -> dict[str, dict]:
+        normalized_tickers = [str(ticker or "").strip().upper() for ticker in tickers if str(ticker or "").strip()]
+        if not normalized_tickers:
+            return {}
+        with SessionLocal() as db:
+            model_repo = PredictionRepository(db)
+            explanation_repo = PredictionExplanationRepository(db)
+            trade_plan_repo = PredictionTradePlanRepository(db)
+            model_outputs = model_repo.get_latest_model_outputs_for_tickers(normalized_tickers)
+            explanation_map = explanation_repo.get_latest_for_tickers(normalized_tickers)
+            trade_plan_map = trade_plan_repo.get_latest_for_tickers(normalized_tickers)
+        return {
+            ticker: self._build_model_highlights(
+                model_outputs.get(ticker),
+                explanation_map.get(ticker, []),
+                trade_plan_map.get(ticker),
+            )
+            for ticker in normalized_tickers
         }
 
     def _fmt(self, value: float | None) -> str:

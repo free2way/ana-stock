@@ -11,7 +11,9 @@ storage/*.sqlite3
 
 data/raw/
 data/normalized/
+data/lake/
 data/qlib/
 data/artifacts/
 
 *.log
+storage/

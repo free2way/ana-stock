@@ -190,6 +190,28 @@ def load_lake_price_history(*, market: str, ticker: str, limit: int = 120) -> li
     return history
 
 
+def get_latest_lake_trade_date(*, market: str, ticker: str | None = None) -> str | None:
+    market_code = str(market or "").strip().upper()
+    parquet_files = _recent_parquet_files(market_code, limit=180)
+    if market_code not in {"CN", "US"} or not parquet_files:
+        return None
+    normalized_ticker = str(ticker or "").strip().upper()
+    where_clause = "WHERE symbol = ?" if normalized_ticker else ""
+    params: list[object] = [parquet_files]
+    if normalized_ticker:
+        params.append(normalized_ticker)
+    sql = f"""
+        SELECT CAST(MAX(CAST(date AS DATE)) AS VARCHAR) AS trade_date
+        FROM read_parquet(?, hive_partitioning = true)
+        {where_clause}
+    """
+    rows, _columns = _duckdb_fetchall(sql, params)
+    if not rows:
+        return None
+    value = rows[0][0] if rows[0] else None
+    return str(value or "").strip() or None
+
+
 def _recent_parquet_files(market: str, *, limit: int) -> list[str]:
     return _all_parquet_files(market)[: max(1, int(limit))]
 

@@ -14,6 +14,7 @@ from sqlalchemy import text
 from app.core.config import get_settings
 from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
+from app.services.market_calendar import previous_market_open_date
 from app.services.market_sync import RAW_FIELDS, merge_market_data_rows, read_raw_csv, write_raw_csv
 from app.services.market_lake import write_daily_ohlcv_parquet
 from app.services.normalizer import MarketDataNormalizer
@@ -368,7 +369,4 @@ def _fetch_polygon_grouped_daily(trade_date: str, *, adjusted: bool) -> list[dic
 
 def _default_us_grouped_trade_date() -> str:
     # In Asia/Shanghai, after the U.S. close the latest grouped daily date is usually the previous U.S. weekday.
-    candidate = app_now().date() - timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate -= timedelta(days=1)
-    return candidate.isoformat()
+    return previous_market_open_date("US", app_now().date() - timedelta(days=1))

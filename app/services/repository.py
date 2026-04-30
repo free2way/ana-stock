@@ -28,6 +28,7 @@ from app.models.tables import (
     WatchlistItem,
     WorkspaceSnapshot,
 )
+from app.services.market_context import load_market_context_snapshot
 from app.services.tradability_filter import evaluate_candidate_tradability
 from app.services.time_utils import app_now, app_now_iso
 
@@ -278,6 +279,7 @@ class SymbolRepository:
 class PredictionRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
+        self._market_context_cache: dict[str, dict] = {}
 
     @staticmethod
     def _compute_action_bucket(candidate: dict) -> str:
@@ -358,7 +360,13 @@ class PredictionRepository:
         return 3
 
     def _build_signal_decision(self, candidate: dict) -> dict:
-        decision = evaluate_candidate_tradability(candidate)
+        market_code = str(candidate.get("market") or "").strip().upper()
+        market_snapshot = None
+        if market_code:
+            if market_code not in self._market_context_cache:
+                self._market_context_cache[market_code] = load_market_context_snapshot(self.db, market=market_code)
+            market_snapshot = self._market_context_cache.get(market_code)
+        decision = evaluate_candidate_tradability(candidate, market_snapshot=market_snapshot)
         payload = dict(candidate)
         payload.update(
             {
@@ -384,6 +392,11 @@ class PredictionRepository:
                 "liquidity_bucket": decision.liquidity_bucket,
                 "risk_flags": decision.risk_flags,
                 "block_reason": decision.block_reason,
+                "trade_readiness_score": decision.trade_readiness_score,
+                "readiness_bucket": decision.readiness_bucket,
+                "readiness_reason": decision.readiness_reason,
+                "preferred_entry_style": decision.preferred_entry_style,
+                "suggested_watch_action": decision.suggested_watch_action,
                 "entry_trigger": decision.entry_trigger,
                 "invalidation_condition": decision.invalidation_condition,
                 "time_horizon": decision.time_horizon,
@@ -657,30 +670,39 @@ class PredictionRepository:
         return payload
 
     def get_latest_model_outputs_for_tickers(self, tickers: list[str]) -> dict[str, dict]:
-        normalized = [ticker.strip().upper() for ticker in tickers if ticker and ticker.strip()]
+        normalized = list(dict.fromkeys(ticker.strip().upper() for ticker in tickers if ticker and ticker.strip()))
         if not normalized:
             return {}
 
+        ranked_predictions = (
+            select(
+                Prediction.id.label("prediction_id"),
+                func.row_number().over(
+                    partition_by=Prediction.symbol_id,
+                    order_by=(Prediction.trade_date.desc(), Prediction.model_run_id.desc(), Prediction.id.desc()),
+                ).label("rn"),
+            )
+            .join(Symbol, Symbol.id == Prediction.symbol_id)
+            .where(Symbol.ticker.in_(normalized))
+            .subquery()
+        )
+
         stmt = (
             select(Prediction, Symbol, ModelRun, PredictionDetail)
+            .join(ranked_predictions, ranked_predictions.c.prediction_id == Prediction.id)
             .join(Symbol, Symbol.id == Prediction.symbol_id)
             .join(ModelRun, ModelRun.id == Prediction.model_run_id)
             .outerjoin(PredictionDetail, PredictionDetail.prediction_id == Prediction.id)
-            .where(Symbol.ticker.in_(normalized))
-            .order_by(Symbol.ticker.asc(), Prediction.trade_date.desc(), Prediction.model_run_id.desc())
+            .where(ranked_predictions.c.rn == 1)
+            .order_by(Symbol.ticker.asc())
         )
         rows = self.db.execute(stmt).all()
 
-        latest_rows: dict[str, tuple[Prediction, Symbol, ModelRun, PredictionDetail | None]] = {}
         pairs: set[tuple[int, str]] = set()
         for prediction, symbol, model_run, prediction_detail in rows:
-            ticker = symbol.ticker
-            if ticker in latest_rows:
-                continue
-            latest_rows[ticker] = (prediction, symbol, model_run, prediction_detail)
             pairs.add((prediction.model_run_id, prediction.trade_date))
 
-        if not latest_rows:
+        if not rows:
             return {}
 
         pair_counts: dict[tuple[int, str], int] = {}
@@ -692,8 +714,7 @@ class PredictionRepository:
             ) or 0
 
         payloads: dict[str, dict] = {}
-        for ticker, row in latest_rows.items():
-            prediction, symbol, model_run, prediction_detail = row
+        for prediction, symbol, model_run, prediction_detail in rows:
             peer_count = pair_counts.get((prediction.model_run_id, prediction.trade_date), 0)
 
             rank_value = prediction.rank_value
@@ -743,7 +764,7 @@ class PredictionRepository:
                         "summary_text": prediction_detail.summary_text,
                     }
                 )
-            payloads[ticker] = payload
+            payloads[symbol.ticker] = payload
         return payloads
 
     def list_recent_prediction_snapshots(self, *, top_n: int = 10, limit_runs: int = 4) -> list[dict]:
@@ -927,6 +948,57 @@ class PredictionExplanationRepository:
         if prediction_id is None:
             return []
         return self.get_for_prediction(prediction_id)
+
+    def get_latest_for_tickers(self, tickers: list[str]) -> dict[str, list[dict]]:
+        normalized = [ticker.strip().upper() for ticker in tickers if ticker and ticker.strip()]
+        if not normalized:
+            return {}
+
+        stmt = (
+            select(Prediction.id, Symbol.ticker)
+            .join(Symbol, Symbol.id == Prediction.symbol_id)
+            .where(Symbol.ticker.in_(normalized))
+            .order_by(Symbol.ticker.asc(), Prediction.trade_date.desc(), Prediction.model_run_id.desc())
+        )
+        rows = self.db.execute(stmt).all()
+
+        latest_prediction_id_by_ticker: dict[str, int] = {}
+        for prediction_id, ticker in rows:
+            clean_ticker = str(ticker or "").strip().upper()
+            if clean_ticker and clean_ticker not in latest_prediction_id_by_ticker:
+                latest_prediction_id_by_ticker[clean_ticker] = int(prediction_id)
+
+        if not latest_prediction_id_by_ticker:
+            return {}
+
+        prediction_id_to_ticker = {
+            prediction_id: ticker for ticker, prediction_id in latest_prediction_id_by_ticker.items()
+        }
+        explanation_stmt = (
+            select(PredictionExplanation)
+            .where(PredictionExplanation.prediction_id.in_(list(prediction_id_to_ticker.keys())))
+            .order_by(
+                PredictionExplanation.prediction_id.asc(),
+                PredictionExplanation.display_order.asc(),
+                desc(func.abs(PredictionExplanation.contribution)),
+            )
+        )
+        explanations = self.db.scalars(explanation_stmt).all()
+        payloads: dict[str, list[dict]] = {ticker: [] for ticker in latest_prediction_id_by_ticker}
+        for row in explanations:
+            ticker = prediction_id_to_ticker.get(int(row.prediction_id))
+            if not ticker:
+                continue
+            payloads[ticker].append(
+                {
+                    "feature_name": row.feature_name,
+                    "feature_value": row.feature_value,
+                    "contribution": row.contribution,
+                    "direction": row.direction,
+                    "display_order": row.display_order,
+                }
+            )
+        return payloads
 
 
 class PredictionDetailRepository:
@@ -1518,6 +1590,43 @@ class DataJobRepository:
                 _sleep_for_lock_retry(attempt)
         raise RuntimeError("Data job completion exhausted retries.")
 
+    def update_job(
+        self,
+        job_id: int,
+        *,
+        status: str | None = None,
+        message: str | None = None,
+        progress: dict | None = None,
+    ) -> DataJob | None:
+        attempts = 4
+        for attempt in range(1, attempts + 1):
+            stmt = select(DataJob).where(DataJob.id == job_id)
+            job = self.db.scalar(stmt)
+            if job is None:
+                return None
+            if status is not None:
+                job.status = status
+            if message is not None:
+                job.message = message
+            if progress is not None:
+                params = _loads_json_object(job.params_json) or {}
+                params["progress"] = {
+                    **(params.get("progress") or {}),
+                    **progress,
+                    "updated_at": utc_now_iso(),
+                }
+                job.params_json = json.dumps(params, ensure_ascii=False)
+            try:
+                self.db.commit()
+                self.db.refresh(job)
+                return job
+            except OperationalError as exc:
+                self.db.rollback()
+                if attempt >= attempts or not _is_sqlite_locked_error(exc):
+                    raise
+                _sleep_for_lock_retry(attempt)
+        raise RuntimeError("Data job progress update exhausted retries.")
+
     def list_recent_jobs(self, limit: int = 20) -> list[dict]:
         stmt = select(DataJob).order_by(DataJob.id.desc()).limit(limit)
         rows = self.db.scalars(stmt).all()
@@ -1867,6 +1976,19 @@ class FundamentalSnapshotRepository:
             deduped[snapshot.symbol_id] = self._to_dict(snapshot, symbol)
         return list(deduped.values())
 
+    def list_history_for_market(self, market: str | None, tickers: list[str] | None = None) -> list[dict]:
+        stmt = (
+            select(FundamentalSnapshot, Symbol)
+            .join(Symbol, Symbol.id == FundamentalSnapshot.symbol_id)
+            .order_by(market_sort_case(Symbol.market), Symbol.ticker.asc(), FundamentalSnapshot.report_date.asc(), FundamentalSnapshot.id.asc())
+        )
+        if market and market != "ALL":
+            stmt = stmt.where(Symbol.market == market)
+        if tickers:
+            stmt = stmt.where(Symbol.ticker.in_([ticker.upper() for ticker in tickers]))
+        rows = self.db.execute(stmt).all()
+        return [self._to_dict(snapshot, symbol) for snapshot, symbol in rows]
+
     def _to_dict(self, snapshot: FundamentalSnapshot, symbol: Symbol | dict) -> dict:
         ticker = symbol.ticker if hasattr(symbol, "ticker") else symbol["ticker"]
         name = symbol.name if hasattr(symbol, "name") else symbol.get("name")
@@ -1954,6 +2076,39 @@ class ConceptSnapshotRepository:
             if key in seen:
                 continue
             seen.add(key)
+            payload.append(
+                {
+                    "ticker": symbol.ticker,
+                    "name": symbol.name,
+                    "market": symbol.market,
+                    "concept_name": snapshot.concept_name,
+                    "concept_code": snapshot.concept_code,
+                    "as_of_date": snapshot.as_of_date,
+                    "source": snapshot.source,
+                    "strength": snapshot.strength,
+                }
+            )
+        return payload
+
+    def list_history_for_market(self, market: str | None, tickers: list[str] | None = None) -> list[dict]:
+        stmt = (
+            select(ConceptSnapshot, Symbol)
+            .join(Symbol, Symbol.id == ConceptSnapshot.symbol_id)
+            .order_by(
+                market_sort_case(Symbol.market),
+                Symbol.ticker.asc(),
+                ConceptSnapshot.as_of_date.asc(),
+                ConceptSnapshot.concept_name.asc(),
+                ConceptSnapshot.id.asc(),
+            )
+        )
+        if market and market != "ALL":
+            stmt = stmt.where(Symbol.market == market)
+        if tickers:
+            stmt = stmt.where(Symbol.ticker.in_([ticker.upper() for ticker in tickers]))
+        rows = self.db.execute(stmt).all()
+        payload: list[dict] = []
+        for snapshot, symbol in rows:
             payload.append(
                 {
                     "ticker": symbol.ticker,

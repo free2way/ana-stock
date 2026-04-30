@@ -271,12 +271,22 @@ def poll_tracked_social_accounts(db: Session, *, max_posts_per_account: int = 5)
             errors.append({"handle": handle, "error": str(exc)})
             continue
         for post in posts:
-            analysis = add_social_post(
-                db,
-                handle=handle,
-                content=post.get("content") or "",
-                source_url=post.get("source_url") or "",
-            )
+            try:
+                analysis = add_social_post(
+                    db,
+                    handle=handle,
+                    content=post.get("content") or "",
+                    source_url=post.get("source_url") or "",
+                )
+            except Exception as exc:
+                errors.append(
+                    {
+                        "handle": handle,
+                        "post_id": post.get("id"),
+                        "error": f"post_analysis_failed: {exc}",
+                    }
+                )
+                continue
             if analysis:
                 fetched_posts.append(post)
                 analyses.append(analysis)
@@ -482,6 +492,27 @@ def _is_ambiguous_social_us_ticker(ticker: str) -> bool:
     return False
 
 
+def _is_terminal_social_us_sync_failure(message: str | None) -> bool:
+    normalized = str(message or "").strip().lower()
+    if not normalized:
+        return False
+    terminal_markers = (
+        "no data",
+        "not found",
+        "no price data",
+        "possibly delisted",
+        "no timezone found",
+        "history not found",
+        "returned no rows",
+        "symbol not found",
+        "failed to fetch",
+        "empty dataframe",
+        "not available",
+        "no market data",
+    )
+    return any(marker in normalized for marker in terminal_markers)
+
+
 def _should_suppress_social_us_ticker(ticker: str, failure_state: dict[str, dict] | None = None) -> bool:
     normalized = _normalize_us_symbol_token(ticker)
     if not normalized:
@@ -577,13 +608,27 @@ def start_social_us_price_sync_job(db: Session, analyses: list[dict], *, start_d
 
 
 def analyze_social_post(db: Session, post: dict) -> dict:
-    symbols = _extract_symbol_mentions(db, post.get("content") or "")
+    failure_state = _load_social_us_sync_failures(db)
+    raw_symbols = _extract_symbol_mentions(db, post.get("content") or "")
+    symbols: list[dict] = []
+    for item in raw_symbols:
+        mention = dict(item)
+        ticker = str(mention.get("ticker") or "").strip().upper()
+        market = str(mention.get("market") or "").strip().upper()
+        if market == "US" and _should_suppress_social_us_ticker(ticker, failure_state):
+            mention["sync_suppressed"] = True
+            mention["sync_suppressed_reason"] = "suppressed_before_analysis"
+        if _should_keep_social_mention(mention):
+            symbols.append(mention)
     watchlist_repo = WatchlistRepository(db)
     watchlist = watchlist_repo.get_or_create_default()
     watchlist_map = watchlist_repo.list_ticker_map(watchlist.id)
     portfolio_tickers = {str(item.get("ticker") or "").upper() for item in load_portfolio_positions()}
     prediction_repo = PredictionRepository(db)
-    outputs = prediction_repo.get_latest_model_outputs_for_tickers([item["ticker"] for item in symbols])
+    try:
+        outputs = prediction_repo.get_latest_model_outputs_for_tickers([item["ticker"] for item in symbols])
+    except Exception:
+        outputs = {}
     rows: list[dict] = []
     for item in symbols:
         ticker = item["ticker"]
@@ -648,6 +693,8 @@ def _run_social_us_price_sync_job(job_id: int, analysis_ids: list[str], tickers:
                     message = str((result_map.get(normalized) or {}).get("message") or "").strip() or None
                     suppressed = bool(item.get("suppressed"))
                     if _is_ambiguous_social_us_ticker(normalized):
+                        suppressed = True
+                    elif _is_terminal_social_us_sync_failure(message):
                         suppressed = True
                     elif next_count >= 2:
                         suppressed = True

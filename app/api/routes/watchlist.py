@@ -382,6 +382,64 @@ def _render_daily_change_chip(value: float | None) -> str:
     )
 
 
+def _watchlist_sort_value(item: dict, sort_by: str) -> tuple[float, str]:
+    normalized = str(sort_by or "daily_change").strip().lower()
+    if normalized == "daily_change":
+        value = item.get("daily_change_pct")
+    else:
+        value = item.get("daily_change_pct")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = -999999.0
+    return numeric, str(item.get("ticker") or "")
+
+
+def _sort_watchlist_items(items: list[dict], *, sort_by: str, sort_order: str) -> list[dict]:
+    normalized_sort = str(sort_by or "daily_change").strip().lower()
+    if normalized_sort not in {"daily_change"}:
+        normalized_sort = "daily_change"
+    normalized_order = str(sort_order or "desc").strip().lower()
+    if normalized_order not in {"asc", "desc"}:
+        normalized_order = "desc"
+    return sorted(
+        items,
+        key=lambda item: _watchlist_sort_value(item, normalized_sort),
+        reverse=(normalized_order == "desc"),
+    )
+
+
+def _watchlist_sort_link(
+    *,
+    lang: str,
+    mode: str,
+    news_view: str,
+    execution_tag_filter: str,
+    exclude_execution_tag_filter: str,
+    sort_by: str,
+    sort_order: str,
+    target: str,
+) -> str:
+    normalized_target = "daily_change" if target != "daily_change" else target
+    next_order = "asc" if sort_by == normalized_target and sort_order == "desc" else "desc"
+    arrow = ""
+    if sort_by == normalized_target:
+        arrow = " ↓" if sort_order == "desc" else " ↑"
+    label = "涨幅" if lang == "zh" else "Day %"
+    query = urlencode(
+        {
+            "lang": lang,
+            "mode": mode,
+            "news_view": news_view,
+            "execution_tag_filter": execution_tag_filter,
+            "exclude_execution_tag_filter": exclude_execution_tag_filter,
+            "sort_by": normalized_target,
+            "sort_order": next_order,
+        }
+    )
+    return f"<a href='/watchlist?{query}' style='color:inherit;text-decoration:none;'>{label}{arrow}</a>"
+
+
 def _load_watchlist_daily_change_pct(*, market: str | None, ticker: str) -> float | None:
     market_value = str(market or "").strip().upper()
     normalized_ticker = normalize_ticker_for_market(ticker, market_value)
@@ -501,6 +559,8 @@ def _render_watchlist_news_panel(
     mode: str,
     execution_tag_filter: str,
     exclude_execution_tag_filter: str,
+    sort_by: str = "daily_change",
+    sort_order: str = "desc",
 ) -> str:
     rows = [
         {
@@ -541,7 +601,7 @@ def _render_watchlist_news_panel(
     no_news_rows = [item for item in items if int(item.get("news_headline_count") or 0) <= 0]
 
     def _tab(label: str, value: str, count: int | None = None) -> str:
-        params = {"lang": lang, "mode": mode, "news_view": value}
+        params = {"lang": lang, "mode": mode, "news_view": value, "sort_by": sort_by, "sort_order": sort_order}
         if execution_tag_filter and execution_tag_filter.upper() != "ALL":
             params["execution_tag_filter"] = execution_tag_filter
         if exclude_execution_tag_filter and exclude_execution_tag_filter.upper() != "ALL":
@@ -747,7 +807,17 @@ def _render_watchlist_analysis_fragment(
     """
 
 
-def _render_watchlist_table_fragment(*, items: list[dict], lang: str) -> str:
+def _render_watchlist_table_fragment(
+    *,
+    items: list[dict],
+    lang: str,
+    mode: str,
+    news_view: str,
+    execution_tag_filter: str,
+    exclude_execution_tag_filter: str,
+    sort_by: str,
+    sort_order: str,
+) -> str:
     def news_chip(item: dict) -> str:
         count = int(item.get("news_headline_count") or 0)
         label = str(item.get("news_sentiment_label") or ("中性" if lang == "zh" else "neutral"))
@@ -813,7 +883,7 @@ def _render_watchlist_table_fragment(*, items: list[dict], lang: str) -> str:
         f"<div><span class='muted'>{'收盘价' if lang == 'zh' else 'Close'}</span><div>{_format_watchlist_close(item.get('latest_close'))}</div></div>"
         f"<div><span class='muted'>{'涨幅' if lang == 'zh' else 'Day %'}</span><div>{_render_daily_change_chip(item.get('daily_change_pct'))}</div></div>"
         "</div>"
-        f"<div class='muted' style='margin-top:8px;'>{item.get('action_hint') or '-'}</div>"
+        f"<div class='mobile-next-step'>{'下一步' if lang == 'zh' else 'Next'}：{html.escape(str(item.get('action_hint') or '-'))}</div>"
         f"<div class='muted' style='margin-top:8px;'>{'新闻' if lang == 'zh' else 'News'}: {news_chip(item)}</div>"
         f"<div style='display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;'>{_execution_tag_chips(item.get('execution_tags'), lang=lang)}</div>"
         "<div class='mobile-stock-actions'>"
@@ -827,10 +897,11 @@ def _render_watchlist_table_fragment(*, items: list[dict], lang: str) -> str:
     return f"""
       <section class="card table-card">
         <div class="eyebrow">Saved Stocks</div>
+        <div class="muted" style="margin-bottom:10px;">{'当前按涨幅排序，点击表头可切换升降序。' if lang == 'zh' else 'Sorted by day change; click the header to toggle direction.'}</div>
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th class='sticky-col sticky-col-1'>Ticker</th><th class='sticky-col sticky-col-2'>Name</th><th>Market</th><th>{'收盘价' if lang == 'zh' else 'Close'}</th><th>{'涨幅' if lang == 'zh' else 'Day %'}</th><th>Decision</th><th>{'下一步' if lang == 'zh' else 'Next Step'}</th><th>Execution Tags</th><th>{'新闻' if lang == 'zh' else 'News'}</th><th>Actions</th></tr>
+              <tr><th class='sticky-col sticky-col-1'>Ticker</th><th class='sticky-col sticky-col-2'>Name</th><th>Market</th><th>{'收盘价' if lang == 'zh' else 'Close'}</th><th>{_watchlist_sort_link(lang=lang, mode=mode, news_view=news_view, execution_tag_filter=execution_tag_filter, exclude_execution_tag_filter=exclude_execution_tag_filter, sort_by=sort_by, sort_order=sort_order, target='daily_change')}</th><th>Decision</th><th>{'下一步' if lang == 'zh' else 'Next Step'}</th><th>Execution Tags</th><th>{'新闻' if lang == 'zh' else 'News'}</th><th>Actions</th></tr>
             </thead>
             <tbody>{item_rows}</tbody>
           </table>
@@ -885,6 +956,8 @@ def watchlist_page(
     message: str | None = None,
     mode: str = Query("monitor"),
     news_view: str = Query("all"),
+    sort_by: str = Query("daily_change"),
+    sort_order: str = Query("desc"),
     analysis_limit: int = Query(12, ge=1, le=60),
     ai_analysis_limit: int = Query(3, ge=0, le=12),
     execution_tag_filter: str = Query("ALL"),
@@ -897,6 +970,12 @@ def watchlist_page(
     view_mode = (mode or "monitor").strip().lower()
     if view_mode not in {"premarket", "monitor", "postmarket"}:
         view_mode = "monitor"
+    sort_by = (sort_by or "daily_change").strip().lower()
+    if sort_by not in {"daily_change"}:
+        sort_by = "daily_change"
+    sort_order = (sort_order or "desc").strip().lower()
+    if sort_order not in {"asc", "desc"}:
+        sort_order = "desc"
     news_view = (news_view or "all").strip().lower()
     if news_view not in {"all", "opportunity", "risk", "coverage"}:
         news_view = "all"
@@ -1023,6 +1102,7 @@ def watchlist_page(
         display_items = [item for item in items if int(item.get("news_headline_count") or 0) <= 0]
     else:
         display_items = items
+    display_items = _sort_watchlist_items(display_items, sort_by=sort_by, sort_order=sort_order)
     render_signature = _watchlist_render_signature(display_items)
     news_panel_html = _render_watchlist_news_panel(
         items=items,
@@ -1031,6 +1111,8 @@ def watchlist_page(
         mode=view_mode,
         execution_tag_filter=execution_tag_filter,
         exclude_execution_tag_filter=exclude_execution_tag_filter,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
     analysis_panel_html = get_or_set(
         "watchlist_analysis_fragment",
@@ -1046,14 +1128,23 @@ def watchlist_page(
     )
     table_panel_html = get_or_set(
         "watchlist_table_fragment",
-        f"{render_signature}|lang={lang}|news={news_view}",
+        f"{render_signature}|lang={lang}|news={news_view}|sort={sort_by}|order={sort_order}",
         ttl_seconds=60.0,
-        loader=lambda: _render_watchlist_table_fragment(items=display_items, lang=lang),
+        loader=lambda: _render_watchlist_table_fragment(
+            items=display_items,
+            lang=lang,
+            mode=view_mode,
+            news_view=news_view,
+            execution_tag_filter=execution_tag_filter,
+            exclude_execution_tag_filter=exclude_execution_tag_filter,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        ),
     )
 
     mode_switch_html = "".join(
         (
-            f"<a href='/watchlist?{urlencode({'mode': value, 'lang': lang, 'news_view': news_view})}' "
+            f"<a href='/watchlist?{urlencode({'mode': value, 'lang': lang, 'news_view': news_view, 'execution_tag_filter': execution_tag_filter, 'exclude_execution_tag_filter': exclude_execution_tag_filter, 'sort_by': sort_by, 'sort_order': sort_order})}' "
             "style='display:inline-flex;align-items:center;padding:8px 12px;border-radius:999px;"
             f"border:1px solid {'#0f766e' if value == view_mode else '#cde9e4'};"
             f"background:{'#0f766e' if value == view_mode else '#fffdf7'};"
@@ -1195,6 +1286,18 @@ def watchlist_page(
           th.sticky-col {{ z-index:4; }}
           .sticky-col-1 {{ left:0; min-width:108px; box-shadow:10px 0 14px rgba(31,41,55,0.05); }}
           .sticky-col-2 {{ left:108px; min-width:160px; max-width:160px; box-shadow:10px 0 14px rgba(31,41,55,0.04); }}
+          .table-wrap th:nth-child(7),
+          .table-wrap td:nth-child(7) {{
+            position:sticky;
+            left:268px;
+            z-index:3;
+            background:#111c28;
+            box-shadow:10px 0 14px rgba(0,0,0,0.16);
+          }}
+          .table-wrap th:nth-child(7) {{
+            z-index:5;
+            background:#152231;
+          }}
           .market-section td {{ background:#132031; color:var(--accent); font-weight:800; letter-spacing:0.03em; border-top:1px solid var(--line); }}
           .table-card a {{ color: var(--accent); text-decoration:none; }}
           .linkbtn {{ display:inline-block; padding:8px 10px; border-radius:10px; background:rgba(61,217,182,0.10); color:var(--accent); font-weight:700; }}
@@ -1225,11 +1328,13 @@ def watchlist_page(
           .mobile-stock-head {{ display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }}
           .mobile-stock-ticker {{ font-weight:800; color:var(--accent); text-decoration:none; }}
           .mobile-stock-grid {{ display:grid; gap:8px; grid-template-columns:repeat(2, minmax(0,1fr)); margin-top:10px; }}
+          .mobile-next-step {{ margin-top:10px; padding:10px 12px; border-radius:12px; background:rgba(61,217,182,0.10); border:1px solid rgba(61,217,182,0.18); color:var(--ink); font-weight:800; }}
           .mobile-stock-actions {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }}
           @media (max-width: 720px) {{
             .table-wrap {{ display:none; }}
             .mobile-stock-list {{ display:grid; }}
             .sticky-col, .sticky-col-1, .sticky-col-2 {{ position:static; box-shadow:none; min-width:auto; max-width:none; }}
+            .table-wrap th:nth-child(7), .table-wrap td:nth-child(7) {{ position:static; box-shadow:none; min-width:auto; max-width:none; }}
           }}
         </style>
         <script>
@@ -1409,7 +1514,10 @@ def watchlist_page(
             <div class="eyebrow">{'执行过滤' if lang == 'zh' else 'Execution Filters'}</div>
             <form class="stack" action="/watchlist" method="get" style="max-width:420px;">
               <input type="hidden" name="lang" value="{lang}" />
+              <input type="hidden" name="mode" value="{view_mode}" />
               <input type="hidden" name="news_view" value="{news_view}" />
+              <input type="hidden" name="sort_by" value="{sort_by}" />
+              <input type="hidden" name="sort_order" value="{sort_order}" />
               <div>
                 <label class="muted" style="display:block;margin-bottom:6px;">{'执行标签' if lang == 'zh' else 'Execution Tag'}</label>
                 <input type="text" name="execution_tag_filter" list="execution-tag-options" value="{execution_tag_filter if execution_tag_filter.upper() != 'ALL' else ''}" placeholder="gap-risk, earnings-soon" />
@@ -1500,6 +1608,9 @@ def watchlist_analysis_fragment(
 def watchlist_table_fragment(
     request: Request,
     mode: str = Query("monitor"),
+    news_view: str = Query("all"),
+    sort_by: str = Query("daily_change"),
+    sort_order: str = Query("desc"),
     execution_tag_filter: str = Query("ALL"),
     exclude_execution_tag_filter: str = Query("ALL"),
     db: Session = Depends(get_db_session),
@@ -1510,11 +1621,20 @@ def watchlist_table_fragment(
     view_mode = (mode or "monitor").strip().lower()
     if view_mode not in {"premarket", "monitor", "postmarket"}:
         view_mode = "monitor"
+    news_view = (news_view or "all").strip().lower()
+    if news_view not in {"all", "opportunity", "risk", "coverage"}:
+        news_view = "all"
+    sort_by = (sort_by or "daily_change").strip().lower()
+    if sort_by not in {"daily_change"}:
+        sort_by = "daily_change"
+    sort_order = (sort_order or "desc").strip().lower()
+    if sort_order not in {"asc", "desc"}:
+        sort_order = "desc"
     execution_tag_filter = execution_tag_filter.strip()
     exclude_execution_tag_filter = exclude_execution_tag_filter.strip()
     cache_key = (
         f"mode={view_mode}|include={execution_tag_filter.lower() or 'all'}"
-        f"|exclude={exclude_execution_tag_filter.lower() or 'all'}"
+        f"|exclude={exclude_execution_tag_filter.lower() or 'all'}|news={news_view}|sort={sort_by}|order={sort_order}"
     )
 
     def _load() -> str:
@@ -1523,6 +1643,13 @@ def watchlist_table_fragment(
             execution_tag_filter=execution_tag_filter,
             exclude_execution_tag_filter=exclude_execution_tag_filter,
         )
+        nlp_snapshot = load_latest_workspace_snapshot(db, SNAPSHOT_WATCHLIST_NLP)
+        nlp_rows = ((nlp_snapshot or {}).get("payload") or {}).get("rows") if isinstance(nlp_snapshot, dict) else None
+        nlp_map = {
+            str(item.get("ticker") or "").strip().upper(): item
+            for item in (nlp_rows or [])
+            if isinstance(item, dict) and item.get("ticker")
+        }
         for item in items:
             model_output = item.get("model_output")
             combined = _lightweight_watchlist_analysis(model_output)
@@ -1531,7 +1658,42 @@ def watchlist_table_fragment(
             item["decision_brief"] = decision_brief
             item["mode_priority"] = _watchlist_mode_priority(combined, view_mode)
             item["ai_brief"] = "AI brief available for top-ranked names."
-        return _render_watchlist_table_fragment(items=items, lang=lang)
+        _attach_watchlist_price_fields(items)
+        _ensure_watchlist_execution_tags(items)
+        for item in items:
+            combined = item.get("combined_analysis") or _lightweight_watchlist_analysis(item.get("model_output"))
+            item["combined_analysis"] = combined
+            news_row = nlp_map.get(str(item.get("ticker") or "").strip().upper()) or {}
+            item["news_sentiment_label"] = news_row.get("sentiment_label") or ("中性" if lang == "zh" else "neutral")
+            item["news_sentiment_score"] = float(news_row.get("sentiment_score") or 0.0)
+            item["news_summary"] = news_row.get("summary_text") or ""
+            item["news_headline_count"] = int(news_row.get("headline_count") or 0)
+            item["news_risk_tags"] = news_row.get("risk_tags") or []
+            item["news_source_counts"] = news_row.get("source_counts") or {}
+            item["news_source_text"] = " · ".join(
+                f"{source}({count})"
+                for source, count in list((item["news_source_counts"] or {}).items())[:2]
+                if source
+            )
+        if news_view == "risk":
+            display_items = [item for item in items if _is_news_risk_item(item)]
+        elif news_view == "opportunity":
+            display_items = [item for item in items if _is_news_opportunity_item(item)]
+        elif news_view == "coverage":
+            display_items = [item for item in items if int(item.get("news_headline_count") or 0) <= 0]
+        else:
+            display_items = items
+        display_items = _sort_watchlist_items(display_items, sort_by=sort_by, sort_order=sort_order)
+        return _render_watchlist_table_fragment(
+            items=display_items,
+            lang=lang,
+            mode=view_mode,
+            news_view=news_view,
+            execution_tag_filter=execution_tag_filter,
+            exclude_execution_tag_filter=exclude_execution_tag_filter,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
 
     return get_or_set("watchlist_table_fragment", cache_key, ttl_seconds=20.0, loader=_load)
 

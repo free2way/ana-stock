@@ -4,15 +4,19 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from app.core.db import SessionLocal
+from app.services.ai_daily_report import build_ai_daily_report, render_ai_daily_report_push_messages, save_ai_daily_report
 from app.services.cn_fundamentals import sync_cn_fundamentals
 from app.services.cn_concepts import sync_cn_concepts
 from app.services.auto_analysis import auto_analysis_service
 from app.services.cn_market_universe import refresh_cn_market_data_daily, refresh_cn_market_data_lake_only
 from app.services.focus_pool import load_today_focus_pool
 from app.services.market_lake import list_lake_symbols
+from app.services.market_calendar import is_market_open_date, next_market_open_date
 from app.services.model_selection_guidance import save_model_selection_guidance_snapshots
 from app.services.nlp_snapshots import NEWS_ENRICHMENT_JOB_TYPE, refresh_nlp_snapshots
-from app.services.repository import AppSettingRepository, DataJobRepository, PredictionRepository, WatchlistRepository
+from app.services.push_notifications import PushNotificationService
+from app.services.recommendation_regression import save_ai_report_recommendation_regression_snapshot
+from app.services.repository import AppSettingRepository, DataJobRepository, PredictionRepository, WatchlistRepository, WorkspaceSnapshotRepository
 from app.services.screener_snapshots import (
     CORE_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
     FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES,
@@ -23,6 +27,7 @@ from app.services.screener_snapshots import (
     refresh_precomputed_screener_snapshots,
 )
 from app.services.technical_snapshot_cache import rebuild_technical_snapshots
+from app.services.template_evaluation import build_lightgbm_prediction_evaluation
 from app.services.trainer import SignalTrainer
 from app.services.workspace_snapshots import (
     SNAPSHOT_MARKET_HEATMAP_WORKSPACE,
@@ -48,13 +53,16 @@ SCREENER_PRECOMPUTE_CORE_JOB_TYPE = "screener_precompute_core"
 SCREENER_PRECOMPUTE_COMBO_JOB_TYPE = "screener_precompute_combos"
 SCREENER_PRECOMPUTE_REST_JOB_TYPE = "screener_precompute_rest"
 MODEL_SELECTION_GUIDANCE_JOB_TYPE = "model_selection_guidance_snapshot"
+MODEL_CALIBRATION_JOB_TYPE = "model_calibration_snapshot"
 MARKET_SNAPSHOT_JOB_TYPE = "market_snapshot_refresh"
+RECOMMENDATION_REGRESSION_JOB_TYPE = "ai_report_recommendation_regression"
+AI_DAILY_REPORT_JOB_TYPE = "generate_ai_daily_report"
 SH_TZ = ZoneInfo("Asia/Shanghai")
 
 DEFAULT_CLOSE_REVIEW_CONFIG = {
     "enabled": False,
-    "run_hour": 20,
-    "run_minute": 30,
+    "run_hour": 18,
+    "run_minute": 0,
     "provider": "auto",
     "days_back": 7,
     "overlap_days": 3,
@@ -136,15 +144,25 @@ class CloseReviewSchedulerService:
         next_run_at = None
         if config["enabled"]:
             now = sh_now()
-            candidate = now.replace(hour=config["run_hour"], minute=config["run_minute"], second=0)
+            next_date = next_market_open_date("CN", now.date(), include_self=True)
+            candidate = now.replace(
+                year=int(next_date[:4]),
+                month=int(next_date[5:7]),
+                day=int(next_date[8:10]),
+                hour=config["run_hour"],
+                minute=config["run_minute"],
+                second=0,
+            )
             if candidate <= now:
-                candidate = candidate + timedelta(days=1)
-                while candidate.weekday() >= 5:
-                    candidate = candidate + timedelta(days=1)
-            else:
-                while candidate.weekday() >= 5:
-                    candidate = candidate + timedelta(days=1)
-                    candidate = candidate.replace(hour=config["run_hour"], minute=config["run_minute"], second=0)
+                next_date = next_market_open_date("CN", now.date(), include_self=False)
+                candidate = now.replace(
+                    year=int(next_date[:4]),
+                    month=int(next_date[5:7]),
+                    day=int(next_date[8:10]),
+                    hour=config["run_hour"],
+                    minute=config["run_minute"],
+                    second=0,
+                )
             next_run_at = candidate.isoformat()
         return {**config, "next_run_at": next_run_at}
 
@@ -173,7 +191,7 @@ class CloseReviewSchedulerService:
         if not config["enabled"]:
             return None
         now = sh_now()
-        if now.weekday() >= 5:
+        if not is_market_open_date("CN", now.date()):
             return None
         if (now.hour, now.minute) < (config["run_hour"], config["run_minute"]):
             return None
@@ -198,6 +216,12 @@ class CloseReviewSchedulerService:
     def run_close_review(self, trigger: str = "manual") -> dict:
         config, job_id, cleaned_jobs = self._prepare_close_review_run(trigger)
         try:
+            with SessionLocal() as db:
+                DataJobRepository(db).update_job(
+                    job_id,
+                    message="Refreshing CN lake prices after close.",
+                    progress={"step": "lake_refresh", "trigger": trigger},
+                )
             refresh_limit = None if config["refresh_limit"] == 0 else config["refresh_limit"]
             refresh_result = self._run_lake_refresh_with_fallback(
                 provider=config["provider"],
@@ -206,6 +230,15 @@ class CloseReviewSchedulerService:
                 overlap_days=config["overlap_days"],
                 rebuild_snapshots=False,
             )
+            with SessionLocal() as db:
+                DataJobRepository(db).update_job(
+                    job_id,
+                    message="Rebuilding watchlist technical snapshots.",
+                    progress={
+                        "step": "snapshot_rebuild",
+                        "refresh_success_count": int(refresh_result.get("success_count") or 0),
+                    },
+                )
             rebuild_result = rebuild_technical_snapshots(
                 market="CN",
                 tickers=self._load_cn_watchlist_tickers(),
@@ -213,6 +246,16 @@ class CloseReviewSchedulerService:
             rebuilt_count = rebuild_result.get("snapshots_rebuilt")
             if rebuilt_count is None:
                 rebuilt_count = rebuild_result.get("rows_written", 0)
+            with SessionLocal() as db:
+                DataJobRepository(db).update_job(
+                    job_id,
+                    message="Running watchlist AI analysis.",
+                    progress={
+                        "step": "watchlist_analysis",
+                        "refresh_success_count": int(refresh_result.get("success_count") or 0),
+                        "rebuilt_count": int(rebuilt_count or 0),
+                    },
+                )
             analysis_result = auto_analysis_service.run_watchlist_analysis(
                 trigger=f"{trigger}_close_review",
                 allowed_markets=["CN"],
@@ -229,6 +272,18 @@ class CloseReviewSchedulerService:
                     ),
                 )
                 self._persist_last_run(db)
+            notifier = PushNotificationService()
+            if notifier.available_channels():
+                notifier.send_event(
+                    event_type="system_update",
+                    title="A股收盘刷新完成",
+                    body=(
+                        f"行情刷新：{refresh_result['success_count']} 条\n"
+                        f"技术快照：{rebuilt_count} 只\n"
+                        f"自选深度分析：{len(analysis_result.get('tickers', []))} 只\n"
+                        "后续会继续运行模型训练、核心预计算和 AI 日报。"
+                    ),
+                )
             threading.Thread(
                 target=self._run_post_close_followups_safe,
                 args=(job_id,),
@@ -367,40 +422,26 @@ class CloseReviewSchedulerService:
                     message="Precomputing screener model results after close review.",
                 )
                 precompute_job_id = job.id
-            batch_results: list[dict] = []
-            total_created = 0
-            total_failed = 0
-            snapshots_created: list[dict] = []
-            failed_items: list[dict] = []
-            for runner in (
-                self._run_screener_precompute_core_job_safe,
-                self._run_screener_precompute_combo_job_safe,
-                self._run_screener_precompute_rest_job_safe,
-            ):
-                batch_result = runner(source_job_id=source_job_id, parent_job_id=precompute_job_id)
-                if not batch_result:
-                    continue
-                batch_results.append(batch_result)
-                total_created += int(batch_result.get("count", 0) or 0)
-                total_failed += int(batch_result.get("failed_count", 0) or 0)
-                snapshots_created.extend(list(batch_result.get("snapshots_created") or []))
-                failed_items.extend(list(batch_result.get("failed_templates") or []))
-                failed_items.extend(list(batch_result.get("failed_presets") or []))
+            core_result = self._run_screener_precompute_core_job_safe(
+                source_job_id=source_job_id,
+                parent_job_id=precompute_job_id,
+            )
             result = {
-                "status": "success" if total_created > 0 else "failed",
-                "count": total_created,
-                "failed_count": total_failed,
-                "snapshots_created": snapshots_created,
-                "failed_templates": failed_items,
-                "batches": batch_results,
+                "status": "success" if int(core_result.get("count", 0) or 0) > 0 else "failed",
+                "count": int(core_result.get("count", 0) or 0),
+                "failed_count": int(core_result.get("failed_count", 0) or 0),
+                "snapshots_created": list(core_result.get("snapshots_created") or []),
+                "failed_templates": list(core_result.get("failed_templates") or []),
+                "batches": [core_result],
+                "tail_jobs_scheduled": True,
             }
             with SessionLocal() as db:
                 DataJobRepository(db).complete_job(
                     precompute_job_id,
                     status="success" if result.get("count", 0) > 0 else "failed",
                     message=(
-                        f"Precomputed {result.get('count', 0)} screener model snapshot(s) "
-                        f"after close review job {source_job_id}"
+                        f"Core precompute finished with {result.get('count', 0)} screener snapshot(s) "
+                        f"after close review job {source_job_id}; combo/rest jobs continue in background."
                         + (
                             f"; {result.get('failed_count', 0)} template(s) failed."
                             if result.get("failed_count", 0)
@@ -409,6 +450,24 @@ class CloseReviewSchedulerService:
                     ),
                     result=result,
                 )
+            notifier = PushNotificationService()
+            if notifier.available_channels():
+                notifier.send_event(
+                    event_type="precompute",
+                    title="A股核心模型预计算完成",
+                    body=(
+                        f"核心快照：{result.get('count', 0)} 个\n"
+                        f"失败模板：{result.get('failed_count', 0)} 个\n"
+                        "组合/补全预计算会在后台继续，页面优先读取已完成核心快照。"
+                    ),
+                )
+            if result.get("count", 0) > 0:
+                threading.Thread(
+                    target=self._run_screener_precompute_tail_jobs_safe,
+                    args=(source_job_id, precompute_job_id),
+                    name=f"screener-precompute-tail-{source_job_id}",
+                    daemon=True,
+                ).start()
         except Exception as exc:
             try:
                 if precompute_job_id is not None:
@@ -417,17 +476,30 @@ class CloseReviewSchedulerService:
                             precompute_job_id,
                             status="failed",
                             message=f"Screener precompute failed: {exc}",
-                        )
+                )
             except Exception:
                 pass
             return
 
+    def _run_screener_precompute_tail_jobs_safe(self, source_job_id: int, parent_job_id: int | None = None) -> None:
+        try:
+            for runner in (
+                self._run_screener_precompute_combo_job_safe,
+                self._run_screener_precompute_rest_job_safe,
+            ):
+                runner(source_job_id=source_job_id, parent_job_id=parent_job_id)
+            self._run_model_selection_guidance_job_safe(source_job_id)
+            self._run_model_calibration_job_safe(source_job_id)
+            self._run_ai_daily_report_job_safe(source_job_id=source_job_id, parent_job_id=parent_job_id)
+        except Exception:
+            return
+
     def _run_screener_precompute_core_job_safe(self, *, source_job_id: int, parent_job_id: int | None = None) -> dict:
-        def _runner() -> dict:
+        def _runner(emitted_job_id: int) -> dict:
             with SessionLocal() as db:
                 return refresh_precomputed_screener_snapshots(
                     db,
-                    source_job_id=source_job_id,
+                    source_job_id=emitted_job_id,
                     markets=["CN"],
                     include_watchlist=False,
                     lake_only=False,
@@ -444,11 +516,11 @@ class CloseReviewSchedulerService:
         )
 
     def _run_screener_precompute_combo_job_safe(self, *, source_job_id: int, parent_job_id: int | None = None) -> dict:
-        def _runner() -> dict:
+        def _runner(emitted_job_id: int) -> dict:
             with SessionLocal() as db:
                 return refresh_precomputed_multi_screener_snapshots(
                     db,
-                    source_job_id=source_job_id,
+                    source_job_id=emitted_job_id,
                     markets=["CN"],
                 )
 
@@ -485,16 +557,30 @@ class CloseReviewSchedulerService:
             },
         ]
 
-        def _runner() -> dict:
+        def _runner(emitted_job_id: int) -> dict:
             nonlocal total_created, total_failed
-            for batch in batch_plan:
+            total_batches = len(batch_plan)
+            for index, batch in enumerate(batch_plan, start=1):
                 template_keys = [key for key in (batch.get("template_keys") or []) if key]
                 if not template_keys:
                     continue
+                with SessionLocal() as progress_db:
+                    DataJobRepository(progress_db).update_job(
+                        emitted_job_id,
+                        message=f"Running screener rest batch {index}/{total_batches}: {batch['label']}.",
+                        progress={
+                            "step": "screener_precompute_rest",
+                            "batch": batch["label"],
+                            "batch_index": index,
+                            "batch_total": total_batches,
+                            "snapshots_created_so_far": total_created,
+                            "failed_so_far": total_failed,
+                        },
+                    )
                 with SessionLocal() as db:
                     batch_result = refresh_precomputed_screener_snapshots(
                         db,
-                        source_job_id=source_job_id,
+                        source_job_id=emitted_job_id,
                         markets=["CN"],
                         include_watchlist=bool(batch.get("include_watchlist")),
                         lake_only=False,
@@ -551,7 +637,17 @@ class CloseReviewSchedulerService:
                     message=message,
                 )
                 child_job_id = job.id
-            result = runner()
+            with SessionLocal() as db:
+                DataJobRepository(db).update_job(
+                    child_job_id,
+                    message=message,
+                    progress={
+                        "step": job_type,
+                        "source_job_id": source_job_id,
+                        "parent_job_id": parent_job_id,
+                    },
+                )
+            result = runner(child_job_id)
             with SessionLocal() as db:
                 DataJobRepository(db).complete_job(
                     child_job_id,
@@ -580,10 +676,142 @@ class CloseReviewSchedulerService:
             self._run_cn_concept_sync_job_safe(source_job_id)
             self._run_news_enrichment_job_safe(source_job_id)
             self._run_screener_precompute_job_safe(source_job_id)
-            self._run_model_selection_guidance_job_safe(source_job_id)
             self._refresh_workspace_snapshots_safe(source_job_id)
             self._run_market_snapshot_job_safe(source_job_id)
         except Exception:
+            return
+
+    def _run_ai_daily_report_job_safe(self, source_job_id: int, parent_job_id: int | None = None) -> None:
+        ai_job_id: int | None = None
+        try:
+            with SessionLocal() as db:
+                job_repo = DataJobRepository(db)
+                job_repo.complete_stale_running_jobs(
+                    job_types=[AI_DAILY_REPORT_JOB_TYPE],
+                    stale_after_hours=2,
+                    message_prefix="Close-review cleanup closed a stale AI daily report job.",
+                )
+                if job_repo.has_running_job(AI_DAILY_REPORT_JOB_TYPE):
+                    return
+                job = job_repo.create_job(
+                    job_type=AI_DAILY_REPORT_JOB_TYPE,
+                    status="running",
+                    params={
+                        "source_job_id": source_job_id,
+                        "depends_on": [parent_job_id] if parent_job_id is not None else [],
+                        "pipeline_step": "ai_daily_report_after_precompute",
+                    },
+                    message="Generating AI daily report after screener precompute tail jobs.",
+                )
+                ai_job_id = job.id
+            with SessionLocal() as db:
+                DataJobRepository(db).update_job(
+                    ai_job_id,
+                    message="Regressing historical recommendations before building AI daily report.",
+                    progress={"step": "recommendation_regression", "source_job_id": source_job_id},
+                )
+                regression_snapshot = save_ai_report_recommendation_regression_snapshot(
+                    db=db,
+                    source_job_id=ai_job_id,
+                )
+            with SessionLocal() as db:
+                DataJobRepository(db).update_job(
+                    ai_job_id,
+                    message="Building AI daily report payload with latest regression policy.",
+                    progress={
+                        "step": "build_report",
+                        "source_job_id": source_job_id,
+                        "recommendation_regression": regression_snapshot,
+                    },
+                )
+
+            report = build_ai_daily_report(limit=8)
+            with SessionLocal() as db:
+                DataJobRepository(db).update_job(
+                    ai_job_id,
+                    message="Saving AI daily report snapshot.",
+                    progress={
+                        "step": "save_report",
+                        "report_date": report.get("report_date"),
+                        "actionable_count": len(report.get("market_recommendations") or []),
+                        "watch_count": len(report.get("market_watch_recommendations") or []),
+                    },
+                )
+            save_ai_daily_report(report)
+
+            push_result = None
+            notifier = PushNotificationService()
+            if notifier.available_channels():
+                with SessionLocal() as db:
+                    DataJobRepository(db).update_job(
+                        ai_job_id,
+                        message="Pushing AI daily report notifications.",
+                        progress={
+                            "step": "push_report",
+                            "report_date": report.get("report_date"),
+                        },
+                    )
+                push_messages = render_ai_daily_report_push_messages(report)
+                push_results = []
+                sent: list[str] = []
+                failed: list[dict] = []
+                for message_item in push_messages:
+                    try:
+                        result = notifier.send_event(
+                            event_type="stock_recommendation",
+                            title=message_item["title"],
+                            body=message_item["body"],
+                        )
+                    except Exception as push_exc:
+                        result = {
+                            "status": "failed",
+                            "sent": [],
+                            "failed": [{"channel": "unknown", "error": str(push_exc)}],
+                        }
+                    push_results.append({"title": message_item["title"], **result})
+                    sent.extend(item for item in (result.get("sent") or []) if item not in sent)
+                    failed.extend(result.get("failed") or [])
+                push_result = {
+                    "status": "success" if sent and not failed else "partial" if sent else "failed",
+                    "sent": sent,
+                    "failed": failed,
+                    "messages": push_results,
+                }
+
+            market_meta = report.get("market_recommendations_meta") or {}
+            market_status = str(market_meta.get("status") or "").strip().lower() or "ready"
+            candidate_count = len(report.get("market_recommendations") or [])
+            message = (
+                f"Generated AI daily report after precompute tail jobs: "
+                f"{candidate_count} A-share market candidate(s), status {market_status}."
+            )
+            if push_result and push_result.get("sent"):
+                message += f" Pushed to {', '.join(push_result['sent'])}."
+            elif push_result and push_result.get("failed"):
+                message += " Report saved, but some push channels failed."
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(
+                    ai_job_id,
+                    status="success",
+                    message=message,
+                    result={
+                        "report_date": report.get("report_date"),
+                        "market_candidate_count": candidate_count,
+                        "market_recommendations_meta": market_meta,
+                        "push_result": push_result,
+                    },
+                )
+        except Exception as exc:
+            try:
+                if ai_job_id is not None:
+                    with SessionLocal() as db:
+                        DataJobRepository(db).complete_job(
+                            ai_job_id,
+                            status="failed",
+                            message=f"AI daily report generation failed after precompute: {exc}",
+                        )
+            except Exception:
+                pass
             return
 
     def _run_model_selection_guidance_job_safe(self, source_job_id: int) -> None:
@@ -630,6 +858,69 @@ class CloseReviewSchedulerService:
                             guidance_job_id,
                             status="failed",
                             message=f"Model selection guidance snapshot failed: {exc}",
+                        )
+            except Exception:
+                pass
+            return
+
+    def _run_model_calibration_job_safe(self, source_job_id: int) -> None:
+        calibration_job_id: int | None = None
+        try:
+            with SessionLocal() as db:
+                job_repo = DataJobRepository(db)
+                job_repo.complete_stale_running_jobs(
+                    job_types=[MODEL_CALIBRATION_JOB_TYPE],
+                    stale_after_hours=2,
+                    message_prefix="Close-review cleanup closed a stale model calibration job.",
+                )
+                if job_repo.has_running_job(MODEL_CALIBRATION_JOB_TYPE):
+                    return
+                job = job_repo.create_job(
+                    job_type=MODEL_CALIBRATION_JOB_TYPE,
+                    status="running",
+                    params={
+                        "source_job_id": source_job_id,
+                        "market": "CN",
+                        "pipeline_step": "model_calibration_snapshot",
+                    },
+                    message="Saving LightGBM out-of-sample calibration snapshot after model guidance.",
+                )
+                calibration_job_id = job.id
+
+            payload = build_lightgbm_prediction_evaluation(market="CN", recent_runs=12, top_n=60)
+            payload["snapshot_meta"] = {
+                "source": "snapshot",
+                "market": "CN",
+                "job_type": MODEL_CALIBRATION_JOB_TYPE,
+            }
+            with SessionLocal() as db:
+                snapshot = WorkspaceSnapshotRepository(db).create_snapshot(
+                    snapshot_type=MODEL_CALIBRATION_JOB_TYPE,
+                    snapshot_date=app_today_iso(),
+                    payload=payload,
+                    source_job_id=calibration_job_id,
+                )
+                DataJobRepository(db).complete_job(
+                    calibration_job_id,
+                    status="success" if int(payload.get("sample_count") or 0) > 0 else "failed",
+                    message=(
+                        "Saved LightGBM out-of-sample calibration snapshot "
+                        f"with {int(payload.get('sample_count') or 0)} sample(s)."
+                    ),
+                    result={
+                        "snapshot_id": snapshot.id,
+                        "sample_count": int(payload.get("sample_count") or 0),
+                        "latest_trade_date": payload.get("latest_trade_date"),
+                    },
+                )
+        except Exception as exc:
+            try:
+                if calibration_job_id is not None:
+                    with SessionLocal() as db:
+                        DataJobRepository(db).complete_job(
+                            calibration_job_id,
+                            status="failed",
+                            message=f"Model calibration snapshot failed: {exc}",
                         )
             except Exception:
                 pass
@@ -685,6 +976,17 @@ class CloseReviewSchedulerService:
                         "ticker_count": len(cn_tickers),
                         "predictions_written": predictions_written,
                     },
+                )
+            notifier = PushNotificationService()
+            if notifier.available_channels():
+                notifier.send_event(
+                    event_type="model_training",
+                    title="A股 LightGBM 训练完成",
+                    body=(
+                        f"训练标的：{len(cn_tickers)} 只\n"
+                        f"写入预测：{predictions_written} 条\n"
+                        "下一步会基于最新预测刷新模型选股快照。"
+                    ),
                 )
         except Exception:
             try:
@@ -967,7 +1269,19 @@ class CloseReviewSchedulerService:
             config = self.get_config(db=db)
             job_repo = DataJobRepository(db)
             cleaned_jobs = job_repo.complete_stale_running_jobs(
-                job_types=[CLOSE_REVIEW_JOB_TYPE, "watchlist_auto_analysis", "init_cn_market_data", CN_SIGNAL_TRAIN_JOB_TYPE],
+                job_types=[
+                    CLOSE_REVIEW_JOB_TYPE,
+                    "watchlist_auto_analysis",
+                    "init_cn_market_data",
+                    CN_SIGNAL_TRAIN_JOB_TYPE,
+                    SCREENER_PRECOMPUTE_JOB_TYPE,
+                    SCREENER_PRECOMPUTE_CORE_JOB_TYPE,
+                    SCREENER_PRECOMPUTE_COMBO_JOB_TYPE,
+                    SCREENER_PRECOMPUTE_REST_JOB_TYPE,
+                    MODEL_SELECTION_GUIDANCE_JOB_TYPE,
+                    MODEL_CALIBRATION_JOB_TYPE,
+                    AI_DAILY_REPORT_JOB_TYPE,
+                ],
                 stale_after_hours=config["stale_job_hours"],
                 message_prefix="Scheduler cleanup closed a stale running job.",
             )
@@ -984,6 +1298,7 @@ class CloseReviewSchedulerService:
                     "refresh_limit": None if config["refresh_limit"] == 0 else config["refresh_limit"],
                     "cleaned_stale_jobs": cleaned_jobs,
                 },
+                message="Starting close review refresh pipeline.",
             )
             self._persist_last_attempt(db, trigger=trigger)
             return config, int(job.id), cleaned_jobs

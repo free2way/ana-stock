@@ -4,7 +4,10 @@ import json
 from collections import defaultdict
 from urllib.parse import urlencode
 
+from sqlalchemy import select
+
 from app.core.db import SessionLocal
+from app.models.tables import WorkspaceSnapshot
 from app.services.market_lake import load_lake_rows, query_lake_daily_movers
 from app.services.repository import SymbolRepository, WorkspaceSnapshotRepository
 from app.services.runtime_cache import get_or_set
@@ -12,8 +15,6 @@ from app.services.screener import MODEL_TEMPLATES
 from app.services.screener_snapshots import (
     FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
     FULL_MARKET_US_PRECOMPUTE_TEMPLATES,
-    build_base_precompute_params,
-    screener_snapshot_type,
 )
 from app.services.template_evaluation import aggregate_window_stats, template_forward_return_from_history
 from app.services.time_utils import app_now_iso, app_today_iso
@@ -88,7 +89,7 @@ def build_model_selection_guidance(
             "winner_lookback_dates": int(winner_lookback_dates),
             "winner_top_n": int(winner_top_n),
             "winner_min_return_pct": float(winner_min_return_pct),
-            "version": 1,
+            "version": 2,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -334,12 +335,62 @@ def _build_guidance_uncached(
 def _load_template_snapshots(*, target_markets: list[str], lookback_snapshots: int, top_n: int) -> list[dict]:
     records: list[dict] = []
     with SessionLocal() as db:
-        repo = WorkspaceSnapshotRepository(db)
+        template_set_by_market = {
+            market_code: set(_templates_for_market(market_code))
+            for market_code in target_markets
+        }
+        max_days = max(1, int(lookback_snapshots))
+        stmt = (
+            select(WorkspaceSnapshot)
+            .where(WorkspaceSnapshot.snapshot_type.like("screener_result:%"))
+            .order_by(WorkspaceSnapshot.id.desc())
+            .limit(max_days * max(sum(len(values) for values in template_set_by_market.values()), 1) * 12)
+        )
+        rows = db.scalars(stmt).all()
+        latest_by_template_day: dict[tuple[str, str, str], dict] = {}
+        for row in rows:
+            try:
+                payload = json.loads(row.payload_json)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            market_code = str(payload.get("market") or "").strip().upper()
+            template_key = str(payload.get("model_template") or "").strip()
+            universe = str(payload.get("universe") or "").strip().lower()
+            if market_code not in template_set_by_market:
+                continue
+            if template_key not in template_set_by_market[market_code]:
+                continue
+            if universe != "full_market":
+                continue
+            signal_date = str(row.snapshot_date or "")[:10]
+            if not signal_date:
+                continue
+            dedupe_key = (market_code, template_key, signal_date)
+            existing = latest_by_template_day.get(dedupe_key)
+            if existing is None or int(row.id) > int(existing.get("id") or 0):
+                latest_by_template_day[dedupe_key] = {
+                    "id": row.id,
+                    "market": market_code,
+                    "template": template_key,
+                    "signal_date": signal_date,
+                    "payload": payload,
+                }
+
         for market_code in target_markets:
             for template_key in _templates_for_market(market_code):
-                params = build_base_precompute_params(model_template=template_key, universe="full_market", market=market_code)
-                for snapshot in repo.list_snapshots(screener_snapshot_type(params), limit=max(1, int(lookback_snapshots))):
-                    signal_date = str(snapshot.get("snapshot_date") or "")[:10]
+                snapshots = sorted(
+                    (
+                        item
+                        for key, item in latest_by_template_day.items()
+                        if key[0] == market_code and key[1] == template_key
+                    ),
+                    key=lambda item: (str(item.get("signal_date") or ""), int(item.get("id") or 0)),
+                    reverse=True,
+                )[:max_days]
+                for snapshot in snapshots:
+                    signal_date = str(snapshot.get("signal_date") or "")[:10]
                     payload = snapshot.get("payload") or {}
                     for row in list(payload.get("rows") or [])[: max(1, int(top_n))]:
                         ticker = str(row.get("ticker") or row.get("symbol") or "").strip().upper()

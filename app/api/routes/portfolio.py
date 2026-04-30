@@ -4,6 +4,7 @@ import csv
 import html
 import threading
 from io import StringIO
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -12,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.core.db import SessionLocal, get_db_session
 from app.models.schema import SymbolCreate
 from app.services.auth import is_authenticated, login_redirect
+from app.services.market_lake import load_lake_price_history
 from app.services.portfolio_intelligence import (
     build_position_management_fields,
     build_portfolio_ai_summary,
@@ -55,6 +57,49 @@ MARKET_OPTIONS = [
     ("CN", "China A-Shares", "Examples: 600519.SH, 000001.SZ"),
     ("HK", "Hong Kong Stocks", "Examples: 0700.HK, 9988.HK"),
 ]
+
+
+def _render_daily_change_chip(value: float | None) -> str:
+    if value is None:
+        return "<span class='muted'>-</span>"
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "<span class='muted'>-</span>"
+    bg = "rgba(148,163,184,0.12)"
+    fg = "#cbd5e1"
+    if numeric > 0:
+        bg = "rgba(22,163,74,0.16)"
+        fg = "#4ade80"
+    elif numeric < 0:
+        bg = "rgba(220,38,38,0.16)"
+        fg = "#f87171"
+    return (
+        "<span style='display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;"
+        f"background:{bg};color:{fg};font-weight:800;font-size:12px;white-space:nowrap;'>{numeric:+.2f}%</span>"
+    )
+
+
+def _load_portfolio_daily_change_pct(*, market: str | None, ticker: str) -> float | None:
+    market_value = str(market or "").strip().upper()
+    normalized_ticker = normalize_ticker_for_market(ticker, market_value)
+    if market_value not in {"CN", "US"} or not normalized_ticker:
+        return None
+    rows = load_lake_price_history(market=market_value, ticker=normalized_ticker, limit=2)
+    if len(rows) < 2:
+        return None
+    latest = rows[-1]
+    previous = rows[-2]
+    latest_close = latest.get("close") or latest.get("adj_close")
+    previous_close = previous.get("close") or previous.get("adj_close")
+    try:
+        latest_value = float(latest_close)
+        previous_value = float(previous_close)
+    except (TypeError, ValueError):
+        return None
+    if previous_value == 0:
+        return None
+    return ((latest_value / previous_value) - 1.0) * 100.0
 
 def _compact_text(value: str | None, limit: int = 28) -> str:
     text = str(value or "").strip()
@@ -113,6 +158,34 @@ def _portfolio_priority_rank(value: object) -> int:
     if raw in {"低", "low", "L", "C"} or lowered == "low":
         return 1
     return 0
+
+
+def _portfolio_sort_value(row: dict, sort_by: str) -> tuple[float, str]:
+    normalized = str(sort_by or "daily_change").strip().lower()
+    if normalized == "daily_change":
+        value = row.get("daily_change_pct")
+    elif normalized == "pnl":
+        value = row.get("pnl_pct")
+    else:
+        value = row.get("daily_change_pct")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = -999999.0
+    return numeric, str(row.get("ticker") or "")
+
+
+def _portfolio_sort_link(*, lang: str, sort_by: str, sort_order: str, target: str) -> str:
+    normalized_target = target if target in {"daily_change", "pnl"} else "daily_change"
+    next_order = "asc" if sort_by == normalized_target and sort_order == "desc" else "desc"
+    arrow = ""
+    if sort_by == normalized_target:
+        arrow = " ↓" if sort_order == "desc" else " ↑"
+    label = "涨幅" if normalized_target == "daily_change" and lang == "zh" else "Day %"
+    if normalized_target == "pnl":
+        label = "盈亏%" if lang == "zh" else "PnL %"
+    query = urlencode({"lang": lang, "sort_by": normalized_target, "sort_order": next_order})
+    return f"<a href='/portfolio?{query}' style='color:inherit;text-decoration:none;'>{label}{arrow}</a>"
 
 
 def _redirect(message: str | None = None) -> RedirectResponse:
@@ -227,11 +300,19 @@ def portfolio_quote_preview(
 def portfolio_page(
     request: Request,
     message: str | None = None,
+    sort_by: str = Query("daily_change"),
+    sort_order: str = Query("desc"),
     db: Session = Depends(get_db_session),
 ) -> str:
     if not is_authenticated(request):
         return login_redirect("/portfolio")
     lang = resolve_request_lang(request, default="zh")
+    sort_by = (sort_by or "daily_change").strip().lower()
+    if sort_by not in {"daily_change", "pnl"}:
+        sort_by = "daily_change"
+    sort_order = (sort_order or "desc").strip().lower()
+    if sort_order not in {"asc", "desc"}:
+        sort_order = "desc"
     symbol_repo = SymbolRepository(db)
     prediction_repo = PredictionRepository(db)
     force_live = bool(message)
@@ -369,10 +450,20 @@ def portfolio_page(
             loader=_load_portfolio_rows,
         )
     for row in rows:
+        row["daily_change_pct"] = _load_portfolio_daily_change_pct(
+            market=row.get("market"),
+            ticker=row.get("ticker") or "",
+        )
+    for row in rows:
         news_row = nlp_map.get(str(row.get("ticker") or "").strip().upper()) or {}
         row["news_sentiment_label"] = news_row.get("sentiment_label") or ("中性" if lang == "zh" else "neutral")
         row["news_summary"] = news_row.get("summary_text") or ""
         row["news_headline_count"] = int(news_row.get("headline_count") or 0)
+    rows = sorted(
+        rows,
+        key=lambda row: _portfolio_sort_value(row, sort_by),
+        reverse=(sort_order == "desc"),
+    )
     watch_items = sorted(
         list(intelligence.get("watch_items", [])),
         key=lambda row: (
@@ -647,6 +738,7 @@ def portfolio_page(
         f"<td>{row['quantity']:.0f}</td>"
         f"<td>{row['cost_basis']:.2f}</td>"
         f"<td>{row['latest_price']:.2f}</td>"
+        f"<td>{_render_daily_change_chip(row.get('daily_change_pct'))}</td>"
         f"<td>{row['market_value']:.2f}</td>"
         f"<td>{row['pnl']:.2f} ({row['pnl_pct']:.1f}%)</td>"
         f"<td>{row['ai_verdict']}</td>"
@@ -664,20 +756,22 @@ def portfolio_page(
         "</td>"
         "</tr>"
         for row in rows
-    ) or "<tr><td colspan='16'>No positions yet.</td></tr>"
+    ) or "<tr><td colspan='17'>No positions yet.</td></tr>"
     mobile_rows_html = "".join(
         "<article class='mobile-position-card'>"
         f"<div class='mobile-position-head'><div><div class='mobile-position-ticker'>{row['ticker']}</div><div class='muted'>{_compact_text(row['name'], 24)} · {row['market']}</div></div><div style='text-align:right;'><div style='font-weight:800;'>{row['pnl']:.2f}</div><div class='muted'>{row['pnl_pct']:.1f}%</div></div></div>"
         f"<div class='mobile-position-grid'>"
         f"<div><span class='muted'>{'数量' if lang == 'zh' else 'Qty'}</span><div>{row['quantity']:.0f}</div></div>"
         f"<div><span class='muted'>{'成本' if lang == 'zh' else 'Cost'}</span><div>{row['cost_basis']:.2f}</div></div>"
-        f"<div><span class='muted'>{'最新价' if lang == 'zh' else 'Last'}</span><div>{row['latest_price']:.2f}</div></div>"
+        f"<div><span class='muted'>{'收盘价' if lang == 'zh' else 'Close'}</span><div>{row['latest_price']:.2f}</div></div>"
+        f"<div><span class='muted'>{'涨幅' if lang == 'zh' else 'Day %'}</span><div>{_render_daily_change_chip(row.get('daily_change_pct'))}</div></div>"
         f"<div><span class='muted'>{'市值' if lang == 'zh' else 'Value'}</span><div>{row['market_value']:.2f}</div></div>"
         f"<div><span class='muted'>AI</span><div>{row['ai_verdict']}</div></div>"
         f"<div><span class='muted'>{'动作桶' if lang == 'zh' else 'Bucket'}</span><div>{row['action_bucket']}</div></div>"
         "</div>"
         f"<div class='muted' style='margin-top:8px;'>{_compact_text(row['ai_headline'], 60)}</div>"
         f"<div class='muted' style='margin-top:6px;'>{_compact_text(row['ai_strategy'], 56)}</div>"
+        f"<div class='mobile-action-bucket'>{'动作桶' if lang == 'zh' else 'Action Bucket'}：{html.escape(str(row['action_bucket'] or '-'))}</div>"
         f"<div class='muted' style='margin-top:6px;'>{'目标仓位' if lang == 'zh' else 'Target'}: {row['target_weight_text']} · {'新闻' if lang == 'zh' else 'News'}: {html.escape(row.get('news_sentiment_label') or '-')} · {int(row.get('news_headline_count') or 0)}</div>"
         f"<div class='muted' style='margin-top:6px;'>{_compact_text(row['note'] or '-', 72)}</div>"
         "<div class='mobile-position-actions'>"
@@ -721,7 +815,7 @@ def portfolio_page(
           .table-wrap::-webkit-scrollbar-track {{ background:#0f1823; border-radius:999px; }}
           .table-wrap::-webkit-scrollbar-thumb {{ background:#32465d; border-radius:999px; border:2px solid #0f1823; }}
           .table-wrap::-webkit-scrollbar-thumb:hover {{ background:#47627f; }}
-          table {{ width:100%; min-width:1380px; border-collapse:collapse; font-size:13px; }}
+          table {{ width:100%; min-width:1460px; border-collapse:collapse; font-size:13px; }}
           th, td {{ text-align:left; padding:9px 8px; border-bottom:1px solid var(--line); vertical-align:top; white-space:nowrap; }}
           th {{ color:var(--muted); font-weight:600; }}
           .mobile-position-list {{ display:none; gap:10px; margin-top:2px; }}
@@ -861,11 +955,28 @@ def portfolio_page(
             position:sticky;
             left:112px;
             z-index:4;
+            min-width:150px;
+            max-width:150px;
+            overflow:hidden;
+            text-overflow:ellipsis;
             background:#0b131d;
             box-shadow:8px 0 18px rgba(0,0,0,0.14);
           }}
+          .positions-table th:nth-child(14),
+          .positions-table td:nth-child(14) {{
+            position:sticky;
+            left:262px;
+            z-index:4;
+            min-width:130px;
+            max-width:130px;
+            overflow:hidden;
+            text-overflow:ellipsis;
+            background:#0b131d;
+            box-shadow:8px 0 18px rgba(0,0,0,0.10);
+          }}
           .positions-table th:first-child,
-          .positions-table th:nth-child(2) {{
+          .positions-table th:nth-child(2),
+          .positions-table th:nth-child(14) {{
             z-index:5;
             background:#101b27;
           }}
@@ -921,6 +1032,7 @@ def portfolio_page(
           .quote-value {{ font-size:16px; font-weight:800; }}
           .quote-value.positive {{ color:#4ade80; }}
           .quote-value.negative {{ color:#f87171; }}
+          .mobile-action-bucket {{ margin-top:10px; padding:10px 12px; border-radius:12px; background:rgba(61,217,182,0.10); border:1px solid rgba(61,217,182,0.18); color:var(--ink); font-weight:800; }}
           input, select, textarea {{ width:100%; padding:10px 12px; border-radius:12px; border:1px solid var(--line); background:#0f1823; color:var(--ink); }}
           button {{ padding:10px 14px; border:none; border-radius:12px; background:var(--accent); color:#fff; font-weight:700; cursor:pointer; }}
           a {{ color:var(--accent); text-decoration:none; }}
@@ -1217,9 +1329,9 @@ def portfolio_page(
                 <button type="submit">Save Position</button>
               </form>
               <div class="quote-preview">
-                <div class="muted">{"输入代码、成本价和股数后，会根据本地最新价即时试算。" if lang == "zh" else "Enter a ticker, cost basis, and quantity to preview value and unrealized PnL from the latest local close."}</div>
+                <div class="muted">{"输入代码、成本价和股数后，会根据本地最新收盘价即时试算。" if lang == "zh" else "Enter a ticker, cost basis, and quantity to preview value and unrealized PnL from the latest local close."}</div>
                 <div class="quote-grid">
-                  <div class="quote-cell"><div class="quote-label">{"最新价" if lang == "zh" else "Latest Close"}</div><div id="portfolio-latest-close" class="quote-value">--</div></div>
+                  <div class="quote-cell"><div class="quote-label">{"收盘价" if lang == "zh" else "Close"}</div><div id="portfolio-latest-close" class="quote-value">--</div></div>
                   <div class="quote-cell"><div class="quote-label">{"预估市值" if lang == "zh" else "Estimated Value"}</div><div id="portfolio-est-value" class="quote-value">--</div></div>
                   <div class="quote-cell"><div class="quote-label">{"浮盈亏" if lang == "zh" else "Unrealized PnL"}</div><div id="portfolio-est-pnl" class="quote-value">--</div></div>
                   <div class="quote-cell"><div class="quote-label">{"浮盈亏%" if lang == "zh" else "Unrealized PnL %"}</div><div id="portfolio-est-pnl-pct" class="quote-value">--</div></div>
@@ -1258,10 +1370,11 @@ def portfolio_page(
           </section>
           <section class="card">
             <div class="eyebrow">Positions</div>
+            <div class="muted" style="margin-bottom:10px;">{'当前按涨幅排序，点击表头可切换升降序。' if lang == 'zh' else 'Sorted by day change; click the header to toggle direction.'}</div>
             <div class="table-wrap positions-table-wrap">
             <table class="positions-table">
               <thead>
-                <tr><th>Ticker</th><th>Name</th><th>Market</th><th>Qty</th><th>Cost</th><th>Last</th><th>Market Value</th><th>PnL</th><th>AI Verdict</th><th>AI Headline</th><th>AI Strategy</th><th>{'目标仓位' if lang == 'zh' else 'Target Wt'}</th><th>{'动作桶' if lang == 'zh' else 'Action Bucket'}</th><th>{'新闻' if lang == 'zh' else 'News'}</th><th>{'备注' if lang == 'zh' else 'Note'}</th><th>{'操作' if lang == 'zh' else 'Actions'}</th></tr>
+                <tr><th>Ticker</th><th>Name</th><th>Market</th><th>Qty</th><th>Cost</th><th>{'收盘价' if lang == 'zh' else 'Close'}</th><th>{_portfolio_sort_link(lang=lang, sort_by=sort_by, sort_order=sort_order, target='daily_change')}</th><th>Market Value</th><th>{_portfolio_sort_link(lang=lang, sort_by=sort_by, sort_order=sort_order, target='pnl')}</th><th>AI Verdict</th><th>AI Headline</th><th>AI Strategy</th><th>{'目标仓位' if lang == 'zh' else 'Target Wt'}</th><th>{'动作桶' if lang == 'zh' else 'Action Bucket'}</th><th>{'新闻' if lang == 'zh' else 'News'}</th><th>{'备注' if lang == 'zh' else 'Note'}</th><th>{'操作' if lang == 'zh' else 'Actions'}</th></tr>
               </thead>
               <tbody>{rows_html}</tbody>
             </table>

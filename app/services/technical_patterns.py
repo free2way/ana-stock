@@ -4,8 +4,10 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from app.core.db import SessionLocal
 from app.core.config import get_settings
 from app.services.market_lake import load_lake_price_history
+from app.services.repository import SymbolRepository
 from app.services.ticker_format import market_ticker_candidates
 
 
@@ -15,6 +17,9 @@ class TechnicalPatternSnapshot:
     as_of_date: str | None
     limit_up_today: bool = False
     limit_up_yesterday: bool = False
+    is_limit_down_today: bool = False
+    limit_band_pct: float | None = None
+    limit_board_type: str | None = None
     volume_breakout: bool = False
     ma_cluster: bool = False
     bullish_ma_stack: bool = False
@@ -29,6 +34,7 @@ class TechnicalPatternSnapshot:
 class TechnicalPatternService:
     def __init__(self) -> None:
         self.settings = get_settings()
+        self._symbol_profile_cache: dict[str, dict] = {}
 
     def evaluate_ticker(self, ticker: str) -> TechnicalPatternSnapshot | None:
         frame = self._load_price_frame(ticker)
@@ -39,8 +45,9 @@ class TechnicalPatternService:
         latest = enriched.iloc[-1]
         previous = enriched.iloc[-2] if len(enriched) >= 2 else None
         matched: list[str] = []
+        limit_band_pct, limit_board_type = self._resolve_cn_limit_profile(ticker)
 
-        limit_up_today = self._is_limit_up_today(enriched)
+        limit_up_today = self._is_limit_up_today(enriched, ticker=ticker)
         if limit_up_today:
             matched.append("今日涨停")
 
@@ -48,7 +55,8 @@ class TechnicalPatternService:
         if volume_breakout:
             matched.append("底部放量突破")
 
-        limit_up_yesterday = self._is_limit_up_yesterday(enriched)
+        limit_up_yesterday = self._is_limit_up_yesterday(enriched, ticker=ticker)
+        is_limit_down_today = self._is_limit_down_today(enriched, ticker=ticker)
 
         ma_cluster = self._is_ma_cluster(enriched)
         if ma_cluster:
@@ -83,6 +91,9 @@ class TechnicalPatternService:
             as_of_date=str(latest.get("date") or latest.name),
             limit_up_today=limit_up_today,
             limit_up_yesterday=limit_up_yesterday,
+            is_limit_down_today=is_limit_down_today,
+            limit_band_pct=limit_band_pct,
+            limit_board_type=limit_board_type,
             volume_breakout=volume_breakout,
             ma_cluster=ma_cluster,
             bullish_ma_stack=bullish_ma_stack,
@@ -203,6 +214,62 @@ class TechnicalPatternService:
             return []
         return [("US", upper)]
 
+    def _lookup_symbol_profile(self, ticker: str) -> dict:
+        normalized = str(ticker or "").strip().upper()
+        if not normalized:
+            return {}
+        cached = self._symbol_profile_cache.get(normalized)
+        if cached is not None:
+            return cached
+        profile: dict = {}
+        try:
+            with SessionLocal() as db:
+                profile = SymbolRepository(db).get_overview(normalized) or {}
+        except Exception:
+            profile = {}
+        self._symbol_profile_cache[normalized] = profile
+        return profile
+
+    def _is_cn_ticker(self, ticker: str) -> bool:
+        upper = str(ticker or "").strip().upper()
+        return bool(upper) and (upper.endswith((".SS", ".SZ", ".SH", ".BJ")) or (upper.isdigit() and len(upper) == 6))
+
+    def _resolve_cn_limit_profile(self, ticker: str) -> tuple[float | None, str | None]:
+        upper = str(ticker or "").strip().upper()
+        if not self._is_cn_ticker(upper):
+            return None, None
+        overview = self._lookup_symbol_profile(upper)
+        name = str(overview.get("name") or "").upper().replace(" ", "")
+        exchange = str(overview.get("exchange") or "").strip().upper()
+        code = upper.split(".", 1)[0]
+        if name.startswith(("ST", "*ST", "S*ST", "PT")):
+            return 5.0, "ST 5cm"
+        if upper.endswith(".BJ") or exchange in {"BSE", "BJ"}:
+            return 30.0, "BSE 30cm"
+        if code.startswith(("688", "689")):
+            return 20.0, "STAR 20cm"
+        if code.startswith(("300", "301")):
+            return 20.0, "ChiNext 20cm"
+        return 10.0, "Main Board 10cm"
+
+    def _limit_threshold_pct(self, ticker: str) -> float | None:
+        band_pct, _board_type = self._resolve_cn_limit_profile(ticker)
+        if band_pct is None:
+            return None
+        return max(0.1, band_pct - 0.2)
+
+    def _daily_return_pct(self, frame: pd.DataFrame, *, current_index: int, previous_index: int) -> float | None:
+        try:
+            current = frame.iloc[current_index]
+            previous = frame.iloc[previous_index]
+        except IndexError:
+            return None
+        previous_close = float(previous.get("close") or 0)
+        current_close = float(current.get("close") or 0)
+        if previous_close <= 0:
+            return None
+        return (current_close / previous_close - 1.0) * 100.0
+
     def _build_indicators(self, frame: pd.DataFrame) -> pd.DataFrame:
         data = frame.copy()
         data["ma5"] = data["close"].rolling(5).mean()
@@ -228,29 +295,32 @@ class TechnicalPatternService:
         data["macd_hist"] = (data["dif"] - data["dea"]) * 2
         return data
 
-    def _is_limit_up_today(self, frame: pd.DataFrame) -> bool:
-        if len(frame) < 2:
+    def _is_limit_up_today(self, frame: pd.DataFrame, *, ticker: str) -> bool:
+        threshold = self._limit_threshold_pct(ticker)
+        if threshold is None or len(frame) < 2:
             return False
-        latest = frame.iloc[-1]
-        previous = frame.iloc[-2]
-        previous_close = float(previous.get("close") or 0)
-        current_close = float(latest.get("close") or 0)
-        if previous_close <= 0:
+        pct = self._daily_return_pct(frame, current_index=-1, previous_index=-2)
+        if pct is None:
             return False
-        pct = (current_close / previous_close - 1.0) * 100.0
-        return pct >= 9.8
+        return pct >= threshold
 
-    def _is_limit_up_yesterday(self, frame: pd.DataFrame) -> bool:
-        if len(frame) < 3:
+    def _is_limit_up_yesterday(self, frame: pd.DataFrame, *, ticker: str) -> bool:
+        threshold = self._limit_threshold_pct(ticker)
+        if threshold is None or len(frame) < 3:
             return False
-        previous = frame.iloc[-2]
-        prev_previous = frame.iloc[-3]
-        prev_previous_close = float(prev_previous.get("close") or 0)
-        previous_close = float(previous.get("close") or 0)
-        if prev_previous_close <= 0:
+        pct = self._daily_return_pct(frame, current_index=-2, previous_index=-3)
+        if pct is None:
             return False
-        pct = (previous_close / prev_previous_close - 1.0) * 100.0
-        return pct >= 9.8
+        return pct >= threshold
+
+    def _is_limit_down_today(self, frame: pd.DataFrame, *, ticker: str) -> bool:
+        threshold = self._limit_threshold_pct(ticker)
+        if threshold is None or len(frame) < 2:
+            return False
+        pct = self._daily_return_pct(frame, current_index=-1, previous_index=-2)
+        if pct is None:
+            return False
+        return pct <= -threshold
 
     def _is_volume_breakout(self, frame: pd.DataFrame) -> bool:
         if len(frame) < 25:

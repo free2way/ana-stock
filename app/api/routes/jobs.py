@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -5,7 +6,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
-from app.core.db import get_db_session
+from app.core.db import SessionLocal, get_db_session
 from app.services.auto_analysis import auto_analysis_service
 from app.services.auth import is_authenticated, login_redirect
 from app.services.backtester import BacktestRunner
@@ -170,6 +171,100 @@ def _combine_screener_precompute_batches(*batch_results: dict) -> dict:
     }
 
 
+def _run_cn_precompute_tail_jobs(*, source_job_id: int, parent_job_id: int | None = None) -> None:
+    def _run_combo_job() -> None:
+        with SessionLocal() as db:
+            job_repo = DataJobRepository(db)
+            job = job_repo.create_job(
+                job_type="screener_precompute_combos",
+                status="running",
+                params={"markets": ["CN"], "universes": ["full_market"], "depends_on": [parent_job_id] if parent_job_id else []},
+                message="Precomputing CN multi-model screener snapshots in the background.",
+            )
+            job_id = job.id
+        try:
+            with SessionLocal() as db:
+                result = refresh_precomputed_multi_screener_snapshots(
+                    db,
+                    source_job_id=source_job_id,
+                    markets=["CN"],
+                )
+            with SessionLocal() as db:
+                complete_job_and_build_payload(
+                    DataJobRepository(db),
+                    job_id=job_id,
+                    status=_result_status(result),
+                    message=f"Precomputed {result.get('count', 0)} CN multi-model screener snapshot(s).",
+                    **{key: value for key, value in result.items() if key not in {'status', 'message'}},
+                )
+        except Exception as exc:
+            with SessionLocal() as db:
+                fail_job_and_build_payload(DataJobRepository(db), job_id=job_id, exc=exc)
+
+    def _run_rest_job() -> None:
+        with SessionLocal() as db:
+            job_repo = DataJobRepository(db)
+            job = job_repo.create_job(
+                job_type="screener_precompute_rest",
+                status="running",
+                params={"markets": ["CN"], "universes": ["full_market", "watchlist"], "depends_on": [parent_job_id] if parent_job_id else []},
+                message="Precomputing secondary CN screener snapshots in the background.",
+            )
+            job_id = job.id
+        try:
+            with SessionLocal() as db:
+                result_full = refresh_precomputed_screener_snapshots(
+                    db,
+                    source_job_id=source_job_id,
+                    markets=["CN"],
+                    include_watchlist=False,
+                    lake_only=False,
+                    template_keys=REST_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES + FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES,
+                    universes=["full_market"],
+                )
+            with SessionLocal() as db:
+                result_watchlist = refresh_precomputed_screener_snapshots(
+                    db,
+                    source_job_id=source_job_id,
+                    markets=["CN"],
+                    include_watchlist=True,
+                    lake_only=False,
+                    template_keys=WATCHLIST_PRECOMPUTE_TEMPLATES,
+                    universes=["watchlist"],
+                )
+            result = {
+                "status": "success" if int(result_full.get("count", 0) or 0) + int(result_watchlist.get("count", 0) or 0) > 0 else "failed",
+                "count": int(result_full.get("count", 0) or 0) + int(result_watchlist.get("count", 0) or 0),
+                "failed_count": int(result_full.get("failed_count", 0) or 0) + int(result_watchlist.get("failed_count", 0) or 0),
+                "snapshots_created": list(result_full.get("snapshots_created") or []) + list(result_watchlist.get("snapshots_created") or []),
+                "failed_templates": list(result_full.get("failed_templates") or []) + list(result_watchlist.get("failed_templates") or []),
+                "batches": [
+                    {"batch": "cn_full_market_rest", **result_full},
+                    {"batch": "watchlist", **result_watchlist},
+                ],
+            }
+            with SessionLocal() as db:
+                complete_job_and_build_payload(
+                    DataJobRepository(db),
+                    job_id=job_id,
+                    status=_result_status(result),
+                    message=f"Precomputed {result.get('count', 0)} secondary CN screener snapshot(s).",
+                    **{key: value for key, value in result.items() if key not in {'status', 'message'}},
+                )
+        except Exception as exc:
+            with SessionLocal() as db:
+                fail_job_and_build_payload(DataJobRepository(db), job_id=job_id, exc=exc)
+
+    try:
+        _run_combo_job()
+    except Exception:
+        pass
+    try:
+        _run_rest_job()
+    except Exception:
+        pass
+
+
 @router.get("/templates")
 def job_templates(request: Request):
     if not is_authenticated(request):
@@ -183,11 +278,12 @@ def job_templates(request: Request):
         {"job_type": "refresh_cn_market_data_lake_only", "description": "Refresh A-share market prices directly into Parquet lake without generating CSV files."},
         {"job_type": "cn_close_review", "description": "Run the post-close CN incremental refresh, rebuild, AI review, and recommendations pipeline."},
         {"job_type": "train_cn_signals", "description": "Train the LightGBM A-share multifactor signal model from the local CN Parquet market lake and write predictions."},
-        {"job_type": "screener_precompute", "description": "Run the full staged A-share screener precompute pipeline after CN close review."},
+        {"job_type": "screener_precompute", "description": "Finish the core A-share screener precompute first, then let combo/rest snapshots continue in background child jobs."},
         {"job_type": "screener_precompute_core", "description": "Precompute the core A-share screener templates used by the dashboard and model screens first."},
         {"job_type": "screener_precompute_combos", "description": "Precompute the core multi-model A-share confluence presets after the base templates are ready."},
         {"job_type": "screener_precompute_rest", "description": "Precompute the remaining A-share screener templates and watchlist snapshots in the background."},
         {"job_type": "model_selection_guidance_snapshot", "description": "Persist the latest model-usage guidance snapshot so Dashboard and Model Performance can read it without full-market recompute."},
+        {"job_type": "model_calibration_snapshot", "description": "Persist out-of-sample LightGBM execution calibration so expected returns are not based only on in-sample buckets."},
         {"job_type": "social_signal_poll", "description": "Poll tracked X accounts every 30 minutes and parse ticker mentions automatically."},
         {"job_type": "social_us_price_sync", "description": "Automatically sync Alpaca-backed U.S. prices for tickers mentioned in imported X posts."},
         {"job_type": "precompute_us_screeners", "description": "Precompute U.S. screener snapshots after U.S. close using the locally synced U.S. symbol pool."},
@@ -282,7 +378,8 @@ async def send_ai_daily_report(request: Request, db: Session = Depends(get_db_se
         failed: list[dict] = []
         results: list[dict] = []
         for message_item in push_messages:
-            result = notifier.send_text(
+            result = notifier.send_event(
+                event_type="stock_recommendation",
                 title=message_item["title"],
                 body=message_item["body"],
                 channels=selected_channels or None,
@@ -442,57 +539,31 @@ async def run_precompute_cn_screeners(request: Request, db: Session = Depends(ge
             template_keys=CORE_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
             universes=["full_market"],
         )
-        result_combos = refresh_precomputed_multi_screener_snapshots(
-            db,
-            source_job_id=job.id,
-            markets=["CN"],
-        )
-        result_full = refresh_precomputed_screener_snapshots(
-            db,
-            source_job_id=job.id,
-            markets=["CN"],
-            include_watchlist=False,
-            lake_only=False,
-            template_keys=REST_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES + FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES,
-            universes=["full_market"],
-        )
-        result_watchlist = refresh_precomputed_screener_snapshots(
-            db,
-            source_job_id=job.id,
-            markets=["CN"],
-            include_watchlist=True,
-            lake_only=False,
-            template_keys=WATCHLIST_PRECOMPUTE_TEMPLATES,
-            universes=["watchlist"],
-        )
-        result_rest = {
-            "status": "success"
-            if int(result_full.get("count", 0) or 0) + int(result_watchlist.get("count", 0) or 0) > 0
-            else "failed",
-            "count": int(result_full.get("count", 0) or 0) + int(result_watchlist.get("count", 0) or 0),
-            "failed_count": int(result_full.get("failed_count", 0) or 0) + int(result_watchlist.get("failed_count", 0) or 0),
-            "snapshots_created": list(result_full.get("snapshots_created") or []) + list(result_watchlist.get("snapshots_created") or []),
-            "failed_templates": list(result_full.get("failed_templates") or []) + list(result_watchlist.get("failed_templates") or []),
-            "batches": [
-                {"batch": "cn_full_market_rest", **result_full},
-                {"batch": "watchlist", **result_watchlist},
-            ],
+        result = {
+            "status": _result_status(result_core),
+            "count": int(result_core.get("count", 0) or 0),
+            "failed_count": int(result_core.get("failed_count", 0) or 0),
+            "snapshots_created": list(result_core.get("snapshots_created") or []),
+            "failed_templates": list(result_core.get("failed_templates") or []),
+            "batches": [{"batch": "core", **result_core}],
+            "tail_jobs_scheduled": True,
         }
-        result = _combine_screener_precompute_batches(
-            {"batch": "core", **result_core},
-            {"batch": "combos", **result_combos},
-            {"batch": "rest", **result_rest},
-        )
         payload = complete_job_and_build_payload(
             job_repo,
             job_id=job.id,
             status=_result_status(result),
             message=(
-                f"Staged CN screener precompute finished: {result.get('count', 0)} snapshot(s)"
-                + (f", {result.get('failed_count', 0)} failure(s)." if result.get("failed_count", 0) else ".")
+                f"Core CN screener precompute finished: {result.get('count', 0)} snapshot(s); "
+                f"combo and rest jobs continue in background."
             ),
             **{key: value for key, value in result.items() if key not in {"status", "message"}},
         )
+        threading.Thread(
+            target=_run_cn_precompute_tail_jobs,
+            kwargs={"source_job_id": job.id, "parent_job_id": job.id},
+            name=f"manual-cn-precompute-tail-{job.id}",
+            daemon=True,
+        ).start()
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
         payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
@@ -1566,8 +1637,10 @@ async def update_auto_analysis_config(request: Request):
     signal_type = await _request_value(request, "signal_type", "momentum")
     lookback_days = await _request_value(request, "lookback_days", 3)
     top_n = await _request_value(request, "top_n", 1)
+    sync_cn_fundamentals_raw = await _request_value(request, "sync_cn_fundamentals", "")
     sync_cn_concepts_raw = await _request_value(request, "sync_cn_concepts", "")
     enabled = str(enabled_raw).lower() in {"1", "true", "yes", "on"}
+    sync_cn_fundamentals_enabled = str(sync_cn_fundamentals_raw).lower() in {"1", "true", "yes", "on"}
     sync_cn_concepts_enabled = str(sync_cn_concepts_raw).lower() in {"1", "true", "yes", "on"}
 
     status = auto_analysis_service.save_config(
@@ -1579,6 +1652,7 @@ async def update_auto_analysis_config(request: Request):
             "signal_type": signal_type,
             "lookback_days": lookback_days,
             "top_n": top_n,
+            "sync_cn_fundamentals": sync_cn_fundamentals_enabled,
             "sync_cn_concepts": sync_cn_concepts_enabled,
         }
     )

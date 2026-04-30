@@ -17,6 +17,7 @@ from app.services.market_sync import sync_market_data
 from app.services.repository import AppSettingRepository, SymbolRepository, WatchlistRepository, WorkspaceSnapshotRepository
 from app.services.runtime_cache import get_or_set
 from app.services.ai_daily_report import build_trade_explain_text, format_trade_gate_reason, format_trade_status
+from app.services.model_selection_guidance import load_model_selection_guidance_snapshot, summarize_model_selection_guidance
 from app.services.screener import MODEL_TEMPLATES, ScreenerService
 from app.services.screener_snapshots import (
     build_base_precompute_params,
@@ -183,7 +184,12 @@ SCREEN_TEXT = {
         "no_match": "No stocks matched the current rules.",
         "no_saved": "No saved strategies yet.",
         "load": "Load",
+        "rename": "Rename",
         "delete": "Delete",
+        "run_strategy": "Run Strategy",
+        "view_evaluation": "View Evaluation",
+        "new_name": "New name",
+        "run_receipt": "Strategy Run Receipt",
         "summary": "Summary",
         "hits": "Hits",
         "review_sync_settings": "Review Sync Settings",
@@ -282,7 +288,12 @@ SCREEN_TEXT = {
         "no_match": "当前没有股票符合筛选规则。",
         "no_saved": "还没有保存的策略。",
         "load": "加载",
+        "rename": "重命名",
         "delete": "删除",
+        "run_strategy": "运行策略",
+        "view_evaluation": "查看评测",
+        "new_name": "新名称",
+        "run_receipt": "策略运行收据",
         "summary": "摘要",
         "hits": "命中数",
         "review_sync_settings": "检查同步设置",
@@ -378,6 +389,8 @@ def _market_section_label(market: str | None, lang: str) -> str:
 
 
 def _confluence_bucket_label(bucket: str, lang: str) -> str:
+    if str(bucket or "").upper() == "ALL":
+        return {"zh": "任意共振动作", "en": "Any confluence"}.get(lang, "Any confluence")
     return CONFLUENCE_BUCKET_LABELS.get(bucket, {}).get(lang, bucket)
 
 
@@ -1187,6 +1200,7 @@ def _technical_pattern_evaluation_card(*, model_template: str, market: str, lang
     )
     maturity = pattern_template_maturity(evaluation, lang=lang)
     windows = evaluation.get("windows") or {}
+    execution = evaluation.get("execution") or {}
     sector_windows = evaluation.get("sector_windows") or {}
     sector_counts = evaluation.get("sector_counts") or {}
     snapshot_total = int(evaluation.get("snapshot_total") or 0)
@@ -1236,6 +1250,21 @@ def _technical_pattern_evaluation_card(*, model_template: str, market: str, lang
             )
         return "".join(rows)
 
+    def _execution_row(action_key: str, label: str) -> str:
+        stats = execution.get(action_key) or {}
+        return (
+            "<tr>"
+            f"<td>{label}</td>"
+            f"<td>{int(stats.get('count') or 0)}</td>"
+            f"<td>{_fmt_number(stats.get('execution_hit_rate'), suffix='%', digits=1)}</td>"
+            f"<td>{_fmt_number(stats.get('avg_next_open_gap'), suffix='%', digits=2)}</td>"
+            f"<td>{_fmt_number(stats.get('avg_next_open_to_high'), suffix='%', digits=2)}</td>"
+            f"<td>{_fmt_number(stats.get('avg_next_low_drawdown'), suffix='%', digits=2)}</td>"
+            f"<td>{_fmt_number(stats.get('gap_blocked_rate'), suffix='%', digits=1)}</td>"
+            f"<td>{_fmt_number(stats.get('limit_unbuyable_rate'), suffix='%', digits=1)}</td>"
+            "</tr>"
+        )
+
     maturity_style = (
         "background:#dcfce7;color:#166534;"
         if str(maturity.get("tone")) == "good"
@@ -1270,6 +1299,11 @@ def _technical_pattern_evaluation_card(*, model_template: str, market: str, lang
         + "<table style='width:100%;min-width:760px;border-collapse:collapse;font-size:13px;'>"
         + f"<thead><tr><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>{'动作' if lang == 'zh' else 'Action'}</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>1D {'样本' if lang == 'zh' else 'Samples'}</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>1D</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>3D {'样本' if lang == 'zh' else 'Samples'}</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>3D</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>5D {'样本' if lang == 'zh' else 'Samples'}</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>5D</th></tr></thead>"
         + f"<tbody>{_metric_row('buy_the_dip', 'Buy The Dip')}{_metric_row('wait_for_breakout', 'Wait For Breakout')}{_metric_row('hold_and_watch', 'Hold And Watch')}</tbody>"
+        + "</table></div>"
+        + "<div style='overflow-x:auto;border:1px solid #e2e8f0;border-radius:12px;background:white;margin-top:12px;'>"
+        + "<table style='width:100%;min-width:860px;border-collapse:collapse;font-size:13px;'>"
+        + f"<thead><tr><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>{'执行动作' if lang == 'zh' else 'Execution'}</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>{'样本' if lang == 'zh' else 'Samples'}</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>{'次日可交易命中' if lang == 'zh' else 'Tradable Hit'}</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>{'次日开盘缺口' if lang == 'zh' else 'Next Open Gap'}</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>{'开盘后最大冲高' if lang == 'zh' else 'Open To High'}</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>{'盘中最大回撤' if lang == 'zh' else 'Intraday Drawdown'}</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>{'高开受阻' if lang == 'zh' else 'Gap Blocked'}</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>{'一字/买不到' if lang == 'zh' else 'Limit Unbuyable'}</th></tr></thead>"
+        + f"<tbody>{_execution_row('buy_the_dip', 'Buy The Dip')}{_execution_row('wait_for_breakout', 'Wait For Breakout')}{_execution_row('hold_and_watch', 'Hold And Watch')}</tbody>"
         + "</table></div>"
         + f"<div class='muted' style='margin-top:10px;'>{note}</div>"
         + f"<div class='muted' style='margin-top:8px;'>{html.escape(str(maturity.get('summary') or ''))}</div>"
@@ -2765,6 +2799,17 @@ def _load_screener_snapshot(params: dict) -> list[dict] | None:
     return rows if isinstance(rows, list) else None
 
 
+def _load_screener_snapshot_record(params: dict) -> dict | None:
+    with SessionLocal() as db:
+        snapshot = WorkspaceSnapshotRepository(db).get_latest_snapshot(screener_snapshot_type(params))
+    if not snapshot:
+        return None
+    payload = snapshot.get("payload") or {}
+    if payload.get("key") != screener_snapshot_key(params):
+        return None
+    return snapshot
+
+
 def _persist_screener_snapshot(params: dict, rows: list[dict]) -> None:
     payload = {
         "key": screener_snapshot_key(params),
@@ -2777,6 +2822,94 @@ def _persist_screener_snapshot(params: dict, rows: list[dict]) -> None:
             snapshot_date=app_now_iso(),
             payload=payload,
         )
+
+
+def _screen_run_receipt_html(
+    *,
+    service: ScreenerService,
+    params: dict,
+    results: list[dict],
+    snapshot_ready: bool,
+    multi_templates_active: list[str],
+    multi_screen_meta: dict,
+    lang: str,
+) -> str:
+    normalized = _normalize_screen_params(params)
+    source_params = normalized
+    source_kind = "multi" if len(multi_templates_active) >= 2 else "exact"
+    snapshot = _load_screener_snapshot_record(source_params)
+    if snapshot is None and len(multi_templates_active) < 2:
+        base_params = build_base_precompute_params(
+            model_template=str(normalized.get("model_template") or "technical_momentum"),
+            universe=str(normalized.get("universe") or "watchlist"),
+            market=str(normalized.get("market") or "ALL"),
+        )
+        snapshot = _load_screener_snapshot_record(base_params)
+        if snapshot is not None:
+            source_params = base_params
+            source_kind = "base_precompute"
+    payload = (snapshot or {}).get("payload") if isinstance(snapshot, dict) else {}
+    if not isinstance(payload, dict):
+        payload = {}
+    param_digest = screener_snapshot_type(source_params).split(":", 1)[-1]
+    source_label = {
+        "multi": "多模型组合快照" if lang == "zh" else "Multi-model snapshot",
+        "base_precompute": "基础预计算快照" if lang == "zh" else "Base precompute snapshot",
+        "exact": "精确参数快照" if lang == "zh" else "Exact parameter snapshot",
+    }.get(source_kind, source_kind)
+    if snapshot is None:
+        source_label = "页面实时结果 / 待预计算" if lang == "zh" else "Page result / pending precompute"
+    template_label = _preset_display_label(normalized, lang)
+    param_summary = _preset_summary(normalized, lang)
+    available_labels = [
+        _template_label(key, MODEL_TEMPLATES[key]["label"], lang)
+        for key in (multi_screen_meta.get("available_templates") or [])
+        if key in MODEL_TEMPLATES
+    ]
+    missing_labels = [
+        _template_label(key, MODEL_TEMPLATES[key]["label"], lang)
+        for key in (multi_screen_meta.get("missing_templates") or [])
+        if key in MODEL_TEMPLATES
+    ]
+    lineage_rows = [
+        ("策略/模型" if lang == "zh" else "Strategy/Model", template_label),
+        ("参数摘要" if lang == "zh" else "Parameter Summary", param_summary),
+        ("结果数量" if lang == "zh" else "Result Count", str(len(results))),
+        ("快照状态" if lang == "zh" else "Snapshot Status", "已就绪" if snapshot_ready else ("待生成" if lang == "zh" else "Pending")),
+        ("来源类型" if lang == "zh" else "Source Type", source_label),
+        ("快照 ID" if lang == "zh" else "Snapshot ID", str((snapshot or {}).get("id") or "-")),
+        ("来源 Job" if lang == "zh" else "Source Job", str((snapshot or {}).get("source_job_id") or "-")),
+        ("生成时间" if lang == "zh" else "Created At", _compact_text(str((snapshot or {}).get("created_at") or payload.get("updated_at") or "-"), 32)),
+        ("参数指纹" if lang == "zh" else "Param Fingerprint", param_digest),
+    ]
+    candidate_stats = payload.get("candidate_stats") if isinstance(payload.get("candidate_stats"), dict) else {}
+    if candidate_stats:
+        returned_count = candidate_stats.get("returned_count")
+        persisted_count = candidate_stats.get("persisted_count")
+        source_limit = candidate_stats.get("limit")
+        stats_text = (
+            f"筛选返回 {returned_count} / 快照落库 {persisted_count} / 上限 {source_limit}"
+            if lang == "zh"
+            else f"Returned {returned_count} / persisted {persisted_count} / limit {source_limit}"
+        )
+        lineage_rows.append(("候选口径" if lang == "zh" else "Candidate Scope", stats_text))
+    if len(multi_templates_active) >= 2:
+        lineage_rows.append(("参与模型" if lang == "zh" else "Available Models", " / ".join(available_labels) or "-"))
+        lineage_rows.append(("缺失模型" if lang == "zh" else "Missing Models", " / ".join(missing_labels) or ("无" if lang == "zh" else "None")))
+    rows_html = "".join(
+        "<div class='receipt-row'>"
+        f"<span>{html.escape(label)}</span>"
+        f"<strong title='{html.escape(value)}'>{html.escape(_compact_text(value, 72))}</strong>"
+        "</div>"
+        for label, value in lineage_rows
+    )
+    return (
+        "<article class='card run-receipt-card'>"
+        f"<div class='eyebrow'>{_lang_text(lang, 'run_receipt')}</div>"
+        f"<p class='lead'>{'这张收据用于回看：本次结果来自哪组参数、哪个快照、哪个后台 job。后续日报和历史命中评测可以继续沿这个指纹关联。' if lang == 'zh' else 'This receipt records which parameters, snapshot, and background job produced the current result set.'}</p>"
+        f"<div class='receipt-grid'>{rows_html}</div>"
+        "</article>"
+    )
 
 
 def _load_today_focus_items() -> list[dict]:
@@ -3241,6 +3374,11 @@ def screener_page(
         {
             "label": {"zh": "回踩共振", "en": "Dip Confluence"},
             "save_name": {"zh": "回踩共振", "en": "Dip Confluence"},
+            "description": {
+                "zh": "用 LightGBM、强趋势、动量、锤子线和水下金叉共同确认回踩机会，适合找不追高的低吸候选。",
+                "en": "Combines LightGBM, trend, momentum, hammer reversal, and underwater MACD cross to find non-chasing dip candidates.",
+            },
+            "best_for": {"zh": "低吸 / Buy the dip", "en": "Dip entries"},
             "params": {
                 "model_template": "next_tesla_swing",
                 "multi_model_templates": ["lightgbm_top_picks", "next_tesla_swing", "technical_momentum", "cn_hammer_reversal", "cn_macd_underwater_cross"],
@@ -3258,6 +3396,11 @@ def screener_page(
         {
             "label": {"zh": "突破共振", "en": "Breakout Confluence"},
             "save_name": {"zh": "突破共振", "en": "Breakout Confluence"},
+            "description": {
+                "zh": "把趋势、动量、放量突破和均线多头排列叠加，用于识别临近突破或已经确认突破的强势股。",
+                "en": "Stacks trend, momentum, volume breakout, and bullish MA alignment to find confirmed or near-confirmed breakouts.",
+            },
+            "best_for": {"zh": "突破确认", "en": "Breakout confirmation"},
             "params": {
                 "model_template": "next_tesla_swing",
                 "multi_model_templates": ["lightgbm_top_picks", "next_tesla_swing", "technical_momentum", "cn_volume_breakout", "cn_bullish_ma_stack"],
@@ -3275,6 +3418,11 @@ def screener_page(
         {
             "label": {"zh": "偏多入场共振", "en": "Bullish Entry Confluence"},
             "save_name": {"zh": "偏多入场共振", "en": "Bullish Entry Confluence"},
+            "description": {
+                "zh": "把多因子、技术动量、放量突破、成长价值和高 ROE 稳增组合在一起，偏向基本面质量更强的入场候选。",
+                "en": "Blends factors, technical momentum, breakout, growth/value, and high-ROE steadiness for higher-quality bullish entries.",
+            },
+            "best_for": {"zh": "质量 + 入场", "en": "Quality entries"},
             "params": {
                 "model_template": "lightgbm_top_picks",
                 "multi_model_templates": ["lightgbm_top_picks", "technical_momentum", "cn_volume_breakout", "cn_growth_value", "cn_high_roe_steady_growth"],
@@ -3292,6 +3440,11 @@ def screener_page(
         {
             "label": {"zh": "强趋势+动量+LightGBM", "en": "Trend + Momentum + LightGBM"},
             "save_name": {"zh": "强趋势+动量+LightGBM", "en": "Trend + Momentum + LightGBM"},
+            "description": {
+                "zh": "用核心模型做宽口径共振，优先看模型命中数量，适合快速找全市场强势候选池。",
+                "en": "Uses the core models as a broad confluence pass, ranking by model-hit count for fast full-market discovery.",
+            },
+            "best_for": {"zh": "强势池初筛", "en": "Momentum pool"},
             "params": {
                 "model_template": "lightgbm_top_picks",
                 "multi_model_templates": ["lightgbm_top_picks", "next_tesla_swing", "technical_momentum"],
@@ -3309,6 +3462,11 @@ def screener_page(
         {
             "label": {"zh": "LightGBM+突破共振", "en": "LightGBM + Breakout"},
             "save_name": {"zh": "LightGBM+突破共振", "en": "LightGBM + Breakout"},
+            "description": {
+                "zh": "保留 LightGBM 排名，同时叠加动量、放量突破和均线结构，适合从模型高分里筛真正可交易的突破票。",
+                "en": "Keeps LightGBM ranking but requires momentum, volume breakout, and MA structure to narrow high-score names into tradable breakouts.",
+            },
+            "best_for": {"zh": "模型高分 + 突破", "en": "High-score breakouts"},
             "params": {
                 "model_template": "lightgbm_top_picks",
                 "multi_model_templates": ["lightgbm_top_picks", "technical_momentum", "cn_volume_breakout", "cn_bullish_ma_stack"],
@@ -3336,6 +3494,140 @@ def screener_page(
             "</div>"
         )
         for preset in quick_confluence_presets
+    )
+    guidance_payload = load_model_selection_guidance_snapshot(
+        db,
+        market=market if market in {"CN", "US", "ALL"} else "CN",
+        allow_fallback=True,
+    )
+    guidance_summary = summarize_model_selection_guidance(guidance_payload, lang=lang)
+    guidance_top_model = guidance_summary.get("top_model") or {}
+    guidance_top_combo = guidance_summary.get("top_combo") or {}
+    top_model_href = html.escape(
+        str(guidance_summary.get("top_model_href") or f"/screeners?lang={lang}&market=CN&universe=full_market&run=1"),
+        quote=True,
+    )
+    top_combo_href = html.escape(
+        str(guidance_summary.get("top_combo_href") or f"/screeners?lang={lang}&market=CN&universe=full_market&run=1"),
+        quote=True,
+    )
+    guidance_source_meta = guidance_summary.get("snapshot_meta") or {}
+    guidance_source_text = (
+        f"{'样本来源' if lang == 'zh' else 'Source'}："
+        f"{'后台评测快照' if str(guidance_source_meta.get('source') or '') == 'snapshot' else '实时回退'}"
+        f" · {guidance_source_meta.get('snapshot_date') or guidance_source_meta.get('generated_at') or '-'}"
+    )
+    guidance_top_model_metrics = (
+        f"1D {_fmt_number(((guidance_top_model.get('stats_1d') or {}).get('avg_return')), suffix='%', digits=2)}"
+        f" / {_fmt_number(((guidance_top_model.get('stats_1d') or {}).get('hit_rate')), suffix='%', digits=1)}"
+        f" · 3D {_fmt_number(((guidance_top_model.get('stats_3d') or {}).get('avg_return')), suffix='%', digits=2)}"
+        f" / {_fmt_number(((guidance_top_model.get('stats_3d') or {}).get('hit_rate')), suffix='%', digits=1)}"
+    )
+    guidance_top_combo_metrics = (
+        f"1D {_fmt_number(((guidance_top_combo.get('stats_1d') or {}).get('avg_return')), suffix='%', digits=2)}"
+        f" / {_fmt_number(((guidance_top_combo.get('stats_1d') or {}).get('hit_rate')), suffix='%', digits=1)}"
+        f" · 5D {_fmt_number(((guidance_top_combo.get('stats_5d') or {}).get('avg_return')), suffix='%', digits=2)}"
+        f" / {_fmt_number(((guidance_top_combo.get('stats_5d') or {}).get('hit_rate')), suffix='%', digits=1)}"
+    )
+    guidance_bridge_html = (
+        "<section class='card' style='background:#f8fbff;border-color:#d7e7f8;'>"
+        f"<div class='eyebrow'>{'今日模型导航' if lang == 'zh' else 'Today Model Guide'}</div>"
+        f"<h2 style='margin:0 0 6px;'>{'先跑最有效的，再补充共振' if lang == 'zh' else 'Start with the best edge, then add confluence'}</h2>"
+        f"<p class='lead'>{html.escape(str(guidance_source_text))}</p>"
+        "<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin-top:14px;'>"
+        "<article class='detail-card' style='background:#ffffff;'>"
+        f"<div class='detail-label'>{'优先模型' if lang == 'zh' else 'Priority Model'}</div>"
+        f"<div style='font-size:22px;font-weight:900;color:#0f172a;margin-top:6px;'>{html.escape(str(guidance_summary.get('top_model_title') or '-'))}</div>"
+        f"<div class='muted' style='margin-top:8px;'>{html.escape(str(guidance_summary.get('top_model_summary') or '-'))}</div>"
+        f"<div class='muted' style='margin-top:8px;'>{html.escape(guidance_top_model_metrics)}</div>"
+        f"<div style='display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;'><a class='detail-link' href='{top_model_href}'>{'按这个模型筛' if lang == 'zh' else 'Run this model'}</a><a class='detail-link' href='{evaluation_overview_href}'>{'看评测' if lang == 'zh' else 'View evaluation'}</a></div>"
+        "</article>"
+        "<article class='detail-card' style='background:#ffffff;'>"
+        f"<div class='detail-label'>{'优先组合' if lang == 'zh' else 'Priority Confluence'}</div>"
+        f"<div style='font-size:22px;font-weight:900;color:#0f172a;margin-top:6px;'>{html.escape(str(guidance_summary.get('top_combo_title') or '-'))}</div>"
+        f"<div class='muted' style='margin-top:8px;'>{html.escape(str(guidance_summary.get('top_combo_summary') or '-'))}</div>"
+        f"<div class='muted' style='margin-top:8px;'>{html.escape(guidance_top_combo_metrics)}</div>"
+        f"<div style='display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;'><a class='detail-link' href='{top_combo_href}'>{'直接跑组合' if lang == 'zh' else 'Run confluence'}</a><a class='detail-link' href='/dashboard/model-performance/winner-traceback?lang={lang}&market={market if market in {'CN','US','ALL'} else 'CN'}'>{'看强票归因' if lang == 'zh' else 'Winner traceback'}</a></div>"
+        "</article>"
+        "<article class='detail-card' style='background:#ffffff;'>"
+        f"<div class='detail-label'>{'今日使用建议' if lang == 'zh' else 'Today Workflow'}</div>"
+        f"<div class='muted' style='margin-top:8px;'>{'1. 先跑优先模型看当日基准候选。 2. 再跑优先组合做降噪。 3. 最后只处理 READY 且接近买点的票。' if lang == 'zh' else '1. Start with the priority model. 2. Use the priority confluence to reduce noise. 3. Only act on READY names near their planned entry zones.'}</div>"
+        f"<div style='display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;'><a class='detail-link' href='{top_model_href}'>{'先跑基准模型' if lang == 'zh' else 'Run baseline'}</a><a class='detail-link' href='{top_combo_href}'>{'再跑共振' if lang == 'zh' else 'Then confluence'}</a></div>"
+        "</article>"
+        "</div>"
+        "</section>"
+    )
+    strategy_template_cards_html = "".join(
+        (
+            "<article class='strategy-template-card'>"
+            "<div class='template-top'>"
+            f"<span class='template-mode'>{'策略模板' if lang == 'zh' else 'Strategy'}</span>"
+            f"<span class='template-market'>{preset['params'].get('market', 'CN')}</span>"
+            "</div>"
+            f"<div class='strategy-template-title'>{preset['label'][lang]}</div>"
+            f"<div class='template-desc'>{preset.get('description', {}).get(lang, '')}</div>"
+            "<div class='strategy-meta-row'>"
+            f"<span class='default-chip'>{preset.get('best_for', {}).get(lang, '')}</span>"
+            f"<span class='default-chip'>{'至少命中' if lang == 'zh' else 'Min hits'} {preset['params'].get('min_multi_model_hits', 2)}</span>"
+            f"<span class='default-chip'>{_confluence_bucket_label(str(preset['params'].get('confluence_action_filter') or 'ALL'), lang)}</span>"
+            "</div>"
+            "<div class='strategy-template-actions'>"
+            f"<a class='detail-link' href='{_build_screen_query(preset['params'])}'>{'运行策略' if lang == 'zh' else 'Run Strategy'}</a>"
+            f"<a class='detail-link' href='{evaluation_overview_href}'>{'查看评测' if lang == 'zh' else 'View Evaluation'}</a>"
+            f"<form method='post' action='/screeners/save' style='margin:0;display:flex;align-items:center;'>"
+            f"<input type='hidden' name='preset_name' value='{html.escape(preset['save_name'][lang])}' />"
+            f"{_preset_hidden_fields_html(preset['params'])}"
+            f"<button type='submit' style='width:auto;min-width:0;padding:10px 12px;'>{'保存为我的策略' if lang == 'zh' else 'Save Strategy'}</button>"
+            "</form>"
+            "</div>"
+            "</article>"
+        )
+        for preset in quick_confluence_presets
+    )
+    single_model_href = _build_screen_query(
+        {
+            **current_params,
+            "multi_model_templates": [],
+            "min_multi_model_hits": 1,
+            "confluence_action_filter": "ALL",
+            "run": 1,
+        }
+    )
+    workbench_entries = [
+        {
+            "code": "MODEL",
+            "title": {"zh": "模型筛选", "en": "Model Screening"},
+            "body": {"zh": "单独运行一个模型模板，适合验证某个打法今天是否有票。", "en": "Run one model template to validate whether a single playbook has candidates today."},
+            "href": single_model_href,
+        },
+        {
+            "code": "TPL",
+            "title": {"zh": "策略模板", "en": "Strategy Templates"},
+            "body": {"zh": "直接使用预设组合：回踩、突破、质量入场、强趋势共振。", "en": "Use pre-built strategy combinations for dips, breakouts, quality entries, and trend confluence."},
+            "href": "#strategy-templates",
+        },
+        {
+            "code": "COMBO",
+            "title": {"zh": "多模型组合", "en": "Multi-Model Confluence"},
+            "body": {"zh": "勾选多个模型，按命中数量和动作一致性筛掉噪音。", "en": "Select multiple models and rank by overlap plus action alignment to reduce noise."},
+            "href": "#multi-model-combos",
+        },
+        {
+            "code": "EVAL",
+            "title": {"zh": "模型评测总览", "en": "Model Evaluation Overview"},
+            "body": {"zh": "先看近期哪个模型或组合更有效，再决定今天用哪套筛选。", "en": "Review recent model and combo effectiveness before choosing today’s screening path."},
+            "href": evaluation_overview_href,
+        },
+    ]
+    strategy_workbench_html = "".join(
+        (
+            f"<a class='workbench-card' href='{entry['href']}'>"
+            f"<span class='workbench-code'>{entry['code']}</span>"
+            f"<strong>{entry['title'][lang]}</strong>"
+            f"<span>{entry['body'][lang]}</span>"
+            "</a>"
+        )
+        for entry in workbench_entries
     )
 
     row_chunks: list[str] = []
@@ -3426,31 +3718,58 @@ def screener_page(
         )
         for item in visible_results
     ) or f"<div class='empty'>{_lang_text(lang, 'no_match') if should_execute else empty_state}</div>"
-    preset_rows = "".join(
-        "<tr>"
-        f"<td title='{preset['name']}'>{_compact_text(preset['name'], 26)}</td>"
-        f"<td title='{_preset_display_label(preset['params'], lang)}'>{_compact_text(_preset_display_label(preset['params'], lang), 24)}</td>"
-        f"<td title='{_preset_summary(preset['params'], lang)}'>{_compact_text(_preset_summary(preset['params'], lang), 44)}</td>"
-        f"<td>{'点击加载后查看' if lang == 'zh' else 'Load to view'}</td>"
-        f"<td><a href='{_build_screen_query(preset['params'])}'>{_lang_text(lang, 'load')}</a></td>"
-        f"<td><form method='post' action='/screeners/delete' style='margin:0;'><input type='hidden' name='preset_name' value='{preset['name']}' /><input type='hidden' name='lang' value='{lang}' /><button type='submit'>{_lang_text(lang, 'delete')}</button></form></td>"
-        "</tr>"
-        for preset in saved_presets
-    ) or f"<tr><td colspan='6'>{_lang_text(lang, 'no_saved')}</td></tr>"
-    mobile_preset_cards = "".join(
-        (
+    preset_rows_parts: list[str] = []
+    mobile_preset_parts: list[str] = []
+    for preset in saved_presets:
+        preset_name = str(preset.get("name") or "").strip()
+        if not preset_name:
+            continue
+        preset_params = preset.get("params") if isinstance(preset.get("params"), dict) else {}
+        run_href = _build_screen_query(preset_params)
+        display_label = _preset_display_label(preset_params, lang)
+        preset_summary = _preset_summary(preset_params, lang)
+        market_label = str(preset_params.get("market") or "ALL")
+        preset_name_html = html.escape(preset_name)
+        preset_rows_parts.append(
+            "<tr>"
+            f"<td title='{preset_name_html}'><strong>{html.escape(_compact_text(preset_name, 26))}</strong><div class='muted'>{market_label}</div></td>"
+            f"<td title='{html.escape(display_label)}'>{html.escape(_compact_text(display_label, 24))}</td>"
+            f"<td title='{html.escape(preset_summary)}'>{html.escape(_compact_text(preset_summary, 48))}</td>"
+            f"<td>{'点击运行后查看' if lang == 'zh' else 'Run to view'}</td>"
+            f"<td><a class='detail-link' href='{run_href}'>{_lang_text(lang, 'run_strategy')}</a><div style='margin-top:6px;'><a class='detail-link' href='{evaluation_overview_href}'>{_lang_text(lang, 'view_evaluation')}</a></div></td>"
+            "<td>"
+            "<form method='post' action='/screeners/rename' style='margin:0;display:grid;gap:6px;min-width:180px;'>"
+            f"<input type='hidden' name='preset_name' value='{preset_name_html}' />"
+            f"<input type='hidden' name='lang' value='{lang}' />"
+            f"<input type='text' name='new_name' placeholder='{_lang_text(lang, 'new_name')}' value='{preset_name_html}' />"
+            f"<button type='submit' style='padding:8px 10px;'>{_lang_text(lang, 'rename')}</button>"
+            "</form>"
+            "</td>"
+            f"<td><form method='post' action='/screeners/delete' style='margin:0;'><input type='hidden' name='preset_name' value='{preset_name_html}' /><input type='hidden' name='lang' value='{lang}' /><button type='submit'>{_lang_text(lang, 'delete')}</button></form></td>"
+            "</tr>"
+        )
+        mobile_preset_parts.append(
             "<article class='mobile-preset-card'>"
-            f"<div style='font-weight:800;'>{_compact_text(preset['name'], 30)}</div>"
-            f"<div class='muted' style='margin-top:6px;'>{_compact_text(_preset_display_label(preset['params'], lang), 28)}</div>"
-            f"<div class='mobile-result-summary'>{_compact_text(_preset_summary(preset['params'], lang), 140)}</div>"
+            f"<div style='font-weight:800;'>{html.escape(_compact_text(preset_name, 30))}</div>"
+            f"<div class='muted' style='margin-top:6px;'>{html.escape(_compact_text(display_label, 28))}</div>"
+            f"<div class='mobile-result-summary'>{html.escape(_compact_text(preset_summary, 140))}</div>"
             "<div class='mobile-result-actions'>"
-            f"<a class='detail-link' href='{_build_screen_query(preset['params'])}'>{_lang_text(lang, 'load')}</a>"
-            f"<form method='post' action='/screeners/delete' style='margin:0;'><input type='hidden' name='preset_name' value='{preset['name']}' /><input type='hidden' name='lang' value='{lang}' /><button type='submit'>{_lang_text(lang, 'delete')}</button></form>"
+            f"<a class='detail-link' href='{run_href}'>{_lang_text(lang, 'run_strategy')}</a>"
+            f"<a class='detail-link' href='{evaluation_overview_href}'>{_lang_text(lang, 'view_evaluation')}</a>"
+            "</div>"
+            "<form method='post' action='/screeners/rename' style='margin:10px 0 0;display:grid;gap:8px;'>"
+            f"<input type='hidden' name='preset_name' value='{preset_name_html}' />"
+            f"<input type='hidden' name='lang' value='{lang}' />"
+            f"<input type='text' name='new_name' placeholder='{_lang_text(lang, 'new_name')}' value='{preset_name_html}' />"
+            f"<button type='submit'>{_lang_text(lang, 'rename')}</button>"
+            "</form>"
+            "<div class='mobile-result-actions'>"
+            f"<form method='post' action='/screeners/delete' style='margin:0;'><input type='hidden' name='preset_name' value='{preset_name_html}' /><input type='hidden' name='lang' value='{lang}' /><button type='submit'>{_lang_text(lang, 'delete')}</button></form>"
             "</div>"
             "</article>"
         )
-        for preset in saved_presets
-    ) or f"<div class='empty'>{_lang_text(lang, 'no_saved')}</div>"
+    preset_rows = "".join(preset_rows_parts) or f"<tr><td colspan='7'>{_lang_text(lang, 'no_saved')}</td></tr>"
+    mobile_preset_cards = "".join(mobile_preset_parts) or f"<div class='empty'>{_lang_text(lang, 'no_saved')}</div>"
     banner_html = _banner_html(message, lang)
     risk_top_tags_html = "".join(
         f"<span class='linkbtn'>{tag} · {count}</span>" for tag, count in risk_top_tags
@@ -3530,6 +3849,15 @@ def screener_page(
         visible_note += (
             f" <a href='{detail_rows_href}' style='color:var(--accent);font-weight:800;text-decoration:none;'>{'需要逐行解释时再展开行内详情' if lang == 'zh' else 'Open row details only when needed'}</a>."
         )
+    run_receipt_html = _screen_run_receipt_html(
+        service=service,
+        params=current_params,
+        results=results,
+        snapshot_ready=snapshot_ready,
+        multi_templates_active=multi_templates_active,
+        multi_screen_meta=multi_screen_meta,
+        lang=lang,
+    ) if should_execute else ""
     lang_switch_html = "".join(
         f"<a href='{_build_screen_query({**current_params, 'lang': code})}' style='padding:8px 12px;border-radius:999px;border:1px solid var(--line);background:{'#eef8f5' if lang == code else '#fff'};text-decoration:none;color:var(--ink);font-weight:700;'>{label}</a>"
         for code, label in LANG_OPTIONS
@@ -3591,6 +3919,70 @@ def screener_page(
           h1 {{ margin:0 0 6px; font-size:32px; }}
           .lead {{ margin:0; color:var(--muted); max-width:760px; }}
           .section-stack {{ display:grid; gap:12px; }}
+          .workbench-grid {{
+            display:grid;
+            gap:12px;
+            grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));
+            margin:12px 0;
+          }}
+          .workbench-card {{
+            display:grid;
+            gap:10px;
+            min-height:142px;
+            padding:16px;
+            border-radius:18px;
+            border:1px solid rgba(61,217,182,0.18);
+            background:
+              linear-gradient(135deg, rgba(61,217,182,0.12), rgba(82,168,255,0.07)),
+              rgba(11,19,29,0.88);
+            color:inherit;
+            text-decoration:none;
+            box-shadow:0 14px 34px rgba(0,0,0,0.18);
+          }}
+          .workbench-card:hover {{ border-color:var(--accent); transform:translateY(-1px); }}
+          .workbench-code {{
+            width:max-content;
+            display:inline-flex;
+            align-items:center;
+            padding:6px 10px;
+            border-radius:999px;
+            background:rgba(61,217,182,0.12);
+            color:var(--accent);
+            font-size:11px;
+            font-weight:900;
+            letter-spacing:0.06em;
+          }}
+          .workbench-card strong {{ font-size:18px; color:var(--ink); }}
+          .workbench-card span:last-child {{ color:var(--muted); font-size:13px; line-height:1.55; }}
+          .strategy-template-section {{ display:grid; gap:12px; margin-bottom:12px; }}
+          .strategy-template-grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); }}
+          .strategy-template-card {{
+            display:grid;
+            gap:12px;
+            align-content:start;
+            min-height:236px;
+            padding:16px;
+            border-radius:18px;
+            border:1px solid var(--line);
+            background:linear-gradient(180deg, rgba(17,28,40,0.98), rgba(12,21,32,0.96));
+            box-shadow:0 12px 28px rgba(0,0,0,0.14);
+          }}
+          .strategy-template-title {{ font-size:18px; font-weight:900; color:var(--ink); }}
+          .strategy-meta-row {{ display:flex; flex-wrap:wrap; gap:8px; }}
+          .strategy-template-actions {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:auto; }}
+          .run-receipt-card {{ background:linear-gradient(180deg, rgba(17,28,40,0.98), rgba(9,17,27,0.96)); border-color:rgba(82,168,255,0.20); }}
+          .receipt-grid {{ display:grid; gap:10px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-top:12px; }}
+          .receipt-row {{
+            display:grid;
+            gap:6px;
+            min-width:0;
+            padding:12px 13px;
+            border-radius:14px;
+            border:1px solid rgba(255,255,255,0.05);
+            background:rgba(11,19,29,0.82);
+          }}
+          .receipt-row span {{ color:var(--muted); font-size:11px; font-weight:900; letter-spacing:0.04em; text-transform:uppercase; }}
+          .receipt-row strong {{ color:var(--ink); font-size:13px; line-height:1.45; word-break:break-word; overflow-wrap:anywhere; }}
           .template-grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-top:12px; }}
           .multi-template-grid {{ display:grid; gap:10px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-top:12px; }}
           .multi-template-chip {{
@@ -3952,8 +4344,8 @@ def screener_page(
           <aside class="sidebar">
             <div class="brand">
               <span class="brand-tag">PQW</span>
-              <h1>{'模型选股' if lang == 'zh' else 'Screeners'}</h1>
-              <p>{'先选模板，再看结果，再决定是否加入自选或盯盘池。' if lang == 'zh' else 'Pick a template, review results, then move names into tracking.'}</p>
+              <h1>{'策略工作台' if lang == 'zh' else 'Strategy Workbench'}</h1>
+              <p>{'模型、模板、组合和评测放在同一条选股路径里。' if lang == 'zh' else 'Models, templates, confluence, and evaluation in one screening path.'}</p>
             </div>
             <nav class="side-nav">{render_workspace_nav_html(lang=lang, active_key='screeners')}</nav>
           </aside>
@@ -4024,15 +4416,27 @@ def screener_page(
             </a>
           </section>
           <div class="card">
-            <div class="eyebrow">{_lang_text(lang, 'quant_screener')}</div>
-            <h1>{_lang_text(lang, 'title')}</h1>
-            <p class="lead">{active_template['description']}</p>
+            <div class="eyebrow">{'Strategy Workbench' if lang == 'en' else '策略工作台'}</div>
+            <h1>{'先选打法，再看结果' if lang == 'zh' else 'Choose the playbook before the picks'}</h1>
+            <p class="lead">{'把单模型、策略模板、多模型共振和模型评测放在同一页，先确定今天用哪套打法，再决定是否加入自选或盯盘池。' if lang == 'zh' else 'Start with a single model, a strategy template, multi-model confluence, or the evaluation overview before moving names into watchlist or focus.'}</p>
             <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;">
               <span class="default-chip">{'Active template' if lang == 'en' else '当前模板'}: {_template_label(model_template, active_template['label'], lang)}</span>
               {active_defaults_html}
             </div>
           </div>
+          {guidance_bridge_html}
+          <section id="strategy-workbench" class="workbench-grid">{strategy_workbench_html}</section>
+          <section id="strategy-templates" class="strategy-template-section">
+            <article class="card">
+              <div class="eyebrow">{'策略模板' if lang == 'zh' else 'Strategy Templates'}</div>
+              <h2 style="margin:0 0 6px;">{'一键运行常用组合' if lang == 'zh' else 'Run the common playbooks in one click'}</h2>
+              <p class="lead">{'这些模板会复用完整筛选参数，适合每天盘后先跑一遍，再把结果加入自选或今日盯盘池。' if lang == 'zh' else 'These templates reuse the full parameter set, making them a fast after-hours first pass before watchlist or focus-pool review.'}</p>
+              <div class="strategy-template-actions" style="margin-top:12px;"><a class="detail-link" href="#my-strategies">{'管理我的策略' if lang == 'zh' else 'Manage My Strategies'}</a></div>
+            </article>
+            <div class="strategy-template-grid">{strategy_template_cards_html}</div>
+          </section>
           {screen_overview_html}
+          {run_receipt_html}
           {banner_html}
           {template_read_html}
           {template_overview_brief_html}
@@ -4043,7 +4447,7 @@ def screener_page(
           {confluence_leaderboard_html}
           {confluence_bucket_groups_html}
           <section class="section-stack">
-            <article class="card">
+            <article id="single-model-rules" class="card">
               <div class="eyebrow">{_lang_text(lang, 'rules')}</div>
               <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;">{quick_confluence_presets_html}</div>
               <div class="template-grid">{template_cards_html}</div>
@@ -4093,7 +4497,7 @@ def screener_page(
                     <input type="number" name="min_volume_ratio" min="0" step="0.1" value="{min_volume_ratio}" />
                   </div>
                 </div>
-                <div class="summary-note">{'如果想做多模型共振，勾选两个或以上模板。系统会按同一只股票被多少个模型同时命中来排序。' if lang == 'zh' else 'For confluence screening, tick two or more templates. The screener will rank names by how many models hit the same ticker.'}</div>
+                <div id="multi-model-combos" class="summary-note">{'如果想做多模型共振，勾选两个或以上模板。系统会按同一只股票被多少个模型同时命中来排序。' if lang == 'zh' else 'For confluence screening, tick two or more templates. The screener will rank names by how many models hit the same ticker.'}</div>
                 <div class="multi-template-grid">{multi_template_picker_html}</div>
                 <details class="advanced-panel">
                   <summary>{_lang_text(lang, 'cn_rules')}</summary>
@@ -4300,12 +4704,14 @@ def screener_page(
               <div class="scroll-hint">{_lang_text(lang, 'drag_hint')}</div>
             </article>
           </section>
-          <section class="card">
+          <section id="my-strategies" class="card">
             <div class="eyebrow">{_lang_text(lang, 'saved_strategies')}</div>
+            <h2 style="margin:0 0 6px;">{'我的策略管理' if lang == 'zh' else 'My Strategy Manager'}</h2>
+            <p class="lead" style="margin-bottom:14px;">{'这里保存的是你自己的筛选模板。可以重新运行、改名、删除，也可以跳到模型评测先看近期表现。' if lang == 'zh' else 'Saved strategies keep your own screening templates. You can rerun, rename, delete, or jump into model evaluation before using them.'}</p>
             <div class="table-wrap saved-strategies-wrap">
             <table>
               <thead>
-                <tr><th>{_lang_text(lang, 'name')}</th><th>{_lang_text(lang, 'model_template')}</th><th>{_lang_text(lang, 'summary')}</th><th>{_lang_text(lang, 'hits')}</th><th>{_lang_text(lang, 'load')}</th><th>{_lang_text(lang, 'delete')}</th></tr>
+                <tr><th>{_lang_text(lang, 'name')}</th><th>{_lang_text(lang, 'model_template')}</th><th>{_lang_text(lang, 'summary')}</th><th>{_lang_text(lang, 'hits')}</th><th>{_lang_text(lang, 'run_strategy')}</th><th>{_lang_text(lang, 'rename')}</th><th>{_lang_text(lang, 'delete')}</th></tr>
               </thead>
               <tbody>{preset_rows}</tbody>
             </table>
@@ -4411,12 +4817,44 @@ def save_screener_preset(
     presets = _load_saved_presets(db)
     clean_name = preset_name.strip()
     filtered = [preset for preset in presets if preset.get("name") != clean_name]
-    filtered.insert(0, {"name": clean_name, "params": params})
+    filtered.insert(0, {"name": clean_name, "params": params, "updated_at": app_now_iso()})
     _save_saved_presets(db, filtered[:20])
     return RedirectResponse(
         url=f"{_build_screen_query(params)}&message={urlencode({'m': f'Saved strategy: {clean_name}'})[2:]}",
         status_code=303,
     )
+
+
+@router.post("/rename")
+def rename_screener_preset(
+    request: Request,
+    preset_name: str = Form(...),
+    new_name: str = Form(...),
+    lang: str = Form("en"),
+    db: Session = Depends(get_db_session),
+) -> RedirectResponse:
+    if not is_authenticated(request):
+        return login_redirect("/screeners")
+    old_name = preset_name.strip()
+    clean_name = new_name.strip()
+    if not old_name or not clean_name:
+        return _redirect_with_message("Strategy name cannot be empty.", lang=lang)
+    presets = _load_saved_presets(db)
+    renamed: list[dict] = []
+    found = False
+    for preset in presets:
+        current_name = str(preset.get("name") or "").strip()
+        if current_name == old_name:
+            renamed.append({**preset, "name": clean_name, "updated_at": app_now_iso()})
+            found = True
+            continue
+        if current_name == clean_name:
+            continue
+        renamed.append(preset)
+    if found:
+        _save_saved_presets(db, renamed[:20])
+        return _redirect_with_message(f"Renamed strategy: {clean_name}", lang=lang)
+    return _redirect_with_message(f"Strategy not found: {old_name}", lang=lang)
 
 
 @router.post("/delete")

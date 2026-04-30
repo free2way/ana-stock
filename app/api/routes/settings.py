@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
+import html
+import json
+
+from fastapi import APIRouter, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.core.config import get_settings
 from app.core.db import SessionLocal
+from app.services.ai_chat import AI_CHAT_PROVIDER_PRESETS, load_ai_chat_config, masked_api_key, save_ai_chat_config
 from app.services.auto_analysis import auto_analysis_service
 from app.services.auth import is_authenticated, login_redirect
 from app.services.close_review_scheduler import close_review_scheduler_service
@@ -40,6 +44,8 @@ def _provider_strategy_view(lang: str) -> dict:
 
 def _settings_shell(*, lang: str, title: str, lead: str, body_html: str, active_path: str) -> str:
     nav_html = render_workspace_nav_html(lang=lang, active_key="settings")
+    en_href = "/settings/notifications?lang=en" if active_path == "notifications" else "/settings/ai-chat?lang=en" if active_path == "ai_chat" else "/settings?lang=en"
+    zh_href = "/settings/notifications?lang=zh" if active_path == "notifications" else "/settings/ai-chat?lang=zh" if active_path == "ai_chat" else "/settings?lang=zh"
     return f"""
     <!DOCTYPE html>
     <html lang="{lang}">
@@ -102,8 +108,8 @@ def _settings_shell(*, lang: str, title: str, lead: str, body_html: str, active_
                 <span class="top-pill">{'工作台模式' if lang == 'zh' else 'Workspace mode'}</span>
               </div>
               <div class="chip-row">
-                <a class="top-pill" href="{active_path == 'notifications' and '/settings/notifications?lang=en' or '/settings?lang=en'}">EN</a>
-                <a class="top-pill" href="{active_path == 'notifications' and '/settings/notifications?lang=zh' or '/settings?lang=zh'}">中文</a>
+                <a class="top-pill" href="{en_href}">EN</a>
+                <a class="top-pill" href="{zh_href}">中文</a>
               </div>
             </div>
             {body_html}
@@ -155,10 +161,13 @@ def settings_home_page(request: Request) -> str:
     close_review_status = close_review_scheduler_service.get_status()
     strategy = _provider_strategy_view(lang)
     latest_cn_refresh = _latest_cn_refresh_summary(lang)
+    with SessionLocal() as db:
+        ai_chat_config = load_ai_chat_config(db)
     configured = {
         "wechat": bool(settings.wechat_webhook_url),
         "feishu": bool(settings.feishu_webhook_url),
         "telegram": bool(settings.telegram_bot_token and settings.telegram_chat_id),
+        "ai_chat": ai_chat_config.is_configured,
     }
     total_configured = sum(1 for value in configured.values() if value)
     auto_provider = str(auto_status.get("provider") or "auto")
@@ -197,6 +206,7 @@ def settings_home_page(request: Request) -> str:
             <div><div class="subtle">{'已配置数量' if lang == 'zh' else 'Configured count'}</div><div class="ticker">{total_configured}</div></div>
             <div><div class="subtle">{'自动分析' if lang == 'zh' else 'Auto analysis'}</div><div class="ticker">{auto_enabled_text} · {auto_provider}</div></div>
             <div><div class="subtle">{'收盘复盘' if lang == 'zh' else 'Close review'}</div><div class="ticker">{close_enabled_text} · {close_provider}</div></div>
+            <div><div class="subtle">{'AI 问答' if lang == 'zh' else 'AI Q&A'}</div><div class="ticker">{('已配置' if lang == 'zh' else 'Configured') if ai_chat_config.is_configured else ('未配置' if lang == 'zh' else 'Missing')} · {ai_chat_config.provider_name}</div></div>
           </div>
         </article>
       </section>
@@ -208,6 +218,10 @@ def settings_home_page(request: Request) -> str:
               <a class="quick-link" href="/settings/notifications?lang={lang}">
                 <div class="ticker">{'通知配置' if lang == 'zh' else 'Notifications'}</div>
                 <div class="section-copy">{'查看 Telegram、企业微信、飞书是否已就绪。' if lang == 'zh' else 'Review Telegram, WeCom, and Feishu readiness.'}</div>
+              </a>
+              <a class="quick-link" href="/settings/ai-chat?lang={lang}">
+                <div class="ticker">{'AI 问答配置' if lang == 'zh' else 'AI Q&A Config'}</div>
+                <div class="section-copy">{'设置 Provider、Base URL、模型和 API Key。' if lang == 'zh' else 'Set provider, base URL, model, and API key.'}</div>
               </a>
               <a class="quick-link" href="/dashboard/ops?lang={lang}">
                 <div class="ticker">{'任务中心' if lang == 'zh' else 'Jobs Center'}</div>
@@ -241,6 +255,7 @@ def settings_home_page(request: Request) -> str:
               <div class="list-row"><div><div class="ticker">Telegram</div><div class="subtle">PQW_TELEGRAM_BOT_TOKEN / PQW_TELEGRAM_CHAT_ID</div></div><div class="ticker">{'已配置' if configured['telegram'] and lang == 'zh' else ('未配置' if lang == 'zh' else ('Configured' if configured['telegram'] else 'Missing'))}</div></div>
               <div class="list-row"><div><div class="ticker">{'企业微信' if lang == 'zh' else 'WeCom'}</div><div class="subtle">PQW_WECHAT_WEBHOOK_URL</div></div><div class="ticker">{'已配置' if configured['wechat'] and lang == 'zh' else ('未配置' if lang == 'zh' else ('Configured' if configured['wechat'] else 'Missing'))}</div></div>
               <div class="list-row"><div><div class="ticker">{'飞书' if lang == 'zh' else 'Feishu'}</div><div class="subtle">PQW_FEISHU_WEBHOOK_URL</div></div><div class="ticker">{'已配置' if configured['feishu'] and lang == 'zh' else ('未配置' if lang == 'zh' else ('Configured' if configured['feishu'] else 'Missing'))}</div></div>
+              <div class="list-row"><div><div class="ticker">{'AI 问答' if lang == 'zh' else 'AI Q&A'}</div><div class="subtle">{html.escape(ai_chat_config.provider_name)} · {html.escape(ai_chat_config.model or '-')} · {html.escape(masked_api_key(ai_chat_config) or '-')}</div></div><div class="ticker">{'已配置' if configured['ai_chat'] and lang == 'zh' else ('未配置' if lang == 'zh' else ('Configured' if configured['ai_chat'] else 'Missing'))}</div></div>
             </div>
           </article>
           <article class="card">
@@ -357,6 +372,41 @@ def notification_settings_page(request: Request) -> str:
         "</article>"
         for item in channel_rows
     )
+    notification_types = [
+        {
+            "type": "系统更新完成" if lang == "zh" else "System update done",
+            "trigger": "A股收盘刷新完成" if lang == "zh" else "A-share close refresh finished",
+            "summary": "刷新条数、技术快照数量、自选深度分析数量" if lang == "zh" else "Refresh rows, technical snapshots, watchlist analysis count",
+        },
+        {
+            "type": "模型训练完成" if lang == "zh" else "Model training done",
+            "trigger": "A股 LightGBM 训练完成" if lang == "zh" else "A-share LightGBM training finished",
+            "summary": "训练标的数量、写入预测数量" if lang == "zh" else "Trained symbol count and predictions written",
+        },
+        {
+            "type": "核心预计算完成" if lang == "zh" else "Core precompute done",
+            "trigger": "核心模型快照完成" if lang == "zh" else "Core screener snapshots finished",
+            "summary": "核心快照数量、失败模板数量、尾部任务状态" if lang == "zh" else "Core snapshot count, failed templates, tail-job status",
+        },
+        {
+            "type": "选股推荐完成" if lang == "zh" else "Stock picks ready",
+            "trigger": "AI 日报生成/发送" if lang == "zh" else "AI report generated/sent",
+            "summary": "持仓总结、A股可执行买入池、观察池、美股 Top 5" if lang == "zh" else "Portfolio review, A-share buy pool, watch pool, U.S. Top 5",
+        },
+        {
+            "type": "持仓风险提醒" if lang == "zh" else "Portfolio risk alert",
+            "trigger": "持仓风险异常" if lang == "zh" else "Portfolio risk anomaly",
+            "summary": "预留类型：后续用于止损、仓位漂移、事件风险提醒" if lang == "zh" else "Reserved for stops, drift, and event-risk alerts",
+        },
+    ]
+    notification_type_rows_html = "".join(
+        "<article class='quick-link'>"
+        f"<div class='ticker'>{item['type']}</div>"
+        f"<div class='section-copy'>{'触发' if lang == 'zh' else 'Trigger'}：{item['trigger']}</div>"
+        f"<div class='subtle'>{'摘要' if lang == 'zh' else 'Summary'}：{item['summary']}</div>"
+        "</article>"
+        for item in notification_types
+    )
     body_html = f"""
       <section class="hero">
         <article class="card">
@@ -379,6 +429,12 @@ def notification_settings_page(request: Request) -> str:
             <span class="eyebrow">{'渠道状态' if lang == 'zh' else 'Channel Status'}</span>
             <h2 class="section-title">{'现在有哪些通道真的可用' if lang == 'zh' else 'Which channels are actually ready'}</h2>
             <div class="list-stack">{channel_rows_html}</div>
+          </article>
+          <article class="card">
+            <span class="eyebrow">{'通知类型' if lang == 'zh' else 'Notification Types'}</span>
+            <h2 class="section-title">{'Telegram 里会看到清晰的事件前缀' if lang == 'zh' else 'Telegram messages now use clear event prefixes'}</h2>
+            <p class="section-copy">{'例如：【系统更新完成】表示行情/任务状态，【选股推荐完成】表示 AI 日报和候选池已经生成，避免把系统日志和交易候选混在一起。' if lang == 'zh' else 'For example: [System update done] is about data/job readiness, while [Stock picks ready] is about AI reports and candidate pools.'}</p>
+            <div class="quick-grid" style="margin-top:12px;">{notification_type_rows_html}</div>
           </article>
         </div>
         <div class="stack">
@@ -406,3 +462,162 @@ def notification_settings_page(request: Request) -> str:
         body_html=body_html,
         active_path="notifications",
     )
+
+
+@router.get("/ai-chat", response_class=HTMLResponse)
+def ai_chat_settings_page(request: Request) -> str:
+    if not is_authenticated(request):
+        return login_redirect("/settings/ai-chat")
+    lang = resolve_request_lang(request, default="zh")
+    with SessionLocal() as db:
+        config = load_ai_chat_config(db)
+    provider_options = "".join(
+        f"<option value='{html.escape(key, quote=True)}'{' selected' if config.provider == key else ''}>{html.escape(item['label'])}</option>"
+        for key, item in AI_CHAT_PROVIDER_PRESETS.items()
+    )
+    preset_cards = "".join(
+        "<article class='quick-link'>"
+        f"<div class='ticker'>{html.escape(item['label'])}</div>"
+        f"<div class='section-copy'>{html.escape(item['base_url'])}</div>"
+        f"<div class='subtle'>{'默认模型' if lang == 'zh' else 'Default model'}：{html.escape(item['model'])}</div>"
+        f"{('<div class=\"subtle\">' + ('可用模型' if lang == 'zh' else 'Model hint') + '：' + html.escape(str(item.get('model_hint'))) + '</div>') if item.get('model_hint') else ''}"
+        "</article>"
+        for item in AI_CHAT_PROVIDER_PRESETS.values()
+    )
+    body_html = f"""
+      <section class="hero">
+        <article class="card">
+          <span class="eyebrow">{'AI Provider' if lang == 'zh' else 'AI Provider'}</span>
+          <h1>{'配置 AI 问答模型' if lang == 'zh' else 'Configure AI Q&A model'}</h1>
+          <p class="lead">{'AI 问答使用 OpenAI-compatible Chat Completions 接口。只要服务商兼容 /chat/completions，就可以在这里配置。API Key 会保存到应用数据库里，请只在你自己的受控环境中使用。' if lang == 'zh' else 'AI Q&A uses an OpenAI-compatible Chat Completions endpoint. Any provider compatible with /chat/completions can be configured here. The API key is saved in the app database, so use this only in your controlled environment.'}</p>
+        </article>
+        <article class="card">
+          <span class="eyebrow">{'当前状态' if lang == 'zh' else 'Current State'}</span>
+          <div class="list-stack">
+            <div><div class="subtle">Provider</div><div class="ticker">{html.escape(config.provider_name)}</div></div>
+            <div><div class="subtle">Model</div><div class="ticker">{html.escape(config.model or '-')}</div></div>
+            <div><div class="subtle">API Key</div><div class="ticker">{html.escape(masked_api_key(config) or ('未设置' if lang == 'zh' else 'Missing'))}</div></div>
+            <div><div class="subtle">Status</div><div class="ticker">{('已配置' if lang == 'zh' else 'Configured') if config.is_configured else ('未配置' if lang == 'zh' else 'Not configured')}</div></div>
+          </div>
+        </article>
+      </section>
+      <section class="workspace">
+        <div class="stack">
+          <article class="card">
+            <span class="eyebrow">{'保存配置' if lang == 'zh' else 'Save Configuration'}</span>
+            <form action="/settings/ai-chat" method="post">
+              <input type="hidden" name="lang" value="{lang}" />
+              <div class="form-grid">
+                <label>
+                  <div class="subtle">Provider</div>
+                  <select name="provider" id="ai-provider">{provider_options}</select>
+                </label>
+                <label>
+                  <div class="subtle">{'显示名称' if lang == 'zh' else 'Display Name'}</div>
+                  <input name="provider_name" id="ai-provider-name" value="{html.escape(config.provider_name, quote=True)}" />
+                </label>
+                <label>
+                  <div class="subtle">Base URL</div>
+                  <input name="base_url" id="ai-base-url" value="{html.escape(config.base_url, quote=True)}" />
+                </label>
+                <label>
+                  <div class="subtle">Model</div>
+                  <input name="model" id="ai-model" list="ai-model-hints" value="{html.escape(config.model, quote=True)}" />
+                  <datalist id="ai-model-hints">
+                    <option value="gemini-2.5-flash"></option>
+                    <option value="gemini-2.5-pro"></option>
+                    <option value="gemini-1.5-flash"></option>
+                    <option value="gemini-1.5-pro"></option>
+                    <option value="gpt-4.1-mini"></option>
+                    <option value="deepseek-chat"></option>
+                    <option value="qwen-plus"></option>
+                    <option value="moonshot-v1-8k"></option>
+                  </datalist>
+                </label>
+                <label>
+                  <div class="subtle">API Key</div>
+                  <input name="api_key" type="password" placeholder="{'留空则保留当前 Key' if lang == 'zh' else 'Leave blank to keep current key'}" />
+                </label>
+                <label>
+                  <div class="subtle">Temperature</div>
+                  <input name="temperature" type="number" step="0.1" min="0" max="1.5" value="{config.temperature:.1f}" />
+                </label>
+                <label>
+                  <div class="subtle">Timeout seconds</div>
+                  <input name="timeout_seconds" type="number" step="1" min="5" max="120" value="{config.timeout_seconds:.0f}" />
+                </label>
+              </div>
+              <div class="form-actions">
+                <label class="checkline"><input type="checkbox" name="clear_api_key" value="1" /> {'清除当前 API Key' if lang == 'zh' else 'Clear current API key'}</label>
+                <button type="submit">{'保存 AI 配置' if lang == 'zh' else 'Save AI Config'}</button>
+                <a class="top-pill" href="/ai-chat?lang={lang}">{'打开 AI 问答' if lang == 'zh' else 'Open AI Q&A'}</a>
+              </div>
+            </form>
+          </article>
+        </div>
+        <div class="stack">
+          <article class="card">
+            <span class="eyebrow">{'Provider 预设' if lang == 'zh' else 'Provider Presets'}</span>
+            <div class="quick-grid">{preset_cards}</div>
+          </article>
+          <article class="card">
+            <span class="eyebrow">{'使用建议' if lang == 'zh' else 'Usage Notes'}</span>
+            <div class="list-stack">
+              <div class="list-row"><div><div class="ticker">{'优先低温度' if lang == 'zh' else 'Prefer low temperature'}</div><div class="subtle">{'股票复盘不是写作文，建议 temperature 0.1-0.3。' if lang == 'zh' else 'Trading review is not creative writing; 0.1-0.3 is recommended.'}</div></div></div>
+              <div class="list-row"><div><div class="ticker">{'不要直接照单买' if lang == 'zh' else 'Do not copy blindly'}</div><div class="subtle">{'AI 问答会读取你的应用上下文，但仍然只能作为分析与检查清单。' if lang == 'zh' else 'AI Q&A reads your app context, but it is still an analysis/checklist assistant.'}</div></div></div>
+              <div class="list-row"><div><div class="ticker">{'兼容接口' if lang == 'zh' else 'Compatible endpoint'}</div><div class="subtle">{'当前按 OpenAI-compatible /chat/completions 调用。' if lang == 'zh' else 'Current calls use OpenAI-compatible /chat/completions.'}</div></div></div>
+              <div class="list-row"><div><div class="ticker">Gemini Model ID</div><div class="subtle">{'Gemini 需要填写 API model id，例如 gemini-2.5-flash；不要填写 Gemini 3.1 Pro / Gemini 3.1 Flash Preview 这类展示名。' if lang == 'zh' else 'Gemini requires API model ids such as gemini-2.5-flash; do not use display names such as Gemini 3.1 Pro.'}</div></div></div>
+            </div>
+          </article>
+        </div>
+      </section>
+      <script>
+        const presets = {json.dumps(AI_CHAT_PROVIDER_PRESETS, ensure_ascii=False)};
+        const select = document.getElementById('ai-provider');
+        select?.addEventListener('change', () => {{
+          const item = presets[select.value];
+          if (!item) return;
+          document.getElementById('ai-provider-name').value = item.label || '';
+          document.getElementById('ai-base-url').value = item.base_url || '';
+          document.getElementById('ai-model').value = item.model || '';
+        }});
+      </script>
+    """
+    return _settings_shell(
+        lang=lang,
+        title="AI 问答配置" if lang == "zh" else "AI Q&A Settings",
+        lead="",
+        body_html=body_html,
+        active_path="ai_chat",
+    )
+
+
+@router.post("/ai-chat")
+def save_ai_chat_settings(
+    request: Request,
+    lang: str = Form("zh"),
+    provider: str = Form("compatible"),
+    provider_name: str = Form("OpenAI Compatible"),
+    base_url: str = Form("https://api.openai.com/v1"),
+    model: str = Form("gpt-4.1-mini"),
+    api_key: str = Form(""),
+    temperature: float = Form(0.2),
+    timeout_seconds: float = Form(30.0),
+    clear_api_key: str | None = Form(None),
+) -> RedirectResponse:
+    if not is_authenticated(request):
+        return login_redirect("/settings/ai-chat")
+    normalized_lang = "zh" if lang == "zh" else "en"
+    with SessionLocal() as db:
+        save_ai_chat_config(
+            db,
+            provider=provider,
+            provider_name=provider_name,
+            base_url=base_url,
+            model=model,
+            api_key="" if clear_api_key else api_key,
+            temperature=temperature,
+            timeout_seconds=timeout_seconds,
+            keep_existing_key=not bool(clear_api_key),
+        )
+    return RedirectResponse(url=f"/settings/ai-chat?lang={normalized_lang}", status_code=303)

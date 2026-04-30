@@ -130,6 +130,7 @@ SNAPSHOT_ROW_FIELDS = {
     "snapshot_runs",
     "matched_patterns",
     "selection_reason",
+    "model_score",
     "model_summary",
     "model_state",
     "model_confidence",
@@ -199,18 +200,18 @@ def _build_default_params(template_key: str, *, universe: str, market: str | Non
     defaults = template.get("defaults") or {}
     template_market = str(market or template.get("market") or "ALL").upper()
     min_trend_score = int(defaults.get("min_trend_score", 60))
-    limit = 300 if universe == "watchlist" else 160
+    limit = 300 if universe == "watchlist" else 5000
 
     if universe == "full_market":
         if template_key == "lightgbm_top_picks":
             # Multi-model confluence needs a much broader LightGBM source pool than
             # the user-facing single-template default threshold.
             min_trend_score = 10
-            limit = 2200
+            limit = 6000
         elif template_key == "technical_momentum":
-            limit = 300
+            limit = 5000
         elif template_key == "next_tesla_swing":
-            limit = 180
+            limit = 5000
 
     return {
         "model_template": template_key,
@@ -434,6 +435,14 @@ def _build_multi_screen_rows_from_snapshots(params: dict) -> tuple[list[dict], d
                 base["_execution_tags"] = []
                 aggregated[ticker] = base
                 existing = base
+            if existing.get("model_score") is None and row.get("model_score") is not None:
+                existing["model_score"] = row.get("model_score")
+            if existing.get("model_signal_strength") is None and row.get("model_signal_strength") is not None:
+                existing["model_signal_strength"] = row.get("model_signal_strength")
+            if existing.get("model_confidence") is None and row.get("model_confidence") is not None:
+                existing["model_confidence"] = row.get("model_confidence")
+            if existing.get("model_percentile") is None and row.get("model_percentile") is not None:
+                existing["model_percentile"] = row.get("model_percentile")
             existing["_template_keys"].append(template_key)
             existing["_template_labels"].append(label)
             existing["_action_labels"].append(str(row.get("action_label") or "").strip())
@@ -565,7 +574,7 @@ def refresh_precomputed_screener_snapshots(
     for params in precompute_params:
         try:
             rows = _screen_with_lake_preferred(params)
-            persisted_rows = _compact_snapshot_rows(rows, limit=int(params.get("limit", 160)))
+            persisted_rows = _compact_snapshot_rows(rows, limit=int(params.get("limit", 5000)))
             with SessionLocal() as snapshot_db:
                 row = WorkspaceSnapshotRepository(snapshot_db).create_snapshot(
                     snapshot_type=screener_snapshot_type(params),
@@ -577,6 +586,11 @@ def refresh_precomputed_screener_snapshots(
                         "model_template": params["model_template"],
                         "market": params["market"],
                         "universe": params["universe"],
+                        "candidate_stats": {
+                            "returned_count": len(rows),
+                            "persisted_count": len(persisted_rows),
+                            "limit": int(params.get("limit", 5000)),
+                        },
                     },
                     source_job_id=source_job_id,
                 )

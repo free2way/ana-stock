@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections import defaultdict
 
 from sqlalchemy import select
@@ -39,6 +40,93 @@ def aggregate_window_stats(values: list[float]) -> dict:
     }
 
 
+def aggregate_execution_stats(profiles: list[dict]) -> dict:
+    usable = [profile for profile in profiles if isinstance(profile, dict) and profile.get("tradable_next_day") is not None]
+    if not usable:
+        return {
+            "count": 0,
+            "execution_hit_rate": None,
+            "avg_next_open_gap": None,
+            "avg_next_open_to_high": None,
+            "avg_next_open_to_close": None,
+            "avg_next_low_drawdown": None,
+            "gap_blocked_rate": None,
+            "limit_unbuyable_rate": None,
+            "high_open_fail_rate": None,
+        }
+    count = len(usable)
+
+    def _avg(key: str) -> float | None:
+        values = [float(item[key]) for item in usable if item.get(key) is not None]
+        return round(sum(values) / len(values), 2) if values else None
+
+    def _rate(key: str) -> float:
+        return round((sum(1 for item in usable if item.get(key)) / count) * 100.0, 1)
+
+    return {
+        "count": count,
+        "execution_hit_rate": _rate("execution_hit"),
+        "avg_next_open_gap": _avg("next_open_gap_pct"),
+        "avg_next_open_to_high": _avg("next_open_to_high_pct"),
+        "avg_next_open_to_close": _avg("next_open_to_close_pct"),
+        "avg_next_low_drawdown": _avg("next_low_drawdown_pct"),
+        "gap_blocked_rate": _rate("gap_blocked"),
+        "limit_unbuyable_rate": _rate("limit_unbuyable"),
+        "high_open_fail_rate": _rate("high_open_fail"),
+    }
+
+
+def aggregate_lightgbm_score_calibration(records: list[dict], *, bucket_count: int = 10) -> list[dict]:
+    clean_records = [
+        item
+        for item in records
+        if item.get("score") is not None
+        and (
+            item.get("return_5d") is not None
+            or item.get("return_3d") is not None
+            or item.get("next_open_to_high_pct") is not None
+        )
+    ]
+    if not clean_records:
+        return []
+    clean_records.sort(key=lambda item: float(item.get("score") or 0.0))
+    bucket_size = max(12, math.ceil(len(clean_records) / max(bucket_count, 1)))
+    buckets: list[dict] = []
+    for start in range(0, len(clean_records), bucket_size):
+        chunk = clean_records[start : start + bucket_size]
+        if not chunk:
+            continue
+
+        def avg(key: str) -> float | None:
+            values = [float(item[key]) for item in chunk if item.get(key) is not None]
+            return round(sum(values) / len(values), 4) if values else None
+
+        scores = [float(item.get("score") or 0.0) for item in chunk]
+        buckets.append(
+            {
+                "score_low": round(min(scores), 6),
+                "score_high": round(max(scores), 6),
+                "score_mid": round(sum(scores) / len(scores), 6),
+                "sample_count": len(chunk),
+                "source": "out_of_sample_predictions",
+                "metrics": {
+                    "next_3d_max_return_avg": avg("max_3d_high_return_pct"),
+                    "next_5d_close_return_avg": avg("return_5d"),
+                    "next_5d_max_return_avg": avg("max_3d_high_return_pct") or avg("return_3d"),
+                    "next_3d_max_drawdown_avg": avg("max_3d_drawdown_pct"),
+                    "next_5d_max_drawdown_avg": avg("max_3d_drawdown_pct"),
+                    "next_open_to_high_avg": avg("next_open_to_high_pct"),
+                    "next_open_to_close_avg": avg("next_open_to_close_pct"),
+                    "tradable_next_day_rate": round(
+                        sum(1 for item in chunk if item.get("tradable_next_day")) / len(chunk) * 100.0,
+                        1,
+                    ),
+                },
+            }
+        )
+    return buckets
+
+
 def template_forward_return_from_history(history: list[dict], *, trade_date: str, sessions: int) -> float | None:
     if not history:
         return None
@@ -56,6 +144,91 @@ def template_forward_return_from_history(history: list[dict], *, trade_date: str
         return round(((float(end_close) / float(start_close)) - 1.0) * 100.0, 2)
     except (TypeError, ValueError, ZeroDivisionError):
         return None
+
+
+def _cn_limit_band_pct(ticker: str, *, name: str | None = None) -> float | None:
+    normalized = str(ticker or "").strip().upper()
+    normalized_name = str(name or "").strip().upper().replace(" ", "")
+    code = normalized.split(".", 1)[0]
+    if normalized_name.startswith(("ST", "*ST", "S*ST", "PT")):
+        return 5.0
+    if normalized.endswith(".BJ"):
+        return 30.0
+    if code.startswith(("688", "689", "300", "301")):
+        return 20.0
+    if normalized.endswith((".SS", ".SH", ".SZ")) or (code.isdigit() and len(code) == 6):
+        return 10.0
+    return None
+
+
+def template_execution_profile_from_history(
+    history: list[dict],
+    *,
+    trade_date: str,
+    ticker: str = "",
+    name: str | None = None,
+    market: str = "CN",
+) -> dict | None:
+    if not history:
+        return None
+    signal_index = next((index for index, row in enumerate(history) if str(row.get("date") or "") >= str(trade_date)), None)
+    if signal_index is None or signal_index + 1 >= len(history):
+        return None
+    signal_row = history[signal_index]
+    next_row = history[signal_index + 1]
+
+    def _float(row: dict, key: str) -> float | None:
+        try:
+            value = float(row.get(key))
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    signal_close = _float(signal_row, "close")
+    next_open = _float(next_row, "open")
+    next_high = _float(next_row, "high")
+    next_low = _float(next_row, "low")
+    next_close = _float(next_row, "close")
+    if not signal_close or not next_open or not next_high or not next_low or not next_close:
+        return None
+
+    next_open_gap_pct = ((next_open / signal_close) - 1.0) * 100.0
+    next_open_to_high_pct = ((next_high / next_open) - 1.0) * 100.0
+    next_open_to_close_pct = ((next_close / next_open) - 1.0) * 100.0
+    next_low_drawdown_pct = ((next_low / next_open) - 1.0) * 100.0
+    next_close_return_pct = ((next_close / signal_close) - 1.0) * 100.0
+    future_3d = history[signal_index + 1 : signal_index + 4]
+    max_3d_high = max((_float(row, "high") or 0.0) for row in future_3d) if future_3d else 0.0
+    min_3d_low = min((_float(row, "low") or next_open) for row in future_3d) if future_3d else next_open
+    max_3d_high_return_pct = ((max_3d_high / next_open) - 1.0) * 100.0 if max_3d_high > 0 else None
+    max_3d_drawdown_pct = ((min_3d_low / next_open) - 1.0) * 100.0 if min_3d_low > 0 else None
+
+    market_code = str(market or "").strip().upper()
+    limit_band_pct = _cn_limit_band_pct(ticker, name=name) if market_code == "CN" else None
+    limit_unbuyable = bool(limit_band_pct and next_open_gap_pct >= limit_band_pct - 0.2)
+    gap_blocked = bool(next_open_gap_pct >= (limit_band_pct - 0.2 if limit_band_pct else 9.5))
+    high_open_fail = bool(next_open_gap_pct >= 2.5 and next_open_to_close_pct <= -2.0)
+    tradable_next_day = not limit_unbuyable and not gap_blocked
+    execution_hit = bool(
+        tradable_next_day
+        and next_open_to_high_pct >= 2.0
+        and next_low_drawdown_pct > -4.0
+        and not high_open_fail
+    )
+    return {
+        "next_open_gap_pct": round(next_open_gap_pct, 2),
+        "next_open_to_high_pct": round(next_open_to_high_pct, 2),
+        "next_open_to_close_pct": round(next_open_to_close_pct, 2),
+        "next_low_drawdown_pct": round(next_low_drawdown_pct, 2),
+        "next_close_return_pct": round(next_close_return_pct, 2),
+        "max_3d_high_return_pct": round(max_3d_high_return_pct, 2) if max_3d_high_return_pct is not None else None,
+        "max_3d_drawdown_pct": round(max_3d_drawdown_pct, 2) if max_3d_drawdown_pct is not None else None,
+        "gap_blocked": gap_blocked,
+        "limit_unbuyable": limit_unbuyable,
+        "tradable_next_day": tradable_next_day,
+        "high_open_fail": high_open_fail,
+        "execution_hit": execution_hit,
+    }
 
 
 def resolve_template_group_label(*, meta: dict | None, ticker: str, market_code: str, name: str | None = None) -> str:
@@ -125,6 +298,47 @@ def normalize_lightgbm_prediction_action(*, entry_style: str | None, signal_labe
     return ""
 
 
+def _load_snapshot_batches_with_symbol_meta(
+    *,
+    target_markets: list[str],
+    model_template: str,
+    lookback_snapshots: int,
+    top_n: int,
+) -> tuple[list[dict], dict[str, dict | None]]:
+    snapshot_batches: list[dict] = []
+    tickers: set[str] = set()
+    with SessionLocal() as db:
+        snapshot_repo = WorkspaceSnapshotRepository(db)
+        symbol_repo = SymbolRepository(db)
+        for market_code in target_markets:
+            params = build_base_precompute_params(
+                model_template=model_template,
+                universe="full_market",
+                market=market_code,
+            )
+            snapshots = snapshot_repo.list_snapshots(
+                screener_snapshot_type(params),
+                limit=max(1, int(lookback_snapshots)),
+            )
+            for snapshot in snapshots:
+                payload = snapshot.get("payload") or {}
+                rows = list(payload.get("rows") or [])[: max(1, int(top_n))]
+                trade_date = str(snapshot.get("snapshot_date") or "")[:10]
+                snapshot_batches.append(
+                    {
+                        "market_code": market_code,
+                        "snapshot_date": trade_date,
+                        "rows": rows,
+                    }
+                )
+                for row in rows:
+                    ticker = str(row.get("ticker") or "").strip().upper()
+                    if ticker:
+                        tickers.add(ticker)
+        symbol_meta = {ticker: symbol_repo.get_overview(ticker) for ticker in tickers}
+    return snapshot_batches, symbol_meta
+
+
 def build_next_tesla_evaluation(*, market: str, lookback_snapshots: int = 15, top_n: int = 20) -> dict:
     target_markets = ["CN", "US"] if str(market or "ALL").upper() == "ALL" else [str(market or "CN").upper()]
     cache_key = json.dumps(
@@ -152,7 +366,6 @@ def build_next_tesla_evaluation(*, market: str, lookback_snapshots: int = 15, to
         }
         samples_by_action: dict[str, list[dict]] = {"buy_the_dip": [], "wait_for_breakout": []}
         history_cache: dict[tuple[str, str], list[dict]] = {}
-        symbol_meta_cache: dict[str, dict | None] = {}
         snapshot_total = 0
         clean_snapshot_total = 0
         per_market: dict[str, dict] = {
@@ -166,72 +379,63 @@ def build_next_tesla_evaluation(*, market: str, lookback_snapshots: int = 15, to
             }
             for code in target_markets
         }
-        with SessionLocal() as db:
-            snapshot_repo = WorkspaceSnapshotRepository(db)
-            symbol_repo = SymbolRepository(db)
-            for market_code in target_markets:
-                params = build_base_precompute_params(
-                    model_template="next_tesla_swing",
-                    universe="full_market",
-                    market=market_code,
+        snapshot_batches, symbol_meta_cache = _load_snapshot_batches_with_symbol_meta(
+            target_markets=target_markets,
+            model_template="next_tesla_swing",
+            lookback_snapshots=lookback_snapshots,
+            top_n=top_n,
+        )
+        for snapshot in snapshot_batches:
+            market_code = str(snapshot.get("market_code") or "").upper()
+            trade_date = str(snapshot.get("snapshot_date") or "")
+            rows = list(snapshot.get("rows") or [])
+            snapshot_total += 1
+            per_market[market_code]["snapshot_total"] += 1
+            if not trade_date:
+                continue
+            labeled_in_snapshot = False
+            for row in rows:
+                action_key = normalize_template_action(row.get("action_label"))
+                if action_key not in action_buckets:
+                    continue
+                labeled_in_snapshot = True
+                ticker = str(row.get("ticker") or "").strip().upper()
+                if not ticker:
+                    continue
+                meta = symbol_meta_cache.get(ticker) or {}
+                sector_label = resolve_template_group_label(
+                    meta=meta,
+                    ticker=ticker,
+                    market_code=market_code,
+                    name=row.get("name"),
                 )
-                snapshots = snapshot_repo.list_snapshots(
-                    screener_snapshot_type(params),
-                    limit=max(1, int(lookback_snapshots)),
-                )
-                for snapshot in snapshots:
-                    snapshot_total += 1
-                    per_market[market_code]["snapshot_total"] += 1
-                    payload = snapshot.get("payload") or {}
-                    rows = list(payload.get("rows") or [])[: max(1, int(top_n))]
-                    trade_date = str(snapshot.get("snapshot_date") or "")[:10]
-                    if not trade_date:
-                        continue
-                    labeled_in_snapshot = False
-                    for row in rows:
-                        action_key = normalize_template_action(row.get("action_label"))
-                        if action_key not in action_buckets:
-                            continue
-                        labeled_in_snapshot = True
-                        ticker = str(row.get("ticker") or "").strip().upper()
-                        if not ticker:
-                            continue
-                        if ticker not in symbol_meta_cache:
-                            symbol_meta_cache[ticker] = symbol_repo.get_overview(ticker)
-                        meta = symbol_meta_cache.get(ticker) or {}
-                        sector_label = resolve_template_group_label(
-                            meta=meta,
-                            ticker=ticker,
-                            market_code=market_code,
-                            name=row.get("name"),
-                        )
-                        history_key = (market_code, ticker)
-                        if history_key not in history_cache:
-                            history_cache[history_key] = load_lake_price_history(market=market_code, ticker=ticker, limit=260)
-                        history = history_cache[history_key]
-                        sample = {
-                            "ticker": ticker,
-                            "name": row.get("name") or ticker,
-                            "market": market_code,
-                            "sector": sector_label,
-                            "trade_date": trade_date,
-                            "return_3d": template_forward_return_from_history(history, trade_date=trade_date, sessions=3),
-                            "return_5d": template_forward_return_from_history(history, trade_date=trade_date, sessions=5),
-                            "return_10d": template_forward_return_from_history(history, trade_date=trade_date, sessions=10),
-                        }
-                        sector_counts[action_key][sector_label] = sector_counts[action_key].get(sector_label, 0) + 1
-                        for window, key in ((3, "return_3d"), (5, "return_5d"), (10, "return_10d")):
-                            value = sample.get(key)
-                            if value is not None:
-                                action_buckets[action_key][window].append(float(value))
-                                per_market[market_code]["action_buckets"][action_key][window].append(float(value))
-                                sector_bucket = sector_buckets[action_key].setdefault(sector_label, {3: [], 5: [], 10: []})
-                                sector_bucket[window].append(float(value))
-                        if len(samples_by_action[action_key]) < 8:
-                            samples_by_action[action_key].append(sample)
-                    if labeled_in_snapshot:
-                        clean_snapshot_total += 1
-                        per_market[market_code]["clean_snapshot_total"] += 1
+                history_key = (market_code, ticker)
+                if history_key not in history_cache:
+                    history_cache[history_key] = load_lake_price_history(market=market_code, ticker=ticker, limit=260)
+                history = history_cache[history_key]
+                sample = {
+                    "ticker": ticker,
+                    "name": row.get("name") or ticker,
+                    "market": market_code,
+                    "sector": sector_label,
+                    "trade_date": trade_date,
+                    "return_3d": template_forward_return_from_history(history, trade_date=trade_date, sessions=3),
+                    "return_5d": template_forward_return_from_history(history, trade_date=trade_date, sessions=5),
+                    "return_10d": template_forward_return_from_history(history, trade_date=trade_date, sessions=10),
+                }
+                sector_counts[action_key][sector_label] = sector_counts[action_key].get(sector_label, 0) + 1
+                for window, key in ((3, "return_3d"), (5, "return_5d"), (10, "return_10d")):
+                    value = sample.get(key)
+                    if value is not None:
+                        action_buckets[action_key][window].append(float(value))
+                        per_market[market_code]["action_buckets"][action_key][window].append(float(value))
+                        sector_bucket = sector_buckets[action_key].setdefault(sector_label, {3: [], 5: [], 10: []})
+                        sector_bucket[window].append(float(value))
+                if len(samples_by_action[action_key]) < 8:
+                    samples_by_action[action_key].append(sample)
+            if labeled_in_snapshot:
+                clean_snapshot_total += 1
+                per_market[market_code]["clean_snapshot_total"] += 1
         windows = {
             action: {window: aggregate_window_stats(values) for window, values in bucket.items()}
             for action, bucket in action_buckets.items()
@@ -345,7 +549,6 @@ def build_technical_momentum_evaluation(*, market: str, lookback_snapshots: int 
         }
         samples_by_action: dict[str, list[dict]] = {"buy": [], "watch": [], "hold": []}
         history_cache: dict[tuple[str, str], list[dict]] = {}
-        symbol_meta_cache: dict[str, dict | None] = {}
         snapshot_total = 0
         labeled_snapshot_total = 0
         per_market: dict[str, dict] = {
@@ -365,74 +568,65 @@ def build_technical_momentum_evaluation(*, market: str, lookback_snapshots: int 
             }
             for code in target_markets
         }
-        with SessionLocal() as db:
-            snapshot_repo = WorkspaceSnapshotRepository(db)
-            symbol_repo = SymbolRepository(db)
-            for market_code in target_markets:
-                params = build_base_precompute_params(
-                    model_template="technical_momentum",
-                    universe="full_market",
-                    market=market_code,
+        snapshot_batches, symbol_meta_cache = _load_snapshot_batches_with_symbol_meta(
+            target_markets=target_markets,
+            model_template="technical_momentum",
+            lookback_snapshots=lookback_snapshots,
+            top_n=top_n,
+        )
+        for snapshot in snapshot_batches:
+            market_code = str(snapshot.get("market_code") or "").upper()
+            trade_date = str(snapshot.get("snapshot_date") or "")
+            rows = list(snapshot.get("rows") or [])
+            snapshot_total += 1
+            per_market[market_code]["snapshot_total"] += 1
+            if not trade_date:
+                continue
+            labeled = False
+            for row in rows:
+                action_key = normalize_template_action(row.get("action_label"))
+                if action_key not in action_buckets:
+                    continue
+                labeled = True
+                ticker = str(row.get("ticker") or "").strip().upper()
+                if not ticker:
+                    continue
+                meta = symbol_meta_cache.get(ticker) or {}
+                sector_label = resolve_template_group_label(
+                    meta=meta,
+                    ticker=ticker,
+                    market_code=market_code,
+                    name=row.get("name"),
                 )
-                snapshots = snapshot_repo.list_snapshots(
-                    screener_snapshot_type(params),
-                    limit=max(1, int(lookback_snapshots)),
-                )
-                for snapshot in snapshots:
-                    snapshot_total += 1
-                    per_market[market_code]["snapshot_total"] += 1
-                    payload = snapshot.get("payload") or {}
-                    rows = list(payload.get("rows") or [])[: max(1, int(top_n))]
-                    trade_date = str(snapshot.get("snapshot_date") or "")[:10]
-                    if not trade_date:
-                        continue
-                    labeled = False
-                    for row in rows:
-                        action_key = normalize_template_action(row.get("action_label"))
-                        if action_key not in action_buckets:
-                            continue
-                        labeled = True
-                        ticker = str(row.get("ticker") or "").strip().upper()
-                        if not ticker:
-                            continue
-                        if ticker not in symbol_meta_cache:
-                            symbol_meta_cache[ticker] = symbol_repo.get_overview(ticker)
-                        meta = symbol_meta_cache.get(ticker) or {}
-                        sector_label = resolve_template_group_label(
-                            meta=meta,
-                            ticker=ticker,
-                            market_code=market_code,
-                            name=row.get("name"),
-                        )
-                        history_key = (market_code, ticker)
-                        if history_key not in history_cache:
-                            history_cache[history_key] = load_lake_price_history(market=market_code, ticker=ticker, limit=260)
-                        history = history_cache[history_key]
-                        sample = {
-                            "ticker": ticker,
-                            "name": row.get("name") or ticker,
-                            "market": market_code,
-                            "sector": sector_label,
-                            "trade_date": trade_date,
-                            "return_3d": template_forward_return_from_history(history, trade_date=trade_date, sessions=3),
-                            "return_5d": template_forward_return_from_history(history, trade_date=trade_date, sessions=5),
-                            "return_10d": template_forward_return_from_history(history, trade_date=trade_date, sessions=10),
-                        }
-                        sector_counts[action_key][sector_label] = sector_counts[action_key].get(sector_label, 0) + 1
-                        per_market_sector_counts = (per_market[market_code].get("sector_counts") or {}).setdefault(action_key, {})
-                        per_market_sector_counts[sector_label] = per_market_sector_counts.get(sector_label, 0) + 1
-                        for window, key in ((3, "return_3d"), (5, "return_5d"), (10, "return_10d")):
-                            value = sample.get(key)
-                            if value is not None:
-                                action_buckets[action_key][window].append(float(value))
-                                per_market[market_code]["action_buckets"][action_key][window].append(float(value))
-                                sector_bucket = sector_buckets[action_key].setdefault(sector_label, {3: [], 5: [], 10: []})
-                                sector_bucket[window].append(float(value))
-                        if len(samples_by_action[action_key]) < 8:
-                            samples_by_action[action_key].append(sample)
-                    if labeled:
-                        labeled_snapshot_total += 1
-                        per_market[market_code]["labeled_snapshot_total"] += 1
+                history_key = (market_code, ticker)
+                if history_key not in history_cache:
+                    history_cache[history_key] = load_lake_price_history(market=market_code, ticker=ticker, limit=260)
+                history = history_cache[history_key]
+                sample = {
+                    "ticker": ticker,
+                    "name": row.get("name") or ticker,
+                    "market": market_code,
+                    "sector": sector_label,
+                    "trade_date": trade_date,
+                    "return_3d": template_forward_return_from_history(history, trade_date=trade_date, sessions=3),
+                    "return_5d": template_forward_return_from_history(history, trade_date=trade_date, sessions=5),
+                    "return_10d": template_forward_return_from_history(history, trade_date=trade_date, sessions=10),
+                }
+                sector_counts[action_key][sector_label] = sector_counts[action_key].get(sector_label, 0) + 1
+                per_market_sector_counts = (per_market[market_code].get("sector_counts") or {}).setdefault(action_key, {})
+                per_market_sector_counts[sector_label] = per_market_sector_counts.get(sector_label, 0) + 1
+                for window, key in ((3, "return_3d"), (5, "return_5d"), (10, "return_10d")):
+                    value = sample.get(key)
+                    if value is not None:
+                        action_buckets[action_key][window].append(float(value))
+                        per_market[market_code]["action_buckets"][action_key][window].append(float(value))
+                        sector_bucket = sector_buckets[action_key].setdefault(sector_label, {3: [], 5: [], 10: []})
+                        sector_bucket[window].append(float(value))
+                if len(samples_by_action[action_key]) < 8:
+                    samples_by_action[action_key].append(sample)
+            if labeled:
+                labeled_snapshot_total += 1
+                per_market[market_code]["labeled_snapshot_total"] += 1
         return {
             "markets": target_markets,
             "lookback_snapshots": int(lookback_snapshots),
@@ -507,7 +701,6 @@ def build_lightgbm_evaluation(*, market: str, lookback_snapshots: int = 15, top_
         }
         samples_by_action: dict[str, list[dict]] = {"pullback": [], "breakout": [], "watch": []}
         history_cache: dict[tuple[str, str], list[dict]] = {}
-        symbol_meta_cache: dict[str, dict | None] = {}
         snapshot_total = 0
         labeled_snapshot_total = 0
         per_market: dict[str, dict] = {
@@ -527,75 +720,66 @@ def build_lightgbm_evaluation(*, market: str, lookback_snapshots: int = 15, top_
             }
             for code in target_markets
         }
-        with SessionLocal() as db:
-            snapshot_repo = WorkspaceSnapshotRepository(db)
-            symbol_repo = SymbolRepository(db)
-            for market_code in target_markets:
-                params = build_base_precompute_params(
-                    model_template="lightgbm_top_picks",
-                    universe="full_market",
-                    market=market_code,
+        snapshot_batches, symbol_meta_cache = _load_snapshot_batches_with_symbol_meta(
+            target_markets=target_markets,
+            model_template="lightgbm_top_picks",
+            lookback_snapshots=lookback_snapshots,
+            top_n=top_n,
+        )
+        for snapshot in snapshot_batches:
+            market_code = str(snapshot.get("market_code") or "").upper()
+            trade_date = str(snapshot.get("snapshot_date") or "")
+            rows = list(snapshot.get("rows") or [])
+            snapshot_total += 1
+            per_market[market_code]["snapshot_total"] += 1
+            if not trade_date:
+                continue
+            labeled = False
+            for row in rows:
+                action_key = normalize_lightgbm_action(row.get("action_label"))
+                if action_key not in action_buckets:
+                    continue
+                labeled = True
+                ticker = str(row.get("ticker") or "").strip().upper()
+                if not ticker:
+                    continue
+                meta = symbol_meta_cache.get(ticker) or {}
+                sector_label = resolve_template_group_label(
+                    meta=meta,
+                    ticker=ticker,
+                    market_code=market_code,
+                    name=row.get("name"),
                 )
-                snapshots = snapshot_repo.list_snapshots(
-                    screener_snapshot_type(params),
-                    limit=max(1, int(lookback_snapshots)),
-                )
-                for snapshot in snapshots:
-                    snapshot_total += 1
-                    per_market[market_code]["snapshot_total"] += 1
-                    payload = snapshot.get("payload") or {}
-                    rows = list(payload.get("rows") or [])[: max(1, int(top_n))]
-                    trade_date = str(snapshot.get("snapshot_date") or "")[:10]
-                    if not trade_date:
-                        continue
-                    labeled = False
-                    for row in rows:
-                        action_key = normalize_lightgbm_action(row.get("action_label"))
-                        if action_key not in action_buckets:
-                            continue
-                        labeled = True
-                        ticker = str(row.get("ticker") or "").strip().upper()
-                        if not ticker:
-                            continue
-                        if ticker not in symbol_meta_cache:
-                            symbol_meta_cache[ticker] = symbol_repo.get_overview(ticker)
-                        meta = symbol_meta_cache.get(ticker) or {}
-                        sector_label = resolve_template_group_label(
-                            meta=meta,
-                            ticker=ticker,
-                            market_code=market_code,
-                            name=row.get("name"),
-                        )
-                        history_key = (market_code, ticker)
-                        if history_key not in history_cache:
-                            history_cache[history_key] = load_lake_price_history(market=market_code, ticker=ticker, limit=260)
-                        history = history_cache[history_key]
-                        sample = {
-                            "ticker": ticker,
-                            "name": row.get("name") or ticker,
-                            "market": market_code,
-                            "sector": sector_label,
-                            "trade_date": trade_date,
-                            "return_1d": template_forward_return_from_history(history, trade_date=trade_date, sessions=1),
-                            "return_3d": template_forward_return_from_history(history, trade_date=trade_date, sessions=3),
-                            "return_5d": template_forward_return_from_history(history, trade_date=trade_date, sessions=5),
-                            "return_10d": template_forward_return_from_history(history, trade_date=trade_date, sessions=10),
-                        }
-                        sector_counts[action_key][sector_label] = sector_counts[action_key].get(sector_label, 0) + 1
-                        per_market_sector_counts = (per_market[market_code].get("sector_counts") or {}).setdefault(action_key, {})
-                        per_market_sector_counts[sector_label] = per_market_sector_counts.get(sector_label, 0) + 1
-                        for window, key in ((1, "return_1d"), (3, "return_3d"), (5, "return_5d"), (10, "return_10d")):
-                            value = sample.get(key)
-                            if value is not None:
-                                action_buckets[action_key][window].append(float(value))
-                                per_market[market_code]["action_buckets"][action_key][window].append(float(value))
-                                sector_bucket = sector_buckets[action_key].setdefault(sector_label, {1: [], 3: [], 5: [], 10: []})
-                                sector_bucket[window].append(float(value))
-                        if len(samples_by_action[action_key]) < 8:
-                            samples_by_action[action_key].append(sample)
-                    if labeled:
-                        labeled_snapshot_total += 1
-                        per_market[market_code]["labeled_snapshot_total"] += 1
+                history_key = (market_code, ticker)
+                if history_key not in history_cache:
+                    history_cache[history_key] = load_lake_price_history(market=market_code, ticker=ticker, limit=260)
+                history = history_cache[history_key]
+                sample = {
+                    "ticker": ticker,
+                    "name": row.get("name") or ticker,
+                    "market": market_code,
+                    "sector": sector_label,
+                    "trade_date": trade_date,
+                    "return_1d": template_forward_return_from_history(history, trade_date=trade_date, sessions=1),
+                    "return_3d": template_forward_return_from_history(history, trade_date=trade_date, sessions=3),
+                    "return_5d": template_forward_return_from_history(history, trade_date=trade_date, sessions=5),
+                    "return_10d": template_forward_return_from_history(history, trade_date=trade_date, sessions=10),
+                }
+                sector_counts[action_key][sector_label] = sector_counts[action_key].get(sector_label, 0) + 1
+                per_market_sector_counts = (per_market[market_code].get("sector_counts") or {}).setdefault(action_key, {})
+                per_market_sector_counts[sector_label] = per_market_sector_counts.get(sector_label, 0) + 1
+                for window, key in ((1, "return_1d"), (3, "return_3d"), (5, "return_5d"), (10, "return_10d")):
+                    value = sample.get(key)
+                    if value is not None:
+                        action_buckets[action_key][window].append(float(value))
+                        per_market[market_code]["action_buckets"][action_key][window].append(float(value))
+                        sector_bucket = sector_buckets[action_key].setdefault(sector_label, {1: [], 3: [], 5: [], 10: []})
+                        sector_bucket[window].append(float(value))
+                if len(samples_by_action[action_key]) < 8:
+                    samples_by_action[action_key].append(sample)
+            if labeled:
+                labeled_snapshot_total += 1
+                per_market[market_code]["labeled_snapshot_total"] += 1
         return {
             "markets": target_markets,
             "lookback_snapshots": int(lookback_snapshots),
@@ -674,6 +858,11 @@ def build_pattern_template_evaluation(
             "wait_for_breakout": {1: [], 3: [], 5: [], 10: []},
             "hold_and_watch": {1: [], 3: [], 5: [], 10: []},
         }
+        execution_buckets: dict[str, list[dict]] = {
+            "buy_the_dip": [],
+            "wait_for_breakout": [],
+            "hold_and_watch": [],
+        }
         sector_buckets: dict[str, dict[str, dict[int, list[float]]]] = {
             "buy_the_dip": {},
             "wait_for_breakout": {},
@@ -690,7 +879,6 @@ def build_pattern_template_evaluation(
             "hold_and_watch": [],
         }
         history_cache: dict[tuple[str, str], list[dict]] = {}
-        symbol_meta_cache: dict[str, dict | None] = {}
         snapshot_total = 0
         labeled_snapshot_total = 0
         per_market: dict[str, dict] = {
@@ -702,76 +890,83 @@ def build_pattern_template_evaluation(
                     "wait_for_breakout": {1: [], 3: [], 5: [], 10: []},
                     "hold_and_watch": {1: [], 3: [], 5: [], 10: []},
                 },
+                "execution_profiles": {
+                    "buy_the_dip": [],
+                    "wait_for_breakout": [],
+                    "hold_and_watch": [],
+                },
             }
             for code in target_markets
         }
-        with SessionLocal() as db:
-            snapshot_repo = WorkspaceSnapshotRepository(db)
-            symbol_repo = SymbolRepository(db)
-            for market_code in target_markets:
-                params = build_base_precompute_params(
-                    model_template=template_key,
-                    universe="full_market",
+        snapshot_batches, symbol_meta_cache = _load_snapshot_batches_with_symbol_meta(
+            target_markets=target_markets,
+            model_template=template_key,
+            lookback_snapshots=lookback_snapshots,
+            top_n=top_n,
+        )
+        for snapshot in snapshot_batches:
+            market_code = str(snapshot.get("market_code") or "").upper()
+            trade_date = str(snapshot.get("snapshot_date") or "")
+            rows = list(snapshot.get("rows") or [])
+            snapshot_total += 1
+            per_market[market_code]["snapshot_total"] += 1
+            if not trade_date:
+                continue
+            labeled = False
+            for row in rows:
+                action_key = normalize_pattern_template_action(row.get("action_label"))
+                if action_key not in action_buckets:
+                    continue
+                labeled = True
+                ticker = str(row.get("ticker") or "").strip().upper()
+                if not ticker:
+                    continue
+                meta = symbol_meta_cache.get(ticker) or {}
+                sector_label = resolve_template_group_label(
+                    meta=meta,
+                    ticker=ticker,
+                    market_code=market_code,
+                    name=row.get("name"),
+                )
+                history_key = (market_code, ticker)
+                if history_key not in history_cache:
+                    history_cache[history_key] = load_lake_price_history(market=market_code, ticker=ticker, limit=260)
+                history = history_cache[history_key]
+                sample = {
+                    "ticker": ticker,
+                    "name": row.get("name") or ticker,
+                    "market": market_code,
+                    "sector": sector_label,
+                    "trade_date": trade_date,
+                    "return_1d": template_forward_return_from_history(history, trade_date=trade_date, sessions=1),
+                    "return_3d": template_forward_return_from_history(history, trade_date=trade_date, sessions=3),
+                    "return_5d": template_forward_return_from_history(history, trade_date=trade_date, sessions=5),
+                    "return_10d": template_forward_return_from_history(history, trade_date=trade_date, sessions=10),
+                }
+                execution_profile = template_execution_profile_from_history(
+                    history,
+                    trade_date=trade_date,
+                    ticker=ticker,
+                    name=row.get("name"),
                     market=market_code,
                 )
-                snapshots = snapshot_repo.list_snapshots(
-                    screener_snapshot_type(params),
-                    limit=max(1, int(lookback_snapshots)),
-                )
-                for snapshot in snapshots:
-                    snapshot_total += 1
-                    per_market[market_code]["snapshot_total"] += 1
-                    payload = snapshot.get("payload") or {}
-                    rows = list(payload.get("rows") or [])[: max(1, int(top_n))]
-                    trade_date = str(snapshot.get("snapshot_date") or "")[:10]
-                    if not trade_date:
-                        continue
-                    labeled = False
-                    for row in rows:
-                        action_key = normalize_pattern_template_action(row.get("action_label"))
-                        if action_key not in action_buckets:
-                            continue
-                        labeled = True
-                        ticker = str(row.get("ticker") or "").strip().upper()
-                        if not ticker:
-                            continue
-                        if ticker not in symbol_meta_cache:
-                            symbol_meta_cache[ticker] = symbol_repo.get_overview(ticker)
-                        meta = symbol_meta_cache.get(ticker) or {}
-                        sector_label = resolve_template_group_label(
-                            meta=meta,
-                            ticker=ticker,
-                            market_code=market_code,
-                            name=row.get("name"),
-                        )
-                        history_key = (market_code, ticker)
-                        if history_key not in history_cache:
-                            history_cache[history_key] = load_lake_price_history(market=market_code, ticker=ticker, limit=260)
-                        history = history_cache[history_key]
-                        sample = {
-                            "ticker": ticker,
-                            "name": row.get("name") or ticker,
-                            "market": market_code,
-                            "sector": sector_label,
-                            "trade_date": trade_date,
-                            "return_1d": template_forward_return_from_history(history, trade_date=trade_date, sessions=1),
-                            "return_3d": template_forward_return_from_history(history, trade_date=trade_date, sessions=3),
-                            "return_5d": template_forward_return_from_history(history, trade_date=trade_date, sessions=5),
-                            "return_10d": template_forward_return_from_history(history, trade_date=trade_date, sessions=10),
-                        }
-                        sector_counts[action_key][sector_label] = sector_counts[action_key].get(sector_label, 0) + 1
-                        for window, key in ((1, "return_1d"), (3, "return_3d"), (5, "return_5d"), (10, "return_10d")):
-                            value = sample.get(key)
-                            if value is not None:
-                                action_buckets[action_key][window].append(float(value))
-                                per_market[market_code]["action_buckets"][action_key][window].append(float(value))
-                                sector_bucket = sector_buckets[action_key].setdefault(sector_label, {1: [], 3: [], 5: [], 10: []})
-                                sector_bucket[window].append(float(value))
-                        if len(samples_by_action[action_key]) < 8:
-                            samples_by_action[action_key].append(sample)
-                    if labeled:
-                        labeled_snapshot_total += 1
-                        per_market[market_code]["labeled_snapshot_total"] += 1
+                if execution_profile:
+                    sample["execution_profile"] = execution_profile
+                    execution_buckets[action_key].append(execution_profile)
+                    ((per_market[market_code].get("execution_profiles") or {}).get(action_key) or []).append(execution_profile)
+                sector_counts[action_key][sector_label] = sector_counts[action_key].get(sector_label, 0) + 1
+                for window, key in ((1, "return_1d"), (3, "return_3d"), (5, "return_5d"), (10, "return_10d")):
+                    value = sample.get(key)
+                    if value is not None:
+                        action_buckets[action_key][window].append(float(value))
+                        per_market[market_code]["action_buckets"][action_key][window].append(float(value))
+                        sector_bucket = sector_buckets[action_key].setdefault(sector_label, {1: [], 3: [], 5: [], 10: []})
+                        sector_bucket[window].append(float(value))
+                if len(samples_by_action[action_key]) < 8:
+                    samples_by_action[action_key].append(sample)
+            if labeled:
+                labeled_snapshot_total += 1
+                per_market[market_code]["labeled_snapshot_total"] += 1
         return {
             "template": template_key,
             "markets": target_markets,
@@ -782,6 +977,10 @@ def build_pattern_template_evaluation(
             "windows": {
                 action: {window: aggregate_window_stats(values) for window, values in bucket.items()}
                 for action, bucket in action_buckets.items()
+            },
+            "execution": {
+                action: aggregate_execution_stats(values)
+                for action, values in execution_buckets.items()
             },
             "sector_windows": {
                 action: {
@@ -802,6 +1001,10 @@ def build_pattern_template_evaluation(
                             for window, values in ((payload.get("action_buckets") or {}).get(action) or {}).items()
                         }
                         for action in ("buy_the_dip", "wait_for_breakout", "hold_and_watch")
+                    },
+                    "execution": {
+                        action: aggregate_execution_stats(values)
+                        for action, values in ((payload.get("execution_profiles") or {}).items())
                     },
                 }
                 for code, payload in per_market.items()
@@ -859,7 +1062,7 @@ def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, t
     cache_key = json.dumps(
         {
             "template": "lightgbm_prediction_eval",
-            "version": 1,
+            "version": 2,
             "market": target_markets,
             "recent_runs": int(recent_runs),
             "top_n": int(top_n),
@@ -874,6 +1077,8 @@ def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, t
             "breakout": {1: [], 3: [], 5: []},
             "watch": {1: [], 3: [], 5: []},
         }
+        execution_buckets: dict[str, list[dict]] = {"pullback": [], "breakout": [], "watch": []}
+        calibration_records: list[dict] = []
         per_market: dict[str, dict] = {
             code: {
                 "windows": {
@@ -881,6 +1086,7 @@ def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, t
                     "breakout": {1: [], 3: [], 5: []},
                     "watch": {1: [], 3: [], 5: []},
                 },
+                "execution_profiles": {"pullback": [], "breakout": [], "watch": []},
                 "sample_count": 0,
             }
             for code in target_markets
@@ -905,11 +1111,14 @@ def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, t
                     "sample_count": 0,
                     "latest_trade_date": None,
                     "windows": {action: {window: aggregate_window_stats([]) for window in (1, 3, 5)} for action in action_buckets},
+                    "execution": {action: aggregate_execution_stats([]) for action in action_buckets},
+                    "score_calibration_buckets": [],
                     "samples": samples_by_action,
                     "per_market": {
                         code: {
                             "sample_count": 0,
                             "windows": {action: {window: aggregate_window_stats([]) for window in (1, 3, 5)} for action in action_buckets},
+                            "execution": {action: aggregate_execution_stats([]) for action in action_buckets},
                         }
                         for code in target_markets
                     },
@@ -944,11 +1153,13 @@ def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, t
                     "sample_count": 0,
                     "latest_trade_date": None,
                     "windows": {action: {window: aggregate_window_stats([]) for window in (1, 3, 5)} for action in action_buckets},
+                    "execution": {action: aggregate_execution_stats([]) for action in action_buckets},
                     "samples": samples_by_action,
                     "per_market": {
                         code: {
                             "sample_count": 0,
                             "windows": {action: {window: aggregate_window_stats([]) for window in (1, 3, 5)} for action in action_buckets},
+                            "execution": {action: aggregate_execution_stats([]) for action in action_buckets},
                         }
                         for code in target_markets
                     },
@@ -1002,15 +1213,48 @@ def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, t
                     "market": market_code,
                     "trade_date": str(prediction.trade_date),
                     "run_id": int(model_run.id),
+                    "score": float(prediction.score or 0.0),
+                    "rank_value": float(prediction.rank_value or 0.0),
                     "entry_style": detail.entry_style,
                     "signal_label": detail.signal_label,
                     "return_1d": template_forward_return_from_history(history, trade_date=str(prediction.trade_date), sessions=1),
                     "return_3d": template_forward_return_from_history(history, trade_date=str(prediction.trade_date), sessions=3),
                     "return_5d": template_forward_return_from_history(history, trade_date=str(prediction.trade_date), sessions=5),
                 }
+                execution_profile = template_execution_profile_from_history(
+                    history,
+                    trade_date=str(prediction.trade_date),
+                    ticker=ticker,
+                    name=symbol.name or ticker,
+                    market=market_code,
+                )
+                if execution_profile:
+                    sample["execution_profile"] = execution_profile
+                    execution_buckets[action_key].append(execution_profile)
+                calibration_records.append(
+                    {
+                        "score": float(prediction.score or 0.0),
+                        "return_3d": sample.get("return_3d"),
+                        "return_5d": sample.get("return_5d"),
+                        **(execution_profile or {}),
+                    }
+                )
                 sample_count += 1
-                per_market.setdefault(market_code, {"windows": {key: {1: [], 3: [], 5: []} for key in action_buckets}, "sample_count": 0})
+                per_market.setdefault(
+                    market_code,
+                    {
+                        "windows": {key: {1: [], 3: [], 5: []} for key in action_buckets},
+                        "execution_profiles": {key: [] for key in action_buckets},
+                        "sample_count": 0,
+                    },
+                )
                 per_market[market_code]["sample_count"] = int(per_market[market_code].get("sample_count") or 0) + 1
+                if execution_profile:
+                    execution_profiles = per_market[market_code].setdefault(
+                        "execution_profiles",
+                        {key: [] for key in action_buckets},
+                    )
+                    execution_profiles.setdefault(action_key, []).append(execution_profile)
                 for window, key in ((1, "return_1d"), (3, "return_3d"), (5, "return_5d")):
                     value = sample.get(key)
                     if value is None:
@@ -1029,6 +1273,11 @@ def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, t
                 action: {window: aggregate_window_stats(values) for window, values in bucket.items()}
                 for action, bucket in action_buckets.items()
             },
+            "execution": {
+                action: aggregate_execution_stats(values)
+                for action, values in execution_buckets.items()
+            },
+            "score_calibration_buckets": aggregate_lightgbm_score_calibration(calibration_records),
             "samples": samples_by_action,
             "per_market": {
                 code: {
@@ -1039,6 +1288,10 @@ def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, t
                             for window, values in ((payload.get("windows") or {}).get(action) or {}).items()
                         }
                         for action in ("pullback", "breakout", "watch")
+                    },
+                    "execution": {
+                        action: aggregate_execution_stats(values)
+                        for action, values in ((payload.get("execution_profiles") or {}).items())
                     },
                 }
                 for code, payload in per_market.items()
