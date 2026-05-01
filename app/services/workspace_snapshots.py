@@ -764,6 +764,10 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
                     "move_5d_total": 0.0,
                     "move_5d_count": 0,
                     "positive_5d_count": 0,
+                    "volume_ratio_total": 0.0,
+                    "volume_ratio_count": 0,
+                    "up_flow_proxy_total": 0.0,
+                    "down_flow_proxy_total": 0.0,
                     "max_signal_strength": 0,
                     "buy_signal_count": 0,
                     "execution_tags": {},
@@ -784,6 +788,22 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
                         item["positive_5d_count"] += 1
                 except (TypeError, ValueError):
                     pass
+            try:
+                volume_ratio = float(row.get("volume_ratio") or 0.0)
+            except (TypeError, ValueError):
+                volume_ratio = 0.0
+            if volume_ratio > 0:
+                item["volume_ratio_total"] += volume_ratio
+                item["volume_ratio_count"] += 1
+                flow_weight = max(0.25, volume_ratio)
+                try:
+                    move_for_flow = float(momentum_5 or 0.0)
+                except (TypeError, ValueError):
+                    move_for_flow = 0.0
+                if move_for_flow > 0:
+                    item["up_flow_proxy_total"] += flow_weight
+                elif move_for_flow < 0:
+                    item["down_flow_proxy_total"] += flow_weight
             signal_label = str(row.get("model_signal_label") or row.get("signal_label") or row.get("action_label") or "").strip().upper()
             if signal_label == "BUY":
                 item["buy_signal_count"] += 1
@@ -825,6 +845,28 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
                 if int(item["move_5d_count"] or 0) > 0
                 else None
             )
+            turnover_ratio_20d = (
+                round(float(item["volume_ratio_total"] or 0.0) / max(int(item["volume_ratio_count"] or 0), 1), 2)
+                if int(item["volume_ratio_count"] or 0) > 0
+                else None
+            )
+            total_flow_proxy = float(item["up_flow_proxy_total"] or 0.0) + float(item["down_flow_proxy_total"] or 0.0)
+            up_turnover_share_pct = (
+                round((float(item["up_flow_proxy_total"] or 0.0) / max(total_flow_proxy, 1e-6)) * 100.0, 1)
+                if total_flow_proxy > 0
+                else None
+            )
+            signed_turnover_pct = (
+                round(((float(item["up_flow_proxy_total"] or 0.0) - float(item["down_flow_proxy_total"] or 0.0)) / max(total_flow_proxy, 1e-6)) * 100.0, 1)
+                if total_flow_proxy > 0
+                else None
+            )
+            flow_proxy_score = None
+            if turnover_ratio_20d is not None or signed_turnover_pct is not None or breadth_pct is not None:
+                ratio_component = ((turnover_ratio_20d or 1.0) - 1.0) * 26.0
+                signed_component = (signed_turnover_pct or 0.0) * 0.30
+                breadth_component = ((breadth_pct or 50.0) - 50.0) * 0.32
+                flow_proxy_score = round(min(100.0, max(0.0, 50.0 + ratio_component + signed_component + breadth_component)), 1)
             tags = [tag for tag, _count in sorted(item["execution_tags"].items(), key=lambda pair: (-pair[1], pair[0]))[:3]]
             intensity = min(100, 18 + hits * 12 + int(avg_score * 0.7) + int(item["max_signal_strength"] * 0.25))
             heatmap_rows.append(
@@ -838,6 +880,10 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
                     "breadth_pct": breadth_pct,
                     "max_signal_strength": item["max_signal_strength"],
                     "buy_signal_count": item["buy_signal_count"],
+                    "turnover_ratio_20d": turnover_ratio_20d,
+                    "up_turnover_share_pct": up_turnover_share_pct,
+                    "signed_turnover_pct": signed_turnover_pct,
+                    "flow_proxy_score": flow_proxy_score,
                     "execution_tags": tags,
                     "ticker_details": item["ticker_details"],
                     "intensity": intensity,

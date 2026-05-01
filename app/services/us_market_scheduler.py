@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from app.core.db import SessionLocal
 from app.services.backtester import BacktestRunner
 from app.services.market_calendar import previous_market_open_date
-from app.services.market_lake import list_lake_symbols
+from app.services.market_lake import count_lake_symbols_for_trade_date, get_latest_lake_trade_date, list_lake_symbols
 from app.services.repository import AppSettingRepository, DataJobRepository
 from app.services.screener_snapshots import refresh_precomputed_screener_snapshots
 from app.services.trainer import SignalTrainer
@@ -23,8 +23,8 @@ US_SIGNAL_TRAIN_JOB_TYPE = "us_signal_train"
 
 DEFAULT_US_MARKET_SCHEDULER_CONFIG = {
     "enabled": True,
-    "run_hour": 10,
-    "run_minute": 0,
+    "run_hour": 11,
+    "run_minute": 15,
     "adjusted": True,
     "last_attempt_date": None,
     "last_attempt_at": None,
@@ -32,7 +32,7 @@ DEFAULT_US_MARKET_SCHEDULER_CONFIG = {
     "last_run_date": None,
     "last_run_at": None,
     "last_run_trade_date": None,
-    "retry_cooldown_minutes": 60,
+    "retry_cooldown_minutes": 20,
     "max_attempts_per_day": 3,
 }
 
@@ -63,9 +63,9 @@ class USMarketSchedulerService:
         config = DEFAULT_US_MARKET_SCHEDULER_CONFIG.copy()
         config.update(payload)
         config["enabled"] = bool(config.get("enabled"))
-        config["run_hour"] = min(23, max(0, _safe_int(config.get("run_hour"), 10)))
-        config["run_minute"] = min(59, max(0, _safe_int(config.get("run_minute"), 0)))
-        config["retry_cooldown_minutes"] = max(1, _safe_int(config.get("retry_cooldown_minutes"), 60))
+        config["run_hour"] = min(23, max(0, _safe_int(config.get("run_hour"), 11)))
+        config["run_minute"] = min(59, max(0, _safe_int(config.get("run_minute"), 15)))
+        config["retry_cooldown_minutes"] = max(1, _safe_int(config.get("retry_cooldown_minutes"), 20))
         config["max_attempts_per_day"] = max(1, _safe_int(config.get("max_attempts_per_day"), 3))
         config["last_attempt_count"] = max(0, _safe_int(config.get("last_attempt_count"), 0))
         config["adjusted"] = bool(config.get("adjusted", True))
@@ -140,6 +140,7 @@ class USMarketSchedulerService:
 
     def run_refresh(self, trigger: str = "manual") -> dict:
         config, job_id = self._prepare_run(trigger)
+        target_trade_date = previous_market_open_date("US", app_now().date() - timedelta(days=1))
         try:
             result = refresh_us_grouped_daily(
                 adjusted=bool(config.get("adjusted", True)),
@@ -149,6 +150,36 @@ class USMarketSchedulerService:
                 write_snapshot=False,
             )
             status = "success" if str(result.get("status")) == "success" else str(result.get("status") or "failed")
+            latest_lake_trade_date = get_latest_lake_trade_date(market="US")
+            latest_lake_symbol_count = (
+                count_lake_symbols_for_trade_date(market="US", trade_date=latest_lake_trade_date)
+                if latest_lake_trade_date
+                else 0
+            )
+            previous_trade_date = previous_market_open_date("US", datetime.fromisoformat(target_trade_date).date() - timedelta(days=1))
+            previous_lake_symbol_count = (
+                count_lake_symbols_for_trade_date(market="US", trade_date=previous_trade_date)
+                if previous_trade_date
+                else 0
+            )
+            coverage_ready = latest_lake_symbol_count > 0 and (
+                previous_lake_symbol_count <= 0
+                or latest_lake_symbol_count >= int(previous_lake_symbol_count * 0.95)
+            )
+            if status != "success" and latest_lake_trade_date == target_trade_date and coverage_ready:
+                status = "success"
+                result = {
+                    **result,
+                    "status": "success",
+                    "trade_date": latest_lake_trade_date,
+                    "message": (
+                        f"U.S. lake already contains {latest_lake_trade_date} with {latest_lake_symbol_count} symbols; "
+                        "proceeding with training and screener precompute without a fresh Polygon success."
+                    ),
+                    "used_existing_lake": True,
+                    "lake_symbol_count": latest_lake_symbol_count,
+                    "previous_lake_symbol_count": previous_lake_symbol_count,
+                }
             with SessionLocal() as db:
                 DataJobRepository(db).complete_job(
                     job_id,
@@ -157,9 +188,10 @@ class USMarketSchedulerService:
                     result=result,
                 )
                 if status == "success":
-                    self._persist_last_run(db, trade_date=str(result.get("trade_date") or ""))
+                    self._persist_last_run(db, trade_date=str(result.get("trade_date") or latest_lake_trade_date or ""))
             if status == "success":
-                self._run_signal_training(source_job_id=job_id, trade_date=str(result.get("trade_date") or ""))
+                resolved_trade_date = str(result.get("trade_date") or latest_lake_trade_date or "")
+                self._run_signal_training(source_job_id=job_id, trade_date=resolved_trade_date)
                 self._run_screener_precompute(source_job_id=job_id)
             return {"status": status, "job_id": job_id, "refresh_result": result}
         except Exception as exc:

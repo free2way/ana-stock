@@ -353,6 +353,16 @@ def evaluate_candidate_tradability(
             status = "REVIEW"
         risk_flags.append("weak-signal-strength")
 
+    normalized_flags = {str(flag).strip().lower() for flag in risk_flags if str(flag).strip()}
+    if "rolled-over-after-spike" in normalized_flags:
+        if status == "READY":
+            status = "REVIEW"
+        elif status == "DEFER":
+            status = "REVIEW"
+        risk_flags.append("confirmation-needed")
+    if "do-not-chase" in normalized_flags and status == "READY":
+        status = "DEFER"
+
     latest_close = _safe_float(candidate.get("latest_close"))
     if latest_close is None:
         if status == "READY":

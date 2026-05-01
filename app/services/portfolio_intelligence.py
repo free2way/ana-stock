@@ -72,6 +72,9 @@ def build_portfolio_ai_summary(
     signal = latest_signal or {}
     score = signal.get("score")
     score_value = float(score) if score is not None else None
+    tradability_status = str(signal.get("tradability_status") or "").strip().upper()
+    invalidation_condition = str(signal.get("invalidation_condition") or "").strip()
+    target_weight = signal.get("target_weight")
     verdict = build_signal_label(score_value, lang=lang) if score_value is not None else _translate_signal_label(signal.get("signal_label"), lang=lang)
     if not verdict:
         verdict = "持有" if lang == "zh" else "Hold"
@@ -84,7 +87,7 @@ def build_portfolio_ai_summary(
         reward_risk_ratio=signal.get("model_reward_risk_ratio"),
     ) if score_value is not None else _translate_entry_style(signal.get("entry_style"), lang=lang)
     raw_note = str(signal.get("execution_note") or "").strip()
-    if raw_note and lang != "zh":
+    if raw_note:
         strategy = raw_note
     else:
         strategy = suggested_style or ("等待确认" if lang == "zh" else "Wait for confirmation")
@@ -93,6 +96,12 @@ def build_portfolio_ai_summary(
         if cost_basis <= 0:
             headline = "缺少成本价，先补齐成本后再判断盈亏和风险。"
             strategy = "先补成本价，再看是否需要调仓"
+        elif tradability_status == "BLOCKED":
+            headline = "当前信号不支持继续进攻，优先按失效条件和仓位纪律处理。"
+            strategy = "不加仓，先看失效位是否被破坏"
+        elif tradability_status in {"DEFER", "REVIEW"}:
+            headline = "当前更适合复核和等待确认，不建议直接放大风险。"
+            strategy = raw_note or "先观察触发条件与失效位，再决定是否调整"
         elif pnl_pct <= -8:
             headline = "亏损已偏大，优先检查止损位和退出条件。"
             strategy = "先控回撤，不建议加仓摊平"
@@ -118,6 +127,12 @@ def build_portfolio_ai_summary(
         if cost_basis <= 0:
             headline = "Cost basis is missing; fill it before judging PnL risk."
             strategy = "Complete cost basis first"
+        elif tradability_status == "BLOCKED":
+            headline = "Current signal does not support adding risk; manage via invalidation and sizing discipline."
+            strategy = "Do not add; respect invalidation first"
+        elif tradability_status in {"DEFER", "REVIEW"}:
+            headline = "This position needs confirmation before taking more risk."
+            strategy = raw_note or "Review trigger and invalidation before adjusting"
         elif pnl_pct <= -8:
             headline = "Drawdown is elevated; review stop and exit conditions first."
             strategy = "Control drawdown; do not average down"
@@ -130,10 +145,64 @@ def build_portfolio_ai_summary(
         else:
             headline = "Review sizing drift and execution risk before adjusting."
 
+    if lang == "zh":
+        extra_parts: list[str] = []
+        if target_weight is not None:
+            try:
+                extra_parts.append(f"目标仓位 {float(target_weight) * 100.0:.1f}%")
+            except (TypeError, ValueError):
+                pass
+        if invalidation_condition and tradability_status in {"BLOCKED", "DEFER", "REVIEW"}:
+            extra_parts.append(f"失效位 {invalidation_condition}")
+        if extra_parts:
+            strategy = f"{strategy} · {'；'.join(extra_parts)}"
+        if tradability_status == "BLOCKED":
+            key_hint = "暂停加仓，优先守失效位"
+        elif tradability_status in {"DEFER", "REVIEW"}:
+            key_hint = "先等确认，不急着动"
+        elif pnl_pct <= -8:
+            key_hint = "先控回撤，别摊平"
+        elif pnl_pct >= 12:
+            key_hint = "优先保护利润"
+        elif target_weight is not None:
+            try:
+                key_hint = f"围绕目标仓位 {float(target_weight) * 100.0:.1f}% 管理"
+            except (TypeError, ValueError):
+                key_hint = "按计划仓位管理"
+        else:
+            key_hint = "按计划跟踪，不追单"
+    else:
+        extra_parts = []
+        if target_weight is not None:
+            try:
+                extra_parts.append(f"target {float(target_weight) * 100.0:.1f}%")
+            except (TypeError, ValueError):
+                pass
+        if invalidation_condition and tradability_status in {"BLOCKED", "DEFER", "REVIEW"}:
+            extra_parts.append(f"invalidation {invalidation_condition}")
+        if extra_parts:
+            strategy = f"{strategy} | {'; '.join(extra_parts)}"
+        if tradability_status == "BLOCKED":
+            key_hint = "Do not add; respect invalidation"
+        elif tradability_status in {"DEFER", "REVIEW"}:
+            key_hint = "Wait for confirmation first"
+        elif pnl_pct <= -8:
+            key_hint = "Control drawdown first"
+        elif pnl_pct >= 12:
+            key_hint = "Protect open profit first"
+        elif target_weight is not None:
+            try:
+                key_hint = f"Manage around target {float(target_weight) * 100.0:.1f}%"
+            except (TypeError, ValueError):
+                key_hint = "Manage to target size"
+        else:
+            key_hint = "Follow the plan; avoid impulse adds"
+
     return {
         "ai_verdict": verdict,
         "ai_headline": headline,
         "ai_strategy": strategy,
+        "key_hint": key_hint,
     }
 
 

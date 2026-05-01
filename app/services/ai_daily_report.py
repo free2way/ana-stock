@@ -83,6 +83,7 @@ def _reason_label_map(lang: str) -> dict[str, str]:
             "confirmation_needed": "市场还在确认阶段，先等二次确认",
             "portfolio_risk_budget": "当前组合风险预算偏紧",
             "balanced_setup": "形态中性，继续观察",
+            "rolled_over_after_spike": "冲高后转弱，先按观察处理",
         }
     return {
         "signal_not_actionable": "Model signal is not actionable yet",
@@ -110,7 +111,40 @@ def _reason_label_map(lang: str) -> dict[str, str]:
         "confirmation_needed": "The tape still needs confirmation",
         "portfolio_risk_budget": "Portfolio risk budget is already tight",
         "balanced_setup": "Balanced setup; keep monitoring",
+        "rolled_over_after_spike": "Momentum faded after the spike; keep it on watch",
     }
+
+
+def format_risk_flags(flags: list[str] | tuple[str, ...] | set[str] | None, *, lang: str = "zh") -> str:
+    if not flags:
+        return "-"
+    label_map = {
+        "zh": {
+            "drawdown-risk": "回撤风险",
+            "low-conviction": "低置信度",
+            "weak-signal-strength": "信号偏弱",
+            "missing-model-score": "缺少模型分",
+            "do-not-chase": "不要追高",
+            "rolled-over-after-spike": "冲高后转弱",
+            "chase-risk": "追高风险",
+            "far-from-trigger": "偏离触发位",
+        },
+        "en": {
+            "drawdown-risk": "Drawdown risk",
+            "low-conviction": "Low conviction",
+            "weak-signal-strength": "Weak signal",
+            "missing-model-score": "Missing model score",
+            "do-not-chase": "Do not chase",
+            "rolled-over-after-spike": "Rolled over after spike",
+            "chase-risk": "Chasing risk",
+            "far-from-trigger": "Far from trigger",
+        },
+    }
+    localized = label_map.get(lang, label_map["en"])
+    values = [localized.get(str(flag).strip(), str(flag).strip().replace("_", " ").replace("-", " ")) for flag in flags if str(flag).strip()]
+    if not values:
+        return "-"
+    return "，".join(values) if lang == "zh" else ", ".join(values)
 
 
 def format_trade_gate_reason(reason: str | None, *, lang: str = "zh") -> str:
@@ -1610,7 +1644,7 @@ def render_ai_daily_report_message(report: dict | None) -> str:
         "",
     ]
     for index, item in enumerate(portfolio_rows, start=1):
-        risk_flags = ", ".join(item.get("risk_flags") or []) or "-"
+        risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
         lines.extend(
             [
                 f"{index}. {_report_security_label(item)}",
@@ -1655,7 +1689,7 @@ def render_ai_daily_report_message(report: dict | None) -> str:
     for index, item in enumerate(market_rows[:5], start=1):
         buy_zone = item.get("buy_zone") or {}
         take_profit = item.get("take_profit") or {}
-        risk_flags = ", ".join(item.get("risk_flags") or []) or "-"
+        risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
         lines.extend(
             [
                 f"{index}. {_report_security_label(item)}",
@@ -1687,7 +1721,7 @@ def render_ai_daily_report_message(report: dict | None) -> str:
         lines.append("")
     for index, item in enumerate(market_watch_rows[:5], start=1):
         buy_zone = item.get("buy_zone") or {}
-        risk_flags = ", ".join(item.get("risk_flags") or []) or "-"
+        risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
         lines.extend(
             [
                 f"{index}. {_report_security_label(item)}",
@@ -1711,7 +1745,7 @@ def render_ai_daily_report_message(report: dict | None) -> str:
         for index, item in enumerate(us_model_rows[:5], start=1):
             buy_zone = item.get("buy_zone") or {}
             take_profit = item.get("take_profit") or {}
-            risk_flags = ", ".join(item.get("risk_flags") or []) or "-"
+            risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
             lines.extend(
                 [
                     f"{index}. {_report_security_label(item)}",
@@ -1806,7 +1840,7 @@ def _render_portfolio_push_message(payload: dict) -> str:
         lines.append("当前持仓库为空，暂无需要复核的持仓。")
         return "\n".join(lines).strip()
     for index, item in enumerate(portfolio_rows, start=1):
-        risk_flags = ", ".join(item.get("risk_flags") or []) or "-"
+        risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
         lines.extend(
             [
                 f"{index}. {_report_security_label(item)}",
@@ -1861,7 +1895,7 @@ def _render_market_top5_push_message(payload: dict) -> str:
     for index, item in enumerate(market_rows[:5], start=1):
         buy_zone = item.get("buy_zone") or {}
         take_profit = item.get("take_profit") or {}
-        risk_flags = ", ".join(item.get("risk_flags") or []) or "-"
+        risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
         lines.extend(
             [
                 f"{index}. {_report_security_label(item)}",
@@ -1890,7 +1924,7 @@ def _render_market_top5_push_message(payload: dict) -> str:
         return "\n".join(lines).strip()
     for index, item in enumerate(market_watch_rows[:5], start=1):
         buy_zone = item.get("buy_zone") or {}
-        risk_flags = ", ".join(item.get("risk_flags") or []) or "-"
+        risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
         lines.extend(
             [
                 f"{index}. {_report_security_label(item)}",
@@ -1921,7 +1955,7 @@ def _render_us_market_top5_push_message(payload: dict) -> str:
     for index, item in enumerate(us_rows[:5], start=1):
         buy_zone = item.get("buy_zone") or {}
         take_profit = item.get("take_profit") or {}
-        risk_flags = ", ".join(item.get("risk_flags") or []) or "-"
+        risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
         lines.extend(
             [
                 f"{index}. {_report_security_label(item)}",
@@ -1957,7 +1991,7 @@ def _render_legacy_ai_daily_report_message(report: dict | None) -> str:
     for index, item in enumerate(payload.get("rows") or [], start=1):
         buy_zone = item.get("buy_zone") or {}
         take_profit = item.get("take_profit") or {}
-        risk_flags = ", ".join(item.get("risk_flags") or []) or "-"
+        risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
         lines.extend(
             [
                 f"{index}. {_report_security_label(item)}",
@@ -1982,7 +2016,7 @@ def _render_legacy_ai_daily_report_message(report: dict | None) -> str:
         lines.extend(["Buy The Dip 候选:", ""])
         for index, item in enumerate(buy_the_dip_rows, start=1):
             buy_zone = item.get("buy_zone") or {}
-            risk_flags = ", ".join(item.get("risk_flags") or []) or "-"
+            risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
             lines.extend(
                 [
                     f"{index}. {_report_security_label(item)}",
@@ -2023,7 +2057,7 @@ def _render_market_structure_lines(structure: dict, *, title: str) -> list[str]:
     if risk_watch:
         lines.append("风险清单：")
         for item in risk_watch[:4]:
-            risk_flags = ", ".join(item.get("risk_flags") or []) or "-"
+            risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
             lines.append(
                 f"- {_report_security_label(item)}: {item.get('tradability_status') or '-'} | {risk_flags} | {item.get('headline') or '-'}"
             )

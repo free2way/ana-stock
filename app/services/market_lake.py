@@ -29,13 +29,27 @@ LAKE_PARQUET_CHUNK_SIZE = 48
 LAKE_DUCKDB_MAX_CONCURRENT_READS = 2
 LAKE_DUCKDB_MAX_RETRIES = 3
 LAKE_MIN_PARQUET_BYTES = 64
+LAKE_FILE_LIST_CACHE_TTL_SECONDS = 15.0
 _LAKE_DUCKDB_READ_SEMAPHORE = threading.BoundedSemaphore(LAKE_DUCKDB_MAX_CONCURRENT_READS)
 _LAKE_BAD_FILE_REGISTRY_LOCK = threading.Lock()
 _LAKE_BAD_FILE_REGISTRY: dict[str, dict] = {}
+_LAKE_FILE_LIST_CACHE_LOCK = threading.Lock()
+_LAKE_FILE_LIST_CACHE: dict[str, dict] = {}
+_LAKE_QUERY_STATS_LOCK = threading.Lock()
+_LAKE_QUERY_STATS: dict[str, dict] = {}
 
 
 def market_lake_root() -> Path:
     return get_settings().data_dir / "lake"
+
+
+def _invalidate_lake_file_cache(market: str | None = None) -> None:
+    normalized = str(market or "").strip().lower()
+    with _LAKE_FILE_LIST_CACHE_LOCK:
+        if normalized:
+            _LAKE_FILE_LIST_CACHE.pop(normalized, None)
+        else:
+            _LAKE_FILE_LIST_CACHE.clear()
 
 
 def write_daily_ohlcv_parquet(*, market: str, trade_date: str, rows: list[dict], merge_existing: bool = False) -> Path:
@@ -52,6 +66,7 @@ def write_daily_ohlcv_parquet(*, market: str, trade_date: str, rows: list[dict],
         except Exception:
             pass
     frame.write_parquet(path, compression="zstd")
+    _invalidate_lake_file_cache(market_code)
     return path
 
 
@@ -82,7 +97,7 @@ def query_us_daily_summary(*, trade_date: str | None = None, limit: int = 10) ->
         ORDER BY dollar_volume DESC NULLS LAST
         LIMIT {max(1, int(limit))}
     """
-    rows, columns = _duckdb_fetchall(sql, [parquet_files, *params])
+    rows, columns = _duckdb_fetchall(sql, [parquet_files, *params], label="lake_us_daily_summary")
     return {
         "status": "success",
         "trade_date": trade_date,
@@ -153,6 +168,7 @@ def query_lake_daily_movers(
     rows, columns = _duckdb_fetchall(
         sql,
         [parquet_files, float(min_dollar_volume), float(min_dollar_volume), float(min_return_pct)],
+        label="lake_daily_movers",
     )
     return [_json_ready_row(dict(zip(columns, row, strict=False))) for row in rows]
 
@@ -180,7 +196,7 @@ def load_lake_price_history(*, market: str, ticker: str, limit: int = 120) -> li
     history: list[dict] = []
     columns: list[str] = []
     for file_chunk in _chunked_paths(parquet_files):
-        rows, chunk_columns = _duckdb_fetchall(sql, [file_chunk, symbol])
+        rows, chunk_columns = _duckdb_fetchall(sql, [file_chunk, symbol], label="lake_price_history")
         if not columns:
             columns = chunk_columns
         history.extend(_json_ready_row(dict(zip(columns, row, strict=False))) for row in rows)
@@ -188,6 +204,54 @@ def load_lake_price_history(*, market: str, ticker: str, limit: int = 120) -> li
     history = history[: max(1, int(limit))]
     history.sort(key=lambda item: item.get("date") or "")
     return history
+
+
+def load_lake_latest_closes(*, market: str, tickers: list[str]) -> dict[str, float | None]:
+    market_code = str(market or "").strip().upper()
+    parquet_files = _recent_parquet_files(market_code, limit=180)
+    normalized = []
+    for ticker in tickers:
+        symbol = str(ticker or "").strip().upper()
+        if symbol and symbol not in normalized:
+            normalized.append(symbol)
+    if market_code not in {"CN", "US"} or not normalized or not parquet_files:
+        return {}
+
+    payload: dict[str, float | None] = {}
+    for start in range(0, len(normalized), 500):
+        ticker_chunk = normalized[start : start + 500]
+        placeholders = ", ".join("?" for _ in ticker_chunk)
+        sql = f"""
+            WITH ranked AS (
+                SELECT
+                    symbol,
+                    close,
+                    adj_close,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol
+                        ORDER BY CAST(date AS DATE) DESC
+                    ) AS row_num
+                FROM read_parquet(?, hive_partitioning = true)
+                WHERE symbol IN ({placeholders})
+            )
+            SELECT symbol, close, adj_close
+            FROM ranked
+            WHERE row_num = 1
+        """
+        rows, _columns = _duckdb_fetchall(
+            sql,
+            [parquet_files, *ticker_chunk],
+            label="lake_latest_closes",
+        )
+        for symbol, close_value, adj_close_value in rows:
+            latest_value = adj_close_value if adj_close_value not in (None, "") else close_value
+            try:
+                payload[str(symbol or "").strip().upper()] = (
+                    None if latest_value in (None, "") else float(latest_value)
+                )
+            except (TypeError, ValueError):
+                payload[str(symbol or "").strip().upper()] = None
+    return payload
 
 
 def get_latest_lake_trade_date(*, market: str, ticker: str | None = None) -> str | None:
@@ -205,11 +269,33 @@ def get_latest_lake_trade_date(*, market: str, ticker: str | None = None) -> str
         FROM read_parquet(?, hive_partitioning = true)
         {where_clause}
     """
-    rows, _columns = _duckdb_fetchall(sql, params)
+    rows, _columns = _duckdb_fetchall(sql, params, label="lake_latest_trade_date")
     if not rows:
         return None
     value = rows[0][0] if rows[0] else None
     return str(value or "").strip() or None
+
+
+def count_lake_symbols_for_trade_date(*, market: str, trade_date: str) -> int:
+    market_code = str(market or "").strip().upper()
+    normalized_trade_date = str(trade_date or "").strip()
+    if market_code not in {"CN", "US"} or not normalized_trade_date:
+        return 0
+    path = market_lake_root() / f"{market_code.lower()}_daily" / f"date={normalized_trade_date}" / "part.parquet"
+    if not path.exists():
+        return 0
+    sql = """
+        SELECT COUNT(DISTINCT symbol) AS symbol_count
+        FROM read_parquet(?, hive_partitioning = true)
+    """
+    rows, _columns = _duckdb_fetchall(sql, [[str(path)]], label="lake_trade_date_symbol_count")
+    if not rows:
+        return 0
+    value = rows[0][0] if rows[0] else 0
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _recent_parquet_files(market: str, *, limit: int) -> list[str]:
@@ -218,6 +304,11 @@ def _recent_parquet_files(market: str, *, limit: int) -> list[str]:
 
 def _all_parquet_files(market: str) -> list[str]:
     market_code = str(market or "").strip().lower()
+    now = time.monotonic()
+    with _LAKE_FILE_LIST_CACHE_LOCK:
+        cached = _LAKE_FILE_LIST_CACHE.get(market_code)
+        if cached and (now - float(cached.get("fetched_at") or 0.0)) < LAKE_FILE_LIST_CACHE_TTL_SECONDS:
+            return list(cached.get("files") or [])
     market_dir = market_lake_root() / f"{market_code}_daily"
     files = sorted(
         (
@@ -228,7 +319,13 @@ def _all_parquet_files(market: str) -> list[str]:
         key=lambda path: path.parent.name,
         reverse=True,
     )
-    return [str(path) for path in files]
+    normalized_files = [str(path) for path in files]
+    with _LAKE_FILE_LIST_CACHE_LOCK:
+        _LAKE_FILE_LIST_CACHE[market_code] = {
+            "files": normalized_files,
+            "fetched_at": now,
+        }
+    return normalized_files
 
 
 def _chunked_paths(paths: list[str], *, chunk_size: int = LAKE_PARQUET_CHUNK_SIZE) -> list[list[str]]:
@@ -280,15 +377,100 @@ def _bad_file_registry_snapshot() -> list[dict]:
     return rows
 
 
-def _duckdb_fetchall(sql: str, params: list | tuple) -> tuple[list[tuple], list[str]]:
+def _record_lake_query_stat(
+    *,
+    label: str,
+    duration_ms: float,
+    row_count: int,
+    file_count: int,
+    status: str,
+    attempt_count: int,
+    error: Exception | None = None,
+) -> None:
+    normalized_label = str(label or "duckdb_query").strip() or "duckdb_query"
+    now = datetime.now().isoformat(timespec="seconds")
+    with _LAKE_QUERY_STATS_LOCK:
+        existing = _LAKE_QUERY_STATS.get(normalized_label) or {
+            "label": normalized_label,
+            "count": 0,
+            "error_count": 0,
+            "last_error": None,
+            "last_status": None,
+            "last_duration_ms": None,
+            "last_row_count": None,
+            "last_file_count": None,
+            "last_attempt_count": None,
+            "avg_duration_ms": 0.0,
+            "max_duration_ms": 0.0,
+            "last_run_at": None,
+        }
+        count = int(existing.get("count") or 0) + 1
+        prior_avg = float(existing.get("avg_duration_ms") or 0.0)
+        avg_duration_ms = ((prior_avg * (count - 1)) + float(duration_ms)) / count
+        error_count = int(existing.get("error_count") or 0) + (1 if status != "success" else 0)
+        _LAKE_QUERY_STATS[normalized_label] = {
+            **existing,
+            "count": count,
+            "error_count": error_count,
+            "last_error": str(error).splitlines()[0][:240] if error else None,
+            "last_status": status,
+            "last_duration_ms": round(float(duration_ms), 2),
+            "last_row_count": int(row_count),
+            "last_file_count": int(file_count),
+            "last_attempt_count": int(attempt_count),
+            "avg_duration_ms": round(avg_duration_ms, 2),
+            "max_duration_ms": round(max(float(existing.get("max_duration_ms") or 0.0), float(duration_ms)), 2),
+            "last_run_at": now,
+        }
+
+
+def _lake_query_stats_snapshot() -> list[dict]:
+    with _LAKE_QUERY_STATS_LOCK:
+        rows = list(_LAKE_QUERY_STATS.values())
+    rows.sort(
+        key=lambda item: (
+            -float(item.get("last_duration_ms") or 0.0),
+            -int(item.get("error_count") or 0),
+            str(item.get("label") or ""),
+        )
+    )
+    return rows
+
+
+def _lake_file_cache_snapshot() -> list[dict]:
+    now = time.monotonic()
+    with _LAKE_FILE_LIST_CACHE_LOCK:
+        rows = [
+            {
+                "market": market_code.upper(),
+                "file_count": len(list(payload.get("files") or [])),
+                "age_seconds": round(max(0.0, now - float(payload.get("fetched_at") or 0.0)), 2),
+            }
+            for market_code, payload in _LAKE_FILE_LIST_CACHE.items()
+        ]
+    rows.sort(key=lambda item: str(item.get("market") or ""))
+    return rows
+
+
+def _duckdb_fetchall(sql: str, params: list | tuple, *, label: str = "duckdb_query") -> tuple[list[tuple], list[str]]:
     last_error: Exception | None = None
     normalized_params = list(params)
+    initial_file_count = len(normalized_params[0]) if normalized_params and isinstance(normalized_params[0], list) else 0
+    started_at = time.perf_counter()
     for attempt in range(LAKE_DUCKDB_MAX_RETRIES):
         try:
             with _LAKE_DUCKDB_READ_SEMAPHORE:
                 with duckdb.connect(database=":memory:") as connection:
                     rows = connection.execute(sql, normalized_params).fetchall()
                     columns = [item[0] for item in connection.description]
+            _record_lake_query_stat(
+                label=label,
+                duration_ms=(time.perf_counter() - started_at) * 1000.0,
+                row_count=len(rows),
+                file_count=len(normalized_params[0]) if normalized_params and isinstance(normalized_params[0], list) else initial_file_count,
+                status="success",
+                attempt_count=attempt + 1,
+            )
             return rows, columns
         except Exception as exc:
             last_error = exc
@@ -300,11 +482,38 @@ def _duckdb_fetchall(sql: str, params: list | tuple) -> tuple[list[tuple], list[
                     normalized_params[0] = filtered_paths
                     continue
                 if not filtered_paths:
+                    _record_lake_query_stat(
+                        label=label,
+                        duration_ms=(time.perf_counter() - started_at) * 1000.0,
+                        row_count=0,
+                        file_count=0,
+                        status="skipped_all_bad_files",
+                        attempt_count=attempt + 1,
+                        error=exc,
+                    )
                     return [], []
             if not _is_too_many_open_files_error(exc) or attempt >= LAKE_DUCKDB_MAX_RETRIES - 1:
+                _record_lake_query_stat(
+                    label=label,
+                    duration_ms=(time.perf_counter() - started_at) * 1000.0,
+                    row_count=0,
+                    file_count=len(normalized_params[0]) if normalized_params and isinstance(normalized_params[0], list) else initial_file_count,
+                    status="error",
+                    attempt_count=attempt + 1,
+                    error=exc,
+                )
                 raise
             time.sleep(0.2 * (attempt + 1))
     if last_error is not None:
+        _record_lake_query_stat(
+            label=label,
+            duration_ms=(time.perf_counter() - started_at) * 1000.0,
+            row_count=0,
+            file_count=len(normalized_params[0]) if normalized_params and isinstance(normalized_params[0], list) else initial_file_count,
+            status="error",
+            attempt_count=LAKE_DUCKDB_MAX_RETRIES,
+            error=last_error,
+        )
         raise last_error
     return [], []
 
@@ -341,7 +550,7 @@ def load_lake_rows(*, markets: list[str] | None = None, tickers: set[str] | None
             params = [file_chunk]
             if normalized_tickers:
                 params.append(sorted(normalized_tickers))
-            rows, chunk_columns = _duckdb_fetchall(sql, params)
+            rows, chunk_columns = _duckdb_fetchall(sql, params, label="lake_load_rows")
             if not columns:
                 columns = chunk_columns
             all_rows.extend(_json_ready_row(dict(zip(columns, row, strict=False))) for row in rows)
@@ -374,7 +583,7 @@ def list_lake_symbols(*, market: str) -> set[str]:
     """
     symbols: set[str] = set()
     for file_chunk in _chunked_paths(parquet_files):
-        rows, _ = _duckdb_fetchall(sql, [file_chunk])
+        rows, _ = _duckdb_fetchall(sql, [file_chunk], label="lake_list_symbols")
         symbols.update(str(row[0] or "").strip().upper() for row in rows if row and row[0])
     return symbols
 
@@ -412,6 +621,8 @@ def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: i
             SELECT
                 CAST(date AS DATE) AS trade_date,
                 symbol,
+                high,
+                low,
                 close,
                 volume,
                 close * volume AS dollar_volume
@@ -422,6 +633,8 @@ def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: i
             SELECT
                 trade_date,
                 symbol,
+                high,
+                low,
                 close,
                 volume,
                 dollar_volume,
@@ -439,6 +652,14 @@ def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: i
                     PARTITION BY symbol ORDER BY trade_date
                     ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
                 ) AS ma60,
+                MAX(high) OVER (
+                    PARTITION BY symbol ORDER BY trade_date
+                    ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
+                ) AS recent_high_10,
+                MAX(high) OVER (
+                    PARTITION BY symbol ORDER BY trade_date
+                    ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                ) AS recent_high_20,
                 ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY trade_date DESC) AS rn
             FROM base
         )
@@ -452,7 +673,15 @@ def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: i
             momentum_20,
             CASE WHEN avg_volume_20 > 0 THEN volume / avg_volume_20 ELSE NULL END AS volume_ratio,
             ma20,
-            ma60
+            ma60,
+            CASE
+                WHEN recent_high_10 > 0 THEN ((recent_high_10 - close) / recent_high_10) * 100.0
+                ELSE NULL
+            END AS pullback_depth_pct,
+            CASE
+                WHEN recent_high_20 > 0 THEN ((recent_high_20 - close) / recent_high_20) * 100.0
+                ELSE NULL
+            END AS distance_to_breakout_pct
         FROM enriched
         WHERE rn = 1
           AND close IS NOT NULL
@@ -464,7 +693,11 @@ def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: i
           dollar_volume DESC
         LIMIT {max(1, int(limit))}
     """
-    rows, columns = _duckdb_fetchall(sql, [parquet_files, *params, float(min_dollar_volume)])
+    rows, columns = _duckdb_fetchall(
+        sql,
+        [parquet_files, *params, float(min_dollar_volume)],
+        label="lake_screen_momentum",
+    )
     results: list[dict] = []
     for index, row in enumerate(rows, start=1):
         item = _json_ready_row(dict(zip(columns, row, strict=False)))
@@ -476,10 +709,10 @@ def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: i
                 "market": market_code,
                 "latest_close": item.get("close"),
                 "trend_score": trend_score,
-                "action_label": _lake_action_label(trend_score),
+                "action_label": _lake_action_label(trend_score, item),
                 "action_summary": _lake_action_summary(item, trend_score),
                 "selection_reason": _lake_selection_reason(item),
-                "distance_to_breakout_pct": None,
+                "risk_flags": _lake_risk_flags(item),
                 "rank_value": index,
                 "snapshot_score": round(
                     trend_score
@@ -526,12 +759,20 @@ def _lake_trend_score(row: dict) -> int:
     momentum_5 = float(row.get("momentum_5") or 0.0)
     momentum_20 = float(row.get("momentum_20") or 0.0)
     volume_ratio = float(row.get("volume_ratio") or 1.0)
+    pullback_depth_pct = float(row.get("pullback_depth_pct") or 0.0)
     close = row.get("close")
     ma20 = row.get("ma20")
     ma60 = row.get("ma60")
     score += max(-12.0, min(12.0, momentum_5 * 120.0))
     score += max(-18.0, min(18.0, momentum_20 * 90.0))
     score += max(-6.0, min(8.0, (volume_ratio - 1.0) * 8.0))
+    score -= max(0.0, min(18.0, (pullback_depth_pct - 3.0) * 1.25))
+    if pullback_depth_pct >= 6.0 and momentum_5 <= 0.02:
+        score -= 6.0
+    if pullback_depth_pct >= 8.0 and momentum_20 >= 0.18 and volume_ratio < 1.05:
+        # Strong 20d momentum alone is not enough if the stock already rolled over
+        # from a recent high and participation is fading.
+        score -= 8.0
     if close is not None and ma20 is not None and float(close) > float(ma20):
         score += 8.0
     if close is not None and ma60 is not None and float(close) > float(ma60):
@@ -539,9 +780,16 @@ def _lake_trend_score(row: dict) -> int:
     return int(max(1, min(99, round(score))))
 
 
-def _lake_action_label(score: int) -> str:
+def _lake_action_label(score: int, row: dict | None = None) -> str:
+    pullback_depth_pct = float((row or {}).get("pullback_depth_pct") or 0.0)
+    momentum_5 = float((row or {}).get("momentum_5") or 0.0)
+    volume_ratio = float((row or {}).get("volume_ratio") or 1.0)
+    if score >= 75 and (pullback_depth_pct >= 8.0 or (pullback_depth_pct >= 6.0 and volume_ratio < 1.0 and momentum_5 <= 0.02)):
+        return "WATCH"
     if score >= 75:
         return "BUY"
+    if score >= 60 and pullback_depth_pct >= 12.0 and momentum_5 <= 0.02:
+        return "HOLD"
     if score >= 60:
         return "WATCH"
     if score <= 35:
@@ -550,20 +798,49 @@ def _lake_action_label(score: int) -> str:
 
 
 def _lake_action_summary(row: dict, score: int) -> str:
-    return (
+    summary = (
         f"Lake momentum score {score}; "
         f"20d momentum {_fmt_pct(row.get('momentum_20'))}, "
         f"5d momentum {_fmt_pct(row.get('momentum_5'))}, "
-        f"volume ratio {float(row.get('volume_ratio') or 0.0):.2f}."
+        f"volume ratio {float(row.get('volume_ratio') or 0.0):.2f}, "
+        f"pullback {float(row.get('pullback_depth_pct') or 0.0):.1f}%."
     )
+    risk_flags = _lake_risk_flags(row)
+    if "rolled-over-after-spike" in risk_flags:
+        summary += " Recent momentum has faded after a sharp spike, so this should stay watch-only."
+    elif "do-not-chase" in risk_flags:
+        summary += " Price is extended versus the recent setup; avoid chasing the close."
+    return summary
 
 
 def _lake_selection_reason(row: dict) -> str:
-    return (
+    reason = (
         f"DuckDB Parquet scan: dollar volume {float(row.get('dollar_volume') or 0.0):.0f}, "
         f"20d momentum {_fmt_pct(row.get('momentum_20'))}, "
-        f"5d momentum {_fmt_pct(row.get('momentum_5'))}."
+        f"5d momentum {_fmt_pct(row.get('momentum_5'))}, "
+        f"pullback {float(row.get('pullback_depth_pct') or 0.0):.1f}% from the 10d high."
     )
+    risk_flags = _lake_risk_flags(row)
+    if "rolled-over-after-spike" in risk_flags:
+        reason += " Treat it as a faded momentum setup instead of a fresh breakout."
+    elif "do-not-chase" in risk_flags:
+        reason += " The setup is still extended, so wait for a cleaner reset."
+    return reason
+
+
+def _lake_risk_flags(row: dict) -> list[str]:
+    flags: list[str] = []
+    pullback_depth_pct = float(row.get("pullback_depth_pct") or 0.0)
+    momentum_5 = float(row.get("momentum_5") or 0.0)
+    momentum_20 = float(row.get("momentum_20") or 0.0)
+    volume_ratio = float(row.get("volume_ratio") or 1.0)
+    if pullback_depth_pct >= 8.0:
+        flags.append("drawdown-risk")
+    if pullback_depth_pct >= 12.0 and momentum_20 >= 0.18 and momentum_5 <= 0.03:
+        flags.append("rolled-over-after-spike")
+    if pullback_depth_pct >= 6.0 and volume_ratio < 1.0:
+        flags.append("do-not-chase")
+    return flags
 
 
 def _fmt_pct(value) -> str:
@@ -607,4 +884,8 @@ def lake_file_health_summary() -> dict:
         "status": "healthy" if not issues else "warning",
         "issues": issues,
         "issue_count": sum(int(item.get("count") or 0) for item in issues),
+        "runtime": {
+            "query_stats": _lake_query_stats_snapshot()[:20],
+            "file_cache": _lake_file_cache_snapshot(),
+        },
     }

@@ -6,6 +6,7 @@ from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
 from app.services.insight_engine import InsightEngine
 from app.services.market_context import load_market_context_snapshot
+from app.services.market_lake import screen_us_lake_momentum
 from app.services.runtime_cache import get_or_set
 from app.services.repository import (
     FundamentalSnapshotRepository,
@@ -944,12 +945,38 @@ class ScreenerService:
                     limit=None,
                     required_patterns=["bullish_ma_stack"],
                 )
+            elif universe == "full_market" and market == "US":
+                us_candidate_limit = 240
+                us_momentum_rows = screen_us_lake_momentum(limit=us_candidate_limit)
+                ranked_tickers = [
+                    str(item.get("ticker") or "").strip().upper()
+                    for item in us_momentum_rows
+                    if str(item.get("ticker") or "").strip()
+                ]
+                if ranked_tickers:
+                    allowed = set(tickers)
+                    prioritized = [ticker for ticker in ranked_tickers if ticker in allowed]
+                    if len(prioritized) < us_candidate_limit:
+                        seen = set(prioritized)
+                        prioritized.extend(
+                            ticker
+                            for ticker in tickers
+                            if ticker not in seen
+                            and (
+                                (cached_snapshot_map.get(ticker) or {}).get("bullish_ma_stack")
+                                or (cached_snapshot_map.get(ticker) or {}).get("volume_breakout")
+                            )
+                        )
+                    tickers = prioritized[:us_candidate_limit]
+                else:
+                    tickers = tickers[:us_candidate_limit]
         model_context_map = self._load_model_context_map(tickers)
 
         min_trend = max(int(min_trend_score or 0), 68)
         min_volume = max(float(min_volume_ratio or 0.0), 0.8)
+        insight_limit = 220 if universe == "full_market" and market == "US" else 260
         for ticker in tickers:
-            insight = self._get_cached_insight(ticker, limit=260, lang="en")
+            insight = self._get_cached_insight(ticker, limit=insight_limit, lang="en")
             if not insight:
                 continue
             setup_context = self._next_tesla_context(insight)
@@ -1432,6 +1459,7 @@ class ScreenerService:
 
     def _build_result_from_insight(self, insight: dict, model_context: dict | None = None) -> dict:
         resolved_name = insight.get("company_name") or self._resolve_symbol_name(insight["ticker"]) or insight["ticker"]
+        risk_flags = list(insight.get("risk_flags") or [])
         return {
             "ticker": insight["ticker"],
             "name": resolved_name,
@@ -1457,12 +1485,13 @@ class ScreenerService:
             "model_conviction_bucket": (model_context or {}).get("conviction_bucket"),
             "model_position_size_hint": (model_context or {}).get("position_size_hint"),
             "model_entry_style": (model_context or {}).get("entry_style"),
-            "model_execution_tags": (model_context or {}).get("execution_tags", []),
+            "model_execution_tags": list((model_context or {}).get("execution_tags", [])) or risk_flags,
             "model_percentile": (model_context or {}).get("percentile"),
             "model_horizon_days": (model_context or {}).get("target_horizon_days"),
             "model_reward_risk_ratio": (model_context or {}).get("model_reward_risk_ratio"),
             "model_expected_drawdown_20d": (model_context or {}).get("expected_drawdown_20d"),
             "matched_patterns": [],
+            "risk_flags": risk_flags,
             "selection_reason": self._build_technical_reason(insight, model_context),
         }
 
@@ -1548,6 +1577,14 @@ class ScreenerService:
         volume_ratio = insight.get("volume_ratio")
         if volume_ratio is not None:
             reasons.append(f"volume {volume_ratio}x")
+        pullback_depth = insight.get("pullback_depth_pct")
+        if pullback_depth is not None:
+            reasons.append(f"pullback {float(pullback_depth):.1f}%")
+        risk_flags = [str(flag).strip() for flag in (insight.get("risk_flags") or []) if str(flag).strip()]
+        if "rolled-over-after-spike" in risk_flags:
+            reasons.append("momentum faded after spike")
+        elif "do-not-chase" in risk_flags:
+            reasons.append("extended, wait for reset")
         highlights = (model_context or {}).get("highlights") or []
         if highlights:
             reasons.append("model: " + ", ".join(highlights[:2]))

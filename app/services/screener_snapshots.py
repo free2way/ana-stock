@@ -113,6 +113,33 @@ CN_MULTI_MODEL_PRECOMPUTE_PRESETS = [
     },
 ]
 
+US_MULTI_MODEL_PRECOMPUTE_PRESETS = [
+    {
+        "key": "us_trend_momentum_lightgbm",
+        "label": "美股强趋势+动量+LightGBM",
+        "templates": ["lightgbm_top_picks", "next_tesla_swing", "technical_momentum"],
+        "min_hits": 2,
+        "confluence_action_filter": "ALL",
+        "sort_by": "model_hit_count",
+    },
+    {
+        "key": "us_breakout_confluence",
+        "label": "美股突破共振",
+        "templates": ["lightgbm_top_picks", "next_tesla_swing", "technical_momentum"],
+        "min_hits": 2,
+        "confluence_action_filter": "breakout_confirmation",
+        "sort_by": "confluence_rank",
+    },
+    {
+        "key": "us_quality_momentum",
+        "label": "美股质量成长共振",
+        "templates": ["lightgbm_top_picks", "technical_momentum", "global_growth_value", "global_income_quality"],
+        "min_hits": 2,
+        "confluence_action_filter": "bullish_entry",
+        "sort_by": "confluence_rank",
+    },
+]
+
 SNAPSHOT_ROW_FIELDS = {
     "ticker",
     "name",
@@ -269,7 +296,11 @@ def build_lake_precompute_screener_params(*, markets: list[str] | None = None) -
     market_set = {str(item).strip().upper() for item in (markets or ["CN", "US"]) if str(item).strip()}
     params: list[dict] = []
     for market in sorted(market_set):
-        if market in {"CN", "US"}:
+        if market == "US":
+            params.append(_build_default_params("lightgbm_top_picks", universe="full_market", market=market))
+            params.append(_build_default_params("technical_momentum", universe="full_market", market=market))
+            continue
+        if market == "CN":
             params.append(_build_default_params("next_tesla_swing", universe="full_market", market=market))
             params.append(_build_default_params("technical_momentum", universe="full_market", market=market))
     return params
@@ -280,9 +311,13 @@ def build_multi_model_precompute_params(*, markets: list[str] | None = None, pre
     normalized_keys = {str(item).strip() for item in (preset_keys or []) if str(item).strip()}
     params: list[dict] = []
     for market in sorted(market_set):
-        if market != "CN":
+        if market == "CN":
+            preset_source = CN_MULTI_MODEL_PRECOMPUTE_PRESETS
+        elif market == "US":
+            preset_source = US_MULTI_MODEL_PRECOMPUTE_PRESETS
+        else:
             continue
-        for preset in CN_MULTI_MODEL_PRECOMPUTE_PRESETS:
+        for preset in preset_source:
             if normalized_keys and str(preset.get("key") or "") not in normalized_keys:
                 continue
             params.append(
@@ -314,7 +349,7 @@ def build_multi_model_precompute_params(*, markets: list[str] | None = None, pre
                     "min_model_signal_strength": 0.0,
                     "execution_tag_filter": "ALL",
                     "exclude_execution_tag_filter": "ALL",
-                    "sort_by": "confluence_rank",
+                    "sort_by": str(preset.get("sort_by") or "confluence_rank"),
                     "sort_order": "desc",
                     "limit": 500,
                 }
@@ -446,7 +481,13 @@ def _build_multi_screen_rows_from_snapshots(params: dict) -> tuple[list[dict], d
             existing["_template_keys"].append(template_key)
             existing["_template_labels"].append(label)
             existing["_action_labels"].append(str(row.get("action_label") or "").strip())
-            for bucket in _template_action_semantic_buckets(template_key, row.get("action_label")):
+            row_risk_flags = {str(flag).strip().lower() for flag in (row.get("risk_flags") or []) if str(flag).strip()}
+            buckets = _template_action_semantic_buckets(template_key, row.get("action_label"))
+            if row_risk_flags.intersection({"rolled-over-after-spike", "do-not-chase"}):
+                buckets = [bucket for bucket in buckets if bucket not in {"bullish_entry", "breakout_confirmation", "buy_the_dip"}]
+                if "watchlist" not in buckets:
+                    buckets.append("watchlist")
+            for bucket in buckets:
                 hits = existing["_confluence_bucket_hits"].setdefault(bucket, [])
                 if template_key not in hits:
                     hits.append(template_key)

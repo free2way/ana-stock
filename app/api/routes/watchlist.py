@@ -158,6 +158,17 @@ def _execution_tag_chips(tags: list[str] | None, *, lang: str) -> str:
     return "".join(_execution_tag_chip(tag, lang=lang) for tag in cleaned[:3])
 
 
+def _watchlist_attention_hint(item: dict, *, lang: str) -> str:
+    tags = {str(tag).strip().lower() for tag in (item.get("execution_tags") or []) if str(tag).strip()}
+    if "chase-risk" in tags and ("wait-for-breakout" in tags or "breakout-only" in tags):
+        return "伪强势，先别追" if lang == "zh" else "False strength, do not chase"
+    if "chase-risk" in tags:
+        return "短线偏热，别追高" if lang == "zh" else "Extended, do not chase"
+    if "buy-the-dip" in tags:
+        return "偏回踩观察" if lang == "zh" else "Dip-watch setup"
+    return ""
+
+
 def _derive_watchlist_execution_tags(item: dict) -> list[str]:
     combined = item.get("combined_analysis") or {}
     decision = str(combined.get("decision") or "HOLD").upper()
@@ -839,21 +850,13 @@ def _render_watchlist_table_fragment(
             return "Waiting"
         return "Off"
 
-    item_rows_list: list[str] = []
-    previous_market = None
-    for item in items:
-        current_market = (item.get("market") or "").upper()
-        if current_market != previous_market:
-            item_rows_list.append(
-                "<tr class='market-section'>"
-                f"<td colspan='10'>{_market_section_label(current_market)}</td>"
-                "</tr>"
-            )
-            previous_market = current_market
-        item_rows_list.append(
+    def render_row(item: dict) -> str:
+        return (
             "<tr>"
             f"<td class='sticky-col sticky-col-1'><a href='/watchlist/open/{item['item_id']}'>{item['ticker']}</a></td>"
-            f"<td class='sticky-col sticky-col-2'>{item['name'] or item['ticker']}</td>"
+            f"<td class='sticky-col sticky-col-2'><div>{item['name'] or item['ticker']}</div>"
+            + (f"<div class='muted' style='margin-top:4px;font-weight:800;color:#f59e0b;'>{html.escape(_watchlist_attention_hint(item, lang=lang))}</div>" if _watchlist_attention_hint(item, lang=lang) else "")
+            + "</td>"
             f"<td>{item['market'] or '-'}</td>"
             f"<td>{_format_watchlist_close(item.get('latest_close'))}</td>"
             f"<td>{_render_daily_change_chip(item.get('daily_change_pct'))}</td>"
@@ -875,38 +878,71 @@ def _render_watchlist_table_fragment(
             "</td>"
             "</tr>"
         )
-    item_rows = "".join(item_rows_list) or "<tr><td colspan='10'>No stocks in your watchlist yet.</td></tr>"
-    mobile_cards = "".join(
-        "<article class='mobile-stock-card'>"
-        f"<div class='mobile-stock-head'><div><a class='mobile-stock-ticker' href='/watchlist/open/{item['item_id']}'>{item['ticker']}</a><div class='muted'>{item['name'] or item['ticker']} · {item.get('market') or '-'}</div></div>{_decision_chip((item.get('combined_analysis') or {}).get('decision') or 'HOLD', lang=lang)}</div>"
-        f"<div class='mobile-stock-grid'>"
-        f"<div><span class='muted'>{'收盘价' if lang == 'zh' else 'Close'}</span><div>{_format_watchlist_close(item.get('latest_close'))}</div></div>"
-        f"<div><span class='muted'>{'涨幅' if lang == 'zh' else 'Day %'}</span><div>{_render_daily_change_chip(item.get('daily_change_pct'))}</div></div>"
-        "</div>"
-        f"<div class='mobile-next-step'>{'下一步' if lang == 'zh' else 'Next'}：{html.escape(str(item.get('action_hint') or '-'))}</div>"
-        f"<div class='muted' style='margin-top:8px;'>{'新闻' if lang == 'zh' else 'News'}: {news_chip(item)}</div>"
-        f"<div style='display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;'>{_execution_tag_chips(item.get('execution_tags'), lang=lang)}</div>"
-        "<div class='mobile-stock-actions'>"
-        f"<a class='linkbtn' href='/watchlist/open/{item['item_id']}'>{'打开分析' if lang == 'zh' else 'Open'}</a>"
-        f"<form action='/watchlist/toggle-sync' method='post' style='display:inline-block;'><input type='hidden' name='item_id' value='{item['item_id']}' /><input type='hidden' name='enabled' value='{'0' if item['sync_enabled'] else '1'}' /><button type='submit'>{'关闭同步' if item['sync_enabled'] else '开启同步'}</button></form>"
-        f"<form action='/watchlist/remove' method='post' style='display:inline-block;'><input type='hidden' name='item_id' value='{item['item_id']}' /><button type='submit' class='danger'>{'删除' if lang == 'zh' else 'Remove'}</button></form>"
-        "</div>"
-        "</article>"
-        for item in items
-    ) or f"<div class='muted'>{'暂无自选股。' if lang == 'zh' else 'No watchlist names yet.'}</div>"
+
+    def render_mobile_card(item: dict) -> str:
+        return (
+            "<article class='mobile-stock-card'>"
+            f"<div class='mobile-stock-head'><div><a class='mobile-stock-ticker' href='/watchlist/open/{item['item_id']}'>{item['ticker']}</a><div class='muted'>{item['name'] or item['ticker']} · {item.get('market') or '-'}</div>"
+            + (f"<div class='muted' style='margin-top:4px;font-weight:800;color:#f59e0b;'>{html.escape(_watchlist_attention_hint(item, lang=lang))}</div>" if _watchlist_attention_hint(item, lang=lang) else "")
+            + f"</div>{_decision_chip((item.get('combined_analysis') or {}).get('decision') or 'HOLD', lang=lang)}</div>"
+            f"<div class='mobile-stock-grid'>"
+            f"<div><span class='muted'>{'收盘价' if lang == 'zh' else 'Close'}</span><div>{_format_watchlist_close(item.get('latest_close'))}</div></div>"
+            f"<div><span class='muted'>{'涨幅' if lang == 'zh' else 'Day %'}</span><div>{_render_daily_change_chip(item.get('daily_change_pct'))}</div></div>"
+            "</div>"
+            f"<div class='mobile-next-step'>{'下一步' if lang == 'zh' else 'Next'}：{html.escape(str(item.get('action_hint') or '-'))}</div>"
+            f"<div class='muted' style='margin-top:8px;'>{'新闻' if lang == 'zh' else 'News'}: {news_chip(item)}</div>"
+            f"<div style='display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;'>{_execution_tag_chips(item.get('execution_tags'), lang=lang)}</div>"
+            "<div class='mobile-stock-actions'>"
+            f"<a class='linkbtn' href='/watchlist/open/{item['item_id']}'>{'打开分析' if lang == 'zh' else 'Open'}</a>"
+            f"<form action='/watchlist/toggle-sync' method='post' style='display:inline-block;'><input type='hidden' name='item_id' value='{item['item_id']}' /><input type='hidden' name='enabled' value='{'0' if item['sync_enabled'] else '1'}' /><button type='submit'>{'关闭同步' if item['sync_enabled'] else '开启同步'}</button></form>"
+            f"<form action='/watchlist/remove' method='post' style='display:inline-block;'><input type='hidden' name='item_id' value='{item['item_id']}' /><button type='submit' class='danger'>{'删除' if lang == 'zh' else 'Remove'}</button></form>"
+            "</div>"
+            "</article>"
+        )
+
+    market_order = ["CN", "US", "HK", "OTHER"]
+    grouped_items: dict[str, list[dict]] = {"CN": [], "US": [], "HK": [], "OTHER": []}
+    for item in items:
+        market_code = str(item.get("market") or "").upper()
+        grouped_items[market_code if market_code in {"CN", "US", "HK"} else "OTHER"].append(item)
+
+    section_blocks: list[str] = []
+    mobile_section_blocks: list[str] = []
+    for market_code in market_order:
+        market_items = grouped_items.get(market_code) or []
+        if not market_items:
+            continue
+        label = _market_section_label(None if market_code == "OTHER" else market_code)
+        table_rows = "".join(render_row(item) for item in market_items)
+        section_blocks.append(
+            "<section style='margin-bottom:16px;'>"
+            f"<div class='market-section-label' style='margin:0 0 8px;font-weight:900;color:var(--accent);'>{label} · {len(market_items)}</div>"
+            "<div class='table-wrap'>"
+            "<table>"
+            "<thead>"
+            f"<tr><th class='sticky-col sticky-col-1'>Ticker</th><th class='sticky-col sticky-col-2'>Name</th><th>Market</th><th>{'收盘价' if lang == 'zh' else 'Close'}</th><th>{_watchlist_sort_link(lang=lang, mode=mode, news_view=news_view, execution_tag_filter=execution_tag_filter, exclude_execution_tag_filter=exclude_execution_tag_filter, sort_by=sort_by, sort_order=sort_order, target='daily_change')}</th><th>Decision</th><th>{'下一步' if lang == 'zh' else 'Next Step'}</th><th>Execution Tags</th><th>{'新闻' if lang == 'zh' else 'News'}</th><th>Actions</th></tr>"
+            "</thead>"
+            f"<tbody>{table_rows}</tbody>"
+            "</table>"
+            "</div>"
+            "</section>"
+        )
+        mobile_section_blocks.append(
+            "<section style='margin-bottom:16px;'>"
+            f"<div class='market-section-label' style='margin:0 0 8px;font-weight:900;color:var(--accent);'>{label} · {len(market_items)}</div>"
+            "<div class='watchlist-mobile-market-grid'>"
+            + "".join(render_mobile_card(item) for item in market_items)
+            + "</div></section>"
+        )
+
+    table_sections_html = "".join(section_blocks) or f"<div class='muted'>{'暂无自选股。' if lang == 'zh' else 'No watchlist names yet.'}</div>"
+    mobile_sections_html = "".join(mobile_section_blocks) or f"<div class='muted'>{'暂无自选股。' if lang == 'zh' else 'No watchlist names yet.'}</div>"
     return f"""
       <section class="card table-card">
         <div class="eyebrow">Saved Stocks</div>
         <div class="muted" style="margin-bottom:10px;">{'当前按涨幅排序，点击表头可切换升降序。' if lang == 'zh' else 'Sorted by day change; click the header to toggle direction.'}</div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr><th class='sticky-col sticky-col-1'>Ticker</th><th class='sticky-col sticky-col-2'>Name</th><th>Market</th><th>{'收盘价' if lang == 'zh' else 'Close'}</th><th>{_watchlist_sort_link(lang=lang, mode=mode, news_view=news_view, execution_tag_filter=execution_tag_filter, exclude_execution_tag_filter=exclude_execution_tag_filter, sort_by=sort_by, sort_order=sort_order, target='daily_change')}</th><th>Decision</th><th>{'下一步' if lang == 'zh' else 'Next Step'}</th><th>Execution Tags</th><th>{'新闻' if lang == 'zh' else 'News'}</th><th>Actions</th></tr>
-            </thead>
-            <tbody>{item_rows}</tbody>
-          </table>
-        </div>
-        <div class="mobile-stock-list">{mobile_cards}</div>
+        {table_sections_html}
+        <div class="mobile-only-sections">{mobile_sections_html}</div>
         <div class="muted" style="margin-top:10px;">{'可拖动底部滚动条查看更多列。' if lang == 'zh' else 'Drag the horizontal scrollbar to see more columns.'}</div>
       </section>
     """
@@ -1299,6 +1335,8 @@ def watchlist_page(
             background:#152231;
           }}
           .market-section td {{ background:#132031; color:var(--accent); font-weight:800; letter-spacing:0.03em; border-top:1px solid var(--line); }}
+          .mobile-only-sections {{ display:none; }}
+          .watchlist-mobile-market-grid {{ display:grid; gap:10px; }}
           .table-card a {{ color: var(--accent); text-decoration:none; }}
           .linkbtn {{ display:inline-block; padding:8px 10px; border-radius:10px; background:rgba(61,217,182,0.10); color:var(--accent); font-weight:700; }}
           .news-console {{ margin-bottom:16px; }}
@@ -1333,6 +1371,7 @@ def watchlist_page(
           @media (max-width: 720px) {{
             .table-wrap {{ display:none; }}
             .mobile-stock-list {{ display:grid; }}
+            .mobile-only-sections {{ display:block; }}
             .sticky-col, .sticky-col-1, .sticky-col-2 {{ position:static; box-shadow:none; min-width:auto; max-width:none; }}
             .table-wrap th:nth-child(7), .table-wrap td:nth-child(7) {{ position:static; box-shadow:none; min-width:auto; max-width:none; }}
           }}

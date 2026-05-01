@@ -6,6 +6,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db_session
+from app.services.ai_daily_report import format_risk_flags, format_trade_status
 from app.services.auth import is_authenticated, login_redirect
 from app.services.insight_engine import InsightEngine
 from app.services.model_signal_summary import build_signal_label, enrich_model_output, model_confidence, summarize_model_output
@@ -916,6 +917,113 @@ def _build_model_context(*, ticker: str, lang: str, db: Session) -> dict:
     return get_or_set("insight_model_context", cache_key, ttl_seconds=90.0, loader=_load)
 
 
+def _insight_trade_banner(*, model_output: dict | None, insight: dict, trade_plan: dict | None, lang: str) -> str:
+    signal = model_output or {}
+    plan = trade_plan or {}
+    status = str(signal.get("tradability_status") or "").strip().upper()
+    risk_flags = [str(flag).strip() for flag in (signal.get("risk_flags") or []) if str(flag).strip()]
+    risk_flag_set = {flag.lower() for flag in risk_flags}
+    entry_trigger = str(signal.get("entry_trigger") or "").strip()
+    invalidation = str(signal.get("invalidation_condition") or plan.get("invalidation_reason") or "").strip()
+    execution_note = str(signal.get("execution_note") or "").strip()
+    signal_label = str(signal.get("signal_label") or insight.get("action_label") or "-").strip()
+    entry_style = str(signal.get("entry_style") or "-").strip()
+    size_hint = str(signal.get("position_size_hint") or "-").strip()
+
+    tone_key = "neutral"
+    if "rolled-over-after-spike" in risk_flag_set:
+        tone_key = "warn"
+        title = "当前交易结论：伪强势，先观察" if lang == "zh" else "Current Trade Take: False strength, stay on watch"
+        summary = (
+            "这只股票最近更像冲高后转弱，不适合再按强势突破去追。"
+            if lang == "zh"
+            else "This setup has rolled over after the spike and should not be treated like a fresh breakout."
+        )
+    elif status == "READY":
+        tone_key = "good"
+        title = "当前交易结论：可执行，但先等触发" if lang == "zh" else "Current Trade Take: Actionable, but wait for the trigger"
+        summary = (
+            "可以列入主观察名单，但仍以触发条件和量价确认优先。"
+            if lang == "zh"
+            else "Keep it on the primary list, but still wait for the trigger and tape confirmation."
+        )
+    elif status in {"REVIEW", "DEFER"}:
+        tone_key = "watch"
+        title = "当前交易结论：先观察确认" if lang == "zh" else "Current Trade Take: Watch and confirm first"
+        summary = (
+            "信号还没到直接动手的时候，更适合等二次确认或更好的入场位。"
+            if lang == "zh"
+            else "The setup is not ready for direct execution yet; wait for confirmation or a better entry."
+        )
+    elif status == "BLOCKED":
+        tone_key = "bad"
+        title = "当前交易结论：暂不参与" if lang == "zh" else "Current Trade Take: Stand aside"
+        summary = (
+            "当前交易条件不满足，先不要参与。"
+            if lang == "zh"
+            else "The current trade conditions are not good enough to participate."
+        )
+    else:
+        title = "当前交易结论：继续跟踪" if lang == "zh" else "Current Trade Take: Keep tracking"
+        summary = (
+            "更适合作为观察对象，等结构和信号进一步清晰。"
+            if lang == "zh"
+            else "Treat it as a monitored name until the structure becomes clearer."
+        )
+
+    if execution_note:
+        summary = execution_note
+
+    tone_styles = {
+        "good": ("rgba(16,185,129,0.16)", "#8af0a6", "rgba(16,185,129,0.30)"),
+        "watch": ("rgba(245,158,11,0.14)", "#fcd34d", "rgba(245,158,11,0.28)"),
+        "warn": ("rgba(249,115,22,0.16)", "#fdba74", "rgba(249,115,22,0.30)"),
+        "bad": ("rgba(239,68,68,0.16)", "#fca5a5", "rgba(239,68,68,0.30)"),
+        "neutral": ("rgba(148,163,184,0.14)", "#cbd5e1", "rgba(148,163,184,0.24)"),
+    }
+    bg, fg, border = tone_styles[tone_key]
+    chips: list[str] = []
+    if status:
+        chips.append(
+            f"<span class='trade-banner-chip'>{escape(format_trade_status(status, lang=lang))}</span>"
+        )
+    if signal_label and signal_label != "-":
+        chips.append(f"<span class='trade-banner-chip'>{escape(signal_label)}</span>")
+    if entry_style and entry_style != "-":
+        chips.append(f"<span class='trade-banner-chip'>{escape(entry_style)}</span>")
+    if size_hint and size_hint != "-":
+        chips.append(f"<span class='trade-banner-chip'>{escape(size_hint)}</span>")
+    if "rolled-over-after-spike" in risk_flag_set:
+        chips.append(
+            f"<span class='trade-banner-chip danger'>{'伪强势' if lang == 'zh' else 'False Strength'}</span>"
+        )
+
+    trigger_text = entry_trigger or (
+        ("等回到买入区或放量重启时再看。" if lang == "zh" else "Reassess only if price resets or volume re-accelerates.")
+        if "rolled-over-after-spike" in risk_flag_set
+        else ("等待进入计划买点。" if lang == "zh" else "Wait for the planned entry zone.")
+    )
+    invalidation_text = invalidation or (
+        "跌破关键支撑 / 风险位就放弃。"
+        if lang == "zh"
+        else "Stand down if key support or the risk level breaks."
+    )
+    risk_text = format_risk_flags(risk_flags, lang=lang)
+
+    return (
+        "<section class='trade-banner' "
+        f"style='background:{bg};color:{fg};border:1px solid {border};'>"
+        f"<div class='trade-banner-head'><div class='trade-banner-title'>{escape(title)}</div>"
+        f"<div class='trade-banner-chip-row'>{''.join(chips)}</div></div>"
+        f"<div class='trade-banner-summary'>{escape(summary)}</div>"
+        f"<div class='trade-banner-grid'>"
+        f"<div><span>{'触发条件' if lang == 'zh' else 'Trigger'}</span><strong>{escape(trigger_text)}</strong></div>"
+        f"<div><span>{'放弃条件' if lang == 'zh' else 'Invalidation'}</span><strong>{escape(invalidation_text)}</strong></div>"
+        f"<div><span>{'风险标记' if lang == 'zh' else 'Risk Flags'}</span><strong>{escape(risk_text)}</strong></div>"
+        "</div></section>"
+    )
+
+
 def _load_chart_histories(*, ticker: str, db: Session) -> tuple[list[dict], list[dict]]:
     cache_key = json.dumps({"ticker": ticker.upper()}, sort_keys=True, ensure_ascii=False)
 
@@ -1032,6 +1140,12 @@ def insight_page(
     model_run_name = "-"
     if model_output:
         model_run_name = model_output.get("model_run", {}).get("name") or "-"
+    trade_banner = _insight_trade_banner(
+        model_output=model_output,
+        insight=insight,
+        trade_plan=trade_plan,
+        lang=lang,
+    )
     model_drivers = context["drivers"]
     positive_driver_items = "".join(
         (
@@ -1170,6 +1284,53 @@ def insight_page(
           .actions {{ display:grid; gap:12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }}
           .label {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:0.04em; }}
           .signal-hero {{ display:grid; gap:16px; grid-template-columns: minmax(260px, 1.4fr) repeat(3, minmax(180px, 1fr)); margin-bottom:16px; }}
+          .trade-banner {{
+            border-radius:20px;
+            padding:16px 18px;
+            margin-bottom:16px;
+            box-shadow:0 18px 38px rgba(0,0,0,0.14);
+          }}
+          .trade-banner-head {{ display:flex; justify-content:space-between; gap:16px; align-items:flex-start; flex-wrap:wrap; }}
+          .trade-banner-title {{ font-size:24px; font-weight:900; letter-spacing:-0.02em; }}
+          .trade-banner-summary {{ margin-top:10px; font-size:15px; line-height:1.65; color:var(--ink); }}
+          .trade-banner-chip-row {{ display:flex; gap:8px; flex-wrap:wrap; }}
+          .trade-banner-chip {{
+            display:inline-flex;
+            align-items:center;
+            padding:6px 10px;
+            border-radius:999px;
+            background:rgba(15,23,42,0.18);
+            color:inherit;
+            font-size:12px;
+            font-weight:800;
+            border:1px solid rgba(255,255,255,0.12);
+          }}
+          .trade-banner-chip.danger {{
+            background:rgba(127,29,29,0.18);
+            border-color:rgba(252,165,165,0.22);
+          }}
+          .trade-banner-grid {{
+            display:grid;
+            gap:12px;
+            grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));
+            margin-top:14px;
+          }}
+          .trade-banner-grid div {{
+            border-radius:14px;
+            padding:12px;
+            background:rgba(15,23,42,0.18);
+            border:1px solid rgba(255,255,255,0.08);
+          }}
+          .trade-banner-grid span {{
+            display:block;
+            font-size:11px;
+            font-weight:800;
+            letter-spacing:0.04em;
+            opacity:0.82;
+            text-transform:uppercase;
+            margin-bottom:6px;
+          }}
+          .trade-banner-grid strong {{ display:block; font-size:14px; line-height:1.55; color:var(--ink); }}
           @media (max-width: 1120px) {{
             .app {{ grid-template-columns:1fr; }}
             .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }}
@@ -1199,6 +1360,7 @@ def insight_page(
             </form>
             <span class="muted">{lang_switch}</span>
           </div>
+          {trade_banner}
           <section class="nav-grid">
             <a class="nav-card" href="/dashboard?lang={lang}">
               <div class="nav-head">

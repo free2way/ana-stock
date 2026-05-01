@@ -565,6 +565,57 @@ def _execution_tag_chip(text: str) -> str:
     )
 
 
+def _risk_flag_chip(flag: str, lang: str) -> str:
+    normalized = str(flag or "").strip().lower()
+    if not normalized:
+        return ""
+    labels = {
+        "rolled-over-after-spike": ("冲高转弱", "Rolled Over"),
+        "do-not-chase": ("不要追高", "No Chase"),
+        "drawdown-risk": ("回撤风险", "Drawdown Risk"),
+        "low-conviction": ("低置信度", "Low Conviction"),
+        "weak-signal-strength": ("信号偏弱", "Weak Signal"),
+        "confirmation-needed": ("等待确认", "Need Confirmation"),
+        "needs-better-entry": ("买点一般", "Need Better Entry"),
+    }
+    zh, en = labels.get(normalized, (normalized.replace("-", " "), normalized.replace("-", " ")))
+    text = zh if lang == "zh" else en.title()
+    tone = "#7c2d12"
+    bg = "#ffedd5"
+    border = "#fdba74"
+    if normalized == "rolled-over-after-spike":
+        tone, bg, border = "#991b1b", "#fee2e2", "#fca5a5"
+    elif normalized in {"drawdown-risk", "weak-signal-strength"}:
+        tone, bg, border = "#9a3412", "#ffedd5", "#fdba74"
+    elif normalized in {"confirmation-needed", "needs-better-entry", "low-conviction"}:
+        tone, bg, border = "#92400e", "#fef3c7", "#fcd34d"
+    return (
+        "<span style='display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;"
+        f"background:{bg};color:{tone};border:1px solid {border};font-weight:800;font-size:11px;line-height:1.1;'>"
+        f"{html.escape(text)}"
+        "</span>"
+    )
+
+
+def _pseudo_strong_signal_html(item: dict, lang: str) -> str:
+    flags = [str(flag).strip() for flag in (item.get("risk_flags") or []) if str(flag).strip()]
+    focus_flags = [
+        flag
+        for flag in flags
+        if flag.lower() in {"rolled-over-after-spike", "do-not-chase", "drawdown-risk", "confirmation-needed"}
+    ]
+    if not focus_flags:
+        return ""
+    lead = (
+        "<span style='display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;"
+        "background:#111827;color:#f8fafc;font-weight:900;font-size:11px;line-height:1.1;'>"
+        + ("伪强势" if lang == "zh" else "False Strength")
+        + "</span>"
+    )
+    chips = "".join(_risk_flag_chip(flag, lang) for flag in focus_flags[:3])
+    return f"<div class='detail-chip-row' style='margin-top:6px;'>{lead}{chips}</div>"
+
+
 def _watchlist_summary(existing: dict | None, lang: str) -> str:
     chips: list[str] = []
     if existing:
@@ -1906,6 +1957,7 @@ def _detail_panel(item: dict, watchlist_map: dict[str, dict], current_params: di
         if model_execution_tags
         else ""
     )
+    pseudo_strength_html = _pseudo_strong_signal_html(item, lang)
     tactical_note_html = (
         f"<div style='margin-top:10px;font-size:13px;color:#334155;line-height:1.55;'><strong>{'模型下一步' if lang == 'zh' else 'Model next step'}:</strong> {html.escape(lightgbm_tactical_note)}</div>"
         if lightgbm_tactical_note
@@ -1931,6 +1983,7 @@ def _detail_panel(item: dict, watchlist_map: dict[str, dict], current_params: di
         "<div class='detail-card'>"
         f"<div class='detail-label'>{_lang_text(lang, 'why_selected')}</div>"
         f"{why_selected_html}"
+        f"{pseudo_strength_html}"
         "</div>"
         "<div class='detail-card'>"
         f"<div class='detail-label'>{_lang_text(lang, 'technical_rating')}</div>"
@@ -2246,6 +2299,64 @@ def _preset_summary(params: dict, lang: str = "en") -> str:
         f"Trend>{params.get('min_trend_score', 60)}, "
         f"Volume>{params.get('min_volume_ratio', 0)}"
     )
+
+
+def _template_audience_group(template_key: str, config: dict) -> str:
+    market = str(config.get("market") or "ALL").upper()
+    mode = str(config.get("mode") or "").strip().lower()
+    if market == "CN" or template_key.startswith("cn_"):
+        return "cn"
+    if mode == "fundamental" and template_key.startswith("global_"):
+        return "us_global"
+    return "core"
+
+
+def _template_group_meta(group_key: str, lang: str) -> dict[str, str]:
+    if group_key == "cn":
+        return {
+            "title": "A股专用模型" if lang == "zh" else "A-Share Models",
+            "hint": "只用于 A 股筛选，适合涨停、均线、布林带、A股基本面等口径。"
+            if lang == "zh"
+            else "Use these only for A-shares: limit-up, MA structure, Bollinger, and A-share-specific fundamentals.",
+            "badge": "A股专用" if lang == "zh" else "A-Share Only",
+        }
+    if group_key == "us_global":
+        return {
+            "title": "美股与全球质量模型" if lang == "zh" else "U.S. & Global Quality Models",
+            "hint": "优先用于美股，也可用于港股等全球质量/估值筛选。"
+            if lang == "zh"
+            else "Primarily for U.S. screening, and also suitable for global quality/value filters.",
+            "badge": "美股/全球" if lang == "zh" else "U.S./Global",
+        }
+    return {
+        "title": "跨市场核心模型" if lang == "zh" else "Cross-market Core Models",
+        "hint": "A股和美股都可先从这组开始，再叠加各自专用模型做二次过滤。"
+        if lang == "zh"
+        else "Start here for both A-shares and U.S. names, then add market-specific models for a second pass.",
+        "badge": "跨市场核心" if lang == "zh" else "Cross-market Core",
+    }
+
+
+def _ordered_template_groups(selected_market: str) -> list[str]:
+    market = str(selected_market or "ALL").upper()
+    if market == "US":
+        return ["core", "us_global", "cn"]
+    if market == "CN":
+        return ["core", "cn", "us_global"]
+    return ["core", "cn", "us_global"]
+
+
+def _template_groups_for_display(selected_market: str, lang: str) -> list[tuple[str, dict[str, str], list[tuple[str, dict]]]]:
+    grouped: dict[str, list[tuple[str, dict]]] = {"core": [], "cn": [], "us_global": []}
+    for key, config in MODEL_TEMPLATES.items():
+        grouped[_template_audience_group(key, config)].append((key, config))
+    sections: list[tuple[str, dict[str, str], list[tuple[str, dict]]]] = []
+    for group_key in _ordered_template_groups(selected_market):
+        items = grouped.get(group_key) or []
+        if not items:
+            continue
+        sections.append((group_key, _template_group_meta(group_key, lang), items))
+    return sections
 
 
 def _watchlist_action_cell(item: dict, watchlist_map: dict[str, dict], current_params: dict, lang: str) -> str:
@@ -3151,6 +3262,7 @@ def screener_page(
         f"<option value='{value}' {'selected' if market == value else ''}>{label}</option>"
         for value, label in market_options
     )
+    template_groups = _template_groups_for_display(market, lang)
     sort_by_option_html = "".join(
         f"<option value='{value}' {'selected' if sort_by == value else ''}>{labels[lang]}</option>"
         for value, labels in SORT_BY_OPTIONS
@@ -3159,24 +3271,54 @@ def screener_page(
         f"<option value='{value}' {'selected' if sort_order == value else ''}>{labels[lang]}</option>"
         for value, labels in SORT_ORDER_OPTIONS
     )
+    template_option_html = "".join(
+        (
+            f"<optgroup label='{html.escape(meta['title'])}'>"
+            + "".join(
+                f"<option value='{value}' {'selected' if model_template == value else ''}>"
+                f"{html.escape(_template_label(value, config['label'], lang))}</option>"
+                for value, config in items
+            )
+            + "</optgroup>"
+        )
+        for _, meta, items in template_groups
+    )
     template_cards_html = "".join(
         (
-            f"<a class='template-card{' active' if value == model_template else ''}' href='{_build_screen_query({**current_params, 'model_template': value, 'market': config.get('market') or market})}'>"
-            f"<div class='template-top'><span class='template-mode'>{config.get('mode', 'mixed')}</span><span class='template-market'>{config.get('market', 'ALL')}</span></div>"
-            f"<div class='template-title'>{_template_label(value, config['label'], lang)}</div>"
-            f"<div class='template-desc'>{config.get('description') or ''}</div>"
-            "</a>"
+            "<div style='margin-bottom:18px;'>"
+            f"<div style='display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px;'>"
+            f"<div style='font-size:15px;font-weight:900;color:var(--ink);'>{html.escape(meta['title'])}</div>"
+            f"<div class='muted' style='font-size:12px;'>{html.escape(meta['hint'])}</div>"
+            "</div>"
+            "<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;'>"
+            + "".join(
+                f"<a class='template-card{' active' if value == model_template else ''}' href='{_build_screen_query({**current_params, 'model_template': value, 'market': config.get('market') or market})}'>"
+                f"<div class='template-top'><span class='template-mode'>{config.get('mode', 'mixed')}</span><span class='template-market'>{html.escape(meta['badge'])}</span></div>"
+                f"<div class='template-title'>{_template_label(value, config['label'], lang)}</div>"
+                f"<div class='template-desc'>{config.get('description') or ''}</div>"
+                "</a>"
+                for value, config in items
+            )
+            + "</div></div>"
         )
-        for value, config in MODEL_TEMPLATES.items()
+        for _, meta, items in template_groups
     )
     multi_template_picker_html = "".join(
         (
-            "<label class='multi-template-chip'>"
-            f"<input type='checkbox' name='multi_model_templates' value='{value}' {'checked' if value in multi_templates_active else ''} />"
-            f"<span>{_template_label(value, config['label'], lang)}</span>"
-            "</label>"
+            "<div style='margin-bottom:12px;'>"
+            f"<div style='font-size:13px;font-weight:800;color:var(--ink);margin-bottom:6px;'>{html.escape(meta['title'])}</div>"
+            f"<div class='muted' style='margin-bottom:8px;font-size:12px;'>{html.escape(meta['hint'])}</div>"
+            "<div style='display:flex;flex-wrap:wrap;gap:8px;'>"
+            + "".join(
+                "<label class='multi-template-chip'>"
+                f"<input type='checkbox' name='multi_model_templates' value='{value}' {'checked' if value in multi_templates_active else ''} />"
+                f"<span>{_template_label(value, config['label'], lang)}</span>"
+                "</label>"
+                for value, config in items
+            )
+            + "</div></div>"
         )
-        for value, config in MODEL_TEMPLATES.items()
+        for _, meta, items in template_groups
     )
     active_defaults = active_template.get("defaults") or {}
     active_defaults_html = "".join(
@@ -3481,6 +3623,72 @@ def screener_page(
                 "lang": lang,
             },
         },
+        {
+            "label": {"zh": "美股强趋势+动量+LightGBM", "en": "US Trend + Momentum + LightGBM"},
+            "save_name": {"zh": "美股强趋势+动量+LightGBM", "en": "US Trend + Momentum + LightGBM"},
+            "description": {
+                "zh": "把美股 LightGBM、Next Tesla Swing 和技术动量叠加，先用模型命中数找出真正有共振的强势候选。",
+                "en": "Stacks U.S. LightGBM, Next Tesla Swing, and technical momentum to prioritize names with real model overlap.",
+            },
+            "best_for": {"zh": "美股强势池", "en": "U.S. momentum pool"},
+            "params": {
+                "model_template": "lightgbm_top_picks",
+                "multi_model_templates": ["lightgbm_top_picks", "next_tesla_swing", "technical_momentum"],
+                "min_multi_model_hits": 2,
+                "confluence_action_filter": "ALL",
+                "market": "US",
+                "universe": "full_market",
+                "min_trend_score": 10,
+                "sort_by": "model_hit_count",
+                "sort_order": "desc",
+                "run": 1,
+                "lang": lang,
+            },
+        },
+        {
+            "label": {"zh": "美股突破共振", "en": "US Breakout Confluence"},
+            "save_name": {"zh": "美股突破共振", "en": "US Breakout Confluence"},
+            "description": {
+                "zh": "保留美股核心三模型，但只看突破确认动作，适合在强势股里继续缩小候选范围。",
+                "en": "Keeps the three core U.S. models but filters for breakout-confirmation setups to narrow the field.",
+            },
+            "best_for": {"zh": "美股突破确认", "en": "U.S. breakouts"},
+            "params": {
+                "model_template": "lightgbm_top_picks",
+                "multi_model_templates": ["lightgbm_top_picks", "next_tesla_swing", "technical_momentum"],
+                "min_multi_model_hits": 2,
+                "confluence_action_filter": "breakout_confirmation",
+                "market": "US",
+                "universe": "full_market",
+                "min_trend_score": 10,
+                "sort_by": "confluence_rank",
+                "sort_order": "desc",
+                "run": 1,
+                "lang": lang,
+            },
+        },
+        {
+            "label": {"zh": "美股质量成长共振", "en": "US Quality Growth Confluence"},
+            "save_name": {"zh": "美股质量成长共振", "en": "US Quality Growth Confluence"},
+            "description": {
+                "zh": "用 LightGBM、技术动量、成长价值和分红质量交叉验证，优先找质量更高的美股入场候选。",
+                "en": "Cross-checks LightGBM, momentum, growth/value, and income quality to surface higher-quality U.S. entries.",
+            },
+            "best_for": {"zh": "美股质量入场", "en": "U.S. quality entries"},
+            "params": {
+                "model_template": "lightgbm_top_picks",
+                "multi_model_templates": ["lightgbm_top_picks", "technical_momentum", "global_growth_value", "global_income_quality"],
+                "min_multi_model_hits": 2,
+                "confluence_action_filter": "bullish_entry",
+                "market": "US",
+                "universe": "full_market",
+                "min_trend_score": 10,
+                "sort_by": "confluence_rank",
+                "sort_order": "desc",
+                "run": 1,
+                "lang": lang,
+            },
+        },
     ]
     quick_confluence_presets_html = "".join(
         (
@@ -3651,7 +3859,7 @@ def screener_page(
         row_chunks.append(
             "<tr>"
             f"<td class='sticky-col sticky-col-1'><a href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a></td>"
-            f"<td class='sticky-col sticky-col-2'>{item.get('name') or '-'}</td>"
+            f"<td class='sticky-col sticky-col-2'><div>{item.get('name') or '-'}</div>{_pseudo_strong_signal_html(item, lang)}</td>"
             f"<td class='sticky-col sticky-col-3'>{_action_badge(item.get('action_label'), lang)}</td>"
             f"<td>{_trend_badge(item.get('trend_score'))}</td>"
             f"<td>{item.get('market') or '-'}</td>"
@@ -3690,7 +3898,7 @@ def screener_page(
         (
             "<article class='mobile-result-card'>"
             f"<div class='mobile-result-head'>"
-            f"<div><div class='mobile-result-ticker'><a href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a></div><div class='muted'>{_compact_text(item.get('name') or '-', 28)} · {item.get('market') or '-'}</div></div>"
+            f"<div><div class='mobile-result-ticker'><a href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a></div><div class='muted'>{_compact_text(item.get('name') or '-', 28)} · {item.get('market') or '-'}</div>{_pseudo_strong_signal_html(item, lang)}</div>"
             f"<div class='mobile-result-price'>{_price_badge(item.get('latest_close') if item.get('latest_close') is not None else item.get('close'))}</div>"
             "</div>"
             f"<div class='mobile-result-chip-row'>{_trend_badge(item.get('trend_score'))}{_action_badge(item.get('action_label'), lang)}{_sync_status_badge(watchlist_map.get(item['ticker']), lang)}</div>"
@@ -3983,7 +4191,9 @@ def screener_page(
           }}
           .receipt-row span {{ color:var(--muted); font-size:11px; font-weight:900; letter-spacing:0.04em; text-transform:uppercase; }}
           .receipt-row strong {{ color:var(--ink); font-size:13px; line-height:1.45; word-break:break-word; overflow-wrap:anywhere; }}
+          .template-group-stack {{ display:grid; gap:18px; margin-top:12px; }}
           .template-grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-top:12px; }}
+          .multi-template-stack {{ display:grid; gap:14px; margin-top:12px; }}
           .multi-template-grid {{ display:grid; gap:10px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-top:12px; }}
           .multi-template-chip {{
             display:flex;
@@ -4014,6 +4224,8 @@ def screener_page(
             border-radius:15px;
             border:1px solid var(--line);
             background:rgba(11,19,29,0.82);
+            color:inherit;
+            text-decoration:none;
           }}
           .template-card.active {{ border-color:rgba(61,217,182,0.34); background:linear-gradient(180deg, rgba(61,217,182,0.14), rgba(82,168,255,0.08)); }}
           .template-top {{ display:flex; align-items:center; justify-content:space-between; gap:8px; }}
@@ -4363,58 +4575,7 @@ def screener_page(
               {lang_switch_html}
             </div>
           </div>
-          <section class="nav-grid">
-            <a class="nav-card" href="/dashboard?lang={lang}">
-              <div class="nav-head">
-                <span class="nav-icon">HOME</span>
-                <div>
-                  <div class="nav-kicker">{'总览' if lang == 'zh' else 'Overview'}</div>
-                  <div class="nav-title">Dashboard</div>
-                </div>
-              </div>
-              <div class="muted">{'返回首页，看系统状态和主要入口。' if lang == 'zh' else 'Return to the hub for system status and primary navigation.'}</div>
-            </a>
-            <a class="nav-card" href="/watchlist">
-              <div class="nav-head">
-                <span class="nav-icon">LIST</span>
-                <div>
-                  <div class="nav-kicker">{'跟踪' if lang == 'zh' else 'Tracking'}</div>
-                  <div class="nav-title">{_lang_text(lang, 'open_watchlist')}</div>
-                </div>
-              </div>
-              <div class="muted">{'把筛出来的股票加入自选，并统一管理同步。' if lang == 'zh' else 'Move screened candidates into your watchlist and manage sync from one place.'}</div>
-            </a>
-            <a class="nav-card" href="/dashboard/continuous-leaders?lang={lang}">
-              <div class="nav-head">
-                <span class="nav-icon">RUN</span>
-                <div>
-                  <div class="nav-kicker">{'持续入选' if lang == 'zh' else 'Persistence'}</div>
-                  <div class="nav-title">{'连续强势股' if lang == 'zh' else 'Continuous Leaders'}</div>
-                </div>
-              </div>
-              <div class="muted">{'查看最近几次模型快照里持续入选的股票。' if lang == 'zh' else 'Inspect names that keep recurring across recent model snapshots.'}</div>
-            </a>
-            <a class="nav-card" href="/screeners/focus/today?lang={lang}">
-              <div class="nav-head">
-                <span class="nav-icon">FOCUS</span>
-                <div>
-                  <div class="nav-kicker">{'盯盘池' if lang == 'zh' else 'Focus'}</div>
-                  <div class="nav-title">{_lang_text(lang, 'today_focus_pool')}</div>
-                </div>
-              </div>
-              <div class="muted">{'把技术形态和模型信号最值得看的股票先放进今日重点盯盘池。' if lang == 'zh' else 'Collect today’s highest-priority names before deciding what goes into the watchlist.'}</div>
-            </a>
-            <a class="nav-card" href="/screeners/market-snapshot?lang={lang}">
-              <div class="nav-head">
-                <span class="nav-icon">SCAN</span>
-                <div>
-                  <div class="nav-kicker">{'盘面快照' if lang == 'zh' else 'Snapshot'}</div>
-                  <div class="nav-title">{_lang_text(lang, 'market_snapshot')}</div>
-                </div>
-              </div>
-              <div class="muted">{'把强势、收口、连阳、放量四类候选股集中成一页，方便盘前盘后快速扫一遍。' if lang == 'zh' else 'Open a single page for momentum, squeeze, candle continuation, and volume-breakout boards.'}</div>
-            </a>
-          </section>
+          {banner_html}
           <div class="card">
             <div class="eyebrow">{'Strategy Workbench' if lang == 'en' else '策略工作台'}</div>
             <h1>{'先选打法，再看结果' if lang == 'zh' else 'Choose the playbook before the picks'}</h1>
@@ -4424,20 +4585,8 @@ def screener_page(
               {active_defaults_html}
             </div>
           </div>
-          {guidance_bridge_html}
-          <section id="strategy-workbench" class="workbench-grid">{strategy_workbench_html}</section>
-          <section id="strategy-templates" class="strategy-template-section">
-            <article class="card">
-              <div class="eyebrow">{'策略模板' if lang == 'zh' else 'Strategy Templates'}</div>
-              <h2 style="margin:0 0 6px;">{'一键运行常用组合' if lang == 'zh' else 'Run the common playbooks in one click'}</h2>
-              <p class="lead">{'这些模板会复用完整筛选参数，适合每天盘后先跑一遍，再把结果加入自选或今日盯盘池。' if lang == 'zh' else 'These templates reuse the full parameter set, making them a fast after-hours first pass before watchlist or focus-pool review.'}</p>
-              <div class="strategy-template-actions" style="margin-top:12px;"><a class="detail-link" href="#my-strategies">{'管理我的策略' if lang == 'zh' else 'Manage My Strategies'}</a></div>
-            </article>
-            <div class="strategy-template-grid">{strategy_template_cards_html}</div>
-          </section>
           {screen_overview_html}
           {run_receipt_html}
-          {banner_html}
           {template_read_html}
           {template_overview_brief_html}
           {lightgbm_bias_bar_html}
@@ -4450,7 +4599,7 @@ def screener_page(
             <article id="single-model-rules" class="card">
               <div class="eyebrow">{_lang_text(lang, 'rules')}</div>
               <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;">{quick_confluence_presets_html}</div>
-              <div class="template-grid">{template_cards_html}</div>
+              <div class="template-group-stack">{template_cards_html}</div>
               <form class="stack" method="get" action="/screeners">
                 <input type="hidden" name="lang" value="{lang}" />
                 <input type="hidden" name="run" value="1" />
@@ -4498,7 +4647,7 @@ def screener_page(
                   </div>
                 </div>
                 <div id="multi-model-combos" class="summary-note">{'如果想做多模型共振，勾选两个或以上模板。系统会按同一只股票被多少个模型同时命中来排序。' if lang == 'zh' else 'For confluence screening, tick two or more templates. The screener will rank names by how many models hit the same ticker.'}</div>
-                <div class="multi-template-grid">{multi_template_picker_html}</div>
+                <div class="multi-template-stack">{multi_template_picker_html}</div>
                 <details class="advanced-panel">
                   <summary>{_lang_text(lang, 'cn_rules')}</summary>
                   <div class="summary-note">{'这些参数保留给需要做精细筛选的时候。' if lang == 'zh' else 'Use these only when you need a more precise filter pass.'}</div>
@@ -4703,6 +4852,17 @@ def screener_page(
               <div class="mobile-result-list">{mobile_result_cards}</div>
               <div class="scroll-hint">{_lang_text(lang, 'drag_hint')}</div>
             </article>
+          </section>
+          {guidance_bridge_html}
+          <section id="strategy-workbench" class="workbench-grid">{strategy_workbench_html}</section>
+          <section id="strategy-templates" class="strategy-template-section">
+            <article class="card">
+              <div class="eyebrow">{'策略模板' if lang == 'zh' else 'Strategy Templates'}</div>
+              <h2 style="margin:0 0 6px;">{'一键运行常用组合' if lang == 'zh' else 'Run the common playbooks in one click'}</h2>
+              <p class="lead">{'这些模板会复用完整筛选参数，适合每天盘后先跑一遍，再把结果加入自选或今日盯盘池。' if lang == 'zh' else 'These templates reuse the full parameter set, making them a fast after-hours first pass before watchlist or focus-pool review.'}</p>
+              <div class="strategy-template-actions" style="margin-top:12px;"><a class="detail-link" href="#my-strategies">{'管理我的策略' if lang == 'zh' else 'Manage My Strategies'}</a></div>
+            </article>
+            <div class="strategy-template-grid">{strategy_template_cards_html}</div>
           </section>
           <section id="my-strategies" class="card">
             <div class="eyebrow">{_lang_text(lang, 'saved_strategies')}</div>

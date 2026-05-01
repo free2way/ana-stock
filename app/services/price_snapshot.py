@@ -4,7 +4,7 @@ import csv
 from pathlib import Path
 
 from app.core.config import get_settings
-from app.services.market_lake import load_lake_price_history
+from app.services.market_lake import load_lake_latest_closes, load_lake_price_history
 from app.services.runtime_cache import get_or_set
 from app.services.ticker_format import market_ticker_candidates
 
@@ -22,6 +22,19 @@ def load_latest_close(ticker: str) -> float | None:
         return None
 
     def _load() -> float | None:
+        for market, symbol in _lake_candidates(normalized):
+            rows = load_lake_price_history(market=market, ticker=symbol, limit=1)
+            if not rows:
+                continue
+            latest = rows[-1]
+            for field in ("close", "adj_close", "latest_close"):
+                value = latest.get(field)
+                if value in {None, ""}:
+                    continue
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
         for path in _candidate_paths(normalized):
             if not path.exists():
                 continue
@@ -41,19 +54,6 @@ def load_latest_close(ticker: str) -> float | None:
                     return float(value)
                 except (TypeError, ValueError):
                     continue
-        for market, symbol in _lake_candidates(normalized):
-            rows = load_lake_price_history(market=market, ticker=symbol, limit=1)
-            if not rows:
-                continue
-            latest = rows[-1]
-            for field in ("close", "adj_close", "latest_close"):
-                value = latest.get(field)
-                if value in {None, ""}:
-                    continue
-                try:
-                    return float(value)
-                except (TypeError, ValueError):
-                    continue
         return None
 
     return get_or_set("latest_local_close", normalized, ttl_seconds=60.0, loader=_load)
@@ -61,11 +61,28 @@ def load_latest_close(ticker: str) -> float | None:
 
 def load_latest_closes(tickers: list[str]) -> dict[str, float | None]:
     values: dict[str, float | None] = {}
+    us_tickers: list[str] = []
+    cn_tickers: list[str] = []
     for ticker in tickers:
         normalized = str(ticker or "").strip().upper()
-        if not normalized:
+        if not normalized or normalized in values:
             continue
-        values[normalized] = load_latest_close(normalized)
+        values[normalized] = None
+        if normalized.endswith((".SS", ".SZ", ".SH", ".BJ")):
+            cn_tickers.append(normalized)
+        elif not normalized.endswith(".HK"):
+            us_tickers.append(normalized)
+
+    for symbol, latest_value in load_lake_latest_closes(market="US", tickers=us_tickers).items():
+        if symbol in values:
+            values[symbol] = latest_value
+    for symbol, latest_value in load_lake_latest_closes(market="CN", tickers=cn_tickers).items():
+        if symbol in values:
+            values[symbol] = latest_value
+
+    for normalized in list(values.keys()):
+        if values[normalized] is None:
+            values[normalized] = load_latest_close(normalized)
     return values
 
 
