@@ -14,12 +14,13 @@ from sqlalchemy import text
 from app.core.config import get_settings
 from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
-from app.services.market_calendar import previous_market_open_date
+from app.services.market_freshness import latest_completed_market_date
 from app.services.market_sync import RAW_FIELDS, merge_market_data_rows, read_raw_csv, write_raw_csv
 from app.services.market_lake import write_daily_ohlcv_parquet
 from app.services.normalizer import MarketDataNormalizer
 from app.services.repository import PriceSyncStateRepository, SymbolRepository
 from app.services.time_utils import app_now, app_now_iso
+from app.services.us_trade_universe import is_known_us_non_common_security
 
 
 def refresh_us_grouped_daily(
@@ -86,6 +87,7 @@ def refresh_us_grouped_daily(
             "error": error_message,
         }
     fetch_seconds = round(time.perf_counter() - started_at, 3)
+    rows, filter_summary = _filter_known_non_common_us_rows(rows)
     if limit is not None and limit > 0:
         rows = rows[:limit]
     if not rows:
@@ -136,6 +138,8 @@ def refresh_us_grouped_daily(
             "snapshot_path": str(snapshot_path) if snapshot_path else None,
             "lake_path": str(lake_path) if lake_path else None,
             "rows_returned": len(rows),
+            "rows_filtered": int(filter_summary.get("filtered_count") or 0),
+            "filter_summary": filter_summary,
             "success_count": success_count,
             "failure_count": failure_count,
             "fetch_seconds": fetch_seconds,
@@ -195,11 +199,51 @@ def refresh_us_grouped_daily(
         "snapshot_path": str(snapshot_path) if snapshot_path else None,
         "lake_path": str(lake_path) if lake_path else None,
         "rows_returned": len(rows),
+        "rows_filtered": int(filter_summary.get("filtered_count") or 0),
+        "filter_summary": filter_summary,
         "success_count": success_count,
         "failure_count": failure_count,
         "fetch_seconds": fetch_seconds,
         "snapshot_write_seconds": snapshot_write_seconds,
         "lake_write_seconds": lake_write_seconds,
+        "examples": examples,
+    }
+
+
+def _filter_known_non_common_us_rows(rows: list[dict]) -> tuple[list[dict], dict]:
+    tickers = sorted({str(row.get("symbol") or "").strip().upper() for row in rows if row.get("symbol")})
+    if not tickers:
+        return rows, {"input_count": len(rows), "kept_count": 0, "filtered_count": 0, "reasons": {}}
+    with SessionLocal() as db:
+        overview_map = SymbolRepository(db).list_overviews_for_tickers(tickers)
+    kept: list[dict] = []
+    reasons: dict[str, int] = {}
+    examples: dict[str, list[str]] = {}
+    for row in rows:
+        ticker = str(row.get("symbol") or "").strip().upper()
+        overview = overview_map.get(ticker) or {}
+        metadata_text = " ".join(
+            str(overview.get(key) or "")
+            for key in ("name", "exchange", "sector", "industry")
+        )
+        should_drop, reason = is_known_us_non_common_security(
+            ticker,
+            overview.get("name"),
+            metadata_text=metadata_text,
+        )
+        if should_drop:
+            reason_key = reason or "known_non_common_security"
+            reasons[reason_key] = reasons.get(reason_key, 0) + 1
+            bucket = examples.setdefault(reason_key, [])
+            if len(bucket) < 6:
+                bucket.append(ticker)
+            continue
+        kept.append(row)
+    return kept, {
+        "input_count": len(rows),
+        "kept_count": len(kept),
+        "filtered_count": len(rows) - len(kept),
+        "reasons": dict(sorted(reasons.items(), key=lambda item: (-item[1], item[0]))),
         "examples": examples,
     }
 
@@ -368,5 +412,4 @@ def _fetch_polygon_grouped_daily(trade_date: str, *, adjusted: bool) -> list[dic
 
 
 def _default_us_grouped_trade_date() -> str:
-    # In Asia/Shanghai, after the U.S. close the latest grouped daily date is usually the previous U.S. weekday.
-    return previous_market_open_date("US", app_now().date() - timedelta(days=1))
+    return latest_completed_market_date("US")

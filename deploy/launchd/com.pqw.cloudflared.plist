@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.pqw.cloudflared</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/opt/homebrew/bin/cloudflared</string>
+      <string>tunnel</string>
+      <string>--protocol</string>
+      <string>http2</string>
+      <string>--config</string>
+      <string>/Volumes/STORAGE_Jackyhu/code/ana/deploy/cloudflare/pqw-ana.yml</string>
+      <string>run</string>
+      <string>pqw-ana</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Volumes/STORAGE_Jackyhu/code/ana</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+      <key>SuccessfulExit</key>
+      <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>/Volumes/STORAGE_Jackyhu/code/ana/storage/cloudflared-pqw-ana.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Volumes/STORAGE_Jackyhu/code/ana/storage/cloudflared-pqw-ana.err.log</string>
+  </dict>
+</plist>

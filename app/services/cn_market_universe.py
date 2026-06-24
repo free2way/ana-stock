@@ -1,12 +1,16 @@
 from datetime import date, timedelta
 
+from sqlalchemy import text
+
 from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
 from app.models.tables import PriceSyncState
 from app.services.market_lake import write_ohlcv_rows_to_lake
 from app.services.market_sync import sync_market_data
+from app.services.market_freshness import latest_completed_market_date
 from app.services.repository import SymbolRepository
 from app.services.technical_snapshot_cache import rebuild_technical_snapshots
+from app.services.time_utils import app_now_iso
 from app.services.tushare_client import TushareClient
 
 
@@ -260,11 +264,13 @@ def refresh_cn_market_data(
         start_date=start_date,
         provider=provider,
         start_dates_by_ticker=start_dates_by_ticker,
+        required_as_of_date=latest_completed_market_date("CN"),
     )
     success_count = sum(1 for item in results if item.get("status") == "success")
     failure_count = sum(1 for item in results if item.get("status") == "failed")
-    status = "success" if failure_count == 0 else "partial"
-    if success_count == 0 and failure_count:
+    stale_count = sum(1 for item in results if item.get("status") == "partial")
+    status = "success" if success_count == len(selected_tickers) else "partial"
+    if success_count == 0 and (failure_count or stale_count):
         status = "failed"
 
     payload = {
@@ -273,6 +279,7 @@ def refresh_cn_market_data(
             f"{'Incrementally refreshed' if incremental else 'Refreshed'} CN market data for {success_count} stock(s)"
             f" over the recent ~{days_back} days"
             + (f", {failure_count} failed." if failure_count else ".")
+            + (f" {stale_count} remain behind the required market date." if stale_count else "")
         ),
         "days_back": days_back,
         "incremental": incremental,
@@ -280,6 +287,8 @@ def refresh_cn_market_data(
         "total_symbols": len(selected_tickers),
         "success_count": success_count,
         "failure_count": failure_count,
+        "stale_count": stale_count,
+        "required_as_of_date": latest_completed_market_date("CN"),
         "results": results,
     }
     if success_count and rebuild_snapshots:
@@ -340,17 +349,81 @@ def refresh_cn_market_data_lake_only(
     rows = [row for ticker_rows in rows_by_ticker.values() for row in ticker_rows]
     parquet_paths = write_ohlcv_rows_to_lake(market="CN", rows=rows) if rows else []
     touched = {str(row.get("symbol") or "").upper() for row in rows if row.get("symbol")}
+    required_as_of_date = end_date or latest_completed_market_date("CN")
+    state_summary = _upsert_lake_only_sync_state(rows, required_as_of_date=required_as_of_date)
+    fresh_count = int(state_summary.get("fresh_count") or 0)
+    stale_count = max(0, len(tickers) - fresh_count)
+    status = "success" if fresh_count == len(tickers) else "partial" if fresh_count else "failed"
     return {
-        "status": "success" if rows else "empty",
-        "message": f"CN lake-only refresh wrote {len(rows)} row(s) for {len(touched)} stock(s) into {len(parquet_paths)} parquet partition(s).",
+        "status": status if rows else "empty",
+        "message": (
+            f"CN lake-only refresh wrote {len(rows)} row(s) for {len(touched)} stock(s) into {len(parquet_paths)} parquet partition(s)."
+            + (f" {stale_count} symbol(s) remain behind required as-of {required_as_of_date}." if stale_count else "")
+        ),
         "start_date": start_date,
         "end_date": end_date,
         "total_symbols": len(tickers),
-        "success_count": len(touched),
+        "success_count": fresh_count,
         "failure_count": 0,
+        "stale_count": stale_count,
+        "required_as_of_date": required_as_of_date,
         "rows_written": len(rows),
         "parquet_files": [str(path) for path in parquet_paths[:12]],
     }
+
+
+def _upsert_lake_only_sync_state(rows: list[dict], *, required_as_of_date: str) -> dict:
+    latest_by_ticker: dict[str, str] = {}
+    for row in rows:
+        ticker = str(row.get("symbol") or "").strip().upper()
+        trade_date = str(row.get("date") or "").strip()
+        if not ticker or not trade_date:
+            continue
+        if trade_date > latest_by_ticker.get(ticker, ""):
+            latest_by_ticker[ticker] = trade_date
+    if not latest_by_ticker:
+        return {"fresh_count": 0, "stale_count": 0}
+    tickers = sorted(latest_by_ticker)
+    dates = [latest_by_ticker[ticker] for ticker in tickers]
+    with SessionLocal() as db:
+        db.execute(
+            text(
+                """
+                WITH payload AS (
+                    SELECT *
+                    FROM unnest(CAST(:tickers AS TEXT[]), CAST(:dates AS TEXT[])) AS p(ticker, last_synced_date)
+                )
+                INSERT INTO price_sync_state (symbol_id, provider, last_synced_date, status, message, updated_at)
+                SELECT
+                    symbols.id,
+                    'tushare_lake',
+                    payload.last_synced_date,
+                    CASE WHEN payload.last_synced_date >= :required_as_of_date THEN 'success' ELSE 'partial' END,
+                    CASE
+                        WHEN payload.last_synced_date >= :required_as_of_date THEN 'Wrote current fetched rows to Parquet lake.'
+                        ELSE 'Wrote fetched rows to Parquet lake, but the market date is stale.'
+                    END,
+                    :updated_at
+                FROM payload
+                JOIN symbols ON symbols.ticker = payload.ticker
+                ON CONFLICT (symbol_id) DO UPDATE SET
+                    provider = EXCLUDED.provider,
+                    last_synced_date = EXCLUDED.last_synced_date,
+                    status = EXCLUDED.status,
+                    message = EXCLUDED.message,
+                    updated_at = EXCLUDED.updated_at
+                """
+            ),
+            {
+                "tickers": tickers,
+                "dates": dates,
+                "required_as_of_date": required_as_of_date,
+                "updated_at": app_now_iso(),
+            },
+        )
+        db.commit()
+    fresh_count = sum(1 for value in dates if value >= required_as_of_date)
+    return {"fresh_count": fresh_count, "stale_count": len(dates) - fresh_count}
 
 
 def _fetch_cn_symbol_universe_from_akshare() -> list[dict]:

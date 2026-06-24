@@ -37,6 +37,8 @@ _LAKE_FILE_LIST_CACHE_LOCK = threading.Lock()
 _LAKE_FILE_LIST_CACHE: dict[str, dict] = {}
 _LAKE_QUERY_STATS_LOCK = threading.Lock()
 _LAKE_QUERY_STATS: dict[str, dict] = {}
+_LAKE_WRITE_LOCKS_GUARD = threading.Lock()
+_LAKE_WRITE_LOCKS: dict[str, threading.Lock] = {}
 
 
 def market_lake_root() -> Path:
@@ -52,20 +54,29 @@ def _invalidate_lake_file_cache(market: str | None = None) -> None:
             _LAKE_FILE_LIST_CACHE.clear()
 
 
-def write_daily_ohlcv_parquet(*, market: str, trade_date: str, rows: list[dict], merge_existing: bool = False) -> Path:
+def _lake_write_lock(path: Path) -> threading.Lock:
+    key = str(path.resolve())
+    with _LAKE_WRITE_LOCKS_GUARD:
+        return _LAKE_WRITE_LOCKS.setdefault(key, threading.Lock())
+
+
+def write_daily_ohlcv_parquet(*, market: str, trade_date: str, rows: list[dict], merge_existing: bool = True) -> Path:
     market_code = str(market or "").strip().lower() or "unknown"
     path = market_lake_root() / f"{market_code}_daily" / f"date={trade_date}" / "part.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
     normalized_rows = [_normalize_ohlcv_row(row, trade_date=trade_date) for row in rows]
-    frame = pl.DataFrame(normalized_rows, schema=LAKE_OHLCV_COLUMNS, orient="row")
-    if merge_existing and path.exists():
-        try:
+    incoming = pl.DataFrame(normalized_rows, schema=LAKE_OHLCV_COLUMNS, orient="row")
+    with _lake_write_lock(path):
+        frame = incoming
+        if merge_existing and path.exists():
+            # A partial refresh must never replace the other symbols in a daily
+            # partition. Fail closed if the existing partition cannot be read.
             existing = pl.read_parquet(path)
-            frame = pl.concat([existing, frame], how="vertical_relaxed")
-            frame = frame.unique(subset=["date", "symbol"], keep="last").sort(["date", "symbol"])
-        except Exception:
-            pass
-    frame.write_parquet(path, compression="zstd")
+            frame = pl.concat([existing, incoming], how="vertical_relaxed")
+        frame = frame.unique(subset=["date", "symbol"], keep="last").sort(["date", "symbol"])
+        temporary_path = path.with_name(f".{path.name}.tmp")
+        frame.write_parquet(temporary_path, compression="zstd")
+        temporary_path.replace(path)
     _invalidate_lake_file_cache(market_code)
     return path
 
@@ -251,6 +262,117 @@ def load_lake_latest_closes(*, market: str, tickers: list[str]) -> dict[str, flo
                 )
             except (TypeError, ValueError):
                 payload[str(symbol or "").strip().upper()] = None
+    return payload
+
+
+def load_lake_latest_metrics(
+    *,
+    market: str,
+    tickers: list[str] | None = None,
+    lookback_days: int = 60,
+) -> dict[str, dict]:
+    market_code = str(market or "").strip().upper()
+    parquet_files = _recent_parquet_files(market_code, limit=max(20, int(lookback_days) + 20))
+    if market_code not in {"CN", "US"} or not parquet_files:
+        return {}
+
+    normalized: list[str] = []
+    for ticker in tickers or []:
+        symbol = str(ticker or "").strip().upper()
+        if symbol and symbol not in normalized:
+            normalized.append(symbol)
+
+    payload: dict[str, dict] = {}
+    chunks = [normalized[index : index + 800] for index in range(0, len(normalized), 800)] if normalized else [[]]
+    for ticker_chunk in chunks:
+        ticker_filter = ""
+        params: list[object] = [parquet_files]
+        if ticker_chunk:
+            placeholders = ", ".join("?" for _ in ticker_chunk)
+            ticker_filter = f"WHERE symbol IN ({placeholders})"
+            params.extend(ticker_chunk)
+        sql = f"""
+            WITH base AS (
+                SELECT
+                    CAST(date AS DATE) AS trade_date,
+                    symbol,
+                    close,
+                    volume,
+                    close * volume AS dollar_volume
+                FROM read_parquet(?, hive_partitioning = true)
+                {ticker_filter}
+            ),
+            ranked AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol
+                        ORDER BY trade_date DESC
+                    ) AS row_num
+                FROM base
+                WHERE close IS NOT NULL
+            ),
+            agg AS (
+                SELECT
+                    symbol,
+                    COUNT(*) AS history_days,
+                    AVG(volume) AS avg_volume,
+                    AVG(dollar_volume) AS avg_dollar_volume,
+                    MAX(trade_date) AS latest_trade_date
+                FROM ranked
+                WHERE row_num <= ?
+                GROUP BY symbol
+            ),
+            duplicate_conflicts AS (
+                SELECT
+                    symbol,
+                    SUM(
+                        CASE
+                            WHEN row_count > 1
+                              AND min_close > 0
+                              AND max_close / NULLIF(min_close, 0) >= 1.2
+                            THEN 1
+                            ELSE 0
+                        END
+                    ) AS duplicate_conflict_days
+                FROM (
+                    SELECT
+                        symbol,
+                        trade_date,
+                        COUNT(*) AS row_count,
+                        MIN(close) AS min_close,
+                        MAX(close) AS max_close
+                    FROM base
+                    WHERE close IS NOT NULL
+                    GROUP BY symbol, trade_date
+                )
+                GROUP BY symbol
+            )
+            SELECT
+                CAST(r.trade_date AS VARCHAR) AS latest_trade_date,
+                r.symbol,
+                r.close AS latest_close,
+                r.volume AS latest_volume,
+                r.dollar_volume AS latest_dollar_volume,
+                a.history_days,
+                a.avg_volume,
+                a.avg_dollar_volume,
+                COALESCE(d.duplicate_conflict_days, 0) AS duplicate_conflict_days
+            FROM ranked r
+            JOIN agg a ON a.symbol = r.symbol
+            LEFT JOIN duplicate_conflicts d ON d.symbol = r.symbol
+            WHERE r.row_num = 1
+        """
+        rows, columns = _duckdb_fetchall(
+            sql,
+            [*params, int(max(1, lookback_days))],
+            label="lake_latest_metrics",
+        )
+        for row in rows:
+            item = _json_ready_row(dict(zip(columns, row, strict=False)))
+            symbol = str(item.get("symbol") or "").strip().upper()
+            if symbol:
+                payload[symbol] = item
     return payload
 
 
@@ -588,7 +710,7 @@ def list_lake_symbols(*, market: str) -> set[str]:
     return symbols
 
 
-def write_ohlcv_rows_to_lake(*, market: str, rows: list[dict], merge_existing: bool = False) -> list[Path]:
+def write_ohlcv_rows_to_lake(*, market: str, rows: list[dict], merge_existing: bool = True) -> list[Path]:
     rows_by_date: dict[str, list[dict]] = {}
     for row in rows:
         trade_date = str(row.get("date") or "").strip()

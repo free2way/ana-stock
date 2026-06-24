@@ -89,21 +89,21 @@ def _render_ai_chat_page(
           .pill {{ display:inline-flex; align-items:center; justify-content:center; padding:8px 12px; border-radius:999px; border:1px solid var(--line); background:rgba(17,28,40,0.72); color:var(--ink); font-size:13px; font-weight:850; }}
           .status-chip {{ display:inline-flex; padding:7px 10px; border-radius:999px; border:1px solid rgba(255,255,255,0.08); background:rgba(61,217,182,0.12); color:#bbf7d0; font-size:12px; font-weight:900; }}
           .status-chip.missing {{ background:rgba(251,191,36,0.12); color:#fde68a; }}
-          .prompt-box {{ min-height:190px; line-height:1.55; }}
+          .prompt-box {{ min-height:150px; line-height:1.5; }}
           .form-actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }}
           .form-actions button {{ width:auto; min-width:150px; }}
-          .template-grid {{ display:grid; gap:10px; }}
-          .template-card {{ width:100%; text-align:left; padding:13px; border-radius:16px; border:1px solid var(--line); background:rgba(21,34,49,0.82); color:var(--ink); cursor:pointer; }}
+          .template-grid {{ display:grid; gap:8px; }}
+          .template-card {{ width:100%; text-align:left; padding:10px; border-radius:10px; border:1px solid var(--line); background:rgba(21,34,49,0.82); color:var(--ink); cursor:pointer; }}
           .template-card:hover {{ border-color:rgba(61,217,182,0.42); background:rgba(24,42,57,0.92); }}
-          .template-card span {{ display:block; font-weight:900; margin-bottom:6px; }}
-          .template-card small {{ display:block; color:var(--muted); line-height:1.45; font-size:12px; }}
+          .template-card span {{ display:block; font-weight:900; margin-bottom:4px; font-size:13px; }}
+          .template-card small {{ display:block; color:var(--muted); line-height:1.35; font-size:11px; }}
           .answer-card {{ border-color:rgba(61,217,182,0.26); }}
           .answer-card.error,.answer-card.not_configured {{ border-color:rgba(251,191,36,0.30); }}
           .answer-meta {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }}
           .answer-meta span {{ display:inline-flex; padding:6px 9px; border-radius:999px; background:rgba(255,255,255,0.06); color:var(--muted); font-size:12px; font-weight:800; }}
           .answer-text {{ color:var(--ink); line-height:1.72; font-size:14px; white-space:normal; }}
-          .guide-list {{ display:grid; gap:10px; }}
-          .guide-list div {{ padding:11px; border:1px solid rgba(255,255,255,0.06); border-radius:14px; background:rgba(15,24,35,0.72); }}
+          .guide-list {{ display:grid; gap:8px; }}
+          .guide-list div {{ padding:9px; border:1px solid rgba(255,255,255,0.06); border-radius:10px; background:rgba(15,24,35,0.72); }}
           @media (max-width: 1120px) {{ .hero,.workspace {{ grid-template-columns:1fr; }} }}
         </style>
       </head>

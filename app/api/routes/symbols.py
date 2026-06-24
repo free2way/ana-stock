@@ -18,7 +18,7 @@ from app.services.symbol_details import SymbolDataService
 from app.services.technical_patterns import TechnicalPatternService
 from app.services.tradingview_client import TradingViewClient
 from app.services.ui_lang import resolve_request_lang
-from app.services.workspace_nav import WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
+from app.services.workspace_nav import WORKSPACE_COMPACT_STYLE, WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
 
 
 router = APIRouter(prefix="/symbols", tags=["symbols"])
@@ -507,6 +507,7 @@ def symbol_page(ticker: str, request: Request, db: Session = Depends(get_db_sess
             radial-gradient(circle at top left, rgba(82,168,255,0.14) 0, transparent 28%),
             radial-gradient(circle at bottom right, rgba(61,217,182,0.10) 0, transparent 26%),
             var(--bg); }}
+          {WORKSPACE_COMPACT_STYLE}
           .app {{ display:grid; grid-template-columns:260px minmax(0, 1fr); min-height:100vh; }}
           {WORKSPACE_SIDEBAR_STYLE}
           .content {{ padding:20px 18px 28px; }}

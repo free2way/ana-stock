@@ -1,6 +1,6 @@
 from collections.abc import Generator
 
-from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.engine import make_url
 
@@ -12,47 +12,11 @@ from app.models import tables  # noqa: F401
 settings = get_settings()
 
 
-def _is_sqlite_url(database_url: str) -> bool:
-    return make_url(database_url).get_backend_name() == "sqlite"
-
-
-def _create_sqlite_engine(database_url: str):
-    sqlite_engine = create_engine(
-        database_url,
-        future=True,
-        pool_size=20,
-        max_overflow=40,
-        pool_timeout=max(30, int(float(settings.sqlite_timeout_seconds))),
-        pool_pre_ping=True,
-        connect_args={
-            "check_same_thread": False,
-            "timeout": float(settings.sqlite_timeout_seconds),
-        },
-    )
-
-    @event.listens_for(sqlite_engine, "connect")
-    def _set_sqlite_pragma(dbapi_connection, _connection_record) -> None:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=NORMAL")
-        cursor.execute(f"PRAGMA busy_timeout={int(float(settings.sqlite_timeout_seconds) * 1000)}")
-        cursor.close()
-
-    return sqlite_engine
-
-
 def _create_generic_engine(database_url: str):
     backend_name = make_url(database_url).get_backend_name()
     if backend_name == "postgresql":
         return _create_postgresql_engine(database_url)
-    return create_engine(
-        database_url,
-        future=True,
-        pool_pre_ping=True,
-        pool_size=10,
-        max_overflow=20,
-        pool_timeout=30,
-    )
+    raise RuntimeError(f"Unsupported database backend: {backend_name}. PostgreSQL is required.")
 
 
 def _build_postgresql_connect_args() -> dict:
@@ -81,8 +45,6 @@ def _create_postgresql_engine(database_url: str):
 
 def _create_engine():
     database_url = settings.resolved_database_url
-    if _is_sqlite_url(database_url):
-        return _create_sqlite_engine(database_url)
     return _create_generic_engine(database_url)
 
 
@@ -161,6 +123,48 @@ def _run_migrations() -> None:
                 connection.execute(text("ALTER TABLE prediction_trade_plans ADD COLUMN invalidation_reason TEXT"))
             if "execution_tags_json" not in columns:
                 connection.execute(text("ALTER TABLE prediction_trade_plans ADD COLUMN execution_tags_json TEXT"))
+    _run_index_migrations(inspector)
+
+
+def _run_index_migrations(inspector) -> None:
+    table_names = set(inspector.get_table_names())
+    statements: list[str] = []
+    if "predictions" in table_names:
+        statements.extend(
+            [
+                (
+                    "CREATE INDEX IF NOT EXISTS ix_predictions_symbol_trade_model "
+                    "ON predictions (symbol_id, trade_date DESC, model_run_id DESC, id DESC)"
+                ),
+                (
+                    "CREATE INDEX IF NOT EXISTS ix_predictions_run_date_score "
+                    "ON predictions (model_run_id, trade_date, score DESC)"
+                ),
+            ]
+        )
+    if "data_jobs" in table_names:
+        statements.append(
+            "CREATE INDEX IF NOT EXISTS ix_data_jobs_type_status_started "
+            "ON data_jobs (job_type, status, started_at DESC)"
+        )
+    if "workspace_snapshots" in table_names:
+        statements.extend(
+            [
+                (
+                    "CREATE INDEX IF NOT EXISTS ix_workspace_snapshots_type_id "
+                    "ON workspace_snapshots (snapshot_type, id DESC)"
+                ),
+                (
+                    "CREATE INDEX IF NOT EXISTS ix_workspace_snapshots_type_date "
+                    "ON workspace_snapshots (snapshot_type, snapshot_date DESC)"
+                ),
+            ]
+        )
+    if not statements:
+        return
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 def get_db_session() -> Generator[Session, None, None]:

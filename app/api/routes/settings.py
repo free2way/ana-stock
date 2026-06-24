@@ -12,6 +12,7 @@ from app.services.ai_chat import AI_CHAT_PROVIDER_PRESETS, load_ai_chat_config, 
 from app.services.auto_analysis import auto_analysis_service
 from app.services.auth import is_authenticated, login_redirect
 from app.services.close_review_scheduler import close_review_scheduler_service
+from app.services.kronos_validation import load_latest_kronos_validation
 from app.services.push_notifications import PushNotificationService
 from app.services.repository import DataJobRepository, SymbolRepository
 from app.services.time_utils import format_app_datetime
@@ -44,8 +45,14 @@ def _provider_strategy_view(lang: str) -> dict:
 
 def _settings_shell(*, lang: str, title: str, lead: str, body_html: str, active_path: str) -> str:
     nav_html = render_workspace_nav_html(lang=lang, active_key="settings")
-    en_href = "/settings/notifications?lang=en" if active_path == "notifications" else "/settings/ai-chat?lang=en" if active_path == "ai_chat" else "/settings?lang=en"
-    zh_href = "/settings/notifications?lang=zh" if active_path == "notifications" else "/settings/ai-chat?lang=zh" if active_path == "ai_chat" else "/settings?lang=zh"
+    active_links = {
+        "notifications": "/settings/notifications",
+        "ai_chat": "/settings/ai-chat",
+        "kronos": "/settings/kronos",
+    }
+    active_base = active_links.get(active_path, "/settings")
+    en_href = f"{active_base}?lang=en"
+    zh_href = f"{active_base}?lang=zh"
     return f"""
     <!DOCTYPE html>
     <html lang="{lang}">
@@ -63,6 +70,10 @@ def _settings_shell(*, lang: str, title: str, lead: str, body_html: str, active_
           .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:16px; flex-wrap:wrap; }}
           .chip-row {{ display:flex; flex-wrap:wrap; gap:10px; }}
           .top-pill {{ display:inline-flex; align-items:center; justify-content:center; padding:8px 12px; border-radius:999px; border:1px solid var(--line); background:rgba(17,28,40,0.7); color:var(--muted); font-size:13px; font-weight:700; }}
+          .status-pill {{ display:inline-flex; align-items:center; justify-content:center; padding:5px 9px; border-radius:999px; border:1px solid rgba(144,163,184,0.2); color:var(--muted); font-size:12px; font-weight:800; white-space:nowrap; }}
+          .status-pill.success {{ color:#9ff3d5; border-color:rgba(61,217,182,0.32); background:rgba(61,217,182,0.08); }}
+          .status-pill.warning {{ color:#ffd08a; border-color:rgba(255,190,92,0.32); background:rgba(255,190,92,0.08); }}
+          .status-pill.idle {{ color:#9fb0c2; background:rgba(144,163,184,0.08); }}
           .hero {{ display:grid; grid-template-columns:minmax(0,1.3fr) minmax(260px,0.85fr); gap:12px; margin-bottom:12px; }}
           .workspace {{ display:grid; grid-template-columns:minmax(0,1.05fr) minmax(300px,0.95fr); gap:12px; }}
           .stack,.list-stack,.quick-grid {{ display:grid; gap:12px; }}
@@ -88,6 +99,8 @@ def _settings_shell(*, lang: str, title: str, lead: str, body_html: str, active_
           .ticker {{ font-weight:800; font-size:15px; color:var(--ink); }}
           .list-row {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; padding:10px 0; border-top:1px solid rgba(144,163,184,0.12); }}
           .list-row:first-child {{ border-top:none; padding-top:0; }}
+          code,.code-box {{ font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }}
+          .code-box {{ overflow:auto; white-space:pre-wrap; word-break:break-word; padding:12px; border-radius:14px; border:1px solid rgba(144,163,184,0.18); background:rgba(3,9,15,0.42); color:#cde7f7; font-size:12px; line-height:1.55; }}
           @media (max-width:1100px) {{ .hero,.workspace {{ grid-template-columns:1fr; }} }}
         </style>
       </head>
@@ -149,6 +162,42 @@ def _latest_cn_refresh_summary(lang: str) -> dict:
     return {"summary": summary, "label": label}
 
 
+def _kronos_config_summary(lang: str) -> dict:
+    settings = get_settings()
+    enabled = bool(settings.kronos_enabled)
+    runner_configured = bool(settings.kronos_runner_command)
+    repo_configured = bool(settings.kronos_repo_path)
+    if enabled and runner_configured:
+        status = "ready"
+        label = "已配置" if lang == "zh" else "Configured"
+        hint = "Kronos 二次验证会在预计算尾部运行。" if lang == "zh" else "Kronos validation runs at the tail of the precompute pipeline."
+    elif enabled:
+        status = "not_configured"
+        label = "待配置" if lang == "zh" else "Needs setup"
+        hint = "已启用接入层，但还没有配置独立 runner。" if lang == "zh" else "Integration is enabled, but the external runner is not configured yet."
+    else:
+        status = "disabled"
+        label = "已关闭" if lang == "zh" else "Disabled"
+        hint = "当前不会执行 Kronos 二次验证。" if lang == "zh" else "Kronos validation will not run."
+    return {
+        "enabled": enabled,
+        "runner_configured": runner_configured,
+        "repo_configured": repo_configured,
+        "status": status,
+        "label": label,
+        "hint": hint,
+        "model": settings.kronos_model_name,
+        "device": settings.kronos_device,
+        "candidate_limit": settings.kronos_candidate_limit,
+        "history_limit": settings.kronos_history_limit,
+        "min_history": settings.kronos_min_history,
+        "horizon_days": settings.kronos_prediction_horizon_days,
+        "timeout_seconds": settings.kronos_timeout_seconds,
+        "runner_command": settings.kronos_runner_command or "",
+        "repo_path": settings.kronos_repo_path or "",
+    }
+
+
 @router.get("", response_class=HTMLResponse)
 def settings_home_page(request: Request) -> str:
     if not is_authenticated(request):
@@ -161,6 +210,7 @@ def settings_home_page(request: Request) -> str:
     close_review_status = close_review_scheduler_service.get_status()
     strategy = _provider_strategy_view(lang)
     latest_cn_refresh = _latest_cn_refresh_summary(lang)
+    kronos = _kronos_config_summary(lang)
     with SessionLocal() as db:
         ai_chat_config = load_ai_chat_config(db)
     configured = {
@@ -223,6 +273,10 @@ def settings_home_page(request: Request) -> str:
                 <div class="ticker">{'AI 问答配置' if lang == 'zh' else 'AI Q&A Config'}</div>
                 <div class="section-copy">{'设置 Provider、Base URL、模型和 API Key。' if lang == 'zh' else 'Set provider, base URL, model, and API key.'}</div>
               </a>
+              <a class="quick-link" href="/settings/kronos?lang={lang}">
+                <div class="ticker">{'Kronos 二次验证' if lang == 'zh' else 'Kronos Validation'}</div>
+                <div class="section-copy">{'查看 K 线基础模型 runner 是否已接入。' if lang == 'zh' else 'Check whether the K-line foundation-model runner is connected.'}</div>
+              </a>
               <a class="quick-link" href="/dashboard/ops?lang={lang}">
                 <div class="ticker">{'任务中心' if lang == 'zh' else 'Jobs Center'}</div>
                 <div class="section-copy">{'回看自动任务、训练、回测和异常提示。' if lang == 'zh' else 'Review automation, training, backtests, and alerts.'}</div>
@@ -256,6 +310,7 @@ def settings_home_page(request: Request) -> str:
               <div class="list-row"><div><div class="ticker">{'企业微信' if lang == 'zh' else 'WeCom'}</div><div class="subtle">PQW_WECHAT_WEBHOOK_URL</div></div><div class="ticker">{'已配置' if configured['wechat'] and lang == 'zh' else ('未配置' if lang == 'zh' else ('Configured' if configured['wechat'] else 'Missing'))}</div></div>
               <div class="list-row"><div><div class="ticker">{'飞书' if lang == 'zh' else 'Feishu'}</div><div class="subtle">PQW_FEISHU_WEBHOOK_URL</div></div><div class="ticker">{'已配置' if configured['feishu'] and lang == 'zh' else ('未配置' if lang == 'zh' else ('Configured' if configured['feishu'] else 'Missing'))}</div></div>
               <div class="list-row"><div><div class="ticker">{'AI 问答' if lang == 'zh' else 'AI Q&A'}</div><div class="subtle">{html.escape(ai_chat_config.provider_name)} · {html.escape(ai_chat_config.model or '-')} · {html.escape(masked_api_key(ai_chat_config) or '-')}</div></div><div class="ticker">{'已配置' if configured['ai_chat'] and lang == 'zh' else ('未配置' if lang == 'zh' else ('Configured' if configured['ai_chat'] else 'Missing'))}</div></div>
+              <div class="list-row"><div><div class="ticker">{'Kronos 二次验证' if lang == 'zh' else 'Kronos Validation'}</div><div class="subtle">{html.escape(kronos['model'])} · {html.escape(kronos['device'])} · {html.escape(kronos['hint'])}</div></div><div><span class="status-pill {'success' if kronos['status'] == 'ready' else ('warning' if kronos['status'] == 'not_configured' else 'idle')}">{html.escape(kronos['label'])}</span></div></div>
             </div>
           </article>
           <article class="card">
@@ -331,6 +386,124 @@ def settings_home_page(request: Request) -> str:
         lead="",
         body_html=body_html,
         active_path="settings",
+    )
+
+
+@router.get("/kronos", response_class=HTMLResponse)
+def kronos_settings_page(request: Request) -> str:
+    if not is_authenticated(request):
+        return login_redirect("/settings/kronos")
+    lang = resolve_request_lang(request, default="zh")
+    kronos = _kronos_config_summary(lang)
+    status_class = "success" if kronos["status"] == "ready" else ("warning" if kronos["status"] == "not_configured" else "idle")
+    with SessionLocal() as db:
+        snapshot = load_latest_kronos_validation(db) or {}
+        recent_job = next(
+            (
+                item
+                for item in DataJobRepository(db).list_recent_jobs(limit=80)
+                if str(item.get("job_type") or "").lower() == "kronos_validation"
+            ),
+            None,
+        )
+    payload = snapshot.get("payload") if isinstance(snapshot, dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    candidate_count = int(payload.get("candidate_count") or 0)
+    validated_count = int(payload.get("validated_count") or 0)
+    pending_count = int(payload.get("not_configured_count") or 0)
+    skipped_count = int(payload.get("skipped_count") or 0)
+    snapshot_status = str(payload.get("status") or "-")
+    snapshot_time = _display_time(str(snapshot.get("created_at") or "")) if snapshot else "-"
+    job_status = str((recent_job or {}).get("status") or "-")
+    job_time = _display_time((recent_job or {}).get("finished_at") or (recent_job or {}).get("started_at"))
+    env_example = "\n".join(
+        [
+            f"PQW_KRONOS_ENABLED={'true' if kronos['enabled'] else 'false'}",
+            'PQW_KRONOS_REPO_PATH="/Volumes/STORAGE_Jackyhu/code/Kronos"',
+            'PQW_KRONOS_RUNNER_COMMAND="/Volumes/STORAGE_Jackyhu/code/ana/.venv-kronos/bin/python /Volumes/STORAGE_Jackyhu/code/ana/scripts/kronos_runner.py"',
+            f"PQW_KRONOS_MODEL_NAME={kronos['model']}",
+            f"PQW_KRONOS_DEVICE={kronos['device']}",
+            f"PQW_KRONOS_CANDIDATE_LIMIT={kronos['candidate_limit']}",
+        ]
+    )
+    setup_commands = "\n".join(
+        [
+            "python3.11 -m venv .venv-kronos",
+            ".venv-kronos/bin/pip install torch transformers huggingface_hub pandas accelerate sentencepiece",
+            "git clone https://github.com/shiyu-coder/Kronos /Volumes/STORAGE_Jackyhu/code/Kronos",
+        ]
+    )
+    body_html = f"""
+      <section class="hero">
+        <article class="card">
+          <span class="eyebrow">{'Kronos 二次验证' if lang == 'zh' else 'Kronos Validation'}</span>
+          <h1>{'把 Top 候选再交给 K 线基础模型复核' if lang == 'zh' else 'Validate top candidates with a K-line foundation model'}</h1>
+          <p class="lead">{'Kronos 不替代 LightGBM 和多模型共振，而是放在预计算尾部做“路径验证”：趋势候选是否仍有 1-3 日延续空间、是否存在明显回撤风险。' if lang == 'zh' else 'Kronos does not replace LightGBM or multi-model confluence. It runs at the tail of precompute as a path validator for 1-3 day continuation and drawdown risk.'}</p>
+          <div class="chip-row" style="margin-top:12px;">
+            <span class="status-pill {status_class}">{html.escape(kronos['label'])}</span>
+            <span class="top-pill">{'模型' if lang == 'zh' else 'Model'} · {html.escape(kronos['model'])}</span>
+            <span class="top-pill">{'设备' if lang == 'zh' else 'Device'} · {html.escape(kronos['device'])}</span>
+          </div>
+        </article>
+        <article class="card">
+          <span class="eyebrow">{'最新快照' if lang == 'zh' else 'Latest Snapshot'}</span>
+          <div class="list-stack">
+            <div><div class="subtle">{'快照状态' if lang == 'zh' else 'Snapshot status'}</div><div class="ticker">{html.escape(snapshot_status)}</div></div>
+            <div><div class="subtle">{'候选 / 已验证' if lang == 'zh' else 'Candidates / validated'}</div><div class="ticker">{candidate_count} / {validated_count}</div></div>
+            <div><div class="subtle">{'待配置 / 跳过' if lang == 'zh' else 'Pending setup / skipped'}</div><div class="ticker">{pending_count} / {skipped_count}</div></div>
+            <div><div class="subtle">{'生成时间' if lang == 'zh' else 'Generated at'}</div><div class="ticker">{html.escape(snapshot_time)}</div></div>
+          </div>
+        </article>
+      </section>
+      <section class="workspace">
+        <div class="stack">
+          <article class="card">
+            <span class="eyebrow">{'当前配置' if lang == 'zh' else 'Current Configuration'}</span>
+            <div class="list-stack">
+              <div class="list-row"><div><div class="ticker">PQW_KRONOS_ENABLED</div><div class="subtle">{'是否启用 Kronos 接入层' if lang == 'zh' else 'Whether the Kronos integration is enabled'}</div></div><div class="ticker">{'true' if kronos['enabled'] else 'false'}</div></div>
+              <div class="list-row"><div><div class="ticker">PQW_KRONOS_RUNNER_COMMAND</div><div class="subtle">{'独立 Python runner，建议单独虚拟环境，避免污染主应用依赖。' if lang == 'zh' else 'External Python runner; a separate virtualenv is recommended.'}</div></div><div><span class="status-pill {'success' if kronos['runner_configured'] else 'warning'}">{'已配置' if kronos['runner_configured'] and lang == 'zh' else ('待配置' if lang == 'zh' else ('Configured' if kronos['runner_configured'] else 'Missing'))}</span></div></div>
+              <div class="list-row"><div><div class="ticker">PQW_KRONOS_REPO_PATH</div><div class="subtle">{'Kronos 源码目录，runner 会把它加入 sys.path。' if lang == 'zh' else 'Kronos source path; the runner adds it to sys.path.'}</div></div><div><span class="status-pill {'success' if kronos['repo_configured'] else 'warning'}">{'已配置' if kronos['repo_configured'] and lang == 'zh' else ('待配置' if lang == 'zh' else ('Configured' if kronos['repo_configured'] else 'Missing'))}</span></div></div>
+              <div class="list-row"><div><div class="ticker">{'候选上限 / 历史窗口' if lang == 'zh' else 'Candidate cap / history window'}</div><div class="subtle">{'用于控制二次验证耗时，页面筛选不依赖实时运行。' if lang == 'zh' else 'Controls validation cost; page filtering does not run Kronos live.'}</div></div><div class="ticker">{kronos['candidate_limit']} / {kronos['history_limit']}</div></div>
+              <div class="list-row"><div><div class="ticker">{'最近任务' if lang == 'zh' else 'Latest job'}</div><div class="subtle">{html.escape(str((recent_job or {}).get('message') or '-'))}</div></div><div class="ticker">{html.escape(job_status)} · {html.escape(job_time)}</div></div>
+            </div>
+          </article>
+          <article class="card">
+            <span class="eyebrow">{'手动验证' if lang == 'zh' else 'Manual Validation'}</span>
+            <p class="section-copy">{'这个按钮会重新构建候选池并刷新 Kronos 快照。未配置 runner 时也会生成“待验证池”，不会影响行情刷新、模型训练和 AI 日报主流程。' if lang == 'zh' else 'This rebuilds the candidate pool and refreshes the Kronos snapshot. Without a runner it still creates a pending validation pool and does not block the main pipeline.'}</p>
+            <form action="/jobs/kronos-validation" method="post" class="form-actions">
+              <input type="hidden" name="redirect_to" value="/settings/kronos?lang={lang}" />
+              <button type="submit">{'刷新 Kronos 验证快照' if lang == 'zh' else 'Refresh Kronos snapshot'}</button>
+              <a class="top-pill" href="/dashboard/ops?lang={lang}">{'打开任务中心' if lang == 'zh' else 'Open Jobs Center'}</a>
+            </form>
+          </article>
+        </div>
+        <div class="stack">
+          <article class="card">
+            <span class="eyebrow">{'推荐环境变量' if lang == 'zh' else 'Recommended environment variables'}</span>
+            <div class="code-box">{html.escape(env_example)}</div>
+          </article>
+          <article class="card">
+            <span class="eyebrow">{'独立运行环境' if lang == 'zh' else 'Separate runtime'}</span>
+            <p class="section-copy">{'当前主应用 Python 是较新的版本，PyTorch/Kronos 建议放进独立 .venv-kronos。这样即便模型依赖安装失败，也不会拖垮主应用。' if lang == 'zh' else 'The main app uses a newer Python runtime, so PyTorch/Kronos should live in .venv-kronos. That keeps model dependency failures from breaking the app.'}</p>
+            <div class="code-box">{html.escape(setup_commands)}</div>
+          </article>
+          <article class="card">
+            <span class="eyebrow">{'验收标准' if lang == 'zh' else 'Acceptance Criteria'}</span>
+            <div class="list-stack">
+              <div class="list-row"><div><div class="ticker">{'未配置时' if lang == 'zh' else 'When not configured'}</div><div class="subtle">{'任务显示待配置，不阻塞预计算和 AI 日报。' if lang == 'zh' else 'Job is shown as needs setup and does not block precompute or AI reports.'}</div></div></div>
+              <div class="list-row"><div><div class="ticker">{'配置后' if lang == 'zh' else 'When configured'}</div><div class="subtle">{'候选行出现 Kronos 分数、1/3 日预期、最大回撤和验证结论。' if lang == 'zh' else 'Candidate rows include Kronos score, 1/3-day expectation, max drawdown, and decision.'}</div></div></div>
+              <div class="list-row"><div><div class="ticker">{'使用方式' if lang == 'zh' else 'Usage'}</div><div class="subtle">{'只作为二次确认，不把单一模型输出当成买入指令。' if lang == 'zh' else 'Use as secondary confirmation, never as a standalone buy instruction.'}</div></div></div>
+            </div>
+          </article>
+        </div>
+      </section>
+    """
+    return _settings_shell(
+        lang=lang,
+        title="Kronos 二次验证" if lang == "zh" else "Kronos Validation",
+        lead="",
+        body_html=body_html,
+        active_path="kronos",
     )
 
 

@@ -30,6 +30,7 @@ from app.services.cn_fundamentals import sync_cn_fundamentals
 from app.services.dataset_build import build_dataset
 from app.services.global_fundamentals import sync_global_fundamentals
 from app.services.job_response import build_job_payload, complete_job_and_build_payload, fail_job_and_build_payload
+from app.services.kronos_validation import KRONOS_VALIDATION_JOB_TYPE, save_kronos_validation_snapshot
 from app.services.market_sync import sync_market_data
 from app.services.market_lake import list_lake_symbols, query_us_daily_summary
 from app.services.market_csv_cleanup import cleanup_market_csv_files
@@ -50,7 +51,9 @@ from app.services.technical_snapshot_cache import rebuild_technical_snapshots
 from app.services.trainer import SignalTrainer
 from app.services.us_market_universe import refresh_us_grouped_daily
 from app.services.us_market_universe import refresh_us_grouped_daily_range
+from app.services.us_trade_universe import build_us_trade_universe
 from app.services.workspace_snapshots import refresh_workspace_snapshots
+from app.services.storage_retention import clean_model_history
 
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -149,6 +152,162 @@ def _result_status(result: dict, *, partial_default: bool = True) -> str:
     if raw in {"success", "failed", "partial", "empty", "not_configured"}:
         return raw if raw != "success" or partial_default else "success"
     return "partial" if partial_default else "success"
+
+
+def _run_background_job(*, job_id: int, label: str, runner) -> None:
+    """Keep long-running operational jobs off the single web-worker request thread."""
+
+    def _work() -> None:
+        try:
+            with SessionLocal() as worker_db:
+                DataJobRepository(worker_db).update_job(
+                    job_id,
+                    message=f"{label} is running in the background.",
+                    progress={"step": "market_refresh"},
+                )
+            result = runner()
+            status = _result_status(result)
+            message = str(result.get("message") or f"{label} finished.")
+            with SessionLocal() as worker_db:
+                DataJobRepository(worker_db).complete_job(
+                    job_id,
+                    status=status,
+                    message=message,
+                    result=result,
+                )
+        except Exception as exc:
+            with SessionLocal() as worker_db:
+                DataJobRepository(worker_db).complete_job(
+                    job_id,
+                    status="failed",
+                    message=str(exc),
+                    result={"error": str(exc)},
+                )
+
+    threading.Thread(
+        target=_work,
+        name=f"background-job-{job_id}",
+        daemon=True,
+    ).start()
+
+
+def _existing_running_job(job_repo: DataJobRepository, job_types: set[str]) -> dict | None:
+    return next(
+        (
+            job
+            for job in job_repo.list_recent_jobs(limit=100)
+            if str(job.get("job_type") or "") in job_types
+            and str(job.get("status") or "").lower() == "running"
+        ),
+        None,
+    )
+
+
+def _precompute_us_screeners_result(*, job_id: int, include_watchlist: bool, lake_only: bool) -> dict:
+    with SessionLocal() as worker_db:
+        result = refresh_precomputed_screener_snapshots(
+            worker_db,
+            source_job_id=job_id,
+            markets=["US"],
+            include_watchlist=include_watchlist,
+            lake_only=lake_only,
+        )
+    result["message"] = (
+        f"Precomputed {result.get('count', 0)} U.S. core candidate snapshot(s): "
+        "LightGBM, Next Tesla Swing, and Technical Momentum."
+    )
+    return result
+
+
+def _train_cn_signals_result(
+    *,
+    job_id: int,
+    run_name: str,
+    model_type: str,
+    signal_type: str,
+    lookback_days: int,
+    tickers: list[str],
+) -> dict:
+    predictions_written = SignalTrainer().train(
+        run_name=run_name,
+        model_type=model_type,
+        signal_type=signal_type,
+        lookback_days=lookback_days,
+        tickers=tickers,
+        market="CN",
+        universe="full_market_cn_lake",
+    )
+    with SessionLocal() as db:
+        refresh_workspace_snapshots(db, source_job_id=job_id)
+    return {
+        "status": "success",
+        "message": f"{run_name}: trained {len(tickers)} A-share symbols with {model_type} and wrote {predictions_written} predictions.",
+        "predictions_written": predictions_written,
+        "run_name": run_name,
+        "signal_type": signal_type,
+        "lookback_days": lookback_days,
+        "ticker_count": len(tickers),
+        "market": "CN",
+        "model_type": model_type,
+    }
+
+
+def _train_us_signals_result(
+    *,
+    job_id: int,
+    run_name: str,
+    model_type: str,
+    signal_type: str,
+    lookback_days: int,
+    top_n: int,
+    tickers: list[str],
+    raw_ticker_count: int,
+    universe_summary: dict,
+) -> dict:
+    predictions_written = SignalTrainer().train(
+        run_name=run_name,
+        model_type=model_type,
+        signal_type=signal_type,
+        lookback_days=lookback_days,
+        tickers=tickers,
+        market="US",
+        universe="full_market_us_lake",
+    )
+    daily_rows_written = BacktestRunner().run(top_n=max(1, top_n))
+    with SessionLocal() as db:
+        try:
+            refresh_workspace_snapshots(db, source_job_id=job_id)
+        except Exception:
+            pass
+    return {
+        "status": "success",
+        "message": (
+            f"{run_name}: trained {len(tickers)} eligible U.S. common-stock symbols "
+            f"({raw_ticker_count} raw) with {model_type}, wrote {predictions_written} predictions "
+            f"and {daily_rows_written} backtest rows."
+        ),
+        "predictions_written": predictions_written,
+        "daily_rows_written": daily_rows_written,
+        "run_name": run_name,
+        "signal_type": signal_type,
+        "lookback_days": lookback_days,
+        "top_n": top_n,
+        "ticker_count": len(tickers),
+        "raw_ticker_count": raw_ticker_count,
+        "universe_summary": universe_summary,
+        "market": "US",
+        "model_type": model_type,
+    }
+
+
+def _storage_retention_result(*, keep_runs: int, keep_snapshots: int, apply: bool) -> dict:
+    with SessionLocal() as db:
+        return clean_model_history(
+            db,
+            keep_model_runs_per_market=keep_runs,
+            keep_workspace_snapshots_per_type=keep_snapshots,
+            apply=apply,
+        )
 
 
 def _combine_screener_precompute_batches(*batch_results: dict) -> dict:
@@ -284,7 +443,9 @@ def job_templates(request: Request):
         {"job_type": "screener_precompute_rest", "description": "Precompute the remaining A-share screener templates and watchlist snapshots in the background."},
         {"job_type": "model_selection_guidance_snapshot", "description": "Persist the latest model-usage guidance snapshot so Dashboard and Model Performance can read it without full-market recompute."},
         {"job_type": "model_calibration_snapshot", "description": "Persist out-of-sample LightGBM execution calibration so expected returns are not based only on in-sample buckets."},
-        {"job_type": "social_signal_poll", "description": "Poll tracked X accounts every 30 minutes and parse ticker mentions automatically."},
+        {"job_type": "kronos_validation", "description": "Validate top model candidates with the optional Kronos K-line foundation-model adapter after screener precompute."},
+        {"job_type": "selection_quality_snapshot", "description": "Persist the unified realized hit-rate ledger for AI report candidates and factor experiment runs after the AI daily report."},
+        {"job_type": "social_signal_poll", "description": "Poll tracked X accounts every 4 hours and parse ticker mentions automatically."},
         {"job_type": "social_us_price_sync", "description": "Automatically sync Alpaca-backed U.S. prices for tickers mentioned in imported X posts."},
         {"job_type": "precompute_us_screeners", "description": "Precompute U.S. screener snapshots after U.S. close using the locally synced U.S. symbol pool."},
         {"job_type": "refresh_us_grouped_daily", "description": "Refresh U.S. grouped daily EOD bars from Polygon for full-market U.S. scans."},
@@ -490,32 +651,38 @@ async def run_precompute_us_screeners(request: Request, db: Session = Depends(ge
     include_watchlist = _as_bool(await _request_value(request, "include_watchlist", False), default=False)
     lake_only = _as_bool(await _request_value(request, "lake_only", True), default=True)
     job_repo = DataJobRepository(db)
+    existing = _existing_running_job(job_repo, {"precompute_us_screeners"})
+    if existing:
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="running",
+                job_id=existing.get("id"),
+                message="U.S. candidate precompute is already running in the background.",
+            ),
+        )
     job = job_repo.create_job(
         job_type="precompute_us_screeners",
         status="running",
         params={"markets": ["US"], "include_watchlist": include_watchlist, "lake_only": lake_only},
     )
-    try:
-        result = refresh_precomputed_screener_snapshots(
-            db,
-            source_job_id=job.id,
-            markets=["US"],
+    _run_background_job(
+        job_id=job.id,
+        label="U.S. candidate precompute",
+        runner=lambda: _precompute_us_screeners_result(
+            job_id=job.id,
             include_watchlist=include_watchlist,
             lake_only=lake_only,
-        )
-        status = _result_status(result)
-        extra = {key: value for key, value in result.items() if key not in {"status", "message"}}
-        payload = complete_job_and_build_payload(
-            job_repo,
+        ),
+    )
+    return _maybe_redirect(
+        redirect_to,
+        build_job_payload(
+            status="running",
             job_id=job.id,
-            status=status,
-            message=f"Precomputed {result.get('count', 0)} U.S. screener snapshot(s).",
-            **extra,
-        )
-        return _maybe_redirect(redirect_to, payload)
-    except Exception as exc:
-        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
-        return _maybe_redirect(redirect_to, payload)
+            message="U.S. candidate precompute started in the background.",
+        ),
+    )
 
 
 @router.post("/precompute-cn-screeners")
@@ -730,6 +897,46 @@ async def run_model_selection_guidance_snapshot(request: Request, db: Session = 
         return _maybe_redirect(redirect_to, payload)
 
 
+@router.post("/kronos-validation")
+async def run_kronos_validation(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    markets_raw = str(await _request_value(request, "markets", "CN")).strip()
+    requested_markets = [item.strip().upper() for item in markets_raw.split(",") if item.strip()]
+    markets = [item for item in requested_markets if item in {"CN", "US"}] or ["CN"]
+    candidate_limit = _as_int(await _request_value(request, "candidate_limit", 60), 60)
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type=KRONOS_VALIDATION_JOB_TYPE,
+        status="running",
+        params={"markets": markets, "candidate_limit": candidate_limit},
+        message="Validating top model candidates with Kronos adapter.",
+    )
+    try:
+        result = save_kronos_validation_snapshot(
+            db=db,
+            source_job_id=job.id,
+            markets=markets,
+            candidate_limit=candidate_limit,
+        )
+        status = _result_status(result)
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status=status,
+            message=(
+                f"Kronos validation snapshot saved: {result.get('candidate_count', 0)} candidate(s), "
+                f"status {result.get('status') or status}."
+            ),
+            **{key: value for key, value in result.items() if key not in {"status", "message"}},
+        )
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
+        return _maybe_redirect(redirect_to, payload)
+
+
 @router.post("/train-us-signals")
 async def run_train_us_signals(request: Request, db: Session = Depends(get_db_session)):
     if not is_authenticated(request):
@@ -740,8 +947,17 @@ async def run_train_us_signals(request: Request, db: Session = Depends(get_db_se
     signal_type = str(await _request_value(request, "signal_type", "momentum")).strip() or "momentum"
     lookback_days = _as_int(await _request_value(request, "lookback_days", 3), 3)
     top_n = _as_int(await _request_value(request, "top_n", 5), 5)
-    us_tickers = sorted(list_lake_symbols(market="US"))
+    background = _as_bool(await _request_value(request, "background", False), default=False)
+    raw_us_tickers = sorted(list_lake_symbols(market="US"))
+    us_tickers, universe_summary = build_us_trade_universe(tickers=raw_us_tickers, include_summary=True)
     job_repo = DataJobRepository(db)
+    if background:
+        existing = _existing_running_job(job_repo, {"us_signal_train"})
+        if existing:
+            return _maybe_redirect(
+                redirect_to,
+                build_job_payload(status="running", job_id=existing.get("id"), message="A U.S. model training job is already running in the background."),
+            )
     job = job_repo.create_job(
         job_type="us_signal_train",
         status="running",
@@ -752,6 +968,8 @@ async def run_train_us_signals(request: Request, db: Session = Depends(get_db_se
             "top_n": top_n,
             "market": "US",
             "ticker_count": len(us_tickers),
+            "raw_ticker_count": len(raw_us_tickers),
+            "universe_summary": universe_summary,
             "model_type": model_type,
         },
     )
@@ -760,12 +978,34 @@ async def run_train_us_signals(request: Request, db: Session = Depends(get_db_se
             job_repo,
             job_id=job.id,
             status="failed",
-            message="No U.S. symbols found in the Parquet market lake. Refresh U.S. grouped daily first.",
+            message="No eligible U.S. common-stock symbols found after universe cleaning. Refresh U.S. grouped daily or relax universe thresholds.",
             predictions_written=0,
             ticker_count=0,
+            raw_ticker_count=len(raw_us_tickers),
+            universe_summary=universe_summary,
             market="US",
         )
         return _maybe_redirect(redirect_to, payload)
+    if background:
+        _run_background_job(
+            job_id=job.id,
+            label="U.S. signal training",
+            runner=lambda: _train_us_signals_result(
+                job_id=job.id,
+                run_name=run_name,
+                model_type=model_type,
+                signal_type=signal_type,
+                lookback_days=lookback_days,
+                top_n=top_n,
+                tickers=us_tickers,
+                raw_ticker_count=len(raw_us_tickers),
+                universe_summary=universe_summary,
+            ),
+        )
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(status="running", job_id=job.id, message="U.S. signal training started in the background. The task center remains available."),
+        )
     trainer = SignalTrainer()
     runner = BacktestRunner()
     try:
@@ -779,9 +1019,9 @@ async def run_train_us_signals(request: Request, db: Session = Depends(get_db_se
             universe="full_market_us_lake",
         )
         daily_rows_written = runner.run(top_n=max(1, top_n))
-        refresh_workspace_snapshots(db, source_job_id=job.id)
         message = (
-            f"{run_name}: trained {len(us_tickers)} U.S. symbols with {model_type}, wrote {predictions_written} predictions "
+            f"{run_name}: trained {len(us_tickers)} eligible U.S. common-stock symbols "
+            f"({len(raw_us_tickers)} raw) with {model_type}, wrote {predictions_written} predictions "
             f"and {daily_rows_written} backtest rows."
         )
         payload = complete_job_and_build_payload(
@@ -795,9 +1035,17 @@ async def run_train_us_signals(request: Request, db: Session = Depends(get_db_se
             signal_type=signal_type,
             lookback_days=lookback_days,
             ticker_count=len(us_tickers),
+            raw_ticker_count=len(raw_us_tickers),
+            universe_summary=universe_summary,
             market="US",
             model_type=model_type,
         )
+        try:
+            refresh_workspace_snapshots(db, source_job_id=job.id)
+        except Exception:
+            # Presentation cache refresh is best-effort; the training job should
+            # stay green once predictions and backtest rows are written.
+            pass
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
         payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
@@ -813,8 +1061,20 @@ async def run_train_cn_signals(request: Request, db: Session = Depends(get_db_se
     model_type = str(await _request_value(request, "model_type", "lightgbm")).strip() or "lightgbm"
     signal_type = str(await _request_value(request, "signal_type", "momentum")).strip() or "momentum"
     lookback_days = _as_int(await _request_value(request, "lookback_days", 3), 3)
+    background = _as_bool(await _request_value(request, "background", False), default=False)
     cn_tickers = sorted(list_lake_symbols(market="CN"))
     job_repo = DataJobRepository(db)
+    if background:
+        existing = _existing_running_job(job_repo, {"train_cn_signals"})
+        if existing:
+            return _maybe_redirect(
+                redirect_to,
+                build_job_payload(
+                    status="running",
+                    job_id=existing.get("id"),
+                    message="An A-share model training job is already running in the background.",
+                ),
+            )
     job = job_repo.create_job(
         job_type="train_cn_signals",
         status="running",
@@ -838,33 +1098,42 @@ async def run_train_cn_signals(request: Request, db: Session = Depends(get_db_se
             market="CN",
         )
         return _maybe_redirect(redirect_to, payload)
-    trainer = SignalTrainer()
+    if background:
+        _run_background_job(
+            job_id=job.id,
+            label="A-share signal training",
+            runner=lambda: _train_cn_signals_result(
+                job_id=job.id,
+                run_name=run_name,
+                model_type=model_type,
+                signal_type=signal_type,
+                lookback_days=lookback_days,
+                tickers=cn_tickers,
+            ),
+        )
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="running",
+                job_id=job.id,
+                message="A-share signal training started in the background. The task center remains available.",
+            ),
+        )
     try:
-        predictions_written = trainer.train(
+        result = _train_cn_signals_result(
+            job_id=job.id,
             run_name=run_name,
             model_type=model_type,
             signal_type=signal_type,
             lookback_days=lookback_days,
             tickers=cn_tickers,
-            market="CN",
-            universe="full_market_cn_lake",
-        )
-        refresh_workspace_snapshots(db, source_job_id=job.id)
-        message = (
-            f"{run_name}: trained {len(cn_tickers)} A-share symbols with {model_type} and wrote {predictions_written} predictions."
         )
         payload = complete_job_and_build_payload(
             job_repo,
             job_id=job.id,
             status="success",
-            message=message,
-            predictions_written=predictions_written,
-            run_name=run_name,
-            signal_type=signal_type,
-            lookback_days=lookback_days,
-            ticker_count=len(cn_tickers),
-            market="CN",
-            model_type=model_type,
+            message=result["message"],
+            **{key: value for key, value in result.items() if key not in {"status", "message"}},
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -883,8 +1152,20 @@ async def run_refresh_us_grouped_daily(request: Request, db: Session = Depends(g
     persist_per_symbol = _as_bool(await _request_value(request, "persist_per_symbol", False), default=False)
     write_lake = _as_bool(await _request_value(request, "write_lake", True), default=True)
     write_snapshot = _as_bool(await _request_value(request, "write_snapshot", False), default=False)
+    background = _as_bool(await _request_value(request, "background", False), default=False)
     limit = _as_optional_int(await _request_value(request, "limit", None))
     job_repo = DataJobRepository(db)
+    if background:
+        existing = _existing_running_job(job_repo, {"refresh_us_grouped_daily"})
+        if existing:
+            return _maybe_redirect(
+                redirect_to,
+                build_job_payload(
+                    status="running",
+                    job_id=existing.get("id"),
+                    message="A U.S. price refresh is already running in the background.",
+                ),
+            )
     job = job_repo.create_job(
         job_type="refresh_us_grouped_daily",
         status="running",
@@ -898,6 +1179,28 @@ async def run_refresh_us_grouped_daily(request: Request, db: Session = Depends(g
             "write_snapshot": write_snapshot,
         },
     )
+    if background:
+        _run_background_job(
+            job_id=job.id,
+            label="U.S. grouped daily price refresh",
+            runner=lambda: refresh_us_grouped_daily(
+                trade_date=trade_date,
+                adjusted=adjusted,
+                limit=limit,
+                normalize=normalize,
+                persist_per_symbol=persist_per_symbol,
+                write_lake=write_lake,
+                write_snapshot=write_snapshot,
+            ),
+        )
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="running",
+                job_id=job.id,
+                message="U.S. price refresh started in the background. The task center remains available.",
+            ),
+        )
     try:
         result = refresh_us_grouped_daily(
             trade_date=trade_date,
@@ -1121,8 +1424,20 @@ async def run_refresh_cn_market_data(request: Request, db: Session = Depends(get
     limit = _as_optional_int(limit_raw)
     overlap_days = _as_int(overlap_days_raw, 3)
     incremental = _as_bool(incremental_raw, default=False)
+    background = _as_bool(await _request_value(request, "background", False), default=False)
 
     job_repo = DataJobRepository(db)
+    if background:
+        existing = _existing_running_job(job_repo, {"refresh_cn_market_data", "refresh_cn_market_data_daily"})
+        if existing:
+            return _maybe_redirect(
+                redirect_to,
+                build_job_payload(
+                    status="running",
+                    job_id=existing.get("id"),
+                    message="An A-share price refresh is already running in the background.",
+                ),
+            )
     job = job_repo.create_job(
         job_type="refresh_cn_market_data_daily" if incremental else "refresh_cn_market_data",
         status="running",
@@ -1134,6 +1449,26 @@ async def run_refresh_cn_market_data(request: Request, db: Session = Depends(get
             "overlap_days": overlap_days,
         },
     )
+    if background:
+        _run_background_job(
+            job_id=job.id,
+            label="A-share price refresh",
+            runner=lambda: refresh_cn_market_data(
+                days_back=days_back,
+                limit=limit,
+                provider=provider,
+                incremental=incremental,
+                overlap_days=overlap_days,
+            ),
+        )
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="running",
+                job_id=job.id,
+                message="A-share price refresh started in the background. The task center remains available.",
+            ),
+        )
     try:
         result = refresh_cn_market_data(
             days_back=days_back,
@@ -1168,8 +1503,20 @@ async def run_refresh_cn_market_data_daily(request: Request, db: Session = Depen
     days_back = _as_int(days_back_raw, 7)
     limit = _as_optional_int(limit_raw)
     overlap_days = _as_int(overlap_days_raw, 3)
+    background = _as_bool(await _request_value(request, "background", False), default=False)
 
     job_repo = DataJobRepository(db)
+    if background:
+        existing = _existing_running_job(job_repo, {"refresh_cn_market_data", "refresh_cn_market_data_daily"})
+        if existing:
+            return _maybe_redirect(
+                redirect_to,
+                build_job_payload(
+                    status="running",
+                    job_id=existing.get("id"),
+                    message="An A-share price refresh is already running in the background.",
+                ),
+            )
     job = job_repo.create_job(
         job_type="refresh_cn_market_data_daily",
         status="running",
@@ -1180,6 +1527,25 @@ async def run_refresh_cn_market_data_daily(request: Request, db: Session = Depen
             "overlap_days": overlap_days,
         },
     )
+    if background:
+        _run_background_job(
+            job_id=job.id,
+            label="A-share incremental price refresh",
+            runner=lambda: refresh_cn_market_data_daily(
+                days_back=days_back,
+                limit=limit,
+                provider=provider,
+                overlap_days=overlap_days,
+            ),
+        )
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="running",
+                job_id=job.id,
+                message="A-share incremental price refresh started in the background. The task center remains available.",
+            ),
+        )
     try:
         result = refresh_cn_market_data_daily(
             days_back=days_back,
@@ -1199,6 +1565,36 @@ async def run_refresh_cn_market_data_daily(request: Request, db: Session = Depen
     except Exception as exc:
         payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
         return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/cleanup-storage-retention")
+async def run_cleanup_storage_retention(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    keep_runs = _as_int(await _request_value(request, "keep_model_runs_per_market", 20), 20)
+    keep_snapshots = _as_int(await _request_value(request, "keep_workspace_snapshots_per_type", 10), 10)
+    confirm = str(await _request_value(request, "confirm", "") or "").strip().upper()
+    apply = confirm == "PURGE"
+    job_repo = DataJobRepository(db)
+    job = job_repo.create_job(
+        job_type="cleanup_storage_retention",
+        status="running",
+        params={"keep_model_runs_per_market": keep_runs, "keep_workspace_snapshots_per_type": keep_snapshots, "apply": apply},
+    )
+    _run_background_job(
+        job_id=job.id,
+        label="Storage retention cleanup" if apply else "Storage retention preview",
+        runner=lambda: _storage_retention_result(keep_runs=keep_runs, keep_snapshots=keep_snapshots, apply=apply),
+    )
+    return _maybe_redirect(
+        redirect_to,
+        build_job_payload(
+            status="running",
+            job_id=job.id,
+            message=("Storage cleanup started in the background." if apply else "Storage-retention preview started in the background."),
+        ),
+    )
 
 
 @router.post("/rebuild-technical-snapshots")
@@ -1765,8 +2161,9 @@ async def run_close_review(request: Request):
     if not is_authenticated(request):
         return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
+    force = _as_bool(await _request_value(request, "force", False), default=False)
     try:
-        payload = close_review_scheduler_service.run_close_review(trigger="manual_cn_default")
+        payload = close_review_scheduler_service.run_close_review(trigger="manual_cn_default", force=force)
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
         payload = {"status": "failed", "message": str(exc)}

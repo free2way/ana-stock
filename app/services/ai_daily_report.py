@@ -7,6 +7,7 @@ from math import isnan
 
 from app.core.db import SessionLocal
 from app.services.ai_analysis import AIAnalysisService
+from app.services.kronos_validation import annotate_rows_with_kronos, load_latest_kronos_validation
 from app.services.market_context import load_market_context_snapshot
 from app.services.market_lake import get_latest_lake_trade_date
 from app.services.portfolio_book import load_portfolio_positions
@@ -14,6 +15,7 @@ from app.services.portfolio_intelligence import build_portfolio_ai_summary, buil
 from app.services.price_snapshot import load_latest_closes
 from app.services.recommendation_regression import load_or_build_recommendation_regression
 from app.services.repository import AppSettingRepository, PredictionRepository, SymbolRepository, WatchlistRepository, WorkspaceSnapshotRepository
+from app.services.selection_quality import load_or_build_selection_quality
 from app.services.model_selection_guidance import load_model_selection_guidance_snapshot, summarize_model_selection_guidance
 from app.services.screener_snapshots import (
     build_base_precompute_params,
@@ -53,6 +55,15 @@ RECOMMENDATION_MIN_READINESS = 55.0
 RECOMMENDATION_MAX_RISK_FLAGS = 2
 RECOMMENDATION_CHASE_MOMENTUM_5 = 18.0
 RECOMMENDATION_MAX_PULLBACK_DISTANCE = 8.0
+A_SHARE_ACTIONABLE_MIN_READINESS = 55.0
+A_SHARE_ACTIONABLE_MIN_VERIFICATION = 115.0
+A_SHARE_ACTIONABLE_MIN_VOLUME_RATIO = 0.6
+A_SHARE_ACTIONABLE_HIGH_RISK_FLAGS = {
+    "chase-risk",
+    "do-not-chase",
+    "rolled-over-after-spike",
+    "missing-latest-price",
+}
 
 
 def _reason_label_map(lang: str) -> dict[str, str]:
@@ -84,6 +95,15 @@ def _reason_label_map(lang: str) -> dict[str, str]:
             "portfolio_risk_budget": "当前组合风险预算偏紧",
             "balanced_setup": "形态中性，继续观察",
             "rolled_over_after_spike": "冲高后转弱，先按观察处理",
+            "actionable_quality_low": "候选质量分不足，先不进入明日 Top 5",
+            "readiness_not_high": "交易就绪度还不够高，先等确认",
+            "weak_verification": "模型验证分不够强，先观察",
+            "needs_model_confirmation": "缺少可靠模型确认，先不要重仓跟随",
+            "high_risk_flag": "风险标签较重，先降级观察",
+            "st_board_watch_only": "ST 股票只放观察池，不进入明日买入 Top 5",
+            "limit_up_watch_only": "今日涨停票次日可能买不到，先放观察池等分歧机会",
+            "low_volume_confirmation": "量能确认不足，先等待放量承接",
+            "insufficient_confluence": "模型/形态共振不足，先不进入 Top 5",
         }
     return {
         "signal_not_actionable": "Model signal is not actionable yet",
@@ -112,6 +132,15 @@ def _reason_label_map(lang: str) -> dict[str, str]:
         "portfolio_risk_budget": "Portfolio risk budget is already tight",
         "balanced_setup": "Balanced setup; keep monitoring",
         "rolled_over_after_spike": "Momentum faded after the spike; keep it on watch",
+        "actionable_quality_low": "Candidate quality is not high enough for tomorrow's top picks",
+        "readiness_not_high": "Trade readiness is not high enough yet",
+        "weak_verification": "Model verification is not strong enough yet",
+        "needs_model_confirmation": "Model confirmation is incomplete",
+        "high_risk_flag": "Risk tags are too heavy for an actionable pick",
+        "st_board_watch_only": "ST names stay on watch only",
+        "limit_up_watch_only": "Limit-up names may be unbuyable next session; keep them on watch",
+        "low_volume_confirmation": "Volume confirmation is not strong enough",
+        "insufficient_confluence": "Model/setup confluence is not strong enough",
     }
 
 
@@ -334,6 +363,30 @@ def _candidate_risk_flags(candidate: dict) -> list[str]:
     return [item.strip() for item in text.replace(";", ",").split(",") if item.strip()]
 
 
+def _risk_flag_gate_score(flags: list[str]) -> float:
+    weights = {
+        "missing-latest-price": 99.0,
+        "weak-market": 1.5,
+        "weak-breadth": 1.0,
+        "crowded-theme": 1.0,
+        "portfolio-risk-budget": 1.0,
+        "chase-risk": 1.25,
+        "do-not-chase": 1.25,
+        "rolled-over-after-spike": 1.25,
+        "drawdown-risk": 1.0,
+        "far-from-trigger": 1.0,
+        "missing-model-score": 1.0,
+        "low-conviction": 0.5,
+        "weak-signal-strength": 0.5,
+        "needs-better-entry": 0.5,
+        "confirmation-needed": 0.5,
+    }
+    score = 0.0
+    for flag in {str(item).strip().lower() for item in flags if str(item).strip()}:
+        score += weights.get(flag, 1.0)
+    return round(score, 2)
+
+
 def _candidate_board_profile(candidate: dict) -> str:
     ticker = str(candidate.get("ticker") or "").strip().upper()
     name = str(candidate.get("name") or "").strip().upper().replace(" ", "")
@@ -423,6 +476,7 @@ def _recommendation_gate_config(candidate: dict) -> dict[str, float | int | str 
     return {
         "min_readiness": round(min_readiness, 1),
         "max_risk_flags": int(max_risk_flags),
+        "max_risk_flag_score": float(max_risk_flags),
         "chase_momentum_5": round(chase_momentum_5, 1),
         "max_pullback_distance": round(max_pullback_distance, 1),
         "regime": regime or None,
@@ -453,7 +507,9 @@ def _recommendation_gate(candidate: dict) -> dict[str, object]:
         return {"allowed": False, "status": "BLOCKED", "reason": "missing_latest_price", "config": config}
     if readiness_bucket in {"LOW", "BLOCKED"} or (readiness and readiness < float(config["min_readiness"] or RECOMMENDATION_MIN_READINESS)):
         return {"allowed": False, "status": "BLOCKED", "reason": "low_trade_readiness", "config": config}
-    if len(risk_flags) > int(config["max_risk_flags"] or RECOMMENDATION_MAX_RISK_FLAGS):
+    risk_flag_score = _risk_flag_gate_score(risk_flags)
+    config["risk_flag_score"] = risk_flag_score
+    if risk_flag_score > float(config.get("max_risk_flag_score") or config["max_risk_flags"] or RECOMMENDATION_MAX_RISK_FLAGS):
         return {"allowed": False, "status": "BLOCKED", "reason": "too_many_risk_flags", "config": config}
     if momentum_5 >= float(config["chase_momentum_5"] or RECOMMENDATION_CHASE_MOMENTUM_5) and entry_style not in {"pullback", "buy_the_dip", "support_hold", "pullback_reentry"}:
         return {"allowed": False, "status": "DO_NOT_CHASE", "reason": "extended_after_sharp_move", "config": config}
@@ -513,6 +569,7 @@ def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, m
         model_selection_guidance = load_model_selection_guidance_snapshot(db, market=market, allow_fallback=True)
         model_selection_guidance_summary = summarize_model_selection_guidance(model_selection_guidance, lang="zh")
         recommendation_regression = load_or_build_recommendation_regression(db=db)
+        selection_quality = load_or_build_selection_quality(db=db)
         market_structure_rows = (
             _load_full_market_report_candidates(
                 db=db,
@@ -551,13 +608,26 @@ def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, m
     market_template_attribution = _build_market_template_attribution(rows=rows, market=market, lang="zh")
     us_market_structure = _build_market_structure(rows=us_model_rows, market="US", lang="zh")
     lightgbm_execution_bias = _build_lightgbm_execution_bias(lang="zh")
+    selection_quality_policy = _build_selection_quality_policy(selection_quality)
+    with SessionLocal() as db:
+        kronos_snapshot = load_latest_kronos_validation(db)
+        annotate_rows_with_kronos(rows, db=db)
     actionable_rows, watch_rows, report_pool_meta = _split_market_recommendation_rows(
         rows,
         actionable_limit=recommendation_limit,
         watch_limit=recommendation_limit,
         regression_policy=(recommendation_regression or {}).get("policy") or {},
+        selection_quality_policy=selection_quality_policy,
         lightgbm_execution_bias=lightgbm_execution_bias,
     )
+    if not actionable_rows and not watch_rows:
+        kronos_payload = (kronos_snapshot or {}).get("payload") if isinstance(kronos_snapshot, dict) else {}
+        watch_rows = _build_kronos_watch_fallback_rows(kronos_payload if isinstance(kronos_payload, dict) else {}, limit=recommendation_limit)
+        if watch_rows:
+            report_pool_meta["watch_count"] = len(watch_rows)
+            report_pool_meta["kronos_ready_count"] = len(watch_rows)
+            report_pool_meta["kronos_support_count"] = sum(1 for item in watch_rows if _kronos_report_decision(item) == "support")
+            report_pool_meta["kronos_watch_fallback"] = True
     with SessionLocal() as db:
         symbol_repo = SymbolRepository(db)
         _hydrate_security_names(
@@ -566,10 +636,22 @@ def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, m
             watch_rows,
             buy_the_dip_rows,
         )
+        annotate_rows_with_kronos(actionable_rows, db=db)
+        annotate_rows_with_kronos(watch_rows, db=db)
     market_recommendation_meta.update(report_pool_meta)
+    selection_quality_note = ""
+    if report_pool_meta.get("selection_quality_policy_applied"):
+        preferred = report_pool_meta.get("selection_quality_preferred_sources") or []
+        downgraded = report_pool_meta.get("selection_quality_downgraded_sources") or []
+        selection_quality_note = (
+            f"命中率闭环已介入排序：优先 {', '.join(preferred[:3]) or '无'}；降权 {', '.join(downgraded[:3]) or '无'}。"
+        )
     market_recommendation_meta["note"] = (
         f"{market_recommendation_meta.get('note') or ''} "
         f"可执行买入池 {report_pool_meta.get('actionable_count') or 0} 只，强势观察池 {report_pool_meta.get('watch_count') or 0} 只。"
+        f"Kronos 已验证 {report_pool_meta.get('kronos_ready_count') or 0} 只，其中支持 {report_pool_meta.get('kronos_support_count') or 0} 只。"
+        f"{selection_quality_note}"
+        f"{'当前为 Kronos 观察兜底，不代表交易纪律已放行。' if report_pool_meta.get('kronos_watch_fallback') else ''}"
     ).strip()
     report_date = (
         str(market_recommendation_meta.get("target_snapshot_date") or "").strip()
@@ -603,6 +685,9 @@ def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, m
         "model_selection_guidance_summary": model_selection_guidance_summary,
         "lightgbm_execution_bias": lightgbm_execution_bias,
         "recommendation_regression": recommendation_regression,
+        "selection_quality": selection_quality,
+        "selection_quality_policy": selection_quality_policy,
+        "kronos_validation": (kronos_snapshot or {}).get("payload") if isinstance(kronos_snapshot, dict) else None,
         "us_model_recommendations": us_model_rows,
         "us_model_recommendations_meta": us_market_recommendation_meta,
         "us_market_structure": us_market_structure,
@@ -723,6 +808,100 @@ def _build_lightgbm_execution_bias(*, lang: str = "zh") -> dict:
     }
 
 
+def _normalize_selection_source_name(row: dict) -> str:
+    template = str(row.get("full_market_template") or row.get("report_source_label") or "ai_daily_report").strip()
+    pool = str(row.get("report_pool") or "").strip()
+    return f"{pool} · {template}" if pool else template
+
+
+def _build_selection_quality_policy(selection_quality: dict | None) -> dict:
+    summary = (selection_quality or {}).get("summary") if isinstance(selection_quality, dict) else {}
+    by_source = (summary or {}).get("by_source") if isinstance(summary, dict) else []
+    source_scores: dict[str, dict] = {}
+    preferred_sources: list[str] = []
+    downgraded_sources: list[str] = []
+    for item in by_source or []:
+        metrics = item.get("metrics") if isinstance(item, dict) else {}
+        if not isinstance(metrics, dict):
+            continue
+        source_name = str(item.get("source_name") or "").strip()
+        if not source_name:
+            continue
+        available = int(metrics.get("available_1d") or 0)
+        if available < 8:
+            continue
+        execution_hit = _safe_float(metrics.get("execution_hit_rate_pct"))
+        hit_1d = _safe_float(metrics.get("hit_rate_1d_pct"))
+        avg_1d = _safe_float(metrics.get("avg_return_1d_pct"))
+        gap_blocked = _safe_float(metrics.get("gap_blocked_rate_pct")) or 0.0
+        open_low = _safe_float(metrics.get("avg_open_to_low_pct")) or 0.0
+        if execution_hit is None or hit_1d is None:
+            continue
+        adjustment = 0.0
+        reasons: list[str] = []
+        if execution_hit >= 56.0 and hit_1d >= 45.0:
+            adjustment += 5.0
+            reasons.append(f"历史执行命中率 {execution_hit:.1f}%")
+        if avg_1d is not None and avg_1d >= 0.5:
+            adjustment += 2.0
+            reasons.append(f"历史 1D 平均收益 {avg_1d:.2f}%")
+        if execution_hit < 42.0 or (avg_1d is not None and avg_1d <= -0.5):
+            adjustment -= 5.0
+            reasons.append(f"近期兑现偏弱，执行命中率 {execution_hit:.1f}%")
+        if gap_blocked >= 12.0:
+            adjustment -= 2.0
+            reasons.append(f"高开买不到比例 {gap_blocked:.1f}%")
+        if open_low <= -4.2:
+            adjustment -= 2.0
+            reasons.append(f"开盘后平均回撤 {open_low:.2f}%")
+        if abs(adjustment) < 0.1:
+            continue
+        adjustment = max(-8.0, min(8.0, adjustment))
+        source_scores[source_name] = {
+            "adjustment": round(adjustment, 1),
+            "available_1d": available,
+            "execution_hit_rate_pct": execution_hit,
+            "hit_rate_1d_pct": hit_1d,
+            "avg_return_1d_pct": avg_1d,
+            "reasons": reasons[:3],
+        }
+        if adjustment > 0:
+            preferred_sources.append(source_name)
+        elif adjustment < 0:
+            downgraded_sources.append(source_name)
+    return {
+        "enabled": bool(source_scores),
+        "source_scores": source_scores,
+        "preferred_sources": preferred_sources[:6],
+        "downgraded_sources": downgraded_sources[:6],
+        "sample_count": int((selection_quality or {}).get("sample_count") or 0) if isinstance(selection_quality, dict) else 0,
+        "snapshot_date": str((selection_quality or {}).get("snapshot_date") or "") if isinstance(selection_quality, dict) else "",
+    }
+
+
+def _apply_selection_quality_policy(row: dict, policy: dict | None) -> dict:
+    source_name = _normalize_selection_source_name(row)
+    source_policy = ((policy or {}).get("source_scores") or {}).get(source_name)
+    if not source_policy:
+        row["selection_quality_source"] = source_name
+        row["selection_quality_adjustment"] = 0.0
+        return row
+    adjustment = _safe_float(source_policy.get("adjustment")) or 0.0
+    quality_score = _safe_float(row.get("quality_gate_score"))
+    if quality_score is not None:
+        row["quality_gate_score"] = round(max(0.0, quality_score + adjustment), 1)
+    row["selection_quality_source"] = source_name
+    row["selection_quality_adjustment"] = round(adjustment, 1)
+    row["selection_quality_metrics"] = {
+        "available_1d": source_policy.get("available_1d"),
+        "execution_hit_rate_pct": source_policy.get("execution_hit_rate_pct"),
+        "hit_rate_1d_pct": source_policy.get("hit_rate_1d_pct"),
+        "avg_return_1d_pct": source_policy.get("avg_return_1d_pct"),
+    }
+    row["selection_quality_reason"] = "；".join(str(item) for item in (source_policy.get("reasons") or []) if str(item).strip())
+    return row
+
+
 def _build_market_recommendation_rows(
     *,
     db,
@@ -736,6 +915,11 @@ def _build_market_recommendation_rows(
     service = AIAnalysisService()
     market_snapshot_context = load_market_context_snapshot(db, market=market)
     candidate_limit = max(recommendation_limit * 14, 80)
+    if str(market or "").upper() == "CN" and prefer_snapshot:
+        # A-share daily selection should look through a wider precomputed pool.
+        # The heavy work is already in background snapshots; here we only enrich
+        # enough candidates to avoid overfitting tomorrow's Top 5 to the first page.
+        candidate_limit = max(recommendation_limit * 25, 500)
     candidates: list[dict] = []
     candidate_meta = {
         "market": market,
@@ -864,8 +1048,17 @@ def _build_market_recommendation_rows(
             continue
         gate = _recommendation_gate(candidate)
         if not gate["allowed"]:
-            candidate_meta["blocked_candidates"] = int(candidate_meta.get("blocked_candidates") or 0) + 1
-            continue
+            if candidate.get("recommendation_gate_allowed") is not False:
+                candidate_meta["blocked_candidates"] = int(candidate_meta.get("blocked_candidates") or 0) + 1
+            candidate = {
+                **candidate,
+                "tradability_status": gate.get("status") or candidate.get("tradability_status") or "BLOCKED",
+                "block_reason": gate.get("reason") or candidate.get("block_reason") or "signal_not_actionable",
+                "recommendation_gate_allowed": False,
+                "recommendation_gate_status": gate.get("status"),
+                "recommendation_gate_reason": gate.get("reason"),
+                "recommendation_gate_config": gate.get("config"),
+            }
         overview = symbol_repo.get_overview(ticker)
         if overview is None:
             continue
@@ -907,8 +1100,12 @@ def _build_market_recommendation_rows(
         )
     )
 
+    output_row_limit = recommendation_limit
+    if str(market or "").upper() == "CN" and prefer_snapshot:
+        output_row_limit = max(recommendation_limit * 4, 80)
+
     rows: list[dict] = []
-    for item in ranked_candidates[:recommendation_limit]:
+    for item in ranked_candidates[:output_row_limit]:
         overview = item.get("overview") or symbol_repo.get_overview(item["ticker"])
         if overview is None:
             continue
@@ -995,12 +1192,22 @@ def _build_market_recommendation_rows(
                 "execution_note": (None if latest_signal is None else latest_signal.get("execution_note")),
                 "risk_flags": ([] if latest_signal is None else latest_signal.get("risk_flags") or []),
                 "trend_score": (None if combined is None else combined.get("trend_score")),
+                "volume_ratio": (
+                    None
+                    if latest_signal is None and combined is None
+                    else (None if latest_signal is None else latest_signal.get("volume_ratio")) or (combined or {}).get("volume_ratio")
+                ),
+                "momentum_1": None if latest_signal is None else latest_signal.get("momentum_1"),
                 "setup_label": (None if combined is None else combined.get("setup_label")),
+                "matched_patterns": [] if latest_signal is None else latest_signal.get("matched_patterns") or [],
                 "full_market_template": (None if latest_signal is None else latest_signal.get("full_market_template")),
                 "full_market_rank_score": (None if latest_signal is None else latest_signal.get("full_market_rank_score")),
                 "report_source_kind": (None if latest_signal is None else latest_signal.get("report_source_kind")),
                 "report_source_label": (None if latest_signal is None else latest_signal.get("report_source_label")),
                 "recommendation_gate_config": (None if latest_signal is None else latest_signal.get("recommendation_gate_config")),
+                "recommendation_gate_allowed": (None if latest_signal is None else latest_signal.get("recommendation_gate_allowed")),
+                "recommendation_gate_status": (None if latest_signal is None else latest_signal.get("recommendation_gate_status")),
+                "recommendation_gate_reason": (None if latest_signal is None else latest_signal.get("recommendation_gate_reason")),
                 "latest_close": (
                     None
                     if latest_signal is None and combined is None
@@ -1088,6 +1295,12 @@ def _recommendation_regression_reason_label(reason: str | None, *, lang: str = "
             "st_regression": "历史回归显示 ST 候选隔夜/盘中质量不稳，默认只观察。",
             "buy_zone_deviation_regression": "历史回归显示当前偏离买点过大，先等回踩确认。",
             "watch_bias_regression": "LightGBM 当前偏观察，历史回归要求压缩可执行池。",
+            "recent_accuracy_cap": "近期真实命中率偏弱，系统主动压缩可执行推荐数量。",
+            "template_regression": "历史回归显示该模型/形态模板近期命中偏弱，先降级观察。",
+            "board_regression": "历史回归显示该板块近期可执行胜率偏弱，先降级观察。",
+            "kronos_regression": "历史回归显示该 Kronos 判断类型近期兑现偏弱，先降级观察。",
+            "quality_score_regression": "近期整体命中率不够强，系统已抬高 Top 5 质量门槛。",
+            "selection_quality_regression": "命中率闭环显示该来源近期兑现偏弱，先降级观察。",
         }.get(normalized, "")
     return {
         "missing_model_score_regression": "Historical regression shows incomplete model scores have weaker hit rates, so downgrade to watch.",
@@ -1095,6 +1308,12 @@ def _recommendation_regression_reason_label(reason: str | None, *, lang: str = "
         "st_regression": "Historical regression shows ST setups have unstable execution quality, so keep them on watch.",
         "buy_zone_deviation_regression": "Historical regression shows this is too far above the buy zone; wait for a pullback.",
         "watch_bias_regression": "LightGBM is watch-biased, so historical regression caps the actionable pool.",
+        "recent_accuracy_cap": "Recent realized hit rate is weak, so the actionable list is intentionally capped.",
+        "template_regression": "Historical regression shows this template has weakened recently, so downgrade to watch.",
+        "board_regression": "Historical regression shows this board has weaker recent execution quality, so downgrade to watch.",
+        "kronos_regression": "Historical regression shows this Kronos decision bucket has weakened recently, so downgrade to watch.",
+        "quality_score_regression": "Recent hit rate is not strong enough, so the Top 5 quality gate has been raised.",
+        "selection_quality_regression": "The realized selection-quality ledger shows this source has weakened, so downgrade to watch.",
     }.get(normalized, "")
 
 
@@ -1114,8 +1333,39 @@ def _recommendation_regression_downgrade_reason(
     if board_profile in excluded_boards:
         return f"{board_profile}_regression"
 
+    downgraded_boards = {
+        str(item).strip().lower()
+        for item in (policy.get("downgrade_actionable_board_profiles") or [])
+    }
+    if board_profile in downgraded_boards:
+        return "board_regression"
+
     if policy.get("downgrade_model_score_missing") and row.get("model_score") is None and row.get("score") is None:
         return "missing_model_score_regression"
+
+    template = str(row.get("full_market_template") or row.get("report_source_label") or "").strip()
+    downgraded_templates = {
+        str(item).strip()
+        for item in (policy.get("downgrade_templates") or [])
+    }
+    if template and template in downgraded_templates:
+        signal_strength = _maybe_float(row.get("model_signal_strength") or row.get("signal_strength"))
+        has_extra_confirmation = (
+            row.get("model_score") is not None
+            or row.get("score") is not None
+            or (signal_strength is not None and signal_strength >= 60.0)
+            or _kronos_report_decision(row) == "support"
+        )
+        if not has_extra_confirmation:
+            return "template_regression"
+
+    kronos_decision = _kronos_report_decision(row)
+    downgraded_kronos = {
+        str(item).strip().lower()
+        for item in (policy.get("downgrade_kronos_decisions") or [])
+    }
+    if kronos_decision and kronos_decision in downgraded_kronos:
+        return "kronos_regression"
 
     downgraded_flags = {str(item).strip().lower() for item in (policy.get("downgrade_risk_flags") or [])}
     for flag in sorted(risk_flags):
@@ -1129,11 +1379,114 @@ def _recommendation_regression_downgrade_reason(
     return ""
 
 
+def _is_cn_limit_up_watch(row: dict) -> bool:
+    matched = {
+        str(item).strip().lower()
+        for item in (row.get("matched_patterns") or [])
+        if str(item).strip()
+    }
+    if "今日涨停".lower() in matched or "limit_up_today" in matched:
+        return True
+    limit_band = _maybe_float(row.get("limit_band_pct"))
+    momentum_1 = _maybe_float(row.get("momentum_1") or row.get("daily_return_pct") or row.get("pct_chg"))
+    if limit_band is not None and momentum_1 is not None and momentum_1 >= limit_band - 0.25:
+        return True
+    return False
+
+
+def _actionable_quality_gate(
+    row: dict,
+    *,
+    deviation: float | None,
+    risk_flags: set[str],
+    regression_policy: dict | None = None,
+) -> dict[str, object]:
+    market = str(row.get("market") or "CN").strip().upper()
+    if market != "CN":
+        return {"allowed": True, "reason": "", "score": 100.0}
+
+    readiness = _maybe_float(row.get("trade_readiness_score")) or 0.0
+    verification = _maybe_float(row.get("verification_score"))
+    signal_strength = _maybe_float(row.get("model_signal_strength") or row.get("signal_strength"))
+    model_score = _maybe_float(row.get("model_score") or row.get("score"))
+    volume_ratio = _maybe_float(row.get("volume_ratio"))
+    template = str(row.get("full_market_template") or "").strip()
+    board_profile = _recommendation_regression_board_profile(row)
+    policy = regression_policy or {}
+    setup = str(row.get("setup_label") or row.get("action_label") or "").strip().lower()
+    kronos_decision = _kronos_report_decision(row)
+    has_model_confirmation = (
+        model_score is not None
+        or signal_strength is not None
+        or template == "lightgbm_top_picks"
+        or kronos_decision == "support"
+    )
+
+    quality_score = 0.0
+    quality_score += min(35.0, readiness * 0.35)
+    if verification is not None:
+        quality_score += min(30.0, max(0.0, verification) * 0.16)
+    if signal_strength is not None:
+        quality_score += min(15.0, max(0.0, signal_strength) * 0.18)
+    if model_score is not None:
+        quality_score += 8.0
+    if template == "lightgbm_top_picks":
+        quality_score += 7.0
+    if template in {str(item).strip() for item in (policy.get("preferred_templates") or [])}:
+        quality_score += 5.0
+    if board_profile in {str(item).strip().lower() for item in (policy.get("preferred_board_profiles") or [])}:
+        quality_score += 3.0
+    if setup in {"pullback_buy", "buy_the_dip", "support_hold"}:
+        quality_score += 6.0
+    if kronos_decision == "support":
+        quality_score += 6.0
+    if kronos_decision in {str(item).strip().lower() for item in (policy.get("preferred_kronos_decisions") or [])}:
+        quality_score += 4.0
+    if kronos_decision in {str(item).strip().lower() for item in (policy.get("downgrade_kronos_decisions") or [])}:
+        quality_score -= 10.0
+    quality_score -= min(24.0, _risk_flag_gate_score(list(risk_flags)) * 7.0)
+    if deviation is not None and deviation > 0:
+        quality_score -= min(10.0, deviation * 0.7)
+
+    if board_profile == "st":
+        return {"allowed": False, "reason": "st_board_watch_only", "score": round(quality_score, 1)}
+    if _is_cn_limit_up_watch(row):
+        return {"allowed": False, "reason": "limit_up_watch_only", "score": round(quality_score, 1)}
+    if risk_flags & A_SHARE_ACTIONABLE_HIGH_RISK_FLAGS:
+        return {"allowed": False, "reason": "high_risk_flag", "score": round(quality_score, 1)}
+    if readiness < A_SHARE_ACTIONABLE_MIN_READINESS:
+        return {"allowed": False, "reason": "readiness_not_high", "score": round(quality_score, 1)}
+    if verification is not None and verification < A_SHARE_ACTIONABLE_MIN_VERIFICATION:
+        return {"allowed": False, "reason": "weak_verification", "score": round(quality_score, 1)}
+    if volume_ratio is not None and volume_ratio > 0 and volume_ratio < A_SHARE_ACTIONABLE_MIN_VOLUME_RATIO:
+        return {"allowed": False, "reason": "low_volume_confirmation", "score": round(quality_score, 1)}
+    if not has_model_confirmation:
+        return {"allowed": False, "reason": "needs_model_confirmation", "score": round(quality_score, 1)}
+    min_quality_score = _maybe_float(policy.get("min_actionable_quality_score")) or 48.0
+    if quality_score < min_quality_score:
+        return {"allowed": False, "reason": "actionable_quality_low", "score": round(quality_score, 1)}
+    return {"allowed": True, "reason": "", "score": round(quality_score, 1)}
+
+
 def _market_pool_reason(row: dict, *, lang: str = "zh") -> str:
     regression_reason = _recommendation_regression_reason_label(row.get("regression_downgrade_reason"), lang=lang)
     if regression_reason:
         return regression_reason
+    quality_reason = str(row.get("quality_gate_reason") or "").strip()
+    if quality_reason:
+        reason_text = format_trade_gate_reason(quality_reason, lang=lang)
+        score = row.get("quality_gate_score")
+        suffix = f"质量分 {score}，" if lang == "zh" and score is not None else ""
+        if lang == "zh":
+            return f"暂不买：{suffix}{reason_text}。先放入观察池，等模型/量价/买点再次共振。"
+        return f"Do not buy yet: {reason_text}. Keep it on watch until model, tape, and entry line up."
     status = str(row.get("tradability_status") or "").strip().upper()
+    block_reason = str(row.get("block_reason") or row.get("recommendation_gate_reason") or "").strip()
+    if block_reason:
+        reason_text = format_trade_gate_reason(block_reason, lang=lang)
+        if lang == "zh":
+            return f"暂不买：{reason_text}。先放入观察池，等风险解除或重新接近买点。"
+        return f"Do not buy yet: {reason_text}. Keep it on watch until the risk clears or price resets."
     deviation = _safe_float(row.get("close_vs_buy_zone_high_pct"))
     risk_flags = {str(item).strip().lower() for item in (row.get("risk_flags") or []) if str(item).strip()}
     if status != "READY":
@@ -1159,6 +1512,7 @@ def _split_market_recommendation_rows(
     actionable_limit: int = 5,
     watch_limit: int = 5,
     regression_policy: dict | None = None,
+    selection_quality_policy: dict | None = None,
     lightgbm_execution_bias: dict | None = None,
 ) -> tuple[list[dict], list[dict], dict]:
     actionable: list[dict] = []
@@ -1179,13 +1533,38 @@ def _split_market_recommendation_rows(
             risk_flags=risk_flags,
             regression_policy=policy,
         )
-        is_actionable = (
+        quality_gate = _actionable_quality_gate(
+            enriched,
+            deviation=deviation,
+            risk_flags=risk_flags,
+            regression_policy=policy,
+        )
+        base_actionable = (
             status == "READY"
             and (deviation is None or deviation <= actionable_deviation_cap)
             and not regression_reason
+            and bool(quality_gate.get("allowed"))
         )
+        enriched["quality_gate_score"] = quality_gate.get("score")
+        enriched["report_pool"] = "actionable" if base_actionable else "watch"
+        enriched = _apply_selection_quality_policy(enriched, selection_quality_policy)
+        adjusted_quality_score = _maybe_float(enriched.get("quality_gate_score"))
+        if not regression_reason:
+            min_quality = _maybe_float(policy.get("min_actionable_quality_score"))
+            if min_quality is not None and adjusted_quality_score is not None and adjusted_quality_score < min_quality:
+                regression_reason = "quality_score_regression"
+        if (
+            not regression_reason
+            and (_maybe_float(enriched.get("selection_quality_adjustment")) or 0.0) < 0
+            and adjusted_quality_score is not None
+            and adjusted_quality_score < 48.0
+        ):
+            regression_reason = "selection_quality_regression"
+        is_actionable = bool(base_actionable and not regression_reason)
         enriched["regression_policy_applied"] = bool(regression_reason)
         enriched["regression_downgrade_reason"] = regression_reason
+        enriched["quality_gate_passed"] = bool(quality_gate.get("allowed"))
+        enriched["quality_gate_reason"] = "" if quality_gate.get("allowed") else str(quality_gate.get("reason") or "")
         enriched["report_pool"] = "actionable" if is_actionable else "watch"
         enriched["report_pool_reason"] = _market_pool_reason(enriched, lang="zh")
         if is_actionable:
@@ -1214,18 +1593,145 @@ def _split_market_recommendation_rows(
             item["report_pool_reason"] = _market_pool_reason(item, lang="zh")
         watch = excess + watch
 
+    actionable.sort(key=_ai_report_kronos_rank_key)
+    max_actionable_count = (policy or {}).get("max_actionable_count")
+    try:
+        max_actionable_count_value = int(max_actionable_count) if max_actionable_count is not None else None
+    except (TypeError, ValueError):
+        max_actionable_count_value = None
+    if max_actionable_count_value is not None and max_actionable_count_value >= 0 and len(actionable) > max_actionable_count_value:
+        excess = actionable[max_actionable_count_value:]
+        actionable = actionable[:max_actionable_count_value]
+        for item in excess:
+            item["report_pool"] = "watch"
+            item["regression_policy_applied"] = True
+            item["regression_downgrade_reason"] = "recent_accuracy_cap"
+            item["report_pool_reason"] = _market_pool_reason(item, lang="zh")
+        watch = excess + watch
+
+    watch.sort(key=_ai_report_kronos_rank_key)
+    kronos_support_count = sum(1 for item in actionable + watch if _kronos_report_decision(item) == "support")
+    kronos_ready_count = sum(1 for item in actionable + watch if _kronos_report_status(item) == "READY")
     return (
         actionable[:actionable_limit],
         watch[:watch_limit],
         {
             "actionable_count": len(actionable),
             "watch_count": len(watch),
+            "kronos_ready_count": kronos_ready_count,
+            "kronos_support_count": kronos_support_count,
             "actionable_limit": actionable_limit,
             "watch_limit": watch_limit,
+            "max_actionable_count": max_actionable_count_value,
             "regression_policy_applied": bool(active_policy_notes),
             "regression_policy_notes": active_policy_notes[:5],
             "actionable_deviation_cap_pct": actionable_deviation_cap,
+            "selection_quality_policy_applied": bool((selection_quality_policy or {}).get("enabled")),
+            "selection_quality_sample_count": int((selection_quality_policy or {}).get("sample_count") or 0),
+            "selection_quality_preferred_sources": list((selection_quality_policy or {}).get("preferred_sources") or [])[:5],
+            "selection_quality_downgraded_sources": list((selection_quality_policy or {}).get("downgraded_sources") or [])[:5],
         },
+    )
+
+
+def _kronos_report_status(row: dict) -> str:
+    validation = row.get("kronos_validation") if isinstance(row.get("kronos_validation"), dict) else {}
+    return str((validation or {}).get("kronos_status") or "").upper()
+
+
+def _build_kronos_watch_fallback_rows(kronos_payload: dict, *, limit: int = 5) -> list[dict]:
+    rows = [dict(item) for item in (kronos_payload.get("rows") or []) if isinstance(item, dict)]
+    if not rows:
+        return []
+
+    def _score(item: dict) -> tuple[float, float, str]:
+        decision = str(item.get("kronos_decision") or "").lower()
+        support = 1.0 if ("支持" in decision or "support" in decision) and "不支持" not in decision else 0.0
+        try:
+            score = float(item.get("kronos_score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        return (-support, -score, str(item.get("ticker") or ""))
+
+    candidates = [
+        item
+        for item in rows
+        if str(item.get("kronos_status") or "").upper() == "READY"
+        and _kronos_report_decision({"kronos_validation": item}) != "reject"
+    ]
+    candidates.sort(key=_score)
+    fallback_rows: list[dict] = []
+    for item in candidates[:limit]:
+        ticker = str(item.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        score = _safe_float(item.get("kronos_score"))
+        fallback_rows.append(
+            {
+                "ticker": ticker,
+                "name": item.get("name") or ticker,
+                "market": item.get("market") or "CN",
+                "verdict": "WATCH",
+                "confidence": round(score or 0.0, 1),
+                "quant_rank": round(score or 0.0, 1),
+                "verification_score": round(score or 0.0, 1),
+                "model_score": score,
+                "trend_score": item.get("trend_score"),
+                "latest_price": item.get("latest_close"),
+                "latest_close": item.get("latest_close"),
+                "tradability_status": "REVIEW",
+                "readiness_bucket": "MEDIUM",
+                "trade_readiness_score": min(80.0, max(45.0, score or 50.0)),
+                "risk_flags": ["kronos-watch-fallback"],
+                "strategy": "Kronos 路径观察",
+                "headline": f"{item.get('kronos_decision') or 'Kronos 中性'}：仅作观察，不作为买入指令",
+                "summary": item.get("kronos_reason") or "交易纪律未放行时，用 Kronos 支持票作为观察清单。",
+                "entry_trigger": "次日不追高，等待模型/价格重新确认",
+                "invalidation_condition": "跌破最新路径低点或下一次预计算转弱",
+                "report_pool": "watch",
+                "report_pool_reason": "全市场候选被交易纪律拦截，仅使用 Kronos 验证池生成观察名单。",
+                "kronos_validation": item,
+            }
+        )
+    return fallback_rows
+
+
+def _kronos_report_decision(row: dict) -> str:
+    validation = row.get("kronos_validation") if isinstance(row.get("kronos_validation"), dict) else {}
+    decision = str((validation or {}).get("kronos_decision") or "").lower()
+    if ("支持" in decision or "support" in decision) and "不支持" not in decision:
+        return "support"
+    if "不支持" in decision or "avoid" in decision:
+        return "reject"
+    if decision:
+        return "neutral"
+    return ""
+
+
+def _ai_report_kronos_rank_key(row: dict) -> tuple[float, float, float, str]:
+    validation = row.get("kronos_validation") if isinstance(row.get("kronos_validation"), dict) else {}
+    try:
+        score = float((validation or {}).get("kronos_score") or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    try:
+        expected = float((validation or {}).get("kronos_expected_return_3d_pct") or 0.0)
+    except (TypeError, ValueError):
+        expected = 0.0
+    try:
+        drawdown = float((validation or {}).get("kronos_max_drawdown_pct") or 0.0)
+    except (TypeError, ValueError):
+        drawdown = 0.0
+    decision = _kronos_report_decision(row)
+    decision_bonus = 10000.0 if decision == "support" else -10000.0 if decision == "reject" else 0.0
+    ready_bonus = 500.0 if _kronos_report_status(row) == "READY" else 0.0
+    kronos_score = decision_bonus + ready_bonus + score * 20.0 + expected * 60.0 + drawdown * 10.0
+    return (
+        -kronos_score,
+        -float(row.get("quality_gate_score") or 0.0),
+        -float(row.get("verification_score") or 0.0),
+        -float(row.get("quant_rank") or 0.0),
+        str(row.get("ticker") or ""),
     )
 
 
@@ -1575,7 +2081,15 @@ def load_ai_daily_report(*, db=None) -> dict | None:
         payload = json.loads(raw)
     except json.JSONDecodeError:
         return None
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        current_regression = load_or_build_recommendation_regression(db=db)
+    except Exception:
+        current_regression = None
+    if isinstance(current_regression, dict) and int(current_regression.get("sample_count") or 0) > 0:
+        payload["recommendation_regression"] = current_regression
+    return payload
 
 
 def list_ai_daily_report_history(*, limit: int = 30, db=None) -> list[dict]:
@@ -1598,9 +2112,13 @@ def _render_recommendation_regression_lines(payload: dict) -> list[str]:
     notes = [str(item).strip() for item in (policy.get("notes") or []) if str(item).strip()]
     summary = regression.get("summary") or {}
     actionable = summary.get("actionable") or {}
+    recent_actionable = summary.get("recent_actionable") or {}
+    recent_all = summary.get("recent_all") or {}
     sample_count = int(regression.get("sample_count") or 0)
     if not notes and sample_count <= 0:
         return []
+    min_quality = policy.get("min_actionable_quality_score")
+    max_actionable = policy.get("max_actionable_count")
     lines = ["历史回归调参："]
     if sample_count > 0:
         lines.append(
@@ -1609,10 +2127,57 @@ def _render_recommendation_regression_lines(payload: dict) -> list[str]:
             f"{actionable.get('close_hit_rate') if actionable.get('close_hit_rate') is not None else '-'}%，"
             f"次日可执行命中率 {actionable.get('execution_hit_rate') if actionable.get('execution_hit_rate') is not None else '-'}%。"
         )
+        lines.append(
+            "近期样本：可执行命中率 "
+            f"{recent_actionable.get('execution_hit_rate') if recent_actionable.get('execution_hit_rate') is not None else '-'}%，"
+            f"整体候选命中率 {recent_all.get('execution_hit_rate') if recent_all.get('execution_hit_rate') is not None else '-'}%，"
+            f"整体深回撤率 {recent_all.get('deep_drawdown_rate') if recent_all.get('deep_drawdown_rate') is not None else '-'}%。"
+        )
+    if min_quality is not None or max_actionable is not None:
+        lines.append(
+            "当前纪律："
+            f"质量门槛 {min_quality if min_quality is not None else '-'}；"
+            f"最多可执行 {max_actionable if max_actionable is not None else '不额外限制'} 只。"
+        )
     if notes:
         lines.extend([f"- {item}" for item in notes[:3]])
     lines.append("")
     return lines
+
+
+def _render_kronos_meta_line(payload: dict | None) -> str:
+    if not isinstance(payload, dict) or not payload:
+        return "Kronos 验证：暂无快照，先按 LightGBM / 多模型共振结果执行。"
+    status = str(payload.get("status") or "-")
+    candidate_count = int(payload.get("candidate_count") or 0)
+    validated_count = int(payload.get("validated_count") or 0)
+    if status == "success":
+        return f"Kronos 验证：已验证 {validated_count}/{candidate_count} 只候选，用作 Top 5 二次路径确认。"
+    if status == "not_configured":
+        return f"Kronos 验证：接入层已就绪，但运行环境未配置；当前候选 {candidate_count} 只已进入待验证池。"
+    return f"Kronos 验证：状态 {status}，候选 {candidate_count} 只，已验证 {validated_count} 只。"
+
+
+def _render_row_kronos_line(item: dict) -> str:
+    validation = item.get("kronos_validation") or {}
+    if not isinstance(validation, dict) or not validation:
+        return "Kronos：暂无二次验证"
+    status = str(validation.get("kronos_status") or "-")
+    decision = str(validation.get("kronos_decision") or "-")
+    score = validation.get("kronos_score")
+    expected = validation.get("kronos_expected_return_3d_pct")
+    drawdown = validation.get("kronos_max_drawdown_pct")
+    if status == "NOT_CONFIGURED":
+        precheck = validation.get("path_precheck") or {}
+        return f"Kronos：待模型验证；路径预检 {precheck.get('score') or '-'}，原因：{validation.get('kronos_reason') or '-'}"
+    details = []
+    if score is not None:
+        details.append(f"分数 {score}")
+    if expected is not None:
+        details.append(f"3日预期 {expected}%")
+    if drawdown is not None:
+        details.append(f"预测回撤 {drawdown}%")
+    return f"Kronos：{decision} · {status}" + (f" · {' · '.join(details)}" if details else "")
 
 
 def render_ai_daily_report_message(report: dict | None) -> str:
@@ -1620,13 +2185,18 @@ def render_ai_daily_report_message(report: dict | None) -> str:
     strategy = payload.get("strategy") or {}
     portfolio_summary = payload.get("portfolio_summary") or {}
     portfolio_rows = payload.get("portfolio_rows") or []
-    market_rows = payload.get("market_recommendations") or payload.get("rows") or []
+    market_rows = (
+        payload.get("market_recommendations")
+        if isinstance(payload.get("market_recommendations"), list)
+        else payload.get("rows") or []
+    )
     market_watch_rows = payload.get("market_watch_recommendations") or []
     market_meta = payload.get("market_recommendations_meta") or {}
     market_structure = payload.get("market_structure") or {}
     market_template_attribution = payload.get("market_template_attribution") or {}
     guidance_summary = payload.get("model_selection_guidance_summary") or {}
     lightgbm_execution_bias = payload.get("lightgbm_execution_bias") or {}
+    kronos_payload = payload.get("kronos_validation") or {}
     us_model_rows = payload.get("us_model_recommendations") or []
     us_market_meta = payload.get("us_model_recommendations_meta") or {}
     us_market_structure = payload.get("us_market_structure") or {}
@@ -1668,6 +2238,7 @@ def render_ai_daily_report_message(report: dict | None) -> str:
         f"{guidance_summary.get('top_combo_summary') or '优先组合：组合样本还不够，暂不强推。'}",
         f"{lightgbm_execution_bias.get('title') or 'LightGBM：今天先观察'}",
         f"{lightgbm_execution_bias.get('summary') or '-'}",
+        _render_kronos_meta_line(kronos_payload),
         "",
     ]
     )
@@ -1849,6 +2420,7 @@ def _render_portfolio_push_message(payload: dict) -> str:
                 f"AI建议：{item.get('ai_verdict') or '-'} | {item.get('ai_headline') or '-'}",
                 f"动作桶：{item.get('action_bucket') or '-'} | 目标仓位：{item.get('target_weight_text') or '-'} | 风险：{risk_flags}",
                 f"操作备注：{item.get('ai_strategy') or '-'}",
+                _render_row_kronos_line(item),
                 "",
             ]
         )
@@ -1857,13 +2429,18 @@ def _render_portfolio_push_message(payload: dict) -> str:
 
 def _render_market_top5_push_message(payload: dict) -> str:
     strategy = payload.get("strategy") or {}
-    market_rows = payload.get("market_recommendations") or payload.get("rows") or []
+    market_rows = (
+        payload.get("market_recommendations")
+        if isinstance(payload.get("market_recommendations"), list)
+        else payload.get("rows") or []
+    )
     market_watch_rows = payload.get("market_watch_recommendations") or []
     market_meta = payload.get("market_recommendations_meta") or {}
     market_structure = payload.get("market_structure") or {}
     market_template_attribution = payload.get("market_template_attribution") or {}
     guidance_summary = payload.get("model_selection_guidance_summary") or {}
     lightgbm_execution_bias = payload.get("lightgbm_execution_bias") or {}
+    kronos_payload = payload.get("kronos_validation") or {}
     lines = [
         "二、明日可执行买入池",
         "以下候选来自收盘后全市场模型扫描，不包含当前自选股和持仓股；仅保留更接近计划买点、且适合次日执行的名字。",
@@ -1876,6 +2453,7 @@ def _render_market_top5_push_message(payload: dict) -> str:
         f"{guidance_summary.get('top_combo_summary') or '优先组合：组合样本还不够，暂不强推。'}",
         f"{lightgbm_execution_bias.get('title') or 'LightGBM：今天先观察'}",
         f"{lightgbm_execution_bias.get('summary') or '-'}",
+        _render_kronos_meta_line(kronos_payload),
         "",
     ]
     lines.extend(_render_recommendation_regression_lines(payload))
@@ -1907,6 +2485,7 @@ def _render_market_top5_push_message(payload: dict) -> str:
                 f"买入区：{buy_zone.get('low', '-')} - {buy_zone.get('high', '-')} | 止损：{item.get('stop_loss', '-')}",
                 f"止盈区：{take_profit.get('low', '-')} - {take_profit.get('high', '-')}",
                 f"风险：{risk_flags}",
+                _render_row_kronos_line(item),
                 f"验证依据：{item.get('verification_note') or '-'}",
                 f"入池原因：{item.get('report_pool_reason') or '-'}",
                 "",
@@ -2133,6 +2712,9 @@ def _candidate_quant_score(candidate: dict, combined: dict) -> float:
     percentile = _safe_float(candidate.get("percentile"))
     trend_score = _safe_float((combined or {}).get("trend_score"))
     setup_label = str((combined or {}).get("setup_label") or "")
+    momentum_5 = _safe_float((combined or {}).get("momentum_5") or candidate.get("momentum_5"))
+    risk_flags = _candidate_risk_flags(candidate)
+    entry_style = _entry_style_value({**candidate, **(combined or {})})
 
     quant_rank = 0.0
     quant_rank += score * 1200.0
@@ -2145,6 +2727,15 @@ def _candidate_quant_score(candidate: dict, combined: dict) -> float:
         quant_rank += 6.0
     elif setup_label == "breakout_watch":
         quant_rank += 4.0
+    if candidate.get("entry_trigger"):
+        quant_rank += 3.0
+    if candidate.get("invalidation_condition"):
+        quant_rank += 3.0
+    quant_rank -= min(28.0, _risk_flag_gate_score(risk_flags) * 8.0)
+    if "missing-model-score" in {str(item).strip().lower() for item in risk_flags}:
+        quant_rank -= 8.0
+    if momentum_5 >= RECOMMENDATION_CHASE_MOMENTUM_5 and entry_style not in {"pullback", "buy_the_dip", "support_hold", "pullback_reentry"}:
+        quant_rank -= min(20.0, (momentum_5 - RECOMMENDATION_CHASE_MOMENTUM_5) * 1.2 + 8.0)
     return round(quant_rank, 1)
 
 
@@ -2337,7 +2928,11 @@ def _recent_daily_report_repeat_counts(*, db, market: str, lookback_days: int = 
         if market_code == "US":
             rows = payload.get("us_model_recommendations") or []
         else:
-            rows = payload.get("market_recommendations") or payload.get("rows") or []
+            rows = (
+                payload.get("market_recommendations")
+                if isinstance(payload.get("market_recommendations"), list)
+                else payload.get("rows") or []
+            )
         if not isinstance(rows, list):
             continue
         seen_in_report: set[str] = set()
@@ -2480,9 +3075,13 @@ def _load_full_market_report_candidates(
             candidate["report_source_label"] = source.get("label")
             gate = _recommendation_gate(candidate)
             candidate["recommendation_gate_config"] = gate.get("config")
+            candidate["recommendation_gate_allowed"] = bool(gate.get("allowed"))
+            candidate["recommendation_gate_status"] = gate.get("status")
+            candidate["recommendation_gate_reason"] = gate.get("reason")
             if not gate["allowed"]:
                 meta["blocked_candidates"] = int(meta.get("blocked_candidates") or 0) + 1
-                continue
+                candidate["tradability_status"] = gate.get("status") or candidate.get("tradability_status") or "BLOCKED"
+                candidate["block_reason"] = gate.get("reason") or candidate.get("block_reason") or "signal_not_actionable"
             repeat_count = int(repeat_counts.get(ticker) or 0)
             if repeat_count > 0:
                 candidate["recent_report_repeat_count"] = repeat_count
@@ -2707,8 +3306,11 @@ def _candidate_from_full_market_row(
         "summary_text": row.get("model_summary") or row.get("selection_reason"),
         "trend_score": trend_score,
         "latest_close": row.get("latest_close"),
+        "volume_ratio": row.get("volume_ratio"),
+        "momentum_1": row.get("momentum_1") or row.get("daily_return_pct") or row.get("pct_chg"),
         "momentum_5": row.get("momentum_5"),
         "distance_to_breakout_pct": row.get("distance_to_breakout_pct"),
+        "matched_patterns": row.get("matched_patterns") or [],
         "setup_label": row.get("setup_label") or row.get("action_label") or template,
         "full_market_template": template,
         "full_market_rank_score": round(rank_score, 1),

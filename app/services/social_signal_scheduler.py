@@ -14,7 +14,7 @@ class SocialSignalSchedulerService:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_started_at = None
-        self.interval_minutes = 30
+        self.interval_minutes = 240
 
     def get_status(self) -> dict:
         next_run_at = None

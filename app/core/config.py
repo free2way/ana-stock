@@ -18,8 +18,6 @@ class Settings(BaseSettings):
     qlib_data_dir: Path = Field(default=ROOT_DIR / "data" / "qlib")
     artifacts_dir: Path = Field(default=ROOT_DIR / "data" / "artifacts")
     database_url: str | None = Field(default=None)
-    sqlite_path: Path = Field(default=ROOT_DIR / "storage" / "app.db")
-    sqlite_timeout_seconds: float = Field(default=30.0)
     postgres_pool_size: int = Field(default=20)
     postgres_max_overflow: int = Field(default=20)
     postgres_pool_timeout_seconds: int = Field(default=30)
@@ -36,6 +34,10 @@ class Settings(BaseSettings):
     alpaca_data_feed: str = Field(default="iex")
     polygon_api_key: str | None = Field(default=None)
     polygon_endpoint: str = Field(default="https://api.polygon.io")
+    us_trade_universe_min_price: float = Field(default=3.0)
+    us_trade_universe_min_avg_dollar_volume: float = Field(default=2_000_000.0)
+    us_trade_universe_min_avg_volume: float = Field(default=200_000.0)
+    us_trade_universe_min_history_days: int = Field(default=10)
     x_bearer_token: str | None = Field(default=None)
     x_api_endpoint: str = Field(default="https://api.x.com/2")
     ai_api_key: str | None = Field(default=None)
@@ -61,6 +63,20 @@ class Settings(BaseSettings):
     backtest_min_adv: float = Field(default=50000000.0)
     backtest_max_gap_pct: float = Field(default=0.08)
     backtest_rebalance_threshold: float = Field(default=0.02)
+    kronos_enabled: bool = Field(default=True)
+    kronos_model_name: str = Field(default="NeoQuasar/Kronos-mini")
+    kronos_runner_command: str | None = Field(default=None)
+    kronos_repo_path: str | None = Field(default=None)
+    kronos_device: str = Field(default="cpu")
+    kronos_candidate_limit: int = Field(default=60)
+    kronos_history_limit: int = Field(default=180)
+    kronos_min_history: int = Field(default=60)
+    kronos_prediction_horizon_days: int = Field(default=3)
+    kronos_timeout_seconds: float = Field(default=180.0)
+    kronos_temperature: float = Field(default=0.8)
+    kronos_top_p: float = Field(default=0.9)
+    kronos_sample_count: int = Field(default=3)
+    kronos_seed: int = Field(default=42)
 
     model_config = SettingsConfigDict(env_prefix="PQW_", env_file=".env", extra="ignore")
 
@@ -73,8 +89,6 @@ class Settings(BaseSettings):
             self.qlib_data_dir,
             self.artifacts_dir,
         ]
-        if not self.database_url:
-            required_paths.append(self.sqlite_path.parent)
         for path in required_paths:
             path.mkdir(parents=True, exist_ok=True)
 
@@ -82,7 +96,7 @@ class Settings(BaseSettings):
     def resolved_database_url(self) -> str:
         if self.database_url:
             return self.database_url
-        return f"sqlite:///{self.sqlite_path}"
+        raise RuntimeError("PQW_DATABASE_URL is required. This application is PostgreSQL-only at runtime.")
 
 
 @lru_cache(maxsize=1)

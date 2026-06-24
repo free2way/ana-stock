@@ -17,7 +17,9 @@ DEFAULT_US_SYMBOL_METADATA_SCHEDULER_CONFIG = {
     "enabled": True,
     "run_hour": 23,
     "run_minute": 0,
-    "limit": 300,
+    # Polygon reference tickers are fetched in 1000-row pages, so use a
+    # full-reference default instead of the old per-symbol 300-name crawl.
+    "limit": 12000,
     "last_run_date": None,
     "last_run_at": None,
 }

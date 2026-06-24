@@ -937,6 +937,9 @@ class SignalTrainer:
                 artifact_path=None,
                 status="running",
             )
+            run_id = int(run.id)
+            # `refresh()` starts a transaction; close it before CPU-heavy feature work.
+            db.commit()
 
             for row in rows:
                 symbol = row.get("symbol")
@@ -1064,15 +1067,15 @@ class SignalTrainer:
                     signal_rows.append(record)
 
             if not signal_rows:
-                model_repo.complete_run(run.id, status="failed", artifact_path=None)
+                model_repo.complete_run(run_id, status="failed", artifact_path=None)
                 raise RuntimeError(
                     "The baseline trainer produced no predictions. You likely need at least 2-3 trading days per symbol."
                 )
 
-            count = prediction_repo.replace_for_model_run(run.id, signal_rows)
-            detail_repo.replace_for_model_run(run.id, detail_rows)
-            explanation_repo.replace_for_model_run(run.id, explanation_rows)
-            artifact_path = str((self.settings.artifacts_dir / f"model_run_{run.id}.json").resolve())
+            count = prediction_repo.replace_for_model_run(run_id, signal_rows)
+            detail_repo.replace_for_model_run(run_id, detail_rows)
+            explanation_repo.replace_for_model_run(run_id, explanation_rows)
+            artifact_path = str((self.settings.artifacts_dir / f"model_run_{run_id}.json").resolve())
             Path(artifact_path).write_text(
                 json.dumps(
                     {
@@ -1085,7 +1088,7 @@ class SignalTrainer:
                 ),
                 encoding="utf-8",
             )
-            model_repo.complete_run(run.id, status="success", artifact_path=artifact_path)
+            model_repo.complete_run(run_id, status="success", artifact_path=artifact_path)
             return count
 
     def _train_lightgbm(
@@ -1206,6 +1209,9 @@ class SignalTrainer:
                 artifact_path=None,
                 status="running",
             )
+            run_id = int(run.id)
+            # Avoid holding an idle PostgreSQL transaction during LightGBM fitting.
+            db.commit()
 
             signal_rows: list[dict] = []
             detail_rows: list[dict] = []
@@ -1339,13 +1345,13 @@ class SignalTrainer:
                 train_pool.extend(labeled_by_date.get(trade_date, []))
 
             if not signal_rows:
-                model_repo.complete_run(run.id, status="failed", artifact_path=None)
+                model_repo.complete_run(run_id, status="failed", artifact_path=None)
                 raise RuntimeError("LightGBM trainer produced no predictions.")
 
-            count = prediction_repo.replace_for_model_run(run.id, signal_rows)
-            detail_repo.replace_for_model_run(run.id, detail_rows)
-            explanation_repo.replace_for_model_run(run.id, explanation_rows)
-            artifact_path = str((self.settings.artifacts_dir / f"model_run_{run.id}.json").resolve())
+            count = prediction_repo.replace_for_model_run(run_id, signal_rows)
+            detail_repo.replace_for_model_run(run_id, detail_rows)
+            explanation_repo.replace_for_model_run(run_id, explanation_rows)
+            artifact_path = str((self.settings.artifacts_dir / f"model_run_{run_id}.json").resolve())
             Path(artifact_path).write_text(
                 json.dumps(
                     {
@@ -1380,7 +1386,7 @@ class SignalTrainer:
                 ),
                 encoding="utf-8",
             )
-            model_repo.complete_run(run.id, status="success", artifact_path=artifact_path)
+            model_repo.complete_run(run_id, status="success", artifact_path=artifact_path)
             return count
 
     def train(

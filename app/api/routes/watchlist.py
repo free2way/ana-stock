@@ -17,7 +17,7 @@ from app.services.model_signal_summary import build_signal_label, model_confiden
 from app.services.nlp_snapshots import summarize_news_rows
 from app.services.runtime_cache import clear_namespace, get_or_set
 from app.services.symbol_details import SymbolDataService
-from app.services.symbol_catalog import infer_symbol_record, search_symbol_catalog
+from app.services.symbol_catalog import infer_symbol_record, search_symbol_catalog, search_symbol_records
 from app.services.ticker_format import normalize_ticker_for_market
 from app.services.ui_lang import resolve_request_lang
 from app.services.watchlist_metadata import refresh_watchlist_metadata
@@ -960,30 +960,7 @@ def suggest_symbols(
     market_value = market.strip().upper() if market else None
     symbol_repo = SymbolRepository(db)
     results = search_symbol_catalog(q, market_value)
-    seen = {(item["ticker"], item["market"]) for item in results}
-    for symbol in symbol_repo.list_symbols():
-        if market_value and (symbol.market or "").upper() != market_value:
-            continue
-        text = q.strip().upper()
-        if not text:
-            continue
-        symbol_name = symbol.name or ""
-        if text in symbol.ticker.upper() or text in symbol_name.upper():
-            key = (symbol.ticker, symbol.market)
-            if key in seen:
-                continue
-            results.append(
-                {
-                    "ticker": symbol.ticker,
-                    "name": symbol_name or symbol.ticker,
-                    "market": symbol.market or market_value or "",
-                    "exchange": symbol.exchange or "",
-                }
-            )
-            seen.add(key)
-        if len(results) >= 8:
-            break
-    return results[:8]
+    return search_symbol_records(symbol_repo.list_symbols(), q, market_value, initial=results, limit=8)
 
 
 @router.get("", response_class=HTMLResponse)
@@ -1239,31 +1216,32 @@ def watchlist_page(
             var(--bg); }}
           {WORKSPACE_COMPACT_STYLE}
           {WORKSPACE_SIDEBAR_STYLE}
-          .content {{ padding:20px 18px 28px; }}
+          .content {{ padding:16px 14px 24px; }}
           .wrap {{ max-width:none; margin:0; padding: 0 0 36px; }}
           .topbar {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }}
           .topbar a {{ color: var(--accent); text-decoration:none; }}
           .banner {{ margin-bottom:12px; padding:12px 14px; border-radius:14px; background:rgba(61,217,182,0.14); color:var(--accent); font-weight:700; }}
           .hero {{ display:grid; gap:12px; grid-template-columns: minmax(280px, 1.05fr) minmax(320px, 0.95fr); margin-bottom:12px; }}
-          .nav-grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-bottom:12px; }}
+          .nav-grid {{ display:grid; gap:8px; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); margin-bottom:10px; }}
           .nav-card {{
             display:block;
             text-decoration:none;
             color:inherit;
             background:linear-gradient(180deg, rgba(17,28,40,0.98) 0%, rgba(21,34,49,0.98) 100%);
             border:1px solid var(--line);
-            border-radius:15px;
-            padding:14px;
-            box-shadow:0 10px 22px rgba(0,0,0,0.12);
+            border-radius:10px;
+            padding:10px;
+            box-shadow:0 8px 18px rgba(0,0,0,0.10);
           }}
           .nav-card:hover {{ border-color:var(--accent); box-shadow:0 12px 28px rgba(61,217,182,0.08); }}
-          .nav-head {{ display:flex; align-items:center; gap:10px; margin-bottom:8px; }}
+          .nav-head {{ display:flex; align-items:center; gap:8px; margin-bottom:5px; }}
           .nav-icon {{
-            width:38px; height:38px; border-radius:12px; display:inline-flex; align-items:center; justify-content:center;
+            width:30px; height:30px; border-radius:9px; display:inline-flex; align-items:center; justify-content:center;
             background:rgba(61,217,182,0.10); color:var(--accent); font-size:11px; font-weight:900; letter-spacing:0.04em; border:1px solid rgba(61,217,182,0.18); flex:0 0 auto;
           }}
-          .nav-title {{ font-size:16px; font-weight:800; color:var(--ink); }}
-          .nav-kicker {{ color:var(--muted); font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; }}
+          .nav-title {{ font-size:14px; font-weight:800; color:var(--ink); }}
+          .nav-kicker {{ color:var(--muted); font-size:10px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; }}
+          .nav-card .muted {{ font-size:11.5px; line-height:1.35; }}
           h1 {{ margin:0 0 6px; font-size:32px; }}
           p {{ margin:0; }}
           form {{ margin:0; }}
@@ -1339,7 +1317,7 @@ def watchlist_page(
           .watchlist-mobile-market-grid {{ display:grid; gap:10px; }}
           .table-card a {{ color: var(--accent); text-decoration:none; }}
           .linkbtn {{ display:inline-block; padding:8px 10px; border-radius:10px; background:rgba(61,217,182,0.10); color:var(--accent); font-weight:700; }}
-          .news-console {{ margin-bottom:16px; }}
+          .news-console {{ margin-bottom:10px; }}
           .news-head {{ display:flex; justify-content:space-between; gap:16px; align-items:flex-start; }}
           .news-head h2 {{ margin:0 0 6px; }}
           .news-score {{ min-width:108px; text-align:right; }}

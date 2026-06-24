@@ -29,6 +29,7 @@ from app.models.tables import (
     WorkspaceSnapshot,
 )
 from app.services.market_context import load_market_context_snapshot
+from app.services.market_freshness import summarize_market_freshness
 from app.services.tradability_filter import evaluate_candidate_tradability
 from app.services.time_utils import app_now, app_now_iso
 
@@ -106,7 +107,7 @@ def market_sort_case(column):
     )
 
 
-def _is_sqlite_locked_error(exc: Exception) -> bool:
+def _is_database_locked_error(exc: Exception) -> bool:
     return "database is locked" in str(exc).lower()
 
 
@@ -1373,6 +1374,7 @@ class PriceSyncStateRepository:
                 "symbol_id": state.symbol_id,
                 "ticker": symbol.ticker,
                 "name": symbol.name,
+                "market": symbol.market,
                 "provider": state.provider,
                 "last_synced_date": state.last_synced_date,
                 "status": state.status,
@@ -1395,6 +1397,7 @@ class PriceSyncStateRepository:
                 "symbol_id": state.symbol_id,
                 "ticker": symbol.ticker,
                 "name": symbol.name,
+                "market": symbol.market,
                 "provider": state.provider,
                 "last_synced_date": state.last_synced_date,
                 "status": state.status,
@@ -1433,6 +1436,22 @@ class PriceSyncStateRepository:
             "status_counts": status_counts,
             "provider_counts": provider_counts,
             "latest_updated_at": latest_updated_at,
+        }
+
+    def get_market_freshness_overview(self, markets: tuple[str, ...] = ("CN", "US")) -> dict[str, dict]:
+        normalized_markets = tuple(str(market or "").strip().upper() for market in markets)
+        rows = self.db.execute(
+            select(Symbol.market, PriceSyncState.last_synced_date)
+            .outerjoin(PriceSyncState, PriceSyncState.symbol_id == Symbol.id)
+            .where(Symbol.market.in_(normalized_markets))
+        ).all()
+        states = [
+            {"market": market, "last_synced_date": last_synced_date}
+            for market, last_synced_date in rows
+        ]
+        return {
+            market: summarize_market_freshness(states, market=market)
+            for market in normalized_markets
         }
 
     def get_state_for_ticker(self, ticker: str) -> dict | None:
@@ -1494,7 +1513,7 @@ class PriceSyncStateRepository:
                 return existing
             except OperationalError as exc:
                 self.db.rollback()
-                if attempt >= attempts or not _is_sqlite_locked_error(exc):
+                if attempt >= attempts or not _is_database_locked_error(exc):
                     raise
                 _sleep_for_lock_retry(attempt)
         raise RuntimeError("Price sync state upsert exhausted retries.")
@@ -1549,7 +1568,7 @@ class DataJobRepository:
                 return job
             except OperationalError as exc:
                 self.db.rollback()
-                if attempt >= attempts or not _is_sqlite_locked_error(exc):
+                if attempt >= attempts or not _is_database_locked_error(exc):
                     raise
                 _sleep_for_lock_retry(attempt)
         raise RuntimeError("Data job creation exhausted retries.")
@@ -1585,7 +1604,7 @@ class DataJobRepository:
                 return job
             except OperationalError as exc:
                 self.db.rollback()
-                if attempt >= attempts or not _is_sqlite_locked_error(exc):
+                if attempt >= attempts or not _is_database_locked_error(exc):
                     raise
                 _sleep_for_lock_retry(attempt)
         raise RuntimeError("Data job completion exhausted retries.")
@@ -1622,7 +1641,7 @@ class DataJobRepository:
                 return job
             except OperationalError as exc:
                 self.db.rollback()
-                if attempt >= attempts or not _is_sqlite_locked_error(exc):
+                if attempt >= attempts or not _is_database_locked_error(exc):
                     raise
                 _sleep_for_lock_retry(attempt)
         raise RuntimeError("Data job progress update exhausted retries.")
@@ -1720,7 +1739,7 @@ class WorkspaceSnapshotRepository:
                 return snapshot
             except OperationalError as exc:
                 self.db.rollback()
-                if attempt >= attempts or not _is_sqlite_locked_error(exc):
+                if attempt >= attempts or not _is_database_locked_error(exc):
                     raise
                 _sleep_for_lock_retry(attempt)
         raise RuntimeError("Workspace snapshot creation exhausted retries.")
@@ -1853,7 +1872,7 @@ class AppSettingRepository:
                 return setting
             except OperationalError as exc:
                 self.db.rollback()
-                if attempt >= attempts or not _is_sqlite_locked_error(exc):
+                if attempt >= attempts or not _is_database_locked_error(exc):
                     raise
                 _sleep_for_lock_retry(attempt)
         raise RuntimeError("App setting update exhausted retries.")

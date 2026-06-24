@@ -25,6 +25,7 @@ from app.services.technical_patterns import TechnicalPatternService
 from app.services.tradability_filter import evaluate_candidate_tradability
 from app.services.tradingview_client import TradingViewClient
 from app.services.tushare_client import TushareClient
+from app.services.us_trade_universe import build_us_trade_universe
 
 
 MODEL_TEMPLATES = {
@@ -1375,6 +1376,8 @@ class ScreenerService:
 
         if market_value == "ALL":
             return tickers
+        if market_value == "US" and universe == "full_market":
+            return build_us_trade_universe(tickers=tickers)
         return [ticker for ticker in tickers if self._infer_market(ticker) == market_value]
 
     def _hydrate_cn_symbol_universe(self, symbol_repo: SymbolRepository) -> list[str]:

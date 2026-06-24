@@ -12,7 +12,7 @@ services:
       PQW_NORMALIZED_DATA_DIR: /app/data/normalized
       PQW_QLIB_DATA_DIR: /app/data/qlib
       PQW_ARTIFACTS_DIR: /app/data/artifacts
-      PQW_SQLITE_PATH: /app/storage/app.db
+      PQW_DATABASE_URL: ${PQW_DATABASE_URL:?Set PQW_DATABASE_URL to a PostgreSQL URL}
     volumes:
       - ./storage:/app/storage
       - ./data:/app/data

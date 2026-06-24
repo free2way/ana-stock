@@ -5,6 +5,7 @@ from app.core.config import get_settings
 from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
 from app.services.market_lake import load_lake_price_history, write_ohlcv_rows_to_lake
+from app.services.market_freshness import is_as_of_current
 from app.services.normalizer import MarketDataNormalizer
 from app.services.openbb_client import HistoricalPriceRequest
 from app.services.providers import resolve_price_provider
@@ -73,6 +74,7 @@ def sync_market_data(
     provider: str = "auto",
     start_dates_by_ticker: dict[str, str] | None = None,
     persist_csv: bool = False,
+    required_as_of_date: str | None = None,
 ) -> list[dict]:
     settings = get_settings()
     normalizer = MarketDataNormalizer()
@@ -170,21 +172,25 @@ def sync_market_data(
                         existing_rows = load_lake_price_history(market=market_code, ticker=symbol.ticker, limit=5)
                     if existing_rows:
                         last_synced_date = str(existing_rows[-1].get("date") or "") or None
+                        is_current = is_as_of_current(last_synced_date, required_as_of_date)
+                        status = "success" if is_current else "partial"
                         message = (
                             f"No new market data returned for {selected_provider_ticker}; "
                             f"retained existing lake history through {last_synced_date}."
                         )
+                        if not is_current:
+                            message += f" Required as-of date is {required_as_of_date}; data remains stale."
                         sync_repo.upsert_state(
                             symbol_id=symbol.id,
                             provider=provider_used,
                             last_synced_date=last_synced_date,
-                            status="success",
+                            status=status,
                             message=message,
                         )
                         results.append(
                             {
                                 "ticker": symbol.ticker,
-                                "status": "success",
+                                "status": status,
                                 "rows": 0,
                                 "stored_rows": 0,
                                 "provider_ticker": selected_provider_ticker,
@@ -210,20 +216,25 @@ def sync_market_data(
                     normalizer.normalize_symbol_file(raw_path, normalized_path)
                 sorted_rows = sorted(rows, key=lambda row: str(row.get("date") or ""))
                 last_synced_date = sorted_rows[-1]["date"] if sorted_rows else None
+                is_current = is_as_of_current(last_synced_date, required_as_of_date)
+                status = "success" if is_current else "partial"
+                message = (
+                    f"Wrote {len(rows)} fetched row(s) to Parquet lake via {selected_provider_ticker}"
+                    + (f" and {len(merged_rows)} stored CSV row(s) to {raw_path.name}" if persist_csv else "")
+                )
+                if not is_current:
+                    message += f" Required as-of date is {required_as_of_date}; fetched data is stale."
                 sync_repo.upsert_state(
                     symbol_id=symbol.id,
                     provider=provider_used,
                     last_synced_date=last_synced_date,
-                    status="success",
-                    message=(
-                        f"Wrote {len(rows)} fetched row(s) to Parquet lake via {selected_provider_ticker}"
-                        + (f" and {len(merged_rows)} stored CSV row(s) to {raw_path.name}" if persist_csv else "")
-                    ),
+                    status=status,
+                    message=message,
                 )
                 results.append(
                     {
                         "ticker": symbol.ticker,
-                        "status": "success",
+                        "status": status,
                         "rows": len(rows),
                         "stored_rows": len(merged_rows),
                         "provider_ticker": selected_provider_ticker,
@@ -232,6 +243,7 @@ def sync_market_data(
                         "raw_path": str(raw_path) if persist_csv else None,
                         "normalized_path": str(normalized_path) if persist_csv else None,
                         "persist_csv": persist_csv,
+                        "message": message,
                     }
                 )
             except Exception as exc:

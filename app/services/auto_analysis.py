@@ -270,7 +270,13 @@ class AutoAnalysisService:
             with SessionLocal() as db:
                 DataJobRepository(db).complete_job(job_id, status="success", message=message)
                 self._persist_last_run(db)
-                refresh_workspace_snapshots(db, source_job_id=job_id)
+            try:
+                with SessionLocal() as db:
+                    refresh_workspace_snapshots(db, source_job_id=job_id)
+            except Exception:
+                # Workspace snapshots are presentation cache; do not fail the trading job if
+                # PostgreSQL closes an idle transaction while the heavier analysis is finishing.
+                pass
             return {
                 "status": "success",
                 "job_id": job_id,

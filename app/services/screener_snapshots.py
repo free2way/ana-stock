@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.db import SessionLocal
+from app.models.tables import WorkspaceSnapshot
 from app.services.repository import (
     PredictionRepository,
     SymbolRepository,
@@ -91,18 +93,12 @@ CN_MULTI_MODEL_PRECOMPUTE_PRESETS = [
         "confluence_action_filter": "buy_the_dip",
     },
     {
-        "key": "breakout_confluence",
-        "label": "突破共振",
-        "templates": ["lightgbm_top_picks", "next_tesla_swing", "technical_momentum", "cn_volume_breakout", "cn_bullish_ma_stack"],
-        "min_hits": 2,
-        "confluence_action_filter": "breakout_confirmation",
-    },
-    {
         "key": "trend_momentum_lightgbm",
         "label": "强趋势+动量+LightGBM",
         "templates": ["lightgbm_top_picks", "next_tesla_swing", "technical_momentum"],
         "min_hits": 2,
         "confluence_action_filter": "ALL",
+        "strategy_profile": "quality_confluence_v1",
     },
     {
         "key": "quality_growth_confluence",
@@ -156,6 +152,12 @@ SNAPSHOT_ROW_FIELDS = {
     "snapshot_hits",
     "snapshot_runs",
     "matched_patterns",
+    "matched_model_templates",
+    "matched_model_labels",
+    "matched_action_buckets",
+    "matched_action_bucket_hits",
+    "model_hit_count",
+    "confluence_alignment_count",
     "selection_reason",
     "model_score",
     "model_summary",
@@ -198,6 +200,8 @@ SNAPSHOT_ROW_FIELDS = {
     "setup_bucket",
     "distance_to_52w_high_pct",
     "pullback_depth_pct",
+    "strategy_tier",
+    "strategy_gate_reason",
 }
 
 
@@ -210,14 +214,39 @@ def screener_snapshot_type(params: dict) -> str:
     return f"{SCREENER_SNAPSHOT_TYPE_PREFIX}{digest}"
 
 
-def load_exact_screener_snapshot_rows(params: dict) -> list[dict] | None:
-    with SessionLocal() as db:
+def load_exact_screener_snapshot(params: dict, *, db: Session | None = None) -> dict | None:
+    if db is None:
+        with SessionLocal() as own_db:
+            snapshot = WorkspaceSnapshotRepository(own_db).get_latest_snapshot(screener_snapshot_type(params))
+    else:
         snapshot = WorkspaceSnapshotRepository(db).get_latest_snapshot(screener_snapshot_type(params))
     if not snapshot:
         return None
     payload = snapshot.get("payload") or {}
     if payload.get("key") != screener_snapshot_key(params):
         return None
+    return snapshot
+
+
+def exact_screener_snapshot_exists(params: dict, *, db: Session | None = None) -> bool:
+    snapshot_type = screener_snapshot_type(params)
+    stmt = (
+        select(WorkspaceSnapshot.id)
+        .where(WorkspaceSnapshot.snapshot_type == snapshot_type)
+        .order_by(WorkspaceSnapshot.id.desc())
+        .limit(1)
+    )
+    if db is None:
+        with SessionLocal() as own_db:
+            return own_db.scalar(stmt) is not None
+    return db.scalar(stmt) is not None
+
+
+def load_exact_screener_snapshot_rows(params: dict, *, db: Session | None = None) -> list[dict] | None:
+    snapshot = load_exact_screener_snapshot(params, db=db)
+    if not snapshot:
+        return None
+    payload = snapshot.get("payload") or {}
     rows = payload.get("rows")
     return list(rows) if isinstance(rows, list) else None
 
@@ -272,7 +301,12 @@ def build_base_precompute_params(*, model_template: str, universe: str, market: 
     return _build_default_params(model_template, universe=universe, market=market)
 
 
-def build_precompute_screener_params(*, markets: list[str] | None = None, include_watchlist: bool = True) -> list[dict]:
+def build_precompute_screener_params(
+    *,
+    markets: list[str] | None = None,
+    include_watchlist: bool = True,
+    include_all_market: bool = True,
+) -> list[dict]:
     market_set = {str(item).strip().upper() for item in (markets or ["CN"]) if str(item).strip()}
     if not market_set:
         market_set = {"CN"}
@@ -283,7 +317,7 @@ def build_precompute_screener_params(*, markets: list[str] | None = None, includ
     if "CN" in market_set:
         for template_key in FULL_MARKET_CN_PRECOMPUTE_TEMPLATES:
             params.append(_build_default_params(template_key, universe="full_market", market="CN"))
-    if market_set.intersection({"CN", "US"}):
+    if "ALL" in market_set or (include_all_market and market_set.intersection({"CN", "US"})):
         for template_key in FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES:
             params.append(_build_default_params(template_key, universe="full_market", market="ALL"))
     if "US" in market_set:
@@ -298,6 +332,7 @@ def build_lake_precompute_screener_params(*, markets: list[str] | None = None) -
     for market in sorted(market_set):
         if market == "US":
             params.append(_build_default_params("lightgbm_top_picks", universe="full_market", market=market))
+            params.append(_build_default_params("next_tesla_swing", universe="full_market", market=market))
             params.append(_build_default_params("technical_momentum", universe="full_market", market=market))
             continue
         if market == "CN":
@@ -328,6 +363,7 @@ def build_multi_model_precompute_params(*, markets: list[str] | None = None, pre
                     "multi_model_templates": list(preset["templates"]),
                     "min_multi_model_hits": int(preset["min_hits"]),
                     "confluence_action_filter": str(preset.get("confluence_action_filter") or "ALL"),
+                    **({"strategy_profile": str(preset["strategy_profile"])} if preset.get("strategy_profile") else {}),
                     "lang": "zh",
                     "universe": "full_market",
                     "market": market,
@@ -460,14 +496,17 @@ def _build_multi_screen_rows_from_snapshots(params: dict) -> tuple[list[dict], d
             score = float(row.get("snapshot_score") or row.get("trend_score") or 0.0)
             existing = aggregated.get(ticker)
             if existing is None or score > float(existing.get("_best_score") or 0.0):
+                previous_meta = {
+                    "_template_keys": list((existing or {}).get("_template_keys") or []),
+                    "_template_labels": list((existing or {}).get("_template_labels") or []),
+                    "_action_labels": list((existing or {}).get("_action_labels") or []),
+                    "_confluence_bucket_hits": dict((existing or {}).get("_confluence_bucket_hits") or {}),
+                    "_selection_reasons": list((existing or {}).get("_selection_reasons") or []),
+                    "_execution_tags": list((existing or {}).get("_execution_tags") or []),
+                }
                 base = dict(row)
                 base["_best_score"] = score
-                base["_template_keys"] = []
-                base["_template_labels"] = []
-                base["_action_labels"] = []
-                base["_confluence_bucket_hits"] = {}
-                base["_selection_reasons"] = []
-                base["_execution_tags"] = []
+                base.update(previous_meta)
                 aggregated[ticker] = base
                 existing = base
             if existing.get("model_score") is None and row.get("model_score") is not None:
@@ -569,10 +608,40 @@ def _build_multi_screen_rows_from_snapshots(params: dict) -> tuple[list[dict], d
             ),
             reverse=reverse,
         )
+    results = _apply_strategy_profile(results, profile=str(params.get("strategy_profile") or ""))
     return results[: int(params.get("limit", 500) or 500)], {
         "available_templates": available_templates,
         "missing_templates": missing_templates,
     }
+
+
+def _apply_strategy_profile(rows: list[dict], *, profile: str) -> list[dict]:
+    """Keep only the execution-ready candidates for the validated quality profile."""
+    if profile != "quality_confluence_v1":
+        return rows
+    blocked_tags = {"chase-risk", "weak-market", "weak-breadth", "do-not-chase", "missing-latest-price"}
+    approved: list[dict] = []
+    for row in rows:
+        tags = {str(item).strip().lower() for item in (row.get("risk_flags") or row.get("model_execution_tags") or []) if str(item).strip()}
+        readiness = float(row.get("trade_readiness_score") or 0.0)
+        ready = str(row.get("tradability_status") or "").upper() == "READY"
+        confluence = int(row.get("model_hit_count") or 0) >= 2
+        if ready and confluence and readiness >= 72.0 and not tags.intersection(blocked_tags):
+            row["strategy_tier"] = "A"
+            row["strategy_gate_reason"] = "双模型共振、市场状态与可成交性均通过"
+            approved.append(row)
+        else:
+            row["strategy_tier"] = "WATCH"
+            row["strategy_gate_reason"] = "未通过质量策略硬门槛"
+    approved.sort(
+        key=lambda row: (
+            float(row.get("trade_readiness_score") or 0.0),
+            int(row.get("model_hit_count") or 0),
+            float(row.get("trend_score") or 0.0),
+        ),
+        reverse=True,
+    )
+    return approved
 
 
 def refresh_precomputed_screener_snapshots(
@@ -584,6 +653,7 @@ def refresh_precomputed_screener_snapshots(
     lake_only: bool = False,
     template_keys: list[str] | None = None,
     universes: list[str] | None = None,
+    include_all_market: bool = True,
 ) -> dict:
     created: list[dict] = []
     failed: list[dict] = []
@@ -591,7 +661,11 @@ def refresh_precomputed_screener_snapshots(
     precompute_params = (
         build_lake_precompute_screener_params(markets=markets)
         if lake_only
-        else build_precompute_screener_params(markets=markets, include_watchlist=include_watchlist)
+        else build_precompute_screener_params(
+            markets=markets,
+            include_watchlist=include_watchlist,
+            include_all_market=include_all_market,
+        )
     )
     normalized_templates = {
         str(item).strip()

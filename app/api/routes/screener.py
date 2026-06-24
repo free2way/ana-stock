@@ -12,15 +12,27 @@ from sqlalchemy.orm import Session
 from app.core.db import SessionLocal, get_db_session
 from app.services.auth import is_authenticated, login_redirect
 from app.services.market_intelligence import build_market_sentiment_snapshot
+from app.services.market_context import load_market_context_snapshot
 from app.models.schema import SymbolCreate
 from app.services.market_sync import sync_market_data
 from app.services.repository import AppSettingRepository, SymbolRepository, WatchlistRepository, WorkspaceSnapshotRepository
 from app.services.runtime_cache import get_or_set
 from app.services.ai_daily_report import build_trade_explain_text, format_trade_gate_reason, format_trade_status
 from app.services.model_selection_guidance import load_model_selection_guidance_snapshot, summarize_model_selection_guidance
+from app.services.recommendation_regression import (
+    load_or_build_recommendation_regression,
+    summarize_recommendation_regression,
+)
+from app.services.selection_quality import (
+    load_or_build_selection_quality,
+    save_selection_quality_snapshot,
+)
 from app.services.screener import MODEL_TEMPLATES, ScreenerService
 from app.services.screener_snapshots import (
     build_base_precompute_params,
+    exact_screener_snapshot_exists,
+    load_exact_screener_snapshot,
+    load_exact_screener_snapshot_rows,
     screener_snapshot_key,
     screener_snapshot_type,
 )
@@ -42,6 +54,17 @@ from app.services.template_evaluation import (
     technical_momentum_maturity,
 )
 from app.services.focus_pool import add_to_today_focus_pool, enrich_focus_pool_with_symbols, load_today_focus_pool
+from app.services.kronos_validation import annotate_rows_with_kronos, load_latest_kronos_validation
+from app.services.factor_experiments import (
+    get_factor_strategy,
+    get_factor_experiment_run,
+    list_factor_definitions,
+    list_factor_experiment_runs,
+    list_factor_strategies,
+    refresh_factor_experiment_run,
+    run_factor_experiment,
+    save_factor_strategy,
+)
 from app.services.ui_lang import resolve_request_lang
 from app.services.workspace_nav import WORKSPACE_COMPACT_STYLE, WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
 from app.services.workspace_snapshots import (
@@ -94,6 +117,7 @@ SORT_BY_OPTIONS = [
     ("trend_score", {"en": "Trend Score", "zh": "趋势分"}),
     ("latest_close", {"en": "Latest Close", "zh": "最新价"}),
     ("model_signal_strength", {"en": "Model Signal", "zh": "模型信号"}),
+    ("kronos_score", {"en": "Kronos Score", "zh": "Kronos 分"}),
     ("trade_readiness_score", {"en": "Trade Readiness", "zh": "交易就绪度"}),
     ("watchlist_state", {"en": "Watchlist State", "zh": "自选状态"}),
     ("snapshot_hits", {"en": "Snapshot Hits", "zh": "命中数"}),
@@ -1592,6 +1616,41 @@ def _annotate_lightgbm_results(items: list[dict], *, selected_market: str, lang:
             item["model_highlights"] = [tactical_note] + highlights
 
 
+def _kronos_sort_value(item: dict) -> float:
+    validation = item.get("kronos_validation") if isinstance(item.get("kronos_validation"), dict) else {}
+    try:
+        score = float((validation or {}).get("kronos_score"))
+    except (TypeError, ValueError):
+        score = -1.0
+    decision = str((validation or {}).get("kronos_decision") or "").lower()
+    support_bonus = 1000.0 if ("支持" in decision or "support" in decision) and "不支持" not in decision else 0.0
+    ready_bonus = 100.0 if str((validation or {}).get("kronos_status") or "").upper() == "READY" else 0.0
+    return support_bonus + ready_bonus + score
+
+
+def _kronos_compact_chip(item: dict, lang: str) -> str:
+    validation = item.get("kronos_validation") if isinstance(item.get("kronos_validation"), dict) else {}
+    if not validation:
+        return ""
+    decision = str(validation.get("kronos_decision") or "-")
+    status = str(validation.get("kronos_status") or "").upper()
+    score = validation.get("kronos_score")
+    is_support = ("支持" in decision or "support" in decision.lower()) and "不支持" not in decision
+    is_reject = "不支持" in decision or "avoid" in decision.lower()
+    bg = "#dcfce7" if is_support else "#fee2e2" if is_reject else "#fef9c3"
+    fg = "#166534" if is_support else "#991b1b" if is_reject else "#854d0e"
+    try:
+        score_text = f"{float(score):.1f}"
+    except (TypeError, ValueError):
+        score_text = "-"
+    label = "Kronos" if lang == "zh" else "Kronos"
+    return (
+        f"<span style='display:inline-flex;align-items:center;padding:5px 10px;border-radius:999px;"
+        f"background:{bg};color:{fg};font-weight:900;font-size:12px;'>"
+        f"{label} {html.escape(score_text)} · {html.escape(decision if status == 'READY' else status or decision)}</span>"
+    )
+
+
 def _lightgbm_confluence_fit_score(item: dict, *, confluence_action_filter: str) -> int:
     action_key = str(item.get("lightgbm_tactical_action") or "").strip().lower()
     if not action_key:
@@ -1623,6 +1682,27 @@ def _rerank_with_lightgbm_tactical_signal(results: list[dict], *, confluence_act
             float(row.get("trend_score") or 0.0),
             str(row.get("ticker") or ""),
         ),
+        reverse=True,
+    )
+
+
+def _apply_quality_confluence_profile(results: list[dict], *, profile: str) -> list[dict]:
+    if profile != "quality_confluence_v1":
+        return results
+    blocked_tags = {"chase-risk", "weak-market", "weak-breadth", "do-not-chase", "missing-latest-price"}
+    approved: list[dict] = []
+    for row in results:
+        tags = {str(item).strip().lower() for item in (row.get("risk_flags") or row.get("model_execution_tags") or []) if str(item).strip()}
+        ready = str(row.get("tradability_status") or "").upper() == "READY"
+        confluence = int(row.get("model_hit_count") or 0) >= 2
+        readiness = float(row.get("trade_readiness_score") or 0.0)
+        if ready and confluence and readiness >= 72.0 and not tags.intersection(blocked_tags):
+            row["strategy_tier"] = "A"
+            row["strategy_gate_reason"] = "双模型共振、市场状态与可成交性均通过"
+            approved.append(row)
+    return sorted(
+        approved,
+        key=lambda row: (float(row.get("trade_readiness_score") or 0.0), int(row.get("model_hit_count") or 0)),
         reverse=True,
     )
 
@@ -2021,6 +2101,7 @@ def _detail_panel(item: dict, watchlist_map: dict[str, dict], current_params: di
 def _model_cell(item: dict, lang: str) -> str:
     summary = item.get("model_summary")
     highlights = item.get("model_highlights") or []
+    kronos_validation = item.get("kronos_validation") if isinstance(item.get("kronos_validation"), dict) else {}
     lightgbm_tactical_tag = str(item.get("lightgbm_tactical_tag") or "").strip()
     raw_state = item.get("model_state")
     if isinstance(raw_state, dict):
@@ -2051,7 +2132,7 @@ def _model_cell(item: dict, lang: str) -> str:
     model_hit_count = item.get("model_hit_count")
     confluence_alignment_count = item.get("confluence_alignment_count")
     matched_action_buckets = list(item.get("matched_action_buckets") or [])
-    if not summary and not highlights and not state and not lightgbm_tactical_tag and readiness_score is None:
+    if not summary and not highlights and not state and not lightgbm_tactical_tag and readiness_score is None and not kronos_validation:
         return "-"
     display_summary = summary
     if lightgbm_tactical_tag:
@@ -2123,6 +2204,41 @@ def _model_cell(item: dict, lang: str) -> str:
         if readiness_score is not None
         else ""
     )
+    kronos_html = ""
+    if kronos_validation:
+        kronos_status = str(kronos_validation.get("kronos_status") or "-").upper()
+        kronos_decision = str(kronos_validation.get("kronos_decision") or "-")
+        kronos_reason = str(kronos_validation.get("kronos_reason") or "-")
+        kronos_score = kronos_validation.get("kronos_score")
+        expected_3d = kronos_validation.get("kronos_expected_return_3d_pct")
+        drawdown = kronos_validation.get("kronos_max_drawdown_pct")
+        is_support = ("支持" in kronos_decision or "support" in kronos_decision.lower()) and "不支持" not in kronos_decision
+        is_reject = "不支持" in kronos_decision or "avoid" in kronos_decision.lower()
+        kronos_bg = "#dcfce7" if is_support else "#fee2e2" if is_reject else "#fef9c3"
+        kronos_fg = "#166534" if is_support else "#991b1b" if is_reject else "#854d0e"
+        try:
+            score_text = f"{float(kronos_score):.1f}"
+        except (TypeError, ValueError):
+            score_text = "-"
+        extra_bits = []
+        try:
+            extra_bits.append(f"3D {float(expected_3d):.2f}%")
+        except (TypeError, ValueError):
+            pass
+        try:
+            extra_bits.append(f"DD {float(drawdown):.2f}%")
+        except (TypeError, ValueError):
+            pass
+        kronos_html = (
+            f"<div style='margin-top:6px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;'>"
+            f"<span style='display:inline-flex;align-items:center;gap:5px;padding:4px 8px;border-radius:999px;background:{kronos_bg};color:{kronos_fg};font-size:12px;font-weight:900;'>"
+            f"Kronos {html.escape(score_text)} · {html.escape(kronos_decision)}</span>"
+            f"</div>"
+            f"<div style='margin-top:4px;font-size:12px;color:#6b7280;white-space:normal;'>"
+            f"{html.escape(kronos_status)}"
+            f"{' · ' + html.escape(' · '.join(extra_bits)) if extra_bits else ''}"
+            f" · {html.escape(kronos_reason)}</div>"
+        )
     block_html = ""
     if block_reason or str(tradability_status or "").upper() in {"BLOCKED", "DO_NOT_CHASE"}:
         block_tone_bg = "#fee2e2" if str(tradability_status or "").upper() != "DO_NOT_CHASE" else "#ffedd5"
@@ -2136,6 +2252,7 @@ def _model_cell(item: dict, lang: str) -> str:
         f"<summary style='cursor:pointer;color:#6b7280;font-size:12px;font-weight:700;list-style:none;'>{compact or details_label}</summary>"
         f"<ul style='margin:8px 0 0 18px;padding:0;'>{detail_rows}</ul>"
         f"{signal_html}"
+        f"{kronos_html}"
         f"{readiness_html}"
         f"{block_html}"
         f"{meta_html}"
@@ -2145,6 +2262,8 @@ def _model_cell(item: dict, lang: str) -> str:
         if highlights
         else signal_html + readiness_html + block_html + meta_html + confidence_html
     )
+    if kronos_html and not highlights:
+        detail_block = signal_html + kronos_html + readiness_html + block_html + meta_html + confidence_html
     return (
         f"<div style='min-width:180px;white-space:normal;'>"
         f"<div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap;'>"
@@ -2442,8 +2561,9 @@ def _current_params(
     multi_model_templates: list[str] | None = None,
     min_multi_model_hits: int = 2,
     confluence_action_filter: str = "ALL",
+    strategy_profile: str = "",
 ) -> dict:
-    return {
+    params = {
         "model_template": model_template,
         "multi_model_templates": _normalize_multi_model_templates(multi_model_templates),
         "min_multi_model_hits": min_multi_model_hits,
@@ -2472,6 +2592,9 @@ def _current_params(
         "sort_order": sort_order,
         "lang": lang,
     }
+    if str(strategy_profile).strip() == "quality_confluence_v1":
+        params["strategy_profile"] = "quality_confluence_v1"
+    return params
 
 
 def _normalize_multi_model_templates(values: object) -> list[str]:
@@ -2496,7 +2619,7 @@ def _normalize_screen_params(params: dict) -> dict:
     effective_market = str(template.get("market") or requested_market)
     if effective_market != "ALL":
         requested_market = effective_market
-    return {
+    normalized = {
         "model_template": model_template,
         "multi_model_templates": _normalize_multi_model_templates(params.get("multi_model_templates")),
         "min_multi_model_hits": max(1, int(float(params.get("min_multi_model_hits", 2)))),
@@ -2526,6 +2649,9 @@ def _normalize_screen_params(params: dict) -> dict:
         "sort_order": str(params.get("sort_order", "desc")),
         "limit": 500,
     }
+    if str(params.get("strategy_profile") or "").strip() == "quality_confluence_v1":
+        normalized["strategy_profile"] = "quality_confluence_v1"
+    return normalized
 
 
 def _load_screen_rows_from_snapshot(service: ScreenerService, normalized: dict) -> tuple[list[dict] | None, bool]:
@@ -3086,6 +3212,838 @@ def _add_screen_results_to_watchlist(
     return added, already_in_watchlist, sync_enabled_count
 
 
+def _focus_pool_trade_candidates(results: list[dict]) -> tuple[list[dict], int]:
+    candidates: list[dict] = []
+    skipped = 0
+    for item in results:
+        status = str(item.get("tradability_status") or "").strip().upper()
+        bucket = str(item.get("readiness_bucket") or "").strip().upper()
+        try:
+            readiness = float(item.get("trade_readiness_score") or 0.0)
+        except (TypeError, ValueError):
+            readiness = 0.0
+        hard_blocked = status in {"BLOCKED", "DO_NOT_CHASE"}
+        low_readiness = bucket in {"LOW", "BLOCKED"} or (readiness > 0 and readiness < 60.0)
+        if hard_blocked or low_readiness:
+            skipped += 1
+            continue
+        candidates.append(item)
+    return candidates, skipped
+
+
+def _factor_lab_url(*, lang: str, message: str | None = None, strategy_id: str | None = None) -> str:
+    params = {"lang": lang}
+    if strategy_id:
+        params["strategy_id"] = strategy_id
+    if message:
+        params["message"] = message
+    return f"/screeners/factor-lab?{urlencode(params)}"
+
+
+def _factor_label(factor: dict, lang: str) -> str:
+    return str(factor.get("label_zh" if lang == "zh" else "label_en") or factor.get("key") or "")
+
+
+def _factor_strategy_summary(strategy: dict, lang: str) -> str:
+    filters = strategy.get("filters") or []
+    weights = strategy.get("weights") or {}
+    if lang == "zh":
+        return f"{len(filters)} 个过滤条件 · {len(weights)} 个权重因子"
+    return f"{len(filters)} filters · {len(weights)} weighted factors"
+
+
+@router.get("/factor-lab", response_class=HTMLResponse)
+def factor_lab_page(
+    request: Request,
+    lang: str = Query("en"),
+    strategy_id: str | None = Query(None),
+    message: str | None = Query(None),
+    db: Session = Depends(get_db_session),
+) -> str:
+    if not is_authenticated(request):
+        return login_redirect("/screeners/factor-lab")
+    lang = resolve_request_lang(request)
+    strategies = list_factor_strategies(db)
+    selected_strategy = get_factor_strategy(db, strategy_id) or (strategies[0] if strategies else {})
+    factor_defs = list_factor_definitions()
+    factor_map = {item["key"]: item for item in factor_defs}
+    runs = list_factor_experiment_runs(db, limit=12)
+
+    categories = [
+        ("technical", "技术条件", "Technical"),
+        ("fundamental", "基本面条件", "Fundamental"),
+        ("risk", "风险标签", "Risk"),
+        ("model", "模型信号", "Model"),
+        ("profit_gap", "利润断层", "Profit Gap"),
+    ]
+    factor_cards = []
+    for category_key, title_zh, title_en in categories:
+        items = [item for item in factor_defs if item.get("category") == category_key]
+        if not items:
+            continue
+        rows = "".join(
+            f"""
+            <tr>
+              <td><strong>{html.escape(_factor_label(item, lang))}</strong><div class="muted mini">{html.escape(str(item.get('key') or ''))}</div></td>
+              <td>{html.escape(str(item.get('description_zh') if lang == 'zh' else item.get('description_zh') or ''))}</td>
+              <td>{html.escape(str(item.get('usage_zh') or ''))}</td>
+              <td>{html.escape(str(item.get('risk_zh') or ''))}</td>
+              <td>{html.escape(str(item.get('market_fit_zh') or ''))}</td>
+            </tr>
+            """
+            for item in items
+        )
+        factor_cards.append(
+            f"""
+            <section class="card">
+              <div class="section-head">
+                <div>
+                  <div class="eyebrow">{html.escape(title_zh if lang == 'zh' else title_en)}</div>
+                  <h2>{html.escape(title_zh if lang == 'zh' else title_en)}</h2>
+                </div>
+                <span class="pill">{len(items)} factors</span>
+              </div>
+              <div class="table-wrap compact-table">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>{'因子' if lang == 'zh' else 'Factor'}</th>
+                      <th>{'含义' if lang == 'zh' else 'Meaning'}</th>
+                      <th>{'用途' if lang == 'zh' else 'Usage'}</th>
+                      <th>{'风险' if lang == 'zh' else 'Risk'}</th>
+                      <th>{'适用环境' if lang == 'zh' else 'Best Regime'}</th>
+                    </tr>
+                  </thead>
+                  <tbody>{rows}</tbody>
+                </table>
+              </div>
+            </section>
+            """
+        )
+
+    strategy_options = "".join(
+        f"<option value='{html.escape(str(item.get('id') or ''))}' {'selected' if str(item.get('id') or '') == str(selected_strategy.get('id') or '') else ''}>{html.escape(str(item.get('name') or item.get('id') or ''))}</option>"
+        for item in strategies
+    )
+    selected_filters = selected_strategy.get("filters") or []
+    selected_weights = selected_strategy.get("weights") or {}
+    filter_rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(_factor_label(factor_map.get(str(item.get('factor_key') or ''), {'key': item.get('factor_key')}), lang))}</td>
+          <td>{html.escape(str(item.get('op') or ''))}</td>
+          <td>{html.escape(str(item.get('value') if item.get('value') is not None else f"{item.get('min', '')} - {item.get('max', '')}"))}</td>
+          <td>{'硬条件' if item.get('required', True) and lang == 'zh' else ('Hard' if item.get('required', True) else ('可缺失' if lang == 'zh' else 'Optional'))}</td>
+        </tr>
+        """
+        for item in selected_filters
+    ) or f"<tr><td colspan='4' class='muted'>{'暂无过滤条件' if lang == 'zh' else 'No filters'}</td></tr>"
+    weight_chips = "".join(
+        f"<span class='chip'>{html.escape(_factor_label(factor_map.get(key, {'key': key}), lang))} · {float(value or 0):.0f}</span>"
+        for key, value in sorted(selected_weights.items(), key=lambda pair: -float(pair[1] or 0))[:16]
+    )
+
+    run_rows = []
+    for snapshot in runs:
+        payload = snapshot.get("payload") or {}
+        strategy = payload.get("strategy") or {}
+        metrics = payload.get("metrics") or {}
+        run_rows.append(
+            f"""
+            <tr>
+              <td><strong>{html.escape(str(strategy.get('name') or '-'))}</strong><div class="muted mini">#{snapshot.get('id')} · {html.escape(str(snapshot.get('created_at') or ''))}</div></td>
+              <td>{html.escape(str(payload.get('source_count') or 0))} / {html.escape(str(payload.get('matched_count') or 0))}</td>
+              <td>{_fmt_metric(metrics.get('hit_rate_1d_pct'), suffix='%')}</td>
+              <td>{_fmt_metric(metrics.get('hit_rate_3d_pct'), suffix='%')}</td>
+              <td>{_fmt_metric(metrics.get('hit_rate_5d_pct'), suffix='%')}</td>
+              <td>{_fmt_metric(metrics.get('avg_max_drawdown_5d_pct'), suffix='%')}</td>
+              <td>{_fmt_metric(metrics.get('gap_unbuyable_rate_pct'), suffix='%')}</td>
+              <td><a class="button secondary mini-button" href="/screeners/factor-lab/runs/{snapshot.get('id')}?lang={lang}">{'详情' if lang == 'zh' else 'Detail'}</a></td>
+            </tr>
+            """
+        )
+    runs_table = "".join(run_rows) or f"<tr><td colspan='8' class='muted'>{'还没有实验 run。先点击运行策略。' if lang == 'zh' else 'No runs yet. Run a strategy first.'}</td></tr>"
+
+    source_params = selected_strategy.get("source_params") or {}
+    snapshot_ready = exact_screener_snapshot_exists(source_params, db=db) if source_params else False
+    source_hint = (
+        "已找到预计算快照，可直接运行。"
+        if snapshot_ready and lang == "zh"
+        else "Snapshot ready."
+        if snapshot_ready
+        else "没有找到对应预计算快照，请先等待/触发模型预计算 job。"
+        if lang == "zh"
+        else "No matching precomputed snapshot yet. Run or wait for screener precompute first."
+    )
+    msg_html = f"<div class='notice'>{html.escape(message)}</div>" if message else ""
+    nav_html = render_workspace_nav_html(lang=lang, active_key="screeners")
+    return f"""
+    <!doctype html>
+    <html lang="{lang}">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title>{'因子实验室' if lang == 'zh' else 'Factor Lab'}</title>
+      <style>
+        {WORKSPACE_SIDEBAR_STYLE}
+        {WORKSPACE_COMPACT_STYLE}
+        :root {{ --bg:#07111b; --panel:#0d1824; --panel2:#111f2d; --line:#213447; --ink:#edf5f2; --muted:#8da1ad; --accent:#35e0b4; --warn:#f8c95d; --bad:#fb7185; }}
+        body {{ margin:0; background:radial-gradient(circle at 20% 0%, rgba(53,224,180,.14), transparent 28%), linear-gradient(135deg,#07111b,#0a1724 58%,#07111b); color:var(--ink); font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+        .workspace-shell {{ gap:12px; }}
+        .workspace-main {{ max-width:1480px; }}
+        .hero {{ display:grid; gap:16px; grid-template-columns:minmax(0,1.5fr) minmax(320px,.8fr); align-items:stretch; margin-bottom:14px; }}
+        .card {{ background:linear-gradient(180deg, rgba(17,31,45,.96), rgba(10,20,31,.96)); border:1px solid var(--line); border-radius:22px; padding:18px; box-shadow:0 18px 40px rgba(0,0,0,.22); }}
+        .section-head {{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; }}
+        .eyebrow {{ color:var(--accent); font-size:12px; font-weight:900; letter-spacing:.12em; text-transform:uppercase; }}
+        h1,h2,h3 {{ margin:0; }}
+        h1 {{ font-size:34px; letter-spacing:-.04em; }}
+        h2 {{ font-size:20px; letter-spacing:-.02em; }}
+        p {{ color:var(--muted); line-height:1.6; margin:8px 0 0; }}
+        .grid {{ display:grid; gap:14px; grid-template-columns:repeat(2, minmax(0, 1fr)); }}
+        .muted {{ color:var(--muted); }}
+        .mini {{ font-size:12px; margin-top:4px; }}
+        .mini-button {{ padding:6px 9px; font-size:12px; white-space:nowrap; }}
+        .pill,.chip {{ display:inline-flex; align-items:center; gap:6px; border-radius:999px; padding:6px 10px; background:rgba(53,224,180,.10); color:var(--accent); font-weight:800; font-size:12px; border:1px solid rgba(53,224,180,.20); }}
+        .chip {{ margin:4px 6px 4px 0; color:#dffdf5; background:rgba(255,255,255,.06); border-color:rgba(255,255,255,.09); }}
+        .toolbar {{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:14px; }}
+        a.button, button {{ border:0; border-radius:14px; padding:11px 14px; background:var(--accent); color:#04231b; font-weight:900; text-decoration:none; cursor:pointer; }}
+        a.secondary, button.secondary {{ background:#18293a; color:var(--ink); border:1px solid var(--line); }}
+        select,input {{ width:100%; box-sizing:border-box; border:1px solid var(--line); background:#081522; color:var(--ink); border-radius:12px; padding:10px 12px; }}
+        label {{ display:block; color:var(--muted); font-size:12px; font-weight:800; margin-bottom:6px; }}
+        .form-grid {{ display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; }}
+        table {{ width:100%; border-collapse:collapse; min-width:920px; }}
+        th,td {{ text-align:left; padding:10px 9px; border-bottom:1px solid var(--line); vertical-align:top; }}
+        th {{ color:var(--muted); font-size:12px; white-space:nowrap; }}
+        td {{ font-size:13px; }}
+        .table-wrap {{ overflow:auto; border:1px solid var(--line); border-radius:16px; background:rgba(8,18,29,.62); }}
+        .compact-table table {{ min-width:1050px; }}
+        .notice {{ border:1px solid rgba(53,224,180,.25); background:rgba(53,224,180,.08); color:#c9fff2; border-radius:16px; padding:12px 14px; margin-bottom:14px; }}
+        .status-ready {{ color:var(--accent); font-weight:900; }}
+        .status-wait {{ color:var(--warn); font-weight:900; }}
+        @media (max-width: 980px) {{ .hero,.grid,.form-grid {{ grid-template-columns:1fr; }} .workspace-shell {{ display:block; }} }}
+      </style>
+    </head>
+    <body>
+      <div class="workspace-shell">
+        <nav class="side-nav">{nav_html}</nav>
+        <main class="workspace-main">
+          {msg_html}
+          <section class="hero">
+            <div class="card">
+              <div class="eyebrow">{'Profit-Oriented Factor Experiments' if lang != 'zh' else '盈利导向因子实验'}</div>
+              <h1>{'因子实验室' if lang == 'zh' else 'Factor Lab'}</h1>
+              <p>{'这里不是替换现有模型，而是在模型结果上增加一层可解释、可回测、可保存的因子配置。你可以把技术条件、基本面、风险标签、LightGBM、多模型命中、Kronos 和利润断层条件组合成自己的选股策略。' if lang == 'zh' else 'This layer does not replace the existing models. It adds explainable, backtestable, saved factor strategies on top of model results.'}</p>
+              <div class="toolbar">
+                <a class="button secondary" href="/screeners?lang={lang}">{'返回模型选股' if lang == 'zh' else 'Back to Screeners'}</a>
+                <a class="button secondary" href="/dashboard/model-performance?lang={lang}">{'模型评测总览' if lang == 'zh' else 'Model Evaluation'}</a>
+              </div>
+            </div>
+            <div class="card">
+              <div class="eyebrow">{'当前策略' if lang == 'zh' else 'Current Strategy'}</div>
+              <h2>{html.escape(str(selected_strategy.get('name') or '-'))}</h2>
+              <p>{html.escape(str(selected_strategy.get('description') or ''))}</p>
+              <p class="{'status-ready' if snapshot_ready else 'status-wait'}">{html.escape(source_hint)}</p>
+              <div class="toolbar">
+                <form method="post" action="/screeners/factor-lab/run">
+                  <input type="hidden" name="lang" value="{lang}" />
+                  <input type="hidden" name="strategy_id" value="{html.escape(str(selected_strategy.get('id') or ''))}" />
+                  <button type="submit">{'运行策略实验' if lang == 'zh' else 'Run Experiment'}</button>
+                </form>
+              </div>
+            </div>
+          </section>
+
+          <section class="grid">
+            <div class="card">
+              <div class="section-head">
+                <div>
+                  <div class="eyebrow">{'策略项目' if lang == 'zh' else 'Strategy Project'}</div>
+                  <h2>{'保存过滤 + 权重' if lang == 'zh' else 'Save Filters + Weights'}</h2>
+                </div>
+              </div>
+              <form method="post" action="/screeners/factor-lab/save">
+                <input type="hidden" name="lang" value="{lang}" />
+                <div class="form-grid">
+                  <div>
+                    <label>{'基于模板' if lang == 'zh' else 'Base strategy'}</label>
+                    <select name="base_strategy_id">{strategy_options}</select>
+                  </div>
+                  <div>
+                    <label>{'新策略名称' if lang == 'zh' else 'New strategy name'}</label>
+                    <input name="name" value="{html.escape(str(selected_strategy.get('name') or ''))}" />
+                  </div>
+                  <div>
+                    <label>{'最低交易就绪度' if lang == 'zh' else 'Min readiness'}</label>
+                    <input name="min_readiness" type="number" step="1" value="58" />
+                  </div>
+                  <div>
+                    <label>{'最低趋势分' if lang == 'zh' else 'Min trend score'}</label>
+                    <input name="min_trend" type="number" step="1" value="58" />
+                  </div>
+                  <div>
+                    <label>{'最低利润同比' if lang == 'zh' else 'Min profit YoY'}</label>
+                    <input name="min_profit_yoy" type="number" step="1" value="15" />
+                  </div>
+                  <div>
+                    <label>{'交易就绪度权重' if lang == 'zh' else 'Readiness weight'}</label>
+                    <input name="readiness_weight" type="number" step="1" value="22" />
+                  </div>
+                </div>
+                <div class="toolbar"><button type="submit">{'保存为我的策略' if lang == 'zh' else 'Save Strategy'}</button></div>
+              </form>
+            </div>
+            <div class="card">
+              <div class="section-head">
+                <div>
+                  <div class="eyebrow">{'已选策略结构' if lang == 'zh' else 'Selected Strategy'}</div>
+                  <h2>{html.escape(_factor_strategy_summary(selected_strategy, lang))}</h2>
+                </div>
+              </div>
+              <div>{weight_chips or f"<span class='muted'>{'暂无权重' if lang == 'zh' else 'No weights'}</span>"}</div>
+              <div class="table-wrap" style="margin-top:12px;">
+                <table>
+                  <thead><tr><th>{'因子' if lang == 'zh' else 'Factor'}</th><th>Op</th><th>{'阈值' if lang == 'zh' else 'Value'}</th><th>{'类型' if lang == 'zh' else 'Type'}</th></tr></thead>
+                  <tbody>{filter_rows}</tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <section class="card" style="margin-top:14px;">
+            <div class="section-head">
+              <div>
+                <div class="eyebrow">{'实验 Run 历史' if lang == 'zh' else 'Experiment Runs'}</div>
+                <h2>{'自动统计 1D/3D/5D 命中率、回撤和高开买不到' if lang == 'zh' else 'Tracks 1D/3D/5D hit rate, drawdown, and gap-unbuyable rate'}</h2>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>{'策略' if lang == 'zh' else 'Strategy'}</th><th>{'源样本/命中' if lang == 'zh' else 'Source/Matched'}</th><th>1D Hit</th><th>3D Hit</th><th>5D Hit</th><th>5D DD</th><th>{'高开买不到' if lang == 'zh' else 'Gap blocked'}</th><th>{'操作' if lang == 'zh' else 'Actions'}</th></tr>
+                </thead>
+                <tbody>{runs_table}</tbody>
+              </table>
+            </div>
+          </section>
+          {''.join(factor_cards)}
+        </main>
+      </div>
+    </body>
+    </html>
+    """
+
+
+def _fmt_metric(value: object, *, suffix: str = "") -> str:
+    if value in (None, ""):
+        return "<span class='muted'>-</span>"
+    try:
+        return f"{float(value):.2f}{suffix}"
+    except (TypeError, ValueError):
+        return html.escape(str(value))
+
+
+@router.get("/selection-quality", response_class=HTMLResponse)
+def selection_quality_page(
+    request: Request,
+    lang: str = Query("en"),
+    db: Session = Depends(get_db_session),
+) -> str:
+    if not is_authenticated(request):
+        return login_redirect("/screeners/selection-quality")
+    lang = resolve_request_lang(request)
+    try:
+        payload = load_or_build_selection_quality(db=db)
+    except Exception as exc:
+        payload = {
+            "sample_count": 0,
+            "summary": {"all": {}, "by_source": []},
+            "guidance": {
+                "headline_zh": f"命中率闭环暂时不可用：{exc}",
+                "headline_en": f"Selection quality is temporarily unavailable: {exc}",
+                "rules_zh": [],
+            },
+            "recent_records": [],
+        }
+    summary = payload.get("summary") or {}
+    all_metrics = summary.get("all") or {}
+    by_source = summary.get("by_source") or []
+    guidance = payload.get("guidance") or {}
+    recent_records = payload.get("recent_records") or []
+    source_counts = payload.get("source_counts") or {}
+    meta = payload.get("snapshot_meta") or {}
+
+    source_rows = "".join(
+        f"""
+        <tr>
+          <td><strong>{html.escape(str(item.get('source_name') or '-'))}</strong><div class="muted mini">{html.escape(str(item.get('source_type') or '-'))}</div></td>
+          <td>{html.escape(str((item.get('metrics') or {}).get('available_1d') or 0))} / {html.escape(str((item.get('metrics') or {}).get('count') or 0))}</td>
+          <td>{_fmt_metric((item.get('metrics') or {}).get('hit_rate_1d_pct'), suffix='%')}</td>
+          <td>{_fmt_metric((item.get('metrics') or {}).get('execution_hit_rate_pct'), suffix='%')}</td>
+          <td>{_fmt_metric((item.get('metrics') or {}).get('avg_return_1d_pct'), suffix='%')}</td>
+          <td>{_fmt_metric((item.get('metrics') or {}).get('avg_open_to_high_pct'), suffix='%')}</td>
+          <td>{_fmt_metric((item.get('metrics') or {}).get('avg_open_to_low_pct'), suffix='%')}</td>
+          <td>{_fmt_metric((item.get('metrics') or {}).get('gap_blocked_rate_pct'), suffix='%')}</td>
+        </tr>
+        """
+        for item in by_source[:24]
+    ) or f"<tr><td colspan='8' class='muted'>{'还没有可评估样本。' if lang == 'zh' else 'No evaluable samples yet.'}</td></tr>"
+
+    record_rows = []
+    for record in recent_records[:60]:
+        ticker = html.escape(str(record.get("ticker") or "-"))
+        name = html.escape(str(record.get("name") or ""))
+        risk_flags = "".join(
+            f"<span class='risk-chip'>{html.escape(str(flag))}</span>"
+            for flag in list(record.get("risk_flags") or [])[:3]
+        )
+        link = f"/insights/{ticker}?lang={lang}" if ticker != "-" else "#"
+        record_rows.append(
+            f"""
+            <tr>
+              <td><strong><a href="{link}">{ticker}</a></strong><div class="muted mini">{name}</div></td>
+              <td>{html.escape(str(record.get('market') or '-'))}</td>
+              <td>{html.escape(str(record.get('signal_date') or '-'))}<div class="muted mini">{html.escape(str(record.get('next_date') or 'pending'))}</div></td>
+              <td>{html.escape(str(record.get('source_name') or '-'))}<div class="muted mini">{html.escape(str(record.get('source_type') or '-'))}</div></td>
+              <td>{_fmt_metric(record.get('score'))}</td>
+              <td>{_fmt_metric(record.get('return_1d_pct'), suffix='%')}</td>
+              <td>{_fmt_metric(record.get('open_to_high_pct'), suffix='%')}</td>
+              <td>{_fmt_metric(record.get('open_to_low_pct'), suffix='%')}</td>
+              <td>{risk_flags or '<span class="muted">-</span>'}</td>
+            </tr>
+            """
+        )
+    records_table = "".join(record_rows) or f"<tr><td colspan='9' class='muted'>{'暂无最近样本。' if lang == 'zh' else 'No recent samples.'}</td></tr>"
+    rules_html = "".join(
+        f"<li>{html.escape(str(rule))}</li>"
+        for rule in list(guidance.get("rules_zh") or [])[:5]
+    )
+    nav_html = render_workspace_nav_html(lang=lang, active_key="screeners")
+    return f"""
+    <!doctype html>
+    <html lang="{lang}">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title>{'命中率闭环' if lang == 'zh' else 'Selection Quality'}</title>
+      <style>
+        {WORKSPACE_SIDEBAR_STYLE}
+        {WORKSPACE_COMPACT_STYLE}
+        :root {{ --bg:#07111b; --panel:#0d1824; --panel2:#111f2d; --line:#213447; --ink:#edf5f2; --muted:#8da1ad; --accent:#35e0b4; --warn:#f8c95d; --bad:#fb7185; }}
+        body {{ margin:0; background:radial-gradient(circle at 18% 0%, rgba(53,224,180,.13), transparent 28%), linear-gradient(135deg,#07111b,#0a1724 58%,#07111b); color:var(--ink); font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+        .workspace-shell {{ gap:12px; }}
+        .workspace-main {{ max-width:1480px; }}
+        .hero {{ display:grid; gap:14px; grid-template-columns:minmax(0,1.35fr) minmax(320px,.75fr); margin-bottom:14px; }}
+        .card {{ background:linear-gradient(180deg, rgba(17,31,45,.96), rgba(10,20,31,.96)); border:1px solid var(--line); border-radius:22px; padding:18px; box-shadow:0 18px 40px rgba(0,0,0,.22); }}
+        .section-head {{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; }}
+        .eyebrow {{ color:var(--accent); font-size:12px; font-weight:900; letter-spacing:.12em; text-transform:uppercase; }}
+        h1,h2 {{ margin:0; letter-spacing:-.03em; }}
+        h1 {{ font-size:34px; }}
+        h2 {{ font-size:20px; }}
+        p,li {{ color:var(--muted); line-height:1.58; }}
+        .metric-grid {{ display:grid; gap:10px; grid-template-columns:repeat(4,minmax(0,1fr)); margin-top:14px; }}
+        .metric {{ border:1px solid var(--line); border-radius:16px; padding:12px; background:rgba(255,255,255,.04); }}
+        .metric b {{ display:block; font-size:22px; color:var(--ink); }}
+        .metric span,.muted {{ color:var(--muted); }}
+        .mini {{ font-size:12px; margin-top:4px; }}
+        .toolbar {{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:14px; }}
+        a.button, button {{ border:0; border-radius:14px; padding:11px 14px; background:var(--accent); color:#04231b; font-weight:900; text-decoration:none; cursor:pointer; }}
+        a.secondary, button.secondary {{ background:#18293a; color:var(--ink); border:1px solid var(--line); }}
+        table {{ width:100%; border-collapse:collapse; min-width:980px; }}
+        th,td {{ text-align:left; padding:10px 9px; border-bottom:1px solid var(--line); vertical-align:top; font-size:13px; }}
+        th {{ color:var(--muted); font-size:12px; white-space:nowrap; }}
+        .table-wrap {{ overflow:auto; border:1px solid var(--line); border-radius:16px; background:rgba(8,18,29,.62); }}
+        .risk-chip {{ display:inline-flex; margin:2px 4px 2px 0; border-radius:999px; padding:4px 8px; background:rgba(248,201,93,.12); color:#ffe4a3; border:1px solid rgba(248,201,93,.24); font-size:12px; font-weight:800; }}
+        a {{ color:#a7f3df; text-decoration:none; }}
+        @media (max-width: 980px) {{ .hero,.metric-grid {{ grid-template-columns:1fr; }} .workspace-shell {{ display:block; }} }}
+      </style>
+    </head>
+    <body>
+      <div class="workspace-shell">
+        <nav class="side-nav">{nav_html}</nav>
+        <main class="workspace-main">
+          <section class="hero">
+            <div class="card">
+              <div class="eyebrow">{'Selection Quality Loop' if lang != 'zh' else '选股质量闭环'}</div>
+              <h1>{'命中率闭环' if lang == 'zh' else 'Selection Quality'}</h1>
+              <p>{html.escape(str(guidance.get('headline_zh' if lang == 'zh' else 'headline_en') or ''))}</p>
+              <div class="metric-grid">
+                <div class="metric"><span>{'总样本' if lang == 'zh' else 'Samples'}</span><b>{html.escape(str(payload.get('sample_count') or 0))}</b></div>
+                <div class="metric"><span>1D Hit</span><b>{_fmt_metric(all_metrics.get('hit_rate_1d_pct'), suffix='%')}</b></div>
+                <div class="metric"><span>{'执行命中' if lang == 'zh' else 'Execution Hit'}</span><b>{_fmt_metric(all_metrics.get('execution_hit_rate_pct'), suffix='%')}</b></div>
+                <div class="metric"><span>{'平均1D' if lang == 'zh' else 'Avg 1D'}</span><b>{_fmt_metric(all_metrics.get('avg_return_1d_pct'), suffix='%')}</b></div>
+              </div>
+              <div class="toolbar">
+                <a class="button secondary" href="/screeners?lang={lang}">{'返回模型选股' if lang == 'zh' else 'Back to Screeners'}</a>
+                <a class="button secondary" href="/screeners/factor-lab?lang={lang}">{'因子实验室' if lang == 'zh' else 'Factor Lab'}</a>
+                <form method="post" action="/screeners/selection-quality/refresh">
+                  <input type="hidden" name="lang" value="{lang}" />
+                  <button type="submit">{'刷新质量快照' if lang == 'zh' else 'Refresh Snapshot'}</button>
+                </form>
+              </div>
+            </div>
+            <div class="card">
+              <div class="eyebrow">{'使用建议' if lang == 'zh' else 'Playbook'}</div>
+              <h2>{'今天怎么用' if lang == 'zh' else 'How to use today'}</h2>
+              <ul>{rules_html or '<li>继续累计样本，优先使用多模型共振候选。</li>'}</ul>
+              <p class="mini">{'来源' if lang == 'zh' else 'Source'}: {html.escape(str(meta.get('source') or 'live'))} · AI {html.escape(str(source_counts.get('ai_daily_report') or 0))} · Factor {html.escape(str(source_counts.get('factor_experiment') or 0))}</p>
+            </div>
+          </section>
+          <section class="card">
+            <div class="section-head">
+              <div>
+                <div class="eyebrow">{'按来源评估' if lang == 'zh' else 'By Source'}</div>
+                <h2>{'谁真的有兑现率' if lang == 'zh' else 'What is really converting'}</h2>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>{'来源' if lang == 'zh' else 'Source'}</th><th>{'有效/总数' if lang == 'zh' else 'Available/Total'}</th><th>1D Hit</th><th>{'执行命中' if lang == 'zh' else 'Execution'}</th><th>{'平均1D' if lang == 'zh' else 'Avg 1D'}</th><th>{'开盘冲高' if lang == 'zh' else 'Open-High'}</th><th>{'开盘回撤' if lang == 'zh' else 'Open-Low'}</th><th>{'高开拦截' if lang == 'zh' else 'Gap Block'}</th></tr>
+                </thead>
+                <tbody>{source_rows}</tbody>
+              </table>
+            </div>
+          </section>
+          <section class="card" style="margin-top:14px;">
+            <div class="section-head">
+              <div>
+                <div class="eyebrow">{'最近样本' if lang == 'zh' else 'Recent Samples'}</div>
+                <h2>{'逐票验证记录' if lang == 'zh' else 'Per-name validation records'}</h2>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>{'股票' if lang == 'zh' else 'Ticker'}</th><th>{'市场' if lang == 'zh' else 'Market'}</th><th>{'信号/验证日' if lang == 'zh' else 'Signal/Next'}</th><th>{'来源' if lang == 'zh' else 'Source'}</th><th>{'分数' if lang == 'zh' else 'Score'}</th><th>1D</th><th>{'冲高' if lang == 'zh' else 'High'}</th><th>{'回撤' if lang == 'zh' else 'Low'}</th><th>{'风险' if lang == 'zh' else 'Risk'}</th></tr>
+                </thead>
+                <tbody>{records_table}</tbody>
+              </table>
+            </div>
+          </section>
+        </main>
+      </div>
+    </body>
+    </html>
+    """
+
+
+@router.post("/selection-quality/refresh")
+def refresh_selection_quality_snapshot(
+    request: Request,
+    lang: str = Form("en"),
+    db: Session = Depends(get_db_session),
+) -> RedirectResponse:
+    if not is_authenticated(request):
+        return login_redirect("/screeners/selection-quality")
+    lang = resolve_request_lang(request)
+    save_selection_quality_snapshot(db=db)
+    return RedirectResponse(f"/screeners/selection-quality?lang={lang}", status_code=303)
+
+
+@router.post("/factor-lab/run")
+def run_factor_lab_strategy(
+    request: Request,
+    lang: str = Form("en"),
+    strategy_id: str = Form(...),
+    db: Session = Depends(get_db_session),
+) -> RedirectResponse:
+    if not is_authenticated(request):
+        return login_redirect("/screeners/factor-lab")
+    lang = resolve_request_lang(request)
+    strategy = get_factor_strategy(db, strategy_id)
+    if not strategy:
+        return RedirectResponse(_factor_lab_url(lang=lang, message="策略不存在。"), status_code=303)
+    source_params = strategy.get("source_params") or {}
+    source_snapshot = load_exact_screener_snapshot(source_params, db=db)
+    if source_snapshot is None:
+        message = "没有找到对应的预计算快照，请先让 screener_precompute job 跑完。" if lang == "zh" else "No matching precomputed snapshot. Please run screener_precompute first."
+        return RedirectResponse(_factor_lab_url(lang=lang, message=message, strategy_id=strategy_id), status_code=303)
+    source_payload = source_snapshot.get("payload") or {}
+    rows = [dict(row) for row in (source_payload.get("rows") or []) if isinstance(row, dict)]
+    source_signal_date = str(source_snapshot.get("snapshot_date") or "")[:10]
+    if source_signal_date:
+        for row in rows:
+            row.setdefault("factor_signal_trade_date", source_signal_date)
+    try:
+        result = run_factor_experiment(
+            db,
+            strategy_id=strategy_id,
+            source_rows=rows,
+            source_params=source_params,
+            limit=80,
+        )
+        payload = result.get("payload") or {}
+        metrics = payload.get("metrics") or {}
+        message = (
+            f"实验完成：源样本 {payload.get('source_count', 0)}，命中 {payload.get('matched_count', 0)}，1D 命中率 {_fmt_plain_metric(metrics.get('hit_rate_1d_pct'))}。"
+            if lang == "zh"
+            else f"Run complete: source {payload.get('source_count', 0)}, matched {payload.get('matched_count', 0)}, 1D hit {_fmt_plain_metric(metrics.get('hit_rate_1d_pct'))}."
+        )
+    except Exception as exc:
+        message = f"实验运行失败：{exc}" if lang == "zh" else f"Experiment failed: {exc}"
+    return RedirectResponse(_factor_lab_url(lang=lang, message=message, strategy_id=strategy_id), status_code=303)
+
+
+def _fmt_plain_metric(value: object) -> str:
+    if value in (None, ""):
+        return "-"
+    try:
+        return f"{float(value):.1f}%"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+@router.get("/factor-lab/runs/{snapshot_id}", response_class=HTMLResponse)
+def factor_lab_run_detail_page(
+    snapshot_id: int,
+    request: Request,
+    lang: str = Query("en"),
+    db: Session = Depends(get_db_session),
+) -> str:
+    if not is_authenticated(request):
+        return login_redirect(f"/screeners/factor-lab/runs/{snapshot_id}")
+    lang = resolve_request_lang(request)
+    snapshot = get_factor_experiment_run(db, snapshot_id)
+    if snapshot is None:
+        return HTMLResponse(
+            f"<h1>{'实验 run 不存在' if lang == 'zh' else 'Run not found'}</h1>",
+            status_code=404,
+        )
+    payload = snapshot.get("payload") or {}
+    strategy = payload.get("strategy") or {}
+    metrics = payload.get("metrics") or {}
+    rows = [row for row in payload.get("rows") or [] if isinstance(row, dict)]
+    factor_defs = {item["key"]: item for item in list_factor_definitions()}
+
+    def _factor_bits(row: dict) -> str:
+        scores = row.get("factor_scores") if isinstance(row.get("factor_scores"), dict) else {}
+        values = row.get("factor_values") if isinstance(row.get("factor_values"), dict) else {}
+        bits: list[str] = []
+        for key, score in sorted(scores.items(), key=lambda pair: -float(pair[1] or -1))[:4]:
+            label = _factor_label(factor_defs.get(key, {"key": key}), lang)
+            value = values.get(key)
+            rendered_value = "-" if value in (None, "") else str(value)
+            bits.append(
+                f"<span class='chip'>{html.escape(label)} {_fmt_metric(score)} · {html.escape(rendered_value[:22])}</span>"
+            )
+        return "".join(bits) or "<span class='muted'>-</span>"
+
+    def _outcome_cell(outcome: dict, key: str) -> str:
+        value = outcome.get(key) if isinstance(outcome, dict) else None
+        if value in (None, ""):
+            return "<span class='muted'>待行情</span>" if lang == "zh" else "<span class='muted'>pending</span>"
+        try:
+            numeric = float(value)
+            cls = "pos" if numeric > 0 else "neg" if numeric < 0 else "flat"
+            return f"<span class='{cls}'>{numeric:.2f}%</span>"
+        except (TypeError, ValueError):
+            return html.escape(str(value))
+
+    row_html = "".join(
+        f"""
+        <tr>
+          <td class="sticky-col"><a class="ticker-link" href="/insights/{html.escape(str(row.get('ticker') or ''), quote=True)}?lang={lang}">{html.escape(str(row.get('ticker') or '-'))}</a><div class="muted mini">{html.escape(str(row.get('name') or '-'))}</div></td>
+          <td>{html.escape(str(row.get('market') or '-'))}</td>
+          <td><strong>{_fmt_metric(row.get('factor_score'))}</strong><div class="muted mini">Trend {_fmt_plain_number(row.get('trend_score'))}</div></td>
+          <td>{_factor_bits(row)}</td>
+          <td>{html.escape(str((row.get('forward_outcome') or {}).get('trade_date') or row.get('factor_signal_trade_date') or '-'))}</td>
+          <td>{_outcome_cell(row.get('forward_outcome') or {}, 'next_open_gap_pct')}</td>
+          <td>{_outcome_cell(row.get('forward_outcome') or {}, 'return_1d_pct')}</td>
+          <td>{_outcome_cell(row.get('forward_outcome') or {}, 'return_3d_pct')}</td>
+          <td>{_outcome_cell(row.get('forward_outcome') or {}, 'return_5d_pct')}</td>
+          <td>{_outcome_cell(row.get('forward_outcome') or {}, 'max_drawdown_5d_pct')}</td>
+          <td>{'是' if (row.get('forward_outcome') or {}).get('gap_unbuyable') and lang == 'zh' else ('Yes' if (row.get('forward_outcome') or {}).get('gap_unbuyable') else ('否' if lang == 'zh' else 'No'))}</td>
+        </tr>
+        """
+        for row in rows
+    ) or f"<tr><td colspan='11' class='muted'>{'这个 run 没有候选明细。' if lang == 'zh' else 'This run has no row details.'}</td></tr>"
+
+    nav_html = render_workspace_nav_html(lang=lang, active_key="screeners")
+    refreshed_from = payload.get("refreshed_from_snapshot_id")
+    refreshed_note = (
+        f"<span class='pill'>{'刷新自' if lang == 'zh' else 'Refreshed from'} #{html.escape(str(refreshed_from))}</span>"
+        if refreshed_from
+        else ""
+    )
+    return f"""
+    <!doctype html>
+    <html lang="{lang}">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title>{'因子实验详情' if lang == 'zh' else 'Factor Run Detail'}</title>
+      <style>
+        {WORKSPACE_SIDEBAR_STYLE}
+        {WORKSPACE_COMPACT_STYLE}
+        :root {{ --bg:#07111b; --panel:#0d1824; --line:#213447; --ink:#edf5f2; --muted:#8da1ad; --accent:#35e0b4; --warn:#f8c95d; --bad:#fb7185; --good:#6ee7b7; }}
+        body {{ margin:0; color:var(--ink); background:radial-gradient(circle at 16% 0%, rgba(53,224,180,.13), transparent 30%), #07111b; font-family:ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+        .workspace-shell {{ gap:12px; }}
+        .workspace-main {{ max-width:1500px; }}
+        .card {{ background:linear-gradient(180deg, rgba(17,31,45,.96), rgba(10,20,31,.96)); border:1px solid var(--line); border-radius:22px; padding:18px; box-shadow:0 18px 40px rgba(0,0,0,.22); margin-bottom:14px; }}
+        .section-head {{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; }}
+        .eyebrow {{ color:var(--accent); font-size:12px; font-weight:900; letter-spacing:.12em; text-transform:uppercase; }}
+        h1,h2 {{ margin:0; }}
+        h1 {{ font-size:32px; letter-spacing:-.04em; }}
+        p {{ color:var(--muted); line-height:1.6; margin:8px 0 0; }}
+        .toolbar {{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:14px; }}
+        a.button, button {{ border:0; border-radius:14px; padding:10px 13px; background:var(--accent); color:#04231b; font-weight:900; text-decoration:none; cursor:pointer; }}
+        a.secondary, button.secondary {{ background:#18293a; color:var(--ink); border:1px solid var(--line); }}
+        .metric-grid {{ display:grid; gap:10px; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); margin-top:14px; }}
+        .metric {{ border:1px solid rgba(255,255,255,.07); background:rgba(8,18,29,.62); border-radius:16px; padding:12px; }}
+        .metric span {{ color:var(--muted); font-size:12px; }}
+        .metric strong {{ display:block; font-size:22px; margin-top:5px; }}
+        .muted {{ color:var(--muted); }}
+        .mini {{ font-size:12px; margin-top:4px; }}
+        .pill,.chip {{ display:inline-flex; align-items:center; gap:6px; border-radius:999px; padding:6px 10px; background:rgba(53,224,180,.10); color:var(--accent); font-weight:800; font-size:12px; border:1px solid rgba(53,224,180,.20); margin:3px 4px 3px 0; }}
+        .chip {{ color:#dffdf5; background:rgba(255,255,255,.06); border-color:rgba(255,255,255,.09); }}
+        .table-wrap {{ overflow:auto; border:1px solid var(--line); border-radius:16px; background:rgba(8,18,29,.62); }}
+        table {{ width:100%; border-collapse:collapse; min-width:1260px; }}
+        th,td {{ text-align:left; padding:10px 9px; border-bottom:1px solid var(--line); vertical-align:top; font-size:13px; }}
+        th {{ color:var(--muted); font-size:12px; white-space:nowrap; }}
+        .sticky-col {{ position:sticky; left:0; z-index:2; background:#0d1824; min-width:150px; box-shadow:10px 0 16px rgba(0,0,0,.12); }}
+        th.sticky-col {{ z-index:4; }}
+        .ticker-link {{ color:var(--accent); font-weight:900; text-decoration:none; }}
+        .pos {{ color:var(--good); font-weight:900; }}
+        .neg {{ color:var(--bad); font-weight:900; }}
+        .flat {{ color:var(--muted); font-weight:900; }}
+      </style>
+    </head>
+    <body>
+      <div class="workspace-shell">
+        <nav class="side-nav">{nav_html}</nav>
+        <main class="workspace-main">
+          <section class="card">
+            <div class="section-head">
+              <div>
+                <div class="eyebrow">{'因子实验 Run' if lang == 'zh' else 'Factor Experiment Run'}</div>
+                <h1>{html.escape(str(strategy.get('name') or '-'))}</h1>
+                <p>{html.escape(str(strategy.get('description') or ''))}</p>
+                <div class="toolbar">
+                  <a class="button secondary" href="/screeners/factor-lab?lang={lang}&strategy_id={html.escape(str(strategy.get('id') or ''), quote=True)}">{'返回因子实验室' if lang == 'zh' else 'Back to Factor Lab'}</a>
+                  <form method="post" action="/screeners/factor-lab/runs/{snapshot_id}/refresh">
+                    <input type="hidden" name="lang" value="{lang}" />
+                    <button type="submit">{'用最新行情刷新表现' if lang == 'zh' else 'Refresh Outcomes'}</button>
+                  </form>
+                  {refreshed_note}
+                </div>
+              </div>
+              <span class="pill">#{snapshot_id}</span>
+            </div>
+            <div class="metric-grid">
+              <div class="metric"><span>{'源样本' if lang == 'zh' else 'Source'}</span><strong>{html.escape(str(payload.get('source_count') or 0))}</strong></div>
+              <div class="metric"><span>{'命中' if lang == 'zh' else 'Matched'}</span><strong>{html.escape(str(payload.get('matched_count') or 0))}</strong></div>
+              <div class="metric"><span>1D Hit</span><strong>{_fmt_metric(metrics.get('hit_rate_1d_pct'), suffix='%')}</strong></div>
+              <div class="metric"><span>3D Hit</span><strong>{_fmt_metric(metrics.get('hit_rate_3d_pct'), suffix='%')}</strong></div>
+              <div class="metric"><span>5D Hit</span><strong>{_fmt_metric(metrics.get('hit_rate_5d_pct'), suffix='%')}</strong></div>
+              <div class="metric"><span>{'高开买不到' if lang == 'zh' else 'Gap blocked'}</span><strong>{_fmt_metric(metrics.get('gap_unbuyable_rate_pct'), suffix='%')}</strong></div>
+            </div>
+          </section>
+          <section class="card">
+            <div class="section-head">
+              <div>
+                <div class="eyebrow">{'候选明细' if lang == 'zh' else 'Candidate Details'}</div>
+                <h2>{'看每只股票为什么入选，以及后续真实表现' if lang == 'zh' else 'Why each name passed and how it performed afterwards'}</h2>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th class="sticky-col">{'股票' if lang == 'zh' else 'Ticker'}</th>
+                    <th>{'市场' if lang == 'zh' else 'Market'}</th>
+                    <th>{'因子分' if lang == 'zh' else 'Factor Score'}</th>
+                    <th>{'主要因子' if lang == 'zh' else 'Top Factors'}</th>
+                    <th>{'信号日' if lang == 'zh' else 'Signal Date'}</th>
+                    <th>{'次日高开' if lang == 'zh' else 'Next Gap'}</th>
+                    <th>1D</th>
+                    <th>3D</th>
+                    <th>5D</th>
+                    <th>5D DD</th>
+                    <th>{'买不到' if lang == 'zh' else 'Blocked'}</th>
+                  </tr>
+                </thead>
+                <tbody>{row_html}</tbody>
+              </table>
+            </div>
+          </section>
+        </main>
+      </div>
+    </body>
+    </html>
+    """
+
+
+def _fmt_plain_number(value: object) -> str:
+    if value in (None, ""):
+        return "-"
+    try:
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+@router.post("/factor-lab/runs/{snapshot_id}/refresh")
+def refresh_factor_lab_run(
+    snapshot_id: int,
+    request: Request,
+    lang: str = Form("en"),
+    db: Session = Depends(get_db_session),
+) -> RedirectResponse:
+    if not is_authenticated(request):
+        return login_redirect(f"/screeners/factor-lab/runs/{snapshot_id}")
+    lang = resolve_request_lang(request)
+    try:
+        result = refresh_factor_experiment_run(db, snapshot_id)
+        refreshed_id = result["snapshot"].id
+        return RedirectResponse(
+            f"/screeners/factor-lab/runs/{refreshed_id}?lang={lang}",
+            status_code=303,
+        )
+    except Exception as exc:
+        message = f"刷新失败：{exc}" if lang == "zh" else f"Refresh failed: {exc}"
+        return RedirectResponse(_factor_lab_url(lang=lang, message=message), status_code=303)
+
+
+@router.post("/factor-lab/save")
+def save_factor_lab_strategy(
+    request: Request,
+    lang: str = Form("en"),
+    base_strategy_id: str = Form(...),
+    name: str = Form(...),
+    min_readiness: float = Form(58.0),
+    min_trend: float = Form(58.0),
+    min_profit_yoy: float = Form(15.0),
+    readiness_weight: float = Form(22.0),
+    db: Session = Depends(get_db_session),
+) -> RedirectResponse:
+    if not is_authenticated(request):
+        return login_redirect("/screeners/factor-lab")
+    lang = resolve_request_lang(request)
+    base = get_factor_strategy(db, base_strategy_id)
+    if not base:
+        return RedirectResponse(_factor_lab_url(lang=lang, message="基础策略不存在。"), status_code=303)
+    strategy = json.loads(json.dumps(base, ensure_ascii=False))
+    strategy["id"] = ""
+    strategy["name"] = name.strip() or str(base.get("name") or "Factor strategy")
+    strategy["filters"] = [
+        item for item in (strategy.get("filters") or [])
+        if str(item.get("factor_key") or "") not in {"trend_score", "trade_readiness_score", "net_profit_yoy"}
+    ]
+    strategy["filters"].extend(
+        [
+            {"factor_key": "trend_score", "op": "gte", "value": float(min_trend), "required": True},
+            {"factor_key": "trade_readiness_score", "op": "gte", "value": float(min_readiness), "required": True},
+            {"factor_key": "net_profit_yoy", "op": "gte", "value": float(min_profit_yoy), "required": False},
+        ]
+    )
+    weights = dict(strategy.get("weights") or {})
+    weights["trade_readiness_score"] = float(readiness_weight)
+    strategy["weights"] = weights
+    saved = save_factor_strategy(db, strategy)
+    message = "策略已保存，可以直接运行实验。" if lang == "zh" else "Strategy saved. You can run it now."
+    return RedirectResponse(_factor_lab_url(lang=lang, message=message, strategy_id=str(saved.get("id") or "")), status_code=303)
+
+
 @router.get("", response_class=HTMLResponse)
 def screener_page(
     request: Request,
@@ -3095,6 +4053,7 @@ def screener_page(
     multi_model_templates: list[str] = Query([]),
     min_multi_model_hits: int = Query(2),
     confluence_action_filter: str = Query("ALL"),
+    strategy_profile: str = Query(""),
     universe: str = Query("watchlist"),
     market: str = Query("ALL"),
     min_trend_score: int = Query(60),
@@ -3136,6 +4095,7 @@ def screener_page(
         multi_model_templates=multi_model_templates,
         min_multi_model_hits=min_multi_model_hits,
         confluence_action_filter=confluence_action_filter,
+        strategy_profile=strategy_profile,
         universe=universe,
         market=market,
         min_trend_score=min_trend_score,
@@ -3168,6 +4128,10 @@ def screener_page(
     else:
         snapshot_ready = _screen_snapshot_ready(service, current_params) if should_execute else True
         results = _run_screen(service, current_params) if should_execute else []
+    results = _apply_quality_confluence_profile(
+        results,
+        profile=str(normalized_current_params.get("strategy_profile") or ""),
+    )
     if results and (model_template == "lightgbm_top_picks" or "lightgbm_top_picks" in multi_templates_active):
         _annotate_lightgbm_results(
             results,
@@ -3179,6 +4143,14 @@ def screener_page(
             results = _rerank_with_lightgbm_tactical_signal(
                 results,
                 confluence_action_filter=confluence_action_filter,
+            )
+    if results:
+        annotate_rows_with_kronos(results, db=db)
+        if sort_by == "kronos_score":
+            results = sorted(
+                results,
+                key=lambda item: _kronos_sort_value(item),
+                reverse=(sort_order != "asc"),
             )
     total_results = len(results)
     detail_rows_enabled = bool(int(show_details or 0))
@@ -3196,6 +4168,117 @@ def screener_page(
         risk_examples.append({"ticker": item.get("ticker"), "tags": tags[:2]})
     risk_examples = risk_examples[:3]
     risk_top_tags = sorted(risk_counts.items(), key=lambda pair: (-pair[1], pair[0]))[:3]
+    try:
+        recommendation_regression = load_or_build_recommendation_regression(db=db)
+    except Exception:
+        recommendation_regression = {}
+    regression_guidance = summarize_recommendation_regression(recommendation_regression, lang=lang)
+    regression_policy = (recommendation_regression or {}).get("policy") or {}
+    status_counts = {"ready": 0, "do_not_chase": 0, "blocked": 0, "review": 0, "low_readiness": 0}
+    for item in visible_results:
+        status = str(item.get("tradability_status") or "").strip().upper()
+        bucket = str(item.get("readiness_bucket") or "").strip().upper()
+        try:
+            readiness = float(item.get("trade_readiness_score") or 0.0)
+        except (TypeError, ValueError):
+            readiness = 0.0
+        if status == "READY":
+            status_counts["ready"] += 1
+        elif status == "DO_NOT_CHASE":
+            status_counts["do_not_chase"] += 1
+        elif status == "BLOCKED":
+            status_counts["blocked"] += 1
+        else:
+            status_counts["review"] += 1
+        if bucket in {"LOW", "BLOCKED"} or (readiness and readiness < 60.0):
+            status_counts["low_readiness"] += 1
+
+    def _screener_regression_discipline_html() -> str:
+        sample_count = int((recommendation_regression or {}).get("sample_count") or 0)
+        if sample_count <= 0 and not visible_results:
+            return ""
+        min_quality = regression_policy.get("min_actionable_quality_score")
+        max_actionable = regression_policy.get("max_actionable_count")
+        metrics = regression_guidance.get("metrics") or []
+        rules = [str(item).strip() for item in (regression_guidance.get("rules") or []) if str(item).strip()]
+        warnings = [str(item).strip() for item in (regression_guidance.get("warnings") or []) if str(item).strip()]
+        if lang == "zh":
+            title = "手动筛选纪律"
+            subtitle = "这里不强行删掉筛选结果，而是提醒你哪些票只能观察，哪些才值得进入明日盯盘。"
+            current_stats = [
+                ("当前展示", f"{len(visible_results)} 只"),
+                ("READY", f"{status_counts['ready']} 只"),
+                ("不要追高", f"{status_counts['do_not_chase']} 只"),
+                ("阻断", f"{status_counts['blocked']} 只"),
+                ("低就绪", f"{status_counts['low_readiness']} 只"),
+                ("质量门槛", str(min_quality) if min_quality is not None else "常规"),
+                ("最多可执行", f"{max_actionable} 只" if max_actionable is not None else "不额外限制"),
+            ]
+            workflow = "使用建议：先按模型/共振筛出候选，再只把 READY + 接近买点 + 无硬风险标签的股票加入重点池；其余放观察池等二次确认。"
+        else:
+            title = "Manual Screening Discipline"
+            subtitle = "The screener keeps results visible, but tells you which names should stay on watch versus move into the next-session focus list."
+            current_stats = [
+                ("Visible", f"{len(visible_results)}"),
+                ("READY", f"{status_counts['ready']}"),
+                ("Do not chase", f"{status_counts['do_not_chase']}"),
+                ("Blocked", f"{status_counts['blocked']}"),
+                ("Low readiness", f"{status_counts['low_readiness']}"),
+                ("Quality gate", str(min_quality) if min_quality is not None else "normal"),
+                ("Max actionable", str(max_actionable) if max_actionable is not None else "no extra cap"),
+            ]
+            workflow = "Workflow: screen for model/confluence candidates first, then only move READY names near buy zones with no hard risk tags into the focus pool."
+        stat_html = "".join(
+            f"<span class='default-chip'>{html.escape(label)}: {html.escape(str(value))}</span>"
+            for label, value in current_stats
+        )
+        metric_html = "".join(
+            f"<span class='default-chip'>{html.escape(str(item.get('label') or '-'))}: {html.escape(str(item.get('value') or '-'))}</span>"
+            for item in metrics[:4]
+            if isinstance(item, dict)
+        )
+        rules_html = "".join(f"<div class='muted'>• {html.escape(item)}</div>" for item in (warnings[:3] or rules[:3])) or "<div class='muted'>-</div>"
+        return (
+            "<article class='card' style='background:linear-gradient(180deg, rgba(17,28,40,0.98), rgba(12,21,32,0.96));border-color:rgba(246,200,95,0.28);'>"
+            f"<div class='eyebrow'>{html.escape(title)}</div>"
+            f"<div style='font-size:18px;font-weight:900;color:var(--ink);margin-bottom:6px;'>{html.escape(str(regression_guidance.get('headline') or title))}</div>"
+            f"<div class='muted'>{html.escape(subtitle)}</div>"
+            f"<div style='display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;'>{stat_html}</div>"
+            f"<div style='display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;'>{metric_html}</div>"
+            f"<div class='summary-note' style='margin-top:12px;'>{html.escape(workflow)}</div>"
+            f"<div class='detail-card' style='margin-top:12px;background:rgba(11,19,29,0.82);border-color:rgba(255,255,255,0.06);'>{rules_html}</div>"
+            "</article>"
+        )
+
+    regression_discipline_html = _screener_regression_discipline_html()
+    quality_profile_status_html = ""
+    if str(normalized_current_params.get("strategy_profile") or "") == "quality_confluence_v1":
+        market_context = load_market_context_snapshot(db, market="CN")
+        regime = str(market_context.get("regime") or "unknown")
+        breadth = market_context.get("breadth_pct")
+        paused = not visible_results
+        title = "A 级质量策略已暂停开仓" if paused else "A 级质量策略候选"
+        detail = (
+            "当前市场处于防御/低广度状态，所有共振票只保留观察，不强行凑单。"
+            if paused else "以下候选已通过双模型、市场状态及可成交性硬门槛。"
+        )
+        if lang != "zh":
+            title = "A-tier quality strategy: no new entries" if paused else "A-tier quality candidates"
+            detail = (
+                "The market gate is defensive or breadth is weak; confluence names remain watch-only."
+                if paused else "These names passed the confluence, market-state, and tradability gates."
+            )
+        quality_profile_status_html = (
+            "<article class='card' style='border-color:rgba(246,200,95,0.32);'>"
+            f"<div class='eyebrow'>{'Quality Confluence · 30 snapshots'}</div>"
+            f"<div style='font-size:18px;font-weight:900;color:var(--ink);margin-bottom:6px;'>{html.escape(title)}</div>"
+            f"<div class='muted'>{html.escape(detail)}</div>"
+            "<div style='display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;'>"
+            f"<span class='default-chip'>Market: {html.escape(regime)}</span>"
+            f"<span class='default-chip'>Breadth: {html.escape(str(breadth if breadth is not None else '-'))}%</span>"
+            f"<span class='default-chip'>A-tier: {len(visible_results)}</span>"
+            "</div></article>"
+        )
     if sort_by == "watchlist_state":
         reverse = sort_order != "asc"
         visible_results = sorted(
@@ -3583,7 +4666,7 @@ def screener_page(
             "label": {"zh": "强趋势+动量+LightGBM", "en": "Trend + Momentum + LightGBM"},
             "save_name": {"zh": "强趋势+动量+LightGBM", "en": "Trend + Momentum + LightGBM"},
             "description": {
-                "zh": "用核心模型做宽口径共振，优先看模型命中数量，适合快速找全市场强势候选池。",
+                "zh": "仅保留双模型共振、READY、就绪度至少 72 且无追高/弱市硬风险的 A 级候选。",
                 "en": "Uses the core models as a broad confluence pass, ranking by model-hit count for fast full-market discovery.",
             },
             "best_for": {"zh": "强势池初筛", "en": "Momentum pool"},
@@ -3592,6 +4675,7 @@ def screener_page(
                 "multi_model_templates": ["lightgbm_top_picks", "next_tesla_swing", "technical_momentum"],
                 "min_multi_model_hits": 2,
                 "confluence_action_filter": "ALL",
+                "strategy_profile": "quality_confluence_v1",
                 "market": "CN",
                 "universe": "full_market",
                 "min_trend_score": 10,
@@ -3689,6 +4773,12 @@ def screener_page(
                 "lang": lang,
             },
         },
+    ]
+    quick_confluence_presets = [
+        preset for preset in quick_confluence_presets
+        if not set((preset.get("params") or {}).get("multi_model_templates") or []).intersection(
+            {"cn_volume_breakout", "cn_macd_underwater_cross"}
+        )
     ]
     quick_confluence_presets_html = "".join(
         (
@@ -3826,6 +4916,18 @@ def screener_page(
             "body": {"zh": "先看近期哪个模型或组合更有效，再决定今天用哪套筛选。", "en": "Review recent model and combo effectiveness before choosing today’s screening path."},
             "href": evaluation_overview_href,
         },
+        {
+            "code": "FACTOR",
+            "title": {"zh": "因子实验室", "en": "Factor Lab"},
+            "body": {"zh": "把过滤条件和权重保存成策略项目，跟踪 1D/3D/5D 命中率和高开买不到。", "en": "Save filters and weights as factor strategies, then track 1D/3D/5D hit rates and gap risk."},
+            "href": f"/screeners/factor-lab?lang={lang}",
+        },
+        {
+            "code": "QUALITY",
+            "title": {"zh": "命中率闭环", "en": "Selection Quality"},
+            "body": {"zh": "统一查看 AI 日报和因子实验的真实兑现率，决定今天该信哪套策略。", "en": "Compare realized AI report and factor-experiment outcomes before choosing today’s strategy."},
+            "href": f"/screeners/selection-quality?lang={lang}",
+        },
     ]
     strategy_workbench_html = "".join(
         (
@@ -3901,7 +5003,7 @@ def screener_page(
             f"<div><div class='mobile-result-ticker'><a href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a></div><div class='muted'>{_compact_text(item.get('name') or '-', 28)} · {item.get('market') or '-'}</div>{_pseudo_strong_signal_html(item, lang)}</div>"
             f"<div class='mobile-result-price'>{_price_badge(item.get('latest_close') if item.get('latest_close') is not None else item.get('close'))}</div>"
             "</div>"
-            f"<div class='mobile-result-chip-row'>{_trend_badge(item.get('trend_score'))}{_action_badge(item.get('action_label'), lang)}{_sync_status_badge(watchlist_map.get(item['ticker']), lang)}</div>"
+            f"<div class='mobile-result-chip-row'>{_trend_badge(item.get('trend_score'))}{_action_badge(item.get('action_label'), lang)}{_sync_status_badge(watchlist_map.get(item['ticker']), lang)}{_kronos_compact_chip(item, lang)}</div>"
             f"<div class='mobile-result-chip-row'>{_number_badge(item.get('model_hit_count'), suffix=('模' if lang == 'zh' else ' hits'), higher_is_good=True)}{_number_badge(item.get('confluence_alignment_count'), suffix=('齐' if lang == 'zh' else ' aligned'), higher_is_good=True)}</div>"
             f"<div class='mobile-result-grid'>"
             f"<div><span class='muted'>5D</span><div>{_change_chip(item.get('momentum_5'))}</div></div>"
@@ -4101,29 +5203,29 @@ def screener_page(
           }}
           {WORKSPACE_COMPACT_STYLE}
           {WORKSPACE_SIDEBAR_STYLE}
-          .content {{ padding:20px 18px 28px; }}
+          .content {{ padding:16px 14px 24px; }}
           .wrap {{ max-width:none; margin:0; padding: 0 0 36px; }}
           .toolbar {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }}
           .toolbar a {{ color: var(--accent); text-decoration:none; font-weight:700; }}
-          .nav-grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-bottom:12px; }}
+          .nav-grid {{ display:grid; gap:8px; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); margin-bottom:10px; }}
           .nav-card {{
             display:block;
             text-decoration:none;
             color:inherit;
             background:linear-gradient(180deg, rgba(17,28,40,0.98) 0%, rgba(21,34,49,0.98) 100%);
             border:1px solid var(--line);
-            border-radius:15px;
-            padding:14px;
-            box-shadow:0 10px 22px rgba(0,0,0,0.12);
+            border-radius:10px;
+            padding:10px;
+            box-shadow:0 8px 18px rgba(0,0,0,0.10);
           }}
           .nav-card:hover {{ border-color:var(--accent); box-shadow:0 12px 28px rgba(61,217,182,0.08); }}
-          .nav-head {{ display:flex; align-items:center; gap:10px; margin-bottom:8px; }}
+          .nav-head {{ display:flex; align-items:center; gap:8px; margin-bottom:5px; }}
           .nav-icon {{
-            width:38px; height:38px; border-radius:12px; display:inline-flex; align-items:center; justify-content:center;
+            width:30px; height:30px; border-radius:9px; display:inline-flex; align-items:center; justify-content:center;
             background:rgba(61,217,182,0.10); color:var(--accent); font-size:11px; font-weight:900; letter-spacing:0.04em; border:1px solid rgba(61,217,182,0.18); flex:0 0 auto;
           }}
-          .nav-title {{ font-size:16px; font-weight:800; color:var(--ink); }}
-          .nav-kicker {{ color:var(--muted); font-size:11px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; }}
+          .nav-title {{ font-size:14px; font-weight:800; color:var(--ink); }}
+          .nav-kicker {{ color:var(--muted); font-size:10px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; }}
           h1 {{ margin:0 0 6px; font-size:32px; }}
           .lead {{ margin:0; color:var(--muted); max-width:760px; }}
           .section-stack {{ display:grid; gap:12px; }}
@@ -4136,9 +5238,9 @@ def screener_page(
           .workbench-card {{
             display:grid;
             gap:10px;
-            min-height:142px;
-            padding:16px;
-            border-radius:18px;
+            min-height:112px;
+            padding:12px;
+            border-radius:12px;
             border:1px solid rgba(61,217,182,0.18);
             background:
               linear-gradient(135deg, rgba(61,217,182,0.12), rgba(82,168,255,0.07)),
@@ -4160,22 +5262,22 @@ def screener_page(
             font-weight:900;
             letter-spacing:0.06em;
           }}
-          .workbench-card strong {{ font-size:18px; color:var(--ink); }}
-          .workbench-card span:last-child {{ color:var(--muted); font-size:13px; line-height:1.55; }}
+          .workbench-card strong {{ font-size:15px; color:var(--ink); }}
+          .workbench-card span:last-child {{ color:var(--muted); font-size:12px; line-height:1.38; }}
           .strategy-template-section {{ display:grid; gap:12px; margin-bottom:12px; }}
           .strategy-template-grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); }}
           .strategy-template-card {{
             display:grid;
-            gap:12px;
+            gap:9px;
             align-content:start;
-            min-height:236px;
-            padding:16px;
-            border-radius:18px;
+            min-height:170px;
+            padding:12px;
+            border-radius:12px;
             border:1px solid var(--line);
             background:linear-gradient(180deg, rgba(17,28,40,0.98), rgba(12,21,32,0.96));
             box-shadow:0 12px 28px rgba(0,0,0,0.14);
           }}
-          .strategy-template-title {{ font-size:18px; font-weight:900; color:var(--ink); }}
+          .strategy-template-title {{ font-size:15px; font-weight:900; color:var(--ink); }}
           .strategy-meta-row {{ display:flex; flex-wrap:wrap; gap:8px; }}
           .strategy-template-actions {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:auto; }}
           .run-receipt-card {{ background:linear-gradient(180deg, rgba(17,28,40,0.98), rgba(9,17,27,0.96)); border-color:rgba(82,168,255,0.20); }}
@@ -4569,6 +5671,7 @@ def screener_page(
             <a href="/screeners/focus/today?lang={lang}">{_lang_text(lang, 'open_focus_pool')}</a>
             <a href="/screeners/market-snapshot?lang={lang}">{_lang_text(lang, 'open_market_snapshot')}</a>
             <a href="/dashboard/model-performance?lang={lang}&market={market if market in {'CN','US','ALL'} else 'ALL'}">{'模型评测总览' if lang == 'zh' else 'Model Evaluation Overview'}</a>
+            <a href="/screeners/kronos-validation?lang={lang}">{'Kronos 二次验证池' if lang == 'zh' else 'Kronos Validation Pool'}</a>
             <a href="/dashboard#cn-fundamental-tickers">{_lang_text(lang, 'sync_cn_fundamentals')}</a>
             <div class="lang-switch">
               <span class="muted">{_lang_text(lang, 'language')}:</span>
@@ -4595,8 +5698,9 @@ def screener_page(
           {confluence_strength_html}
           {confluence_leaderboard_html}
           {confluence_bucket_groups_html}
-          <section class="section-stack">
-            <article id="single-model-rules" class="card">
+          {quality_profile_status_html}
+	          <section class="section-stack">
+	            <article id="single-model-rules" class="card">
               <div class="eyebrow">{_lang_text(lang, 'rules')}</div>
               <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;">{quick_confluence_presets_html}</div>
               <div class="template-group-stack">{template_cards_html}</div>
@@ -4729,11 +5833,12 @@ def screener_page(
                     <option value="thin-liquidity"></option>
                   </datalist>
                 </details>
-                <button type="submit">{_lang_text(lang, 'run_screener')}</button>
-              </form>
-            </article>
-            <article class="card">
-              <div class="eyebrow">{_lang_text(lang, 'risk_overview')}</div>
+	                <button type="submit">{_lang_text(lang, 'run_screener')}</button>
+	              </form>
+	            </article>
+	            {regression_discipline_html}
+	            <article class="card">
+	              <div class="eyebrow">{_lang_text(lang, 'risk_overview')}</div>
               <div class="rules-grid">
                 <div class="detail-card" style="background:#f9f7f0;">
                   <div class="detail-label">{_lang_text(lang, 'tagged_names')}</div>
@@ -5565,16 +6670,256 @@ def add_all_screener_results_to_focus(
             url=f"{_build_screen_query(params)}&message={urlencode({'m': _snapshot_pending_message(lang)})[2:]}",
             status_code=303,
         )
-    result = add_to_today_focus_pool(_run_screen(ScreenerService(), params), top_n=focus_top_n)
+    raw_results = _run_screen(ScreenerService(), params)
+    focus_candidates, skipped_count = _focus_pool_trade_candidates(raw_results)
+    result = add_to_today_focus_pool(focus_candidates, top_n=focus_top_n)
     message = (
-        f"Added {result['added']} stock(s) to today focus pool"
+        f"Added {result['added']} stock(s) to today focus pool; skipped {skipped_count} blocked/low-readiness name(s)."
         if lang == "en"
-        else f"已将 {result['added']} 只股票加入今日重点盯盘池"
+        else f"已将 {result['added']} 只股票加入今日重点盯盘池；已跳过 {skipped_count} 只阻断/低就绪度候选"
     )
     return RedirectResponse(
         url=f"{_build_screen_query(params)}&message={urlencode({'m': message})[2:]}",
         status_code=303,
     )
+
+
+@router.get("/kronos-validation", response_class=HTMLResponse)
+def kronos_validation_pool_page(
+    request: Request,
+    lang: str = Query("zh"),
+    market: str = Query("ALL"),
+    status: str = Query("ALL"),
+    db: Session = Depends(get_db_session),
+) -> str:
+    if not is_authenticated(request):
+        return login_redirect("/screeners/kronos-validation")
+    lang = resolve_request_lang(request)
+    selected_market = str(market or "ALL").strip().upper()
+    selected_status = str(status or "ALL").strip().upper()
+    snapshot = load_latest_kronos_validation(db) or {}
+    payload = snapshot.get("payload") if isinstance(snapshot, dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    rows = [dict(item) for item in (payload.get("rows") or []) if isinstance(item, dict)]
+    if selected_market in {"CN", "US"}:
+        rows = [row for row in rows if str(row.get("market") or "").strip().upper() == selected_market]
+    if selected_status != "ALL":
+        rows = [row for row in rows if str(row.get("kronos_status") or "").strip().upper() == selected_status]
+
+    def _safe_num(value, default: float = -999999.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    rows.sort(
+        key=lambda item: (
+            2 if "支持" in str(item.get("kronos_decision") or "") or "support" in str(item.get("kronos_decision") or "").lower() else 1 if str(item.get("kronos_status") or "").upper() == "READY" else 0,
+            _safe_num(item.get("kronos_score")),
+            _safe_num((item.get("path_precheck") or {}).get("score")),
+            _safe_num(item.get("trade_readiness_score")),
+        ),
+        reverse=True,
+    )
+    all_rows = payload.get("rows") or []
+    status_counts: dict[str, int] = {}
+    market_counts: dict[str, int] = {}
+    for item in all_rows:
+        row_status = str((item or {}).get("kronos_status") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        row_market = str((item or {}).get("market") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        status_counts[row_status] = status_counts.get(row_status, 0) + 1
+        market_counts[row_market] = market_counts.get(row_market, 0) + 1
+
+    def _status_badge(row_status: object) -> str:
+        value = str(row_status or "-").strip().upper()
+        cls = "ready" if value == "READY" else "pending" if value in {"NOT_CONFIGURED", "PENDING"} else "skipped" if value == "SKIPPED" else "failed" if value == "FAILED" else "idle"
+        label = {
+            "READY": "已验证" if lang == "zh" else "Validated",
+            "NOT_CONFIGURED": "待配置" if lang == "zh" else "Needs setup",
+            "PENDING": "待运行" if lang == "zh" else "Pending",
+            "SKIPPED": "已跳过" if lang == "zh" else "Skipped",
+            "FAILED": "失败" if lang == "zh" else "Failed",
+        }.get(value, value)
+        return f"<span class='status-badge {cls}'>{html.escape(label)}</span>"
+
+    def _fmt(value: object, suffix: str = "", digits: int = 2) -> str:
+        try:
+            return f"{float(value):.{digits}f}{suffix}"
+        except (TypeError, ValueError):
+            return "-"
+
+    def _decision_chip(decision: object) -> str:
+        text = str(decision or "-").strip()
+        tone = "support" if "支持" in text or "support" in text.lower() else "avoid" if "不支持" in text or "avoid" in text.lower() else "neutral"
+        return f"<span class='decision-chip {tone}'>{html.escape(text)}</span>"
+
+    def _filter_href(next_market: str | None = None, next_status: str | None = None) -> str:
+        return f"/screeners/kronos-validation?{urlencode({'lang': lang, 'market': next_market or selected_market, 'status': next_status or selected_status})}"
+
+    market_chips = "".join(
+        f"<a class='filter-chip{' active' if selected_market == value else ''}' href='{_filter_href(next_market=value)}'>{label}</a>"
+        for value, label in (
+            ("ALL", "全部市场" if lang == "zh" else "All"),
+            ("CN", f"A股 {market_counts.get('CN', 0)}" if lang == "zh" else f"CN {market_counts.get('CN', 0)}"),
+            ("US", f"美股 {market_counts.get('US', 0)}" if lang == "zh" else f"US {market_counts.get('US', 0)}"),
+        )
+    )
+    status_chips = "".join(
+        f"<a class='filter-chip{' active' if selected_status == value else ''}' href='{_filter_href(next_status=value)}'>{label}</a>"
+        for value, label in (
+            ("ALL", "全部状态" if lang == "zh" else "All status"),
+            ("READY", f"已验证 {status_counts.get('READY', 0)}" if lang == "zh" else f"Validated {status_counts.get('READY', 0)}"),
+            ("NOT_CONFIGURED", f"待配置 {status_counts.get('NOT_CONFIGURED', 0)}" if lang == "zh" else f"Needs setup {status_counts.get('NOT_CONFIGURED', 0)}"),
+            ("SKIPPED", f"跳过 {status_counts.get('SKIPPED', 0)}" if lang == "zh" else f"Skipped {status_counts.get('SKIPPED', 0)}"),
+            ("FAILED", f"失败 {status_counts.get('FAILED', 0)}" if lang == "zh" else f"Failed {status_counts.get('FAILED', 0)}"),
+        )
+    )
+    row_html = "".join(
+        "<tr>"
+        f"<td class='sticky-col sticky-col-1'><a class='ticker-link' href='/insights/{html.escape(str(item.get('ticker') or ''), quote=True)}?lang={lang}'>{html.escape(str(item.get('ticker') or '-'))}</a><div class='muted'>{html.escape(str(item.get('name') or '-'))}</div></td>"
+        f"<td>{html.escape(str(item.get('market') or '-'))}</td>"
+        f"<td>{_status_badge(item.get('kronos_status'))}</td>"
+        f"<td>{_decision_chip(item.get('kronos_decision'))}<div class='muted'>{html.escape(str(item.get('kronos_reason') or '-'))}</div></td>"
+        f"<td>{_fmt(item.get('kronos_score'), digits=1)}<div class='muted'>预检 {_fmt((item.get('path_precheck') or {}).get('score'), digits=1)}</div></td>"
+        f"<td>{_fmt(item.get('kronos_expected_return_1d_pct'), '%')}<div class='muted'>3日 {_fmt(item.get('kronos_expected_return_3d_pct'), '%')}</div></td>"
+        f"<td>{_fmt(item.get('kronos_max_drawdown_pct'), '%')}</td>"
+        f"<td>{_fmt(item.get('latest_close'))}<div class='muted'>{html.escape(str(item.get('latest_date') or '-'))}</div></td>"
+        f"<td>{html.escape(str(item.get('source') or '-'))}<div class='muted'>{html.escape(' / '.join(item.get('source_templates') or []) or '-')}</div></td>"
+        f"<td>{html.escape(str(item.get('model_signal_label') or '-'))}<div class='muted'>强度 {_fmt(item.get('model_signal_strength'), digits=1)}</div></td>"
+        f"<td>{html.escape(str(item.get('history_count') or '-'))}</td>"
+        "</tr>"
+        for item in rows
+    ) or (
+        f"<tr><td colspan='11'>{'当前筛选条件下没有 Kronos 验证候选。可以先在任务中心刷新 Kronos 验证快照，或等待收盘预计算自动生成。' if lang == 'zh' else 'No Kronos validation candidates under current filters. Refresh the snapshot or wait for post-close precompute.'}</td></tr>"
+    )
+    snapshot_time = html.escape(str(payload.get("updated_at") or snapshot.get("created_at") or "-"))
+    status_text = html.escape(str(payload.get("status") or "-"))
+    message_text = html.escape(str(payload.get("message") or "-"))
+    model_name = html.escape(str(payload.get("model_name") or "-"))
+    candidate_count = int(payload.get("candidate_count") or 0)
+    validated_count = int(payload.get("validated_count") or 0)
+    nav_html = render_workspace_nav_html(lang=lang, active_key="screeners")
+    refresh_markets = selected_market if selected_market in {"CN", "US"} else "CN,US"
+    return f"""
+    <!DOCTYPE html>
+    <html lang="{lang}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{'Kronos 二次验证池' if lang == 'zh' else 'Kronos Validation Pool'}</title>
+        <style>
+          :root {{ --bg:#071018; --panel:#111c28; --panel-2:#152231; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; }}
+          * {{ box-sizing:border-box; }}
+          body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.15), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.10), transparent 26%),var(--bg); }}
+          a {{ color:inherit; text-decoration:none; }}
+          {WORKSPACE_COMPACT_STYLE}
+          {WORKSPACE_SIDEBAR_STYLE}
+          .content {{ padding:16px 14px 28px; }}
+          .wrap {{ max-width:none; margin:0; }}
+          .toolbar,.chip-row {{ display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px; }}
+          .pill,.filter-chip {{ display:inline-flex; align-items:center; justify-content:center; padding:8px 12px; border-radius:999px; border:1px solid var(--line); background:rgba(17,28,40,0.72); color:var(--muted); font-size:13px; font-weight:800; }}
+          .filter-chip.active,.pill.primary {{ color:#06131b; border-color:var(--accent); background:var(--accent); }}
+          .card {{ border:1px solid var(--line); border-radius:18px; background:linear-gradient(180deg, rgba(17,28,40,0.96), rgba(12,21,31,0.94)); padding:16px; margin-bottom:12px; box-shadow:0 14px 34px rgba(0,0,0,0.18); }}
+          .hero {{ display:grid; grid-template-columns:minmax(0,1.2fr) minmax(280px,0.8fr); gap:12px; }}
+          .eyebrow {{ display:inline-flex; padding:6px 10px; border-radius:999px; background:rgba(61,217,182,0.12); color:var(--accent); font-size:12px; font-weight:900; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:10px; }}
+          h1 {{ margin:0 0 8px; font-size:32px; letter-spacing:-0.03em; }}
+          .lead,.muted {{ color:var(--muted); line-height:1.5; }}
+          .metric-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }}
+          .metric {{ border:1px solid rgba(144,163,184,0.12); border-radius:14px; background:rgba(11,19,29,0.72); padding:12px; }}
+          .metric strong {{ display:block; font-size:24px; margin-top:4px; }}
+          .table-wrap {{ width:100%; overflow:auto; border-radius:16px; border:1px solid var(--line); background:rgba(11,19,29,0.8); }}
+          table {{ width:100%; min-width:1280px; border-collapse:collapse; font-size:13px; }}
+          th,td {{ padding:10px 9px; text-align:left; vertical-align:top; border-bottom:1px solid var(--line); white-space:nowrap; }}
+          th {{ color:var(--muted); font-weight:800; }}
+          td .muted {{ font-size:12px; white-space:normal; max-width:360px; }}
+          .sticky-col {{ position:sticky; left:0; z-index:2; background:var(--panel); box-shadow:10px 0 16px rgba(0,0,0,0.14); }}
+          th.sticky-col {{ z-index:4; }}
+          .sticky-col-1 {{ min-width:170px; }}
+          .ticker-link {{ color:var(--accent); font-weight:900; }}
+          .status-badge,.decision-chip {{ display:inline-flex; align-items:center; padding:5px 9px; border-radius:999px; font-size:12px; font-weight:900; border:1px solid rgba(144,163,184,0.2); }}
+          .status-badge.ready,.decision-chip.support {{ color:#9ff3d5; border-color:rgba(61,217,182,0.32); background:rgba(61,217,182,0.08); }}
+          .status-badge.pending,.decision-chip.neutral {{ color:#ffd08a; border-color:rgba(255,190,92,0.32); background:rgba(255,190,92,0.08); }}
+          .status-badge.skipped {{ color:#b9c7d7; background:rgba(144,163,184,0.08); }}
+          .status-badge.failed,.decision-chip.avoid {{ color:#ffaaa5; border-color:rgba(239,68,68,0.32); background:rgba(239,68,68,0.08); }}
+          form.inline {{ display:inline-flex; align-items:center; gap:8px; margin:0; }}
+          input,select,button {{ border-radius:999px; border:1px solid var(--line); padding:8px 12px; background:rgba(11,19,29,0.82); color:var(--ink); font:inherit; font-weight:800; }}
+          button {{ background:var(--accent); color:#06131b; border-color:var(--accent); cursor:pointer; }}
+          @media (max-width:1120px) {{ .app {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }} .hero {{ grid-template-columns:1fr; }} }}
+        </style>
+      </head>
+      <body>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{'Kronos 验证池' if lang == 'zh' else 'Kronos Pool'}</h1>
+              <p>{'这里展示模型候选经过 K 线路径模型二次验证后的结果。' if lang == 'zh' else 'Review model candidates after K-line path validation.'}</p>
+            </div>
+            <nav class="side-nav">{nav_html}</nav>
+          </aside>
+          <main class="content">
+            <div class="wrap">
+              <div class="toolbar">
+                <a class="pill" href="/screeners?lang={lang}">← {'返回模型选股' if lang == 'zh' else 'Back to Screeners'}</a>
+                <a class="pill" href="/settings/kronos?lang={lang}">{'Kronos 配置' if lang == 'zh' else 'Kronos Settings'}</a>
+                <a class="pill" href="/dashboard/ai-daily-report?lang={lang}">{'AI 日报' if lang == 'zh' else 'AI Report'}</a>
+                <form class="inline" action="/jobs/kronos-validation" method="post">
+                  <input type="hidden" name="redirect_to" value="/screeners/kronos-validation?lang={lang}&market={selected_market}&status={selected_status}" />
+                  <input type="hidden" name="markets" value="{refresh_markets}" />
+                  <input type="hidden" name="candidate_limit" value="80" />
+                  <button type="submit">{'刷新验证池' if lang == 'zh' else 'Refresh Pool'}</button>
+                </form>
+              </div>
+              <section class="hero">
+                <article class="card">
+                  <div class="eyebrow">{'二次验证，不是单独选股' if lang == 'zh' else 'Secondary validation, not standalone screening'}</div>
+                  <h1>{'Kronos 二次验证池' if lang == 'zh' else 'Kronos Validation Pool'}</h1>
+                  <p class="lead">{'这里的股票来自 LightGBM、多模型共振和技术模板的 Top 候选。Kronos 负责验证未来 1-3 日 K 线路径是否支持，而不是重新扫描全市场。' if lang == 'zh' else 'These names come from LightGBM, multi-model confluence, and technical-template top candidates. Kronos validates the 1-3 day path instead of scanning the whole market.'}</p>
+                  <div class="chip-row" style="margin-top:12px;">{market_chips}</div>
+                  <div class="chip-row">{status_chips}</div>
+                </article>
+                <article class="card">
+                  <div class="eyebrow">{'最新快照' if lang == 'zh' else 'Latest Snapshot'}</div>
+                  <div class="metric-grid">
+                    <div class="metric"><span class="muted">{'状态' if lang == 'zh' else 'Status'}</span><strong>{status_text}</strong></div>
+                    <div class="metric"><span class="muted">{'模型' if lang == 'zh' else 'Model'}</span><strong style="font-size:17px;">{model_name}</strong></div>
+                    <div class="metric"><span class="muted">{'候选' if lang == 'zh' else 'Candidates'}</span><strong>{candidate_count}</strong></div>
+                    <div class="metric"><span class="muted">{'已验证' if lang == 'zh' else 'Validated'}</span><strong>{validated_count}</strong></div>
+                  </div>
+                  <div class="muted" style="margin-top:10px;">{message_text}</div>
+                  <div class="muted" style="margin-top:6px;">{'更新时间' if lang == 'zh' else 'Updated'}: {snapshot_time}</div>
+                </article>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{'验证结果' if lang == 'zh' else 'Validation Results'}</div>
+                <div class="muted">{'优先看“已验证 + Kronos 支持 + 预期收益为正 + 回撤可控”的股票；待配置状态说明主流程已接上，但独立 PyTorch/Kronos runner 还没有启用。' if lang == 'zh' else 'Focus on validated names with Kronos support, positive expected return, and controlled drawdown. Needs-setup means the pipeline is wired, but the isolated PyTorch/Kronos runner is not enabled yet.'}</div>
+                <div class="table-wrap" style="margin-top:12px;">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th class="sticky-col sticky-col-1">{'股票' if lang == 'zh' else 'Ticker'}</th>
+                        <th>{'市场' if lang == 'zh' else 'Market'}</th>
+                        <th>{'状态' if lang == 'zh' else 'Status'}</th>
+                        <th>{'结论 / 原因' if lang == 'zh' else 'Decision / Reason'}</th>
+                        <th>{'Kronos 分' if lang == 'zh' else 'Kronos Score'}</th>
+                        <th>{'预期收益' if lang == 'zh' else 'Expected Return'}</th>
+                        <th>{'最大回撤' if lang == 'zh' else 'Max Drawdown'}</th>
+                        <th>{'最新价' if lang == 'zh' else 'Latest Close'}</th>
+                        <th>{'候选来源' if lang == 'zh' else 'Source'}</th>
+                        <th>{'原模型信号' if lang == 'zh' else 'Original Signal'}</th>
+                        <th>{'历史条数' if lang == 'zh' else 'Bars'}</th>
+                      </tr>
+                    </thead>
+                    <tbody>{row_html}</tbody>
+                  </table>
+                </div>
+              </section>
+            </div>
+          </main>
+        </div>
+      </body>
+    </html>
+    """
 
 
 @router.get("/focus/today", response_class=HTMLResponse)

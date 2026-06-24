@@ -72,6 +72,7 @@ def social_signals_page(
     lang = resolve_request_lang(request, default="zh")
     summary = social_signal_summary(db)
     poll_status = summary.get("poll_status") or {}
+    poll_interval_text = _poll_interval_text(poll_status, lang)
     hot_scope = str(hot_scope or "all").strip().lower()
     if hot_scope not in {"all", "not_watchlist", "not_portfolio", "new_candidates"}:
         hot_scope = "all"
@@ -156,7 +157,7 @@ def social_signals_page(
                 <article style="border:1px solid var(--line);border-radius:16px;padding:14px 15px;background:rgba(15,24,35,0.58);">
                   <div class="eyebrow">{'轮询状态' if lang == 'zh' else 'Polling Status'}</div>
                   <div style="margin-top:6px;font-size:22px;font-weight:900;">{int(poll_status.get('last_new_mentions') or 0)}</div>
-                  <div class="muted">{(f'上次新增提及 {int(poll_status.get("last_new_mentions") or 0)} · 每 30 分钟自动检查' if lang == 'zh' else f'Last new mentions {int(poll_status.get("last_new_mentions") or 0)} · Auto-check every 30 min')}</div>
+                  <div class="muted">{(f'上次新增提及 {int(poll_status.get("last_new_mentions") or 0)} · {poll_interval_text}自动检查' if lang == 'zh' else f'Last new mentions {int(poll_status.get("last_new_mentions") or 0)} · Auto-check every {poll_interval_text}')}</div>
                 </article>
               </div>
             </div>
@@ -218,17 +219,20 @@ def social_signals_page(
           a {{ color:inherit; text-decoration:none; }}
           {WORKSPACE_COMPACT_STYLE}
           {WORKSPACE_SIDEBAR_STYLE}
-          .main {{ padding:20px 18px 28px; }}
+          .main {{ padding:16px 14px 24px; }}
           .wrap {{ max-width:none; margin:0; }}
-          .hero,.grid {{ display:grid; gap:16px; grid-template-columns:minmax(0,1.15fr) minmax(320px,0.85fr); margin-bottom:16px; }}
-          h1 {{ margin:8px 0; font-size:34px; line-height:1.04; letter-spacing:-0.03em; }}
+          .hero,.grid {{ display:grid; gap:10px; grid-template-columns:minmax(0,1.15fr) minmax(320px,0.85fr); margin-bottom:10px; }}
+          h1 {{ margin:4px 0; font-size:28px; line-height:1.04; letter-spacing:-0.03em; }}
+          .hero .card {{ padding:12px; }}
+          .hero .lead {{ font-size:12px; line-height:1.42; }}
+          .hero .card:first-child .lead + .lead {{ display:none; }}
           .ticker {{ font-weight:800; }}
-          .score {{ font-size:22px; font-weight:900; color:var(--accent); }}
+          .score {{ font-size:18px; font-weight:900; color:var(--accent); }}
           button {{ width:auto; background:linear-gradient(135deg, rgba(61,217,182,0.88), rgba(82,168,255,0.82)); color:#03131f; border-color:transparent; font-weight:800; cursor:pointer; }}
           button.danger {{ background:rgba(255,107,107,0.14); color:#ffb4b4; border-color:rgba(255,107,107,0.32); }}
-          .form-grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); }}
-          table {{ width:100%; min-width:1120px; border-collapse:collapse; font-size:14px; }}
-          .banner {{ margin-bottom:16px; padding:14px 16px; border-radius:16px; background:rgba(61,217,182,0.12); color:var(--accent); border:1px solid rgba(61,217,182,0.24); font-weight:800; }}
+          .form-grid {{ display:grid; gap:8px; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); }}
+          table {{ width:100%; min-width:1120px; border-collapse:collapse; font-size:13px; }}
+          .banner {{ margin-bottom:10px; padding:10px 12px; border-radius:10px; background:rgba(61,217,182,0.12); color:var(--accent); border:1px solid rgba(61,217,182,0.24); font-weight:800; }}
         </style>
       </head>
       <body>
@@ -240,12 +244,12 @@ def social_signals_page(
               <p>{'跟踪 X 账户观点，但必须经过模型与交易条件验证。' if lang == 'zh' else 'Track X account ideas, but validate them against model and trade conditions.'}</p>
             </div>
             <nav class="side-nav">{nav_html}</nav>
-            <div class="sidebar-foot">{'每 30 分钟自动检查追踪账号；手工粘贴只作为备用入口。' if lang == 'zh' else 'Tracked accounts are checked every 30 minutes; manual paste is only a fallback.'}</div>
+            <div class="sidebar-foot">{(f'{poll_interval_text}自动检查追踪账号；手工粘贴只作为备用入口。' if lang == 'zh' else f'Tracked accounts are checked every {poll_interval_text}; manual paste is only a fallback.')}</div>
           </aside>
           <main class="main"><div class="wrap">
             {banner}
             <section class="hero">
-              <article class="card"><span class="eyebrow">X Signal Desk</span><h1>{'X 账户自动验证台' if lang == 'zh' else 'X Account Auto Validation'}</h1><p class="lead">{('已追踪账号' if lang == 'zh' else 'Tracked accounts')} {tracked_account_count} · {_h(tracked_handles)}</p><p class="lead">{'系统每 30 分钟检查追踪账号，自动抽取帖子里的股票，判断账号观点方向，再和模型信号、自选股、持仓股交叉验证。美股 cashtag 如 $TSLA 会自动按 US 股票处理。' if lang == 'zh' else 'The system checks tracked accounts every 30 minutes, extracts ticker mentions, infers account view, then validates against model signals, watchlist, and portfolio. US cashtags such as $TSLA are treated as US stocks automatically.'}</p></article>
+              <article class="card"><span class="eyebrow">X Signal Desk</span><h1>{'X 账户自动验证台' if lang == 'zh' else 'X Account Auto Validation'}</h1><p class="lead">{('已追踪账号' if lang == 'zh' else 'Tracked accounts')} {tracked_account_count} · {_h(tracked_handles)}</p><p class="lead">{(f'系统{poll_interval_text}检查追踪账号，自动抽取帖子里的股票，判断账号观点方向，再和模型信号、自选股、持仓股交叉验证。美股 cashtag 如 $TSLA 会自动按 US 股票处理。' if lang == 'zh' else f'The system checks tracked accounts every {poll_interval_text}, extracts ticker mentions, infers account view, then validates against model signals, watchlist, and portfolio. US cashtags such as $TSLA are treated as US stocks automatically.')}</p></article>
               <article class="card"><span class="eyebrow">{'自动轮询状态' if lang == 'zh' else 'Auto Poll Status'}</span><div class="stack">
                 <div class="list-row"><div><div class="ticker">{'状态' if lang == 'zh' else 'Status'}</div><div class="muted">{_poll_status_text(poll_status, lang)}</div></div><div class="score">{int(poll_status.get('last_new_mentions') or 0)}</div></div>
                 <div class="muted">{'上次运行' if lang == 'zh' else 'Last run'}: {_h(poll_status.get('last_run_at') or '-')}</div>
@@ -414,9 +418,22 @@ def _poll_status_text(status: dict, lang: str) -> str:
         )
     last_status = status.get("last_status") or "-"
     message = status.get("last_message") or "-"
+    interval_text = _poll_interval_text(status, lang)
     if lang == "zh":
-        return f"每 30 分钟自动检查；上次状态 {last_status}；{message}"
-    return f"Checks every 30 minutes; last status {last_status}; {message}"
+        return f"{interval_text}自动检查；上次状态 {last_status}；{message}"
+    return f"Checks every {interval_text}; last status {last_status}; {message}"
+
+
+def _poll_interval_text(status: dict, lang: str) -> str:
+    minutes = int(status.get("interval_minutes") or 240)
+    if lang == "zh":
+        if minutes % 60 == 0:
+            return f"每 {minutes // 60} 小时"
+        return f"每 {minutes} 分钟"
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return f"{hours} hour{'s' if hours != 1 else ''}"
+    return f"{minutes} min"
 
 
 def _source_preview(item: dict, lang: str) -> str:

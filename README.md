@@ -166,7 +166,7 @@ http://127.0.0.1:8000/dashboard
 - PostgreSQL is the supported primary app database.
 - Parquet is the primary market history storage format.
 - DuckDB queries the Parquet lake directly for fast scans.
-- Legacy SQLite-related files or migration notes may still exist in the repo for historical compatibility, but the current target architecture is PostgreSQL-first.
+- The application is PostgreSQL-only at runtime. Set `PQW_DATABASE_URL` before starting the app or jobs.
 
 ## Documentation
 

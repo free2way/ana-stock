@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from app.services.model_signal_summary import build_signal_label, entry_style
 from app.services.portfolio_book import load_portfolio_positions
 from app.services.price_snapshot import load_latest_closes
+from app.services.recommendation_regression import load_or_build_recommendation_regression
 from app.services.repository import PredictionRepository, SymbolRepository
 from app.services.runtime_cache import get_or_set
 
@@ -376,6 +377,55 @@ def _execution_risk_summary(
     return " · ".join(parts) or ("正常执行" if lang == "zh" else "Normal execution")
 
 
+def _recent_hit_rate_guard(db: Session, *, lang: str) -> dict:
+    try:
+        regression = load_or_build_recommendation_regression(db=db)
+    except Exception:
+        regression = {}
+    summary = (regression or {}).get("summary") or {}
+    recent = summary.get("recent_all") or {}
+    recent_actionable = summary.get("recent_actionable") or {}
+    recent_watch = summary.get("recent_watch") or {}
+
+    def _float(value, fallback: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    recent_hit = _float(recent.get("execution_hit_rate"))
+    recent_close = _float(recent.get("close_hit_rate"))
+    recent_drawdown = _float(recent.get("deep_drawdown_rate"))
+    watch_hit = _float(recent_watch.get("execution_hit_rate"))
+    action_hit = _float(recent_actionable.get("execution_hit_rate"))
+    active = int(recent.get("count") or 0) >= 20 and (
+        recent_hit < 45.0 or recent_close < 45.0 or recent_drawdown >= 35.0
+    )
+    if lang == "zh":
+        message = (
+            f"最近推荐执行命中 {recent_hit:.1f}%、深回撤 {recent_drawdown:.1f}%，"
+            "组合先防守：不新增风险，优先保护浮盈和处理亏损。"
+            if active
+            else f"最近推荐执行命中 {recent_hit:.1f}%，组合可按原计划复核执行。"
+        )
+    else:
+        message = (
+            f"Recent execution hit rate is {recent_hit:.1f}% with {recent_drawdown:.1f}% deep drawdown; "
+            "stay defensive, avoid adding risk, protect gains and clean up losers."
+            if active
+            else f"Recent execution hit rate is {recent_hit:.1f}%; keep following the plan."
+        )
+    return {
+        "active": active,
+        "message": message,
+        "recent_execution_hit_rate": recent_hit,
+        "recent_close_hit_rate": recent_close,
+        "recent_deep_drawdown_rate": recent_drawdown,
+        "recent_actionable_hit_rate": action_hit,
+        "recent_watch_hit_rate": watch_hit,
+    }
+
+
 def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
     positions = load_portfolio_positions()
     tickers = [item["ticker"] for item in positions]
@@ -384,6 +434,7 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
     def _load() -> dict:
         symbol_repo = SymbolRepository(db)
         prediction_repo = PredictionRepository(db)
+        hit_rate_guard = _recent_hit_rate_guard(db, lang=lang)
         overviews = symbol_repo.list_overviews_for_tickers(tickers)
         latest_outputs = prediction_repo.get_latest_model_outputs_for_tickers(tickers)
         latest_prices = load_latest_closes(tickers)
@@ -401,11 +452,16 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
             }
             latest_signal = latest_outputs.get(item["ticker"])
             latest_signal = prediction_repo._build_signal_decision(latest_signal or {}) if latest_signal else None
-            latest_price = float(latest_prices.get(item["ticker"]) or 0.0)
+            latest_price_raw = latest_prices.get(item["ticker"])
+            latest_price_missing = latest_price_raw is None or float(latest_price_raw or 0.0) <= 0.0
+            latest_price = 0.0 if latest_price_missing else float(latest_price_raw or 0.0)
+            risk_flags = list((latest_signal or {}).get("risk_flags") or [])
+            if not latest_price_missing:
+                risk_flags = [flag for flag in risk_flags if str(flag) != "missing-latest-price"]
             quantity = float(item.get("quantity") or 0.0)
             cost_basis = float(item.get("cost_basis") or 0.0)
             market_value = latest_price * quantity
-            pnl_pct = ((latest_price / cost_basis) - 1.0) * 100 if cost_basis else 0.0
+            pnl_pct = ((latest_price / cost_basis) - 1.0) * 100 if cost_basis and not latest_price_missing else 0.0
             total_market_value += market_value
 
             sector = str(overview.get("sector") or (overview.get("industry") or ("未分类" if lang == "zh" else "Unclassified")))
@@ -433,7 +489,8 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
                     "liquidity_bucket": (latest_signal or {}).get("liquidity_bucket"),
                     "stop_loss_type": (latest_signal or {}).get("stop_loss_type"),
                     "execution_note": (latest_signal or {}).get("execution_note"),
-                    "risk_flags": (latest_signal or {}).get("risk_flags") or [],
+                    "risk_flags": risk_flags,
+                    "latest_price_missing": latest_price_missing,
                 }
             )
 
@@ -459,23 +516,32 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
         for row in row_actions:
             weight_pct = (float(row["market_value"] or 0.0) / total_market_value * 100.0) if total_market_value else 0.0
             row["weight_pct"] = round(weight_pct, 1)
-            row["risk_tag"] = _risk_tag(
-                pnl_pct=float(row["pnl_pct"] or 0.0),
-                market_value=float(row["market_value"] or 0.0),
-                total_market_value=total_market_value,
-                lang=lang,
-            )
-            row["action_priority"] = _action_priority(
-                pnl_pct=float(row["pnl_pct"] or 0.0),
-                weight_pct=weight_pct,
-                signal_label=str(row["signal_label"] or ""),
-                lang=lang,
-            )
-            row["action_reason"] = _action_reason(
+            if row.get("latest_price_missing"):
+                row["risk_tag"] = "缺行情" if lang == "zh" else "Missing price"
+            else:
+                row["risk_tag"] = _risk_tag(
+                    pnl_pct=float(row["pnl_pct"] or 0.0),
+                    market_value=float(row["market_value"] or 0.0),
+                    total_market_value=total_market_value,
+                    lang=lang,
+                )
+            row["action_priority"] = ("高" if lang == "zh" else "High") if row.get("latest_price_missing") else _action_priority(
                 pnl_pct=float(row["pnl_pct"] or 0.0),
                 weight_pct=weight_pct,
                 signal_label=str(row["signal_label"] or ""),
                 lang=lang,
+            )
+            row["action_reason"] = (
+                "缺少最新行情，先不要按盈亏做决策；需要补行情或确认该标的是否仍可交易。"
+                if lang == "zh" and row.get("latest_price_missing")
+                else "Latest price is missing; do not make a PnL-based decision until data is repaired."
+                if row.get("latest_price_missing")
+                else _action_reason(
+                    pnl_pct=float(row["pnl_pct"] or 0.0),
+                    weight_pct=weight_pct,
+                    signal_label=str(row["signal_label"] or ""),
+                    lang=lang,
+                )
             )
             target_weight = row.get("target_weight")
             target_weight_value = float(target_weight) if target_weight is not None else None
@@ -488,11 +554,17 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
                 target_weight=target_weight_value,
                 lang=lang,
             )
-            row["rebalance_action"] = _rebalance_action(
-                weight_pct=weight_pct,
-                target_weight=target_weight_value,
-                signal_label=str(row["signal_label"] or ""),
-                lang=lang,
+            row["rebalance_action"] = (
+                "先修复行情源，再决定是否卖出或调仓。"
+                if lang == "zh" and row.get("latest_price_missing")
+                else "Repair the price feed before deciding on sell/rebalance."
+                if row.get("latest_price_missing")
+                else _rebalance_action(
+                    weight_pct=weight_pct,
+                    target_weight=target_weight_value,
+                    signal_label=str(row["signal_label"] or ""),
+                    lang=lang,
+                )
             )
             row["execution_risk_summary"] = _execution_risk_summary(
                 tradability_status=row.get("tradability_status"),
@@ -537,7 +609,8 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
             for row in row_actions
             if str(row.get("action_priority") or "").lower() in {"高", "high"}
         )
-        if drawdown_count >= 2 or concentration_pct >= 45.0 or (top_position and float(top_position.get("weight_pct") or 0.0) >= 25.0):
+        missing_price_count = sum(1 for row in row_actions if row.get("latest_price_missing"))
+        if hit_rate_guard.get("active") or drawdown_count >= 2 or concentration_pct >= 45.0 or (top_position and float(top_position.get("weight_pct") or 0.0) >= 25.0):
             risk_posture = "防守" if lang == "zh" else "Defensive"
         elif profit_protection_count >= 2 or trim_candidates >= 2:
             risk_posture = "均衡偏防守" if lang == "zh" else "Balanced / defensive"
@@ -546,17 +619,21 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
         if lang == "zh":
             risk_summary = f"最大行业暴露 {top_sector[0]}，约占组合 {concentration_pct}%"
             posture_summary = (
-                f"当前更偏{risk_posture}，优先处理 {review_candidates} 只高优先级仓位。"
+                f"当前更偏{risk_posture}，优先处理 {review_candidates + missing_price_count} 只高优先级/缺行情仓位。"
                 if row_actions
                 else "当前没有持仓。"
             )
+            if hit_rate_guard.get("active"):
+                posture_summary = f"{posture_summary} {hit_rate_guard.get('message')}"
         else:
             risk_summary = f"Largest sector exposure is {top_sector[0]}, about {concentration_pct}% of the portfolio"
             posture_summary = (
-                f"Current posture is {risk_posture}; {review_candidates} positions deserve priority review."
+                f"Current posture is {risk_posture}; {review_candidates + missing_price_count} high-priority/missing-price positions deserve review."
                 if row_actions
                 else "There are no portfolio positions."
             )
+            if hit_rate_guard.get("active"):
+                posture_summary = f"{posture_summary} {hit_rate_guard.get('message')}"
 
         return {
             "total_market_value": round(total_market_value, 2),
@@ -585,6 +662,8 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
             "trim_candidates": trim_candidates,
             "exit_candidates": exit_candidates,
             "review_candidates": review_candidates,
+            "missing_price_count": missing_price_count,
+            "hit_rate_guard": hit_rate_guard,
             "risk_posture": risk_posture,
             "risk_summary": risk_summary,
             "posture_summary": posture_summary,

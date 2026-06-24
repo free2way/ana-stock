@@ -1216,6 +1216,7 @@ def insight_page(
             radial-gradient(circle at top left, rgba(82,168,255,0.14) 0, transparent 28%),
             radial-gradient(circle at top right, rgba(61,217,182,0.10) 0, transparent 26%),
             var(--bg); }}
+          {WORKSPACE_COMPACT_STYLE}
           .app {{ display:grid; grid-template-columns:260px minmax(0, 1fr); min-height:100vh; }}
           {WORKSPACE_SIDEBAR_STYLE}
           .content {{ padding:20px 18px 28px; }}

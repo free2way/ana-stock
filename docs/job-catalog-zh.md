@@ -186,7 +186,7 @@
 
 ### 3.8 `social_signal_poll`
 
-定位：每 30 分钟轮询 X 账号，抓取社交信号。  
+定位：每 4 小时轮询 X 账号，抓取社交信号。
 代码位置：[app/services/social_signal_scheduler.py](/Volumes/STORAGE_Jackyhu/code/ana/app/services/social_signal_scheduler.py:11)
 
 当前职责：
@@ -197,7 +197,7 @@
 
 默认频率：
 
-- `30 分钟`
+- `4 小时`
 
 如果你的研究流程依赖社交信号，这条 job 就属于核心生产 job。  
 如果你暂时不用 X 信号，它可以被视为“核心可选”。

@@ -3,20 +3,25 @@ import threading
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import select
+
 from app.core.db import SessionLocal
+from app.models.tables import ModelRun
 from app.services.ai_daily_report import build_ai_daily_report, render_ai_daily_report_push_messages, save_ai_daily_report
 from app.services.cn_fundamentals import sync_cn_fundamentals
 from app.services.cn_concepts import sync_cn_concepts
 from app.services.auto_analysis import auto_analysis_service
 from app.services.cn_market_universe import refresh_cn_market_data_daily, refresh_cn_market_data_lake_only
 from app.services.focus_pool import load_today_focus_pool
-from app.services.market_lake import list_lake_symbols
+from app.services.kronos_validation import KRONOS_VALIDATION_JOB_TYPE, save_kronos_validation_snapshot
+from app.services.market_lake import count_lake_symbols_for_trade_date, get_latest_lake_trade_date, list_lake_symbols
 from app.services.market_calendar import is_market_open_date, next_market_open_date
 from app.services.model_selection_guidance import save_model_selection_guidance_snapshots
 from app.services.nlp_snapshots import NEWS_ENRICHMENT_JOB_TYPE, refresh_nlp_snapshots
 from app.services.push_notifications import PushNotificationService
 from app.services.recommendation_regression import save_ai_report_recommendation_regression_snapshot
 from app.services.repository import AppSettingRepository, DataJobRepository, PredictionRepository, WatchlistRepository, WorkspaceSnapshotRepository
+from app.services.selection_quality import save_selection_quality_snapshot
 from app.services.screener_snapshots import (
     CORE_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
     FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES,
@@ -56,8 +61,26 @@ MODEL_SELECTION_GUIDANCE_JOB_TYPE = "model_selection_guidance_snapshot"
 MODEL_CALIBRATION_JOB_TYPE = "model_calibration_snapshot"
 MARKET_SNAPSHOT_JOB_TYPE = "market_snapshot_refresh"
 RECOMMENDATION_REGRESSION_JOB_TYPE = "ai_report_recommendation_regression"
+SELECTION_QUALITY_JOB_TYPE = "selection_quality_snapshot"
 AI_DAILY_REPORT_JOB_TYPE = "generate_ai_daily_report"
 SH_TZ = ZoneInfo("Asia/Shanghai")
+CN_MIN_FULL_MARKET_REFRESH_SYMBOLS = 4000
+
+
+CN_CLOSE_REVIEW_COMPLETION_REQUIRED_JOBS = [
+    CLOSE_REVIEW_JOB_TYPE,
+    CN_SIGNAL_TRAIN_JOB_TYPE,
+    SCREENER_PRECOMPUTE_JOB_TYPE,
+    SCREENER_PRECOMPUTE_CORE_JOB_TYPE,
+    SCREENER_PRECOMPUTE_COMBO_JOB_TYPE,
+    SCREENER_PRECOMPUTE_REST_JOB_TYPE,
+    MODEL_SELECTION_GUIDANCE_JOB_TYPE,
+    MODEL_CALIBRATION_JOB_TYPE,
+    KRONOS_VALIDATION_JOB_TYPE,
+    MARKET_SNAPSHOT_JOB_TYPE,
+    AI_DAILY_REPORT_JOB_TYPE,
+    SELECTION_QUALITY_JOB_TYPE,
+]
 
 DEFAULT_CLOSE_REVIEW_CONFIG = {
     "enabled": False,
@@ -66,7 +89,7 @@ DEFAULT_CLOSE_REVIEW_CONFIG = {
     "provider": "auto",
     "days_back": 7,
     "overlap_days": 3,
-    "refresh_limit": 500,
+    "refresh_limit": 0,
     "stale_job_hours": 12,
     "retry_cooldown_minutes": 60,
     "max_attempts_per_day": 4,
@@ -198,6 +221,20 @@ class CloseReviewSchedulerService:
         today = now.date().isoformat()
         if config.get("last_run_date") == today:
             return None
+        with SessionLocal() as db:
+            completion = self._daily_close_review_pipeline_completion(db, target_date=today)
+            if completion.get("completed"):
+                self._persist_last_run(
+                    db,
+                    reason="scheduler_skip_completed_pipeline",
+                    completion=completion,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": "completed_pipeline",
+                    "message": "Today's close-review pipeline is already complete; scheduler skipped the night inspection rerun.",
+                    "completion": completion,
+                }
         if config.get("last_scheduler_attempt_date") == today:
             if int(config.get("last_scheduler_attempt_count") or 0) >= int(config.get("max_attempts_per_day") or 4):
                 return None
@@ -213,7 +250,23 @@ class CloseReviewSchedulerService:
                     pass
         return self.run_close_review(trigger="scheduler")
 
-    def run_close_review(self, trigger: str = "manual") -> dict:
+    def run_close_review(self, trigger: str = "manual", *, force: bool = False) -> dict:
+        if self._should_skip_completed_pipeline(trigger, force=force):
+            with SessionLocal() as db:
+                completion = self._daily_close_review_pipeline_completion(db, target_date=sh_now().date().isoformat())
+                self._persist_last_run(
+                    db,
+                    reason=f"{trigger}_skip_completed_pipeline",
+                    completion=completion,
+                )
+            return {
+                "status": "skipped",
+                "reason": "completed_pipeline",
+                "message": (
+                    "Today's close-review pipeline is already complete; skipped duplicate close-review/night inspection."
+                ),
+                "completion": completion,
+            }
         config, job_id, cleaned_jobs = self._prepare_close_review_run(trigger)
         try:
             with SessionLocal() as db:
@@ -230,6 +283,33 @@ class CloseReviewSchedulerService:
                 overlap_days=config["overlap_days"],
                 rebuild_snapshots=False,
             )
+            refresh_status = str(refresh_result.get("status") or "success").lower()
+            refreshed_symbols = int(refresh_result.get("success_count") or refresh_result.get("rows_written") or 0)
+            required_as_of_date = str(refresh_result.get("required_as_of_date") or sh_now().date().isoformat())
+            lake_symbol_count = count_lake_symbols_for_trade_date(market="CN", trade_date=required_as_of_date)
+            freshness_confirmed = refresh_status == "success" or (
+                refresh_status == "partial"
+                and refreshed_symbols >= CN_MIN_FULL_MARKET_REFRESH_SYMBOLS
+                and lake_symbol_count >= CN_MIN_FULL_MARKET_REFRESH_SYMBOLS
+            )
+            if not freshness_confirmed:
+                stale_count = int(refresh_result.get("stale_count") or 0)
+                message = (
+                    "Close review stopped before analysis because CN price freshness was not confirmed: "
+                    f"refresh status {refresh_status}, stale {stale_count}, "
+                    f"refreshed {refreshed_symbols}, lake symbols {lake_symbol_count}."
+                )
+                with SessionLocal() as db:
+                    DataJobRepository(db).complete_job(job_id, status="partial", message=message)
+                return {
+                    "status": "partial",
+                    "job_id": job_id,
+                    "refresh_result": refresh_result,
+                    "rebuild_result": {"status": "skipped", "message": "Skipped until price freshness is confirmed."},
+                    "analysis_result": {"status": "skipped", "tickers": []},
+                    "cleaned_stale_jobs": cleaned_jobs,
+                    "message": message,
+                }
             with SessionLocal() as db:
                 DataJobRepository(db).update_job(
                     job_id,
@@ -304,6 +384,14 @@ class CloseReviewSchedulerService:
                 DataJobRepository(db).complete_job(job_id, status="failed", message=str(exc))
             raise
 
+    def _should_skip_completed_pipeline(self, trigger: str, *, force: bool = False) -> bool:
+        if force:
+            return False
+        today = sh_now().date().isoformat()
+        with SessionLocal() as db:
+            completion = self._daily_close_review_pipeline_completion(db, target_date=today)
+        return bool(completion.get("completed"))
+
     def _run_lake_refresh_with_fallback(
         self,
         *,
@@ -316,13 +404,21 @@ class CloseReviewSchedulerService:
         end_date = sh_now().date()
         start_date = end_date - timedelta(days=max(0, days_back - 1))
         if str(provider or "auto").strip().lower() in {"auto", "tushare"}:
+            # The close-review pipeline is a daily production pipeline. It must
+            # not create a canonical "today" lake partition from only a limited
+            # subset of symbols; that was the root cause of stale watchlist data.
+            effective_limit = None
             result = refresh_cn_market_data_lake_only(
                 start_date=start_date.isoformat(),
                 end_date=end_date.isoformat(),
-                limit=limit,
+                limit=effective_limit,
             )
             result["provider_used"] = "tushare_lake"
             result["providers_attempted"] = ["tushare_lake"]
+            if limit is not None:
+                result["requested_limit"] = limit
+                result["effective_limit"] = effective_limit
+                result["limit_ignored_reason"] = "close_review_requires_full_market_cn_lake_refresh"
             return result
         return self._run_refresh_with_fallbacks(
             provider=provider,
@@ -490,7 +586,9 @@ class CloseReviewSchedulerService:
                 runner(source_job_id=source_job_id, parent_job_id=parent_job_id)
             self._run_model_selection_guidance_job_safe(source_job_id)
             self._run_model_calibration_job_safe(source_job_id)
+            self._run_kronos_validation_job_safe(source_job_id)
             self._run_ai_daily_report_job_safe(source_job_id=source_job_id, parent_job_id=parent_job_id)
+            self._run_selection_quality_job_safe(source_job_id=source_job_id, parent_job_id=parent_job_id)
         except Exception:
             return
 
@@ -505,6 +603,7 @@ class CloseReviewSchedulerService:
                     lake_only=False,
                     template_keys=CORE_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
                     universes=["full_market"],
+                    include_all_market=False,
                 )
 
         return self._run_named_screener_precompute_job(
@@ -539,21 +638,17 @@ class CloseReviewSchedulerService:
         batch_plan = [
             {
                 "label": "cn_full_market_rest",
+                "markets": ["CN"],
                 "template_keys": REST_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
                 "universes": ["full_market"],
                 "include_watchlist": False,
             },
             {
                 "label": "watchlist",
+                "markets": ["CN"],
                 "template_keys": WATCHLIST_PRECOMPUTE_TEMPLATES,
                 "universes": ["watchlist"],
                 "include_watchlist": True,
-            },
-            {
-                "label": "full_market_all",
-                "template_keys": FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES,
-                "universes": ["full_market"],
-                "include_watchlist": False,
             },
         ]
 
@@ -581,11 +676,12 @@ class CloseReviewSchedulerService:
                     batch_result = refresh_precomputed_screener_snapshots(
                         db,
                         source_job_id=emitted_job_id,
-                        markets=["CN"],
+                        markets=batch.get("markets") or ["CN"],
                         include_watchlist=bool(batch.get("include_watchlist")),
                         lake_only=False,
                         template_keys=template_keys,
                         universes=batch.get("universes") or None,
+                        include_all_market=bool(batch.get("include_all_market", False)),
                     )
                 batch_result["batch"] = batch["label"]
                 batch_results.append(batch_result)
@@ -780,10 +876,13 @@ class CloseReviewSchedulerService:
 
             market_meta = report.get("market_recommendations_meta") or {}
             market_status = str(market_meta.get("status") or "").strip().lower() or "ready"
-            candidate_count = len(report.get("market_recommendations") or [])
+            actionable_count = len(report.get("market_recommendations") or [])
+            watch_count = len(report.get("market_watch_recommendations") or [])
+            scanned_count = int(market_meta.get("candidate_count") or 0)
             message = (
                 f"Generated AI daily report after precompute tail jobs: "
-                f"{candidate_count} A-share market candidate(s), status {market_status}."
+                f"{actionable_count} actionable A-share candidate(s), {watch_count} watch candidate(s), "
+                f"{scanned_count} ranked candidate(s), status {market_status}."
             )
             if push_result and push_result.get("sent"):
                 message += f" Pushed to {', '.join(push_result['sent'])}."
@@ -796,7 +895,10 @@ class CloseReviewSchedulerService:
                     message=message,
                     result={
                         "report_date": report.get("report_date"),
-                        "market_candidate_count": candidate_count,
+                        "market_candidate_count": actionable_count,
+                        "market_actionable_count": actionable_count,
+                        "market_watch_count": watch_count,
+                        "market_ranked_candidate_count": scanned_count,
                         "market_recommendations_meta": market_meta,
                         "push_result": push_result,
                     },
@@ -809,6 +911,103 @@ class CloseReviewSchedulerService:
                             ai_job_id,
                             status="failed",
                             message=f"AI daily report generation failed after precompute: {exc}",
+                        )
+            except Exception:
+                pass
+
+    def _run_selection_quality_job_safe(self, source_job_id: int, parent_job_id: int | None = None) -> None:
+        quality_job_id: int | None = None
+        try:
+            with SessionLocal() as db:
+                job_repo = DataJobRepository(db)
+                job_repo.complete_stale_running_jobs(
+                    job_types=[SELECTION_QUALITY_JOB_TYPE],
+                    stale_after_hours=2,
+                    message_prefix="Close-review cleanup closed a stale selection quality job.",
+                )
+                if job_repo.has_running_job(SELECTION_QUALITY_JOB_TYPE):
+                    return
+                job = job_repo.create_job(
+                    job_type=SELECTION_QUALITY_JOB_TYPE,
+                    status="running",
+                    params={
+                        "source_job_id": source_job_id,
+                        "depends_on": [parent_job_id] if parent_job_id is not None else [],
+                        "pipeline_step": "selection_quality_after_ai_daily_report",
+                    },
+                    message="Building unified selection-quality snapshot after AI daily report.",
+                )
+                quality_job_id = job.id
+            with SessionLocal() as db:
+                snapshot = save_selection_quality_snapshot(db=db, source_job_id=quality_job_id)
+                DataJobRepository(db).complete_job(
+                    quality_job_id,
+                    status="success",
+                    message=(
+                        f"Selection-quality snapshot #{snapshot.get('id')} saved with "
+                        f"{snapshot.get('sample_count', 0)} evaluated candidate record(s)."
+                    ),
+                    result=snapshot,
+                )
+        except Exception as exc:
+            try:
+                if quality_job_id is not None:
+                    with SessionLocal() as db:
+                        DataJobRepository(db).complete_job(
+                            quality_job_id,
+                            status="failed",
+                            message=f"Selection-quality snapshot failed after AI daily report: {exc}",
+                        )
+            except Exception:
+                pass
+            return
+
+    def _run_kronos_validation_job_safe(self, source_job_id: int) -> None:
+        kronos_job_id: int | None = None
+        try:
+            with SessionLocal() as db:
+                job_repo = DataJobRepository(db)
+                job_repo.complete_stale_running_jobs(
+                    job_types=[KRONOS_VALIDATION_JOB_TYPE],
+                    stale_after_hours=2,
+                    message_prefix="Close-review cleanup closed a stale Kronos validation job.",
+                )
+                if job_repo.has_running_job(KRONOS_VALIDATION_JOB_TYPE):
+                    return
+                job = job_repo.create_job(
+                    job_type=KRONOS_VALIDATION_JOB_TYPE,
+                    status="running",
+                    params={
+                        "source_job_id": source_job_id,
+                        "pipeline_step": "kronos_validation_after_precompute",
+                    },
+                    message="Validating top CN model candidates with optional Kronos adapter after precompute.",
+                )
+                kronos_job_id = job.id
+            with SessionLocal() as db:
+                result = save_kronos_validation_snapshot(
+                    db=db,
+                    source_job_id=kronos_job_id,
+                    markets=["CN"],
+                )
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(
+                    kronos_job_id,
+                    status=str(result.get("status") or "success"),
+                    message=(
+                        f"Kronos validation snapshot saved: {result.get('candidate_count', 0)} candidate(s), "
+                        f"status {result.get('status') or '-'}."
+                    ),
+                    result=result,
+                )
+        except Exception as exc:
+            try:
+                if kronos_job_id is not None:
+                    with SessionLocal() as db:
+                        DataJobRepository(db).complete_job(
+                            kronos_job_id,
+                            status="failed",
+                            message=f"Kronos validation failed after precompute: {exc}",
                         )
             except Exception:
                 pass
@@ -928,6 +1127,7 @@ class CloseReviewSchedulerService:
 
     def _run_cn_signal_training_job_safe(self, source_job_id: int) -> None:
         cn_job_id: int | None = None
+        run_name = f"cn_close_{sh_now().date().isoformat()}"
         try:
             cn_tickers = sorted(list_lake_symbols(market="CN"))
             if not cn_tickers:
@@ -955,7 +1155,7 @@ class CloseReviewSchedulerService:
                 cn_job_id = job.id
             trainer = SignalTrainer()
             predictions_written = trainer.train(
-                run_name=f"cn_close_{sh_now().date().isoformat()}",
+                run_name=run_name,
                 model_type="lightgbm",
                 signal_type="momentum",
                 lookback_days=3,
@@ -964,7 +1164,6 @@ class CloseReviewSchedulerService:
                 universe="full_market_cn_lake",
             )
             with SessionLocal() as db:
-                refresh_workspace_snapshots(db, source_job_id=cn_job_id)
                 DataJobRepository(db).complete_job(
                     cn_job_id,
                     status="success",
@@ -977,6 +1176,13 @@ class CloseReviewSchedulerService:
                         "predictions_written": predictions_written,
                     },
                 )
+            try:
+                with SessionLocal() as db:
+                    refresh_workspace_snapshots(db, source_job_id=cn_job_id)
+            except Exception:
+                # Snapshot refresh is a presentation cache. Do not fail the model training job
+                # after predictions have been written successfully.
+                pass
             notifier = PushNotificationService()
             if notifier.available_channels():
                 notifier.send_event(
@@ -988,14 +1194,23 @@ class CloseReviewSchedulerService:
                         "下一步会基于最新预测刷新模型选股快照。"
                     ),
                 )
-        except Exception:
+        except Exception as exc:
             try:
                 if cn_job_id is not None:
                     with SessionLocal() as db:
+                        running_runs = db.scalars(
+                            select(ModelRun).where(ModelRun.name == run_name, ModelRun.status == "running")
+                        ).all()
+                        for run in running_runs:
+                            run.status = "failed"
+                            run.finished_at = utc_now_iso()
+                        if running_runs:
+                            db.commit()
                         DataJobRepository(db).complete_job(
                             cn_job_id,
                             status="failed",
-                            message="A-share LightGBM signal training failed.",
+                            message=f"A-share LightGBM signal training failed: {exc}",
+                            result={"error": str(exc)},
                         )
             except Exception:
                 pass
@@ -1238,11 +1453,77 @@ class CloseReviewSchedulerService:
         except Exception:
             return
 
-    def _persist_last_run(self, db) -> None:
+    def _daily_close_review_pipeline_completion(self, db, *, target_date: str) -> dict:
+        latest_lake_date = get_latest_lake_trade_date(market="CN")
+        lake_symbol_count = (
+            count_lake_symbols_for_trade_date(market="CN", trade_date=latest_lake_date)
+            if latest_lake_date
+            else 0
+        )
+        lake_ready = bool(
+            latest_lake_date and latest_lake_date >= target_date and lake_symbol_count >= CN_MIN_FULL_MARKET_REFRESH_SYMBOLS
+        )
+        jobs = [
+            item
+            for item in DataJobRepository(db).list_recent_jobs(360)
+            if str(item.get("started_at") or "")[:10] == target_date
+        ]
+        latest_by_type: dict[str, dict] = {}
+        for item in jobs:
+            job_type = str(item.get("job_type") or "").strip()
+            if not job_type or job_type in latest_by_type:
+                continue
+            latest_by_type[job_type] = item
+
+        required: dict[str, dict] = {}
+        missing: list[str] = []
+        not_success: list[dict] = []
+        for job_type in CN_CLOSE_REVIEW_COMPLETION_REQUIRED_JOBS:
+            item = latest_by_type.get(job_type)
+            if item is None:
+                missing.append(job_type)
+                required[job_type] = {"status": "missing"}
+                continue
+            status = str(item.get("status") or "").strip().lower()
+            required[job_type] = {
+                "id": item.get("id"),
+                "status": status,
+                "started_at": item.get("started_at"),
+                "finished_at": item.get("finished_at"),
+                "duration_seconds": item.get("duration_seconds"),
+                "message": item.get("message"),
+            }
+            if status != "success":
+                not_success.append({"job_type": job_type, "id": item.get("id"), "status": status})
+
+        completed = lake_ready and not missing and not not_success
+        return {
+            "completed": completed,
+            "target_date": target_date,
+            "lake": {
+                "latest_trade_date": latest_lake_date,
+                "symbol_count": lake_symbol_count,
+                "ready": lake_ready,
+            },
+            "required_jobs": required,
+            "missing_jobs": missing,
+            "not_success_jobs": not_success,
+        }
+
+    def _persist_last_run(self, db, *, reason: str | None = None, completion: dict | None = None) -> None:
         config = self.get_config(db=db)
         now = sh_now()
         config["last_run_date"] = now.date().isoformat()
         config["last_run_at"] = utc_now_iso()
+        if reason:
+            config["last_run_reason"] = reason
+        if completion is not None:
+            config["last_run_completion_summary"] = {
+                "target_date": completion.get("target_date"),
+                "lake": completion.get("lake"),
+                "missing_jobs": completion.get("missing_jobs") or [],
+                "not_success_jobs": completion.get("not_success_jobs") or [],
+            }
         AppSettingRepository(db).set(CLOSE_REVIEW_CONFIG_KEY, json.dumps(config))
 
     def _persist_last_attempt(self, db, *, trigger: str) -> None:

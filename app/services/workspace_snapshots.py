@@ -736,8 +736,11 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
             ticker = str(row.get("ticker") or "").strip().upper()
             overview = overviews.get(ticker) or {}
             market = str(overview.get("market") or row.get("market") or "CN").upper()
-            market_counts[market] = market_counts.get(market, 0) + 1
             template = str(row.get("_template") or "").strip()
+            if market == "US" and not str(overview.get("sector") or "").strip():
+                # U.S. sector flow should be based on real sector metadata, not
+                # inferred labels from ticker/name heuristics.
+                continue
             label = resolve_template_group_label(
                 meta=overview,
                 ticker=ticker,
@@ -745,8 +748,14 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
                 name=row.get("name") or overview.get("name"),
             )
             used_fallback_label = not label or label in {"其他", "Unclassified", "美股综合 / US General", "A股其他 / CN Other"}
+            if market == "US" and used_fallback_label:
+                # The U.S. heatmap should represent sector/industry flow. Names without
+                # sector metadata remain available in continuous-leader views instead of
+                # being mixed into synthetic momentum buckets.
+                continue
             if used_fallback_label:
                 label = _market_heatmap_fallback_label(row, template)
+            market_counts[market] = market_counts.get(market, 0) + 1
             label = _market_heatmap_display_label(
                 label=label,
                 market=market,
@@ -1009,25 +1018,12 @@ def build_pipeline_status_snapshot(db: Session, *, lang: str = "zh") -> dict:
     latest_backtest = BacktestRepository(db).get_latest_backtest_summary() or {}
     close_review_action_feed = build_close_review_action_feed(load_ai_daily_report(db=db), lang=lang)
     sync_states = PriceSyncStateRepository(db).list_states_with_symbols()
-    refresh_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "cn_close_review"), None)
-    analysis_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "watchlist_auto_analysis"), None)
-    news_job = next((item for item in recent_jobs if str(item.get("job_type") or "").lower() == "news_enrichment"), None)
-    us_train_job = next(
-        (
-            item
-            for item in recent_jobs
-            if str(item.get("job_type") or "").lower() in {"us_signal_train", "train_us_signals"}
-        ),
-        None,
-    ) or DataJobRepository(db).get_latest_job({"us_signal_train", "train_us_signals"})
-    guidance_job = next(
-        (
-            item
-            for item in recent_jobs
-            if str(item.get("job_type") or "").lower() == "model_selection_guidance_snapshot"
-        ),
-        None,
-    ) or DataJobRepository(db).get_latest_job("model_selection_guidance_snapshot")
+    job_repo = DataJobRepository(db)
+    refresh_job = job_repo.get_latest_job("cn_close_review")
+    analysis_job = job_repo.get_latest_job("watchlist_auto_analysis")
+    news_job = job_repo.get_latest_job("news_enrichment")
+    us_train_job = job_repo.get_latest_job({"us_signal_train", "train_us_signals"})
+    guidance_job = job_repo.get_latest_job("model_selection_guidance_snapshot")
     latest_dashboard_nlp = WorkspaceSnapshotRepository(db).get_latest_snapshot(SNAPSHOT_DASHBOARD_NLP) or {}
     latest_watchlist_nlp = WorkspaceSnapshotRepository(db).get_latest_snapshot(SNAPSHOT_WATCHLIST_NLP) or {}
     nlp_payload = (latest_dashboard_nlp.get("payload") or {}) if isinstance(latest_dashboard_nlp, dict) else {}

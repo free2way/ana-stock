@@ -218,7 +218,7 @@ def get_social_poll_status(db: Session | None = None) -> dict:
     settings = get_settings()
     return {
         "enabled": True,
-        "interval_minutes": 30,
+        "interval_minutes": 240,
         "provider": "x_api" if settings.x_bearer_token else "not_configured",
         "configured": bool(settings.x_bearer_token),
         "last_run_at": state.get("last_run_at"),

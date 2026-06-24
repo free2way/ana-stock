@@ -8,11 +8,14 @@ from app.core.db import SessionLocal
 from app.services.backtester import BacktestRunner
 from app.services.market_calendar import previous_market_open_date
 from app.services.market_lake import count_lake_symbols_for_trade_date, get_latest_lake_trade_date, list_lake_symbols
-from app.services.repository import AppSettingRepository, DataJobRepository
+from app.services.market_sync import sync_market_data
+from app.services.portfolio_book import load_portfolio_positions
+from app.services.repository import AppSettingRepository, DataJobRepository, WatchlistRepository
 from app.services.screener_snapshots import refresh_precomputed_screener_snapshots
 from app.services.trainer import SignalTrainer
 from app.services.time_utils import app_now
 from app.services.us_market_universe import refresh_us_grouped_daily
+from app.services.us_trade_universe import build_us_trade_universe
 from app.services.workspace_snapshots import refresh_workspace_snapshots, save_market_workspace_snapshots
 
 
@@ -33,7 +36,12 @@ DEFAULT_US_MARKET_SCHEDULER_CONFIG = {
     "last_run_at": None,
     "last_run_trade_date": None,
     "retry_cooldown_minutes": 20,
-    "max_attempts_per_day": 3,
+    "priority_price_sync_enabled": True,
+    "priority_price_sync_limit": 80,
+    # Polygon grouped daily is sometimes published later than the first
+    # post-close probe. Keep retrying through the afternoon in Asia/Shanghai
+    # instead of exhausting the day at 11:55.
+    "max_attempts_per_day": 12,
 }
 
 
@@ -68,6 +76,8 @@ class USMarketSchedulerService:
         config["retry_cooldown_minutes"] = max(1, _safe_int(config.get("retry_cooldown_minutes"), 20))
         config["max_attempts_per_day"] = max(1, _safe_int(config.get("max_attempts_per_day"), 3))
         config["last_attempt_count"] = max(0, _safe_int(config.get("last_attempt_count"), 0))
+        config["priority_price_sync_enabled"] = bool(config.get("priority_price_sync_enabled", True))
+        config["priority_price_sync_limit"] = max(1, _safe_int(config.get("priority_price_sync_limit"), 80))
         config["adjusted"] = bool(config.get("adjusted", True))
         return config
 
@@ -149,6 +159,15 @@ class USMarketSchedulerService:
                 write_lake=True,
                 write_snapshot=False,
             )
+            priority_sync_result = (
+                self._sync_priority_us_prices(
+                    target_trade_date=target_trade_date,
+                    limit=int(config.get("priority_price_sync_limit") or 80),
+                )
+                if config.get("priority_price_sync_enabled", True)
+                else {"status": "disabled"}
+            )
+            result = {**result, "priority_price_sync": priority_sync_result}
             status = "success" if str(result.get("status")) == "success" else str(result.get("status") or "failed")
             latest_lake_trade_date = get_latest_lake_trade_date(market="US")
             latest_lake_symbol_count = (
@@ -184,7 +203,7 @@ class USMarketSchedulerService:
                 DataJobRepository(db).complete_job(
                     job_id,
                     status=status,
-                    message=result.get("message") or "U.S. market close refresh finished.",
+                    message=self._refresh_message_with_priority_sync(result),
                     result=result,
                 )
                 if status == "success":
@@ -199,8 +218,127 @@ class USMarketSchedulerService:
                 DataJobRepository(db).complete_job(job_id, status="failed", message=str(exc))
             raise
 
+    def _priority_us_tickers(self) -> list[str]:
+        tickers: list[str] = []
+
+        def add(ticker: object, market: object = None) -> None:
+            normalized = str(ticker or "").strip().upper()
+            market_code = str(market or "").strip().upper()
+            if not normalized or normalized.endswith((".SS", ".SZ", ".SH", ".BJ", ".HK")):
+                return
+            if market_code and market_code != "US":
+                return
+            if normalized not in tickers:
+                tickers.append(normalized)
+
+        for item in load_portfolio_positions():
+            add(item.get("ticker"), item.get("market"))
+
+        with SessionLocal() as db:
+            watchlist_repo = WatchlistRepository(db)
+            watchlist = watchlist_repo.get_or_create_default()
+            for item in watchlist_repo.list_items(watchlist.id):
+                add(item.get("ticker"), item.get("market"))
+        return tickers
+
+    def _priority_us_price_gaps(self, *, target_trade_date: str, limit: int) -> list[dict]:
+        from app.services.market_lake import load_lake_price_history
+
+        gaps: list[dict] = []
+        for ticker in self._priority_us_tickers():
+            history = load_lake_price_history(market="US", ticker=ticker, limit=1)
+            latest_date = str((history[-1] or {}).get("date") or "") if history else ""
+            if not latest_date or (target_trade_date and latest_date < target_trade_date):
+                gaps.append(
+                    {
+                        "ticker": ticker,
+                        "latest_date": latest_date or None,
+                        # Fetch from the last known date inclusively. The lake
+                        # writer de-duplicates rows and this keeps adjusted data
+                        # repairs safe without needing a U.S. business-day helper here.
+                        "start_date": latest_date or "2025-01-01",
+                    }
+                )
+            if len(gaps) >= limit:
+                break
+        return gaps
+
+    def _stale_priority_us_tickers(self, *, target_trade_date: str, limit: int) -> list[str]:
+        return [row["ticker"] for row in self._priority_us_price_gaps(target_trade_date=target_trade_date, limit=limit)]
+
+    def _sync_priority_us_prices(self, *, target_trade_date: str, limit: int) -> dict:
+        price_gaps = self._priority_us_price_gaps(target_trade_date=target_trade_date, limit=limit)
+        stale_tickers = [row["ticker"] for row in price_gaps]
+        if not stale_tickers:
+            return {
+                "status": "skipped",
+                "message": "All priority U.S. portfolio/watchlist tickers already have current lake prices.",
+                "target_trade_date": target_trade_date,
+                "ticker_count": 0,
+                "success_count": 0,
+                "failure_count": 0,
+            }
+        try:
+            results = sync_market_data(
+                tickers=stale_tickers,
+                start_date="2025-01-01",
+                start_dates_by_ticker={
+                    row["ticker"]: row["start_date"]
+                    for row in price_gaps
+                    if row.get("ticker") and row.get("start_date")
+                },
+                end_date=target_trade_date or None,
+                provider="auto",
+            )
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "message": f"Priority U.S. single-ticker price sync failed: {exc}",
+                "target_trade_date": target_trade_date,
+                "tickers": stale_tickers,
+                "price_gaps": price_gaps,
+                "ticker_count": len(stale_tickers),
+                "success_count": 0,
+                "failure_count": len(stale_tickers),
+            }
+        success_count = sum(1 for row in results if str(row.get("status") or "").lower() == "success")
+        failure_count = max(0, len(results) - success_count)
+        compact_results = [
+            {
+                "ticker": row.get("ticker"),
+                "status": row.get("status"),
+                "rows": row.get("rows"),
+                "provider_ticker": row.get("provider_ticker"),
+                "last_synced_date": row.get("last_synced_date"),
+                "message": row.get("message"),
+            }
+            for row in results
+        ]
+        return {
+            "status": "success" if success_count and failure_count == 0 else "partial" if success_count else "failed",
+            "message": f"Priority U.S. price fallback synced {success_count}/{len(stale_tickers)} portfolio/watchlist ticker(s).",
+            "target_trade_date": target_trade_date,
+            "tickers": stale_tickers,
+            "price_gaps": price_gaps,
+            "ticker_count": len(stale_tickers),
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "results": compact_results,
+        }
+
+    def _refresh_message_with_priority_sync(self, result: dict) -> str:
+        base = str(result.get("message") or "U.S. market close refresh finished.")
+        priority = result.get("priority_price_sync") if isinstance(result, dict) else None
+        if not isinstance(priority, dict):
+            return base
+        status = str(priority.get("status") or "")
+        if status in {"disabled", "skipped"}:
+            return base
+        return f"{base} Priority fallback: {priority.get('message') or status}"
+
     def _run_signal_training(self, *, source_job_id: int, trade_date: str) -> None:
-        us_tickers = sorted(list_lake_symbols(market="US"))
+        raw_us_tickers = sorted(list_lake_symbols(market="US"))
+        us_tickers, universe_summary = build_us_trade_universe(tickers=raw_us_tickers, include_summary=True)
         if not us_tickers:
             return
         with SessionLocal() as db:
@@ -219,6 +357,8 @@ class USMarketSchedulerService:
                     "source_job_id": source_job_id,
                     "trade_date": trade_date,
                     "ticker_count": len(us_tickers),
+                    "raw_ticker_count": len(raw_us_tickers),
+                    "universe_summary": universe_summary,
                     "market": "US",
                     "model_type": "lightgbm",
                 },
@@ -238,22 +378,31 @@ class USMarketSchedulerService:
             )
             daily_rows_written = runner.run(top_n=5)
             with SessionLocal() as db:
-                refresh_workspace_snapshots(db, source_job_id=job.id)
                 DataJobRepository(db).complete_job(
                     job.id,
                     status="success",
                     message=(
-                        f"Trained {len(us_tickers)} U.S. symbols, wrote {predictions_written} predictions "
+                        f"Trained {len(us_tickers)} eligible U.S. common-stock symbols "
+                        f"({len(raw_us_tickers)} raw), wrote {predictions_written} predictions "
                         f"and {daily_rows_written} backtest rows."
                     ),
                     result={
                         "market": "US",
                         "trade_date": trade_date,
                         "ticker_count": len(us_tickers),
+                        "raw_ticker_count": len(raw_us_tickers),
+                        "universe_summary": universe_summary,
                         "predictions_written": predictions_written,
                         "daily_rows_written": daily_rows_written,
                     },
                 )
+            try:
+                with SessionLocal() as db:
+                    refresh_workspace_snapshots(db, source_job_id=job.id)
+            except Exception:
+                # Snapshot refresh is a presentation cache. Do not fail a completed
+                # U.S. training run after predictions/backtests have already landed.
+                pass
         except Exception as exc:
             with SessionLocal() as db:
                 DataJobRepository(db).complete_job(job.id, status="failed", message=str(exc))

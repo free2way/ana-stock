@@ -73,7 +73,7 @@ def model_selection_guidance_snapshot_type(market: str | None) -> str:
 def build_model_selection_guidance(
     *,
     market: str = "CN",
-    lookback_snapshots: int = 18,
+    lookback_snapshots: int = 30,
     top_n: int = 60,
     winner_lookback_dates: int = 10,
     winner_top_n: int = 20,

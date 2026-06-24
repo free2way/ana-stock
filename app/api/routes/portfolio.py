@@ -36,7 +36,7 @@ from app.services.portfolio_book import (
 from app.services.price_snapshot import load_latest_close, load_latest_closes
 from app.services.repository import PredictionRepository, SymbolRepository, WatchlistRepository
 from app.services.runtime_cache import clear_namespace, get_or_set
-from app.services.symbol_catalog import infer_symbol_record, search_symbol_catalog
+from app.services.symbol_catalog import infer_symbol_record, search_symbol_catalog, search_symbol_records
 from app.services.ticker_format import normalize_ticker_for_market
 from app.services.time_utils import app_today_iso
 from app.services.ui_lang import resolve_request_lang
@@ -303,30 +303,7 @@ def suggest_portfolio_symbols(
     market_value = market.strip().upper() if market else None
     symbol_repo = SymbolRepository(db)
     results = search_symbol_catalog(q, market_value)
-    seen = {(item["ticker"], item["market"]) for item in results}
-    text = q.strip().upper()
-    if not text:
-        return results[:8]
-    for symbol in symbol_repo.list_symbols():
-        if market_value and (symbol.market or "").upper() != market_value:
-            continue
-        symbol_name = symbol.name or ""
-        if text in symbol.ticker.upper() or text in symbol_name.upper():
-            key = (symbol.ticker, symbol.market)
-            if key in seen:
-                continue
-            results.append(
-                {
-                    "ticker": symbol.ticker,
-                    "name": symbol_name or symbol.ticker,
-                    "market": symbol.market or market_value or "",
-                    "exchange": symbol.exchange or "",
-                }
-            )
-            seen.add(key)
-        if len(results) >= 8:
-            break
-    return results[:8]
+    return search_symbol_records(symbol_repo.list_symbols(), q, market_value, initial=results, limit=8)
 
 
 @router.get("/quote")
@@ -405,7 +382,12 @@ def portfolio_page(
     )
 
     raw_positions = load_portfolio_positions()
-    if isinstance(snapshot_payload, dict) and isinstance(snapshot_payload.get("rows"), list) and isinstance(snapshot_payload.get("totals"), dict):
+    snapshot_rows = snapshot_payload.get("rows") if isinstance(snapshot_payload, dict) else None
+    snapshot_rows_ready = (
+        isinstance(snapshot_rows, list)
+        and all("latest_price_missing" in row for row in snapshot_rows if isinstance(row, dict))
+    )
+    if isinstance(snapshot_payload, dict) and snapshot_rows_ready and isinstance(snapshot_payload.get("totals"), dict):
         rows = list(snapshot_payload.get("rows") or [])
         totals = snapshot_payload.get("totals") or {}
         total_market_value = float(totals.get("market_value") or 0.0)
@@ -429,13 +411,15 @@ def portfolio_page(
                     "market": item.get("market"),
                 }
                 latest_signal = latest_outputs.get(item["ticker"])
-                latest_price = float(latest_prices.get(item["ticker"]) or 0.0)
+                latest_price_raw = latest_prices.get(item["ticker"])
+                latest_price_missing = latest_price_raw is None or float(latest_price_raw or 0.0) <= 0.0
+                latest_price = 0.0 if latest_price_missing else float(latest_price_raw or 0.0)
                 quantity = float(item.get("quantity") or 0.0)
                 cost_basis = float(item.get("cost_basis") or 0.0)
                 market_value = latest_price * quantity
                 cost_value = cost_basis * quantity
-                pnl = market_value - cost_value
-                pnl_pct = ((latest_price / cost_basis) - 1.0) * 100 if cost_basis else 0.0
+                pnl = 0.0 if latest_price_missing else market_value - cost_value
+                pnl_pct = ((latest_price / cost_basis) - 1.0) * 100 if cost_basis and not latest_price_missing else 0.0
                 total_market_value += market_value
                 total_cost += cost_value
                 position_drafts.append(
@@ -449,6 +433,7 @@ def portfolio_page(
                         "market_value": market_value,
                         "pnl": pnl,
                         "pnl_pct": pnl_pct,
+                        "latest_price_missing": latest_price_missing,
                     }
                 )
             for draft in position_drafts:
@@ -480,6 +465,7 @@ def portfolio_page(
                         "market_value": draft["market_value"],
                         "pnl": draft["pnl"],
                         "pnl_pct": draft["pnl_pct"],
+                        "latest_price_missing": draft.get("latest_price_missing", False),
                         "ai_headline": ai_summary["ai_headline"],
                         "ai_verdict": ai_summary["ai_verdict"],
                         "ai_strategy": ai_summary["ai_strategy"],
@@ -860,6 +846,10 @@ def portfolio_page(
         for row in watch_items
     ) or f"<div class='muted'>{'当前筛选下暂无持仓动作建议' if lang == 'zh' else 'No action items for the current filter'}</div>"
     def _render_position_row(row: dict) -> str:
+        price_missing = bool(row.get("latest_price_missing"))
+        latest_price_text = "缺行情" if lang == "zh" and price_missing else ("Missing" if price_missing else f"{float(row.get('latest_price') or 0.0):.2f}")
+        pnl_text = "缺行情" if lang == "zh" and price_missing else ("Missing price" if price_missing else f"{_format_portfolio_money(row['pnl'], market=row.get('market'))} ({row['pnl_pct']:.1f}%)")
+        sell_price_text = "" if price_missing else f"{float(row.get('latest_price') or 0.0):.2f}"
         return (
             "<tr>"
             f"<td>{row['ticker']}</td>"
@@ -867,10 +857,10 @@ def portfolio_page(
             f"<td>{row['market']}</td>"
             f"<td>{row['quantity']:.0f}</td>"
             f"<td>{row['cost_basis']:.2f}</td>"
-            f"<td>{row['latest_price']:.2f}</td>"
+            f"<td>{latest_price_text}</td>"
             f"<td>{_render_daily_change_chip(row.get('daily_change_pct'))}</td>"
             f"<td>{_format_portfolio_money(row['market_value'], market=row.get('market'))}</td>"
-            f"<td>{_format_portfolio_money(row['pnl'], market=row.get('market'))} ({row['pnl_pct']:.1f}%)</td>"
+            f"<td>{pnl_text}</td>"
             f"<td>{row['ai_verdict']}</td>"
             f"<td title='{row['ai_headline']}'>{_compact_text(row['ai_headline'], 30)}</td>"
             f"<td title='{row['ai_strategy']}'>{_compact_text(row['ai_strategy'], 24)}</td>"
@@ -881,7 +871,7 @@ def portfolio_page(
             f"<td title='{html.escape(row['note'] or '-', quote=True)}'>{_compact_text(row['note'] or '-', 20)}</td>"
             "<td>"
             "<div class='position-actions'>"
-            f"<button type='button' class='ghost-btn' onclick=\"openSellModal('{html.escape(row['ticker'], quote=True)}','{html.escape(row['name'], quote=True)}','{float(row['quantity']):.6f}','{float(row['latest_price']):.2f}')\">{'卖出' if lang == 'zh' else 'Sell'}</button>"
+            f"<button type='button' class='ghost-btn' onclick=\"openSellModal('{html.escape(row['ticker'], quote=True)}','{html.escape(row['name'], quote=True)}','{float(row['quantity']):.6f}','{sell_price_text}')\">{'卖出' if lang == 'zh' else 'Sell'}</button>"
             f"<form action='/portfolio/remove' method='post' style='margin:0;'><input type='hidden' name='ticker' value='{row['ticker']}' /><button type='submit' class='ghost-btn danger-btn'>{'删除' if lang == 'zh' else 'Delete'}</button></form>"
             "</div>"
             "</td>"
@@ -889,13 +879,18 @@ def portfolio_page(
         )
 
     def _render_mobile_position_card(row: dict) -> str:
+        price_missing = bool(row.get("latest_price_missing"))
+        latest_price_text = "缺行情" if lang == "zh" and price_missing else ("Missing" if price_missing else f"{float(row.get('latest_price') or 0.0):.2f}")
+        pnl_value_text = "缺行情" if lang == "zh" and price_missing else ("Missing price" if price_missing else f"{_format_portfolio_money(row['pnl'], market=row.get('market'))}")
+        pnl_pct_text = "-" if price_missing else f"{row['pnl_pct']:.1f}%"
+        sell_price_text = "" if price_missing else f"{float(row.get('latest_price') or 0.0):.2f}"
         return (
             "<article class='mobile-position-card'>"
-            f"<div class='mobile-position-head'><div><div class='mobile-position-ticker'>{row['ticker']}</div><div class='muted'>{_compact_text(row['name'], 24)} · {row['market']}</div></div><div style='text-align:right;'><div style='font-weight:800;'>{row['pnl']:.2f}</div><div class='muted'>{row['pnl_pct']:.1f}%</div></div></div>"
+            f"<div class='mobile-position-head'><div><div class='mobile-position-ticker'>{row['ticker']}</div><div class='muted'>{_compact_text(row['name'], 24)} · {row['market']}</div></div><div style='text-align:right;'><div style='font-weight:800;'>{pnl_value_text}</div><div class='muted'>{pnl_pct_text}</div></div></div>"
             f"<div class='mobile-position-grid'>"
             f"<div><span class='muted'>{'数量' if lang == 'zh' else 'Qty'}</span><div>{row['quantity']:.0f}</div></div>"
             f"<div><span class='muted'>{'成本' if lang == 'zh' else 'Cost'}</span><div>{row['cost_basis']:.2f}</div></div>"
-            f"<div><span class='muted'>{'收盘价' if lang == 'zh' else 'Close'}</span><div>{row['latest_price']:.2f}</div></div>"
+            f"<div><span class='muted'>{'收盘价' if lang == 'zh' else 'Close'}</span><div>{latest_price_text}</div></div>"
             f"<div><span class='muted'>{'涨幅' if lang == 'zh' else 'Day %'}</span><div>{_render_daily_change_chip(row.get('daily_change_pct'))}</div></div>"
             f"<div><span class='muted'>{'市值' if lang == 'zh' else 'Value'}</span><div>{_format_portfolio_money(row['market_value'], market=row.get('market'))}</div></div>"
             f"<div><span class='muted'>AI</span><div>{row['ai_verdict']}</div></div>"
@@ -908,7 +903,7 @@ def portfolio_page(
             f"<div class='muted' style='margin-top:6px;'>{'目标仓位' if lang == 'zh' else 'Target'}: {row['target_weight_text']} · {'新闻' if lang == 'zh' else 'News'}: {html.escape(row.get('news_sentiment_label') or '-')} · {int(row.get('news_headline_count') or 0)}</div>"
             f"<div class='muted' style='margin-top:6px;'>{_compact_text(row['note'] or '-', 72)}</div>"
             "<div class='mobile-position-actions'>"
-            f"<button type='button' class='ghost-btn' onclick=\"openSellModal('{html.escape(row['ticker'], quote=True)}','{html.escape(row['name'], quote=True)}','{float(row['quantity']):.6f}','{float(row['latest_price']):.2f}')\">{'卖出' if lang == 'zh' else 'Sell'}</button>"
+            f"<button type='button' class='ghost-btn' onclick=\"openSellModal('{html.escape(row['ticker'], quote=True)}','{html.escape(row['name'], quote=True)}','{float(row['quantity']):.6f}','{sell_price_text}')\">{'卖出' if lang == 'zh' else 'Sell'}</button>"
             f"<form action='/portfolio/remove' method='post' style='margin:0;'><input type='hidden' name='ticker' value='{row['ticker']}' /><button type='submit' class='ghost-btn danger-btn'>{'删除' if lang == 'zh' else 'Delete'}</button></form>"
             "</div>"
             "</article>"
@@ -971,10 +966,10 @@ def portfolio_page(
             var(--bg); color:var(--ink); }}
           {WORKSPACE_COMPACT_STYLE}
           {WORKSPACE_SIDEBAR_STYLE}
-          .content {{ padding:20px 18px 28px; }}
+          .content {{ padding:16px 14px 24px; }}
           .wrap {{ max-width:none; margin:0; padding:0 0 36px; }}
-          .grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); margin-bottom:12px; }}
-          .metric {{ font-size:24px; font-weight:800; margin:2px 0 6px; }}
+          .grid {{ display:grid; gap:8px; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); margin-bottom:10px; }}
+          .metric {{ font-size:20px; font-weight:800; margin:0 0 4px; }}
           .banner {{ margin-bottom:12px; padding:12px 14px; border-radius:14px; background:rgba(61,217,182,0.14); color:var(--accent); font-weight:700; }}
           .table-wrap {{ width:100%; max-width:100%; overflow-x:auto; overflow-y:hidden; border-radius:12px; border:1px solid var(--line); background:rgba(11,19,29,0.82); padding-bottom:8px; scrollbar-gutter:stable both-edges; }}
           .table-wrap::-webkit-scrollbar {{ height:12px; }}
@@ -987,9 +982,9 @@ def portfolio_page(
           .mobile-position-list {{ display:none; gap:10px; margin-top:2px; }}
           .mobile-position-card {{
             border:1px solid var(--line);
-            border-radius:14px;
+            border-radius:10px;
             background:rgba(11,19,29,0.82);
-            padding:12px;
+            padding:10px;
           }}
           .mobile-position-head {{
             display:flex;
@@ -1000,15 +995,15 @@ def portfolio_page(
           .mobile-position-ticker {{ font-size:15px; font-weight:800; color:var(--accent); }}
           .mobile-position-grid {{
             display:grid;
-            gap:8px;
+            gap:6px;
             grid-template-columns:repeat(2, minmax(0, 1fr));
-            margin-top:10px;
+            margin-top:8px;
           }}
           .mobile-position-grid > div {{
             border:1px solid rgba(255,255,255,0.04);
-            border-radius:12px;
+            border-radius:10px;
             background:rgba(21,34,49,0.9);
-            padding:10px 12px;
+            padding:8px 10px;
           }}
           .mobile-position-actions {{ display:grid; gap:8px; margin-top:10px; }}
           .position-actions {{ display:grid; gap:6px; min-width:120px; }}
@@ -1195,18 +1190,18 @@ def portfolio_page(
           .suggest-meta {{ display:block; color:var(--muted); font-size:12px; margin-top:4px; }}
           .hint {{ color:var(--muted); font-size:13px; }}
           .quote-preview {{
-            margin-top:12px;
+            margin-top:8px;
             border:1px solid var(--line);
-            border-radius:16px;
+            border-radius:12px;
             background:rgba(11,19,29,0.72);
-            padding:12px;
+            padding:10px;
             display:grid;
-            gap:8px;
+            gap:6px;
           }}
-          .quote-grid {{ display:grid; gap:8px; grid-template-columns:repeat(2, minmax(0, 1fr)); }}
-          .quote-cell {{ padding:10px 12px; border-radius:12px; background:rgba(21,34,49,0.9); border:1px solid rgba(255,255,255,0.03); }}
-          .quote-label {{ color:var(--muted); font-size:12px; margin-bottom:4px; }}
-          .quote-value {{ font-size:16px; font-weight:800; }}
+          .quote-grid {{ display:grid; gap:6px; grid-template-columns:repeat(2, minmax(0, 1fr)); }}
+          .quote-cell {{ padding:8px 10px; border-radius:10px; background:rgba(21,34,49,0.9); border:1px solid rgba(255,255,255,0.03); }}
+          .quote-label {{ color:var(--muted); font-size:11px; margin-bottom:3px; }}
+          .quote-value {{ font-size:14px; font-weight:800; }}
           .quote-value.positive {{ color:#4ade80; }}
           .quote-value.negative {{ color:#f87171; }}
           .mobile-action-bucket {{ margin-top:10px; padding:10px 12px; border-radius:12px; background:rgba(61,217,182,0.10); border:1px solid rgba(61,217,182,0.18); color:var(--ink); font-weight:800; }}
