@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -13,7 +14,9 @@ from app.services.repository import (
     SymbolRepository,
     WorkspaceSnapshotRepository,
 )
-from app.services.market_lake import screen_cn_lake_momentum, screen_us_lake_momentum
+from app.services.market_lake import get_latest_lake_trade_date, screen_cn_lake_momentum, screen_us_lake_momentum
+from app.services.market_freshness import is_snapshot_as_of_current
+from app.services.market_freshness import latest_completed_market_date
 from app.services.screener import MODEL_TEMPLATES, ScreenerService
 from app.services.technical_patterns import TechnicalPatternService
 from app.services.time_utils import app_now_iso
@@ -214,6 +217,21 @@ def screener_snapshot_type(params: dict) -> str:
     return f"{SCREENER_SNAPSHOT_TYPE_PREFIX}{digest}"
 
 
+def _snapshot_input_meta(params: dict) -> dict:
+    market = str(params.get("market") or "").strip().upper()
+    if market not in {"CN", "US"}:
+        return {"market": market or None, "input_as_of_date": None, "required_as_of_date": None}
+    try:
+        latest = get_latest_lake_trade_date(market=market)
+    except Exception:
+        latest = None
+    return {
+        "market": market,
+        "input_as_of_date": latest,
+        "required_as_of_date": latest_completed_market_date(market),
+    }
+
+
 def load_exact_screener_snapshot(params: dict, *, db: Session | None = None) -> dict | None:
     if db is None:
         with SessionLocal() as own_db:
@@ -224,6 +242,9 @@ def load_exact_screener_snapshot(params: dict, *, db: Session | None = None) -> 
         return None
     payload = snapshot.get("payload") or {}
     if payload.get("key") != screener_snapshot_key(params):
+        return None
+    market = str(params.get("market") or payload.get("market") or "").strip().upper()
+    if (payload.get("schema_version") or payload.get("input")) and not is_snapshot_as_of_current(snapshot.get("snapshot_date"), market):
         return None
     return snapshot
 
@@ -655,6 +676,7 @@ def refresh_precomputed_screener_snapshots(
     universes: list[str] | None = None,
     include_all_market: bool = True,
 ) -> dict:
+    started_at = time.perf_counter()
     created: list[dict] = []
     failed: list[dict] = []
 
@@ -687,6 +709,7 @@ def refresh_precomputed_screener_snapshots(
         ]
 
     for params in precompute_params:
+        template_started_at = time.perf_counter()
         try:
             rows = _screen_with_lake_preferred(params)
             persisted_rows = _compact_snapshot_rows(rows, limit=int(params.get("limit", 5000)))
@@ -701,6 +724,7 @@ def refresh_precomputed_screener_snapshots(
                         "model_template": params["model_template"],
                         "market": params["market"],
                         "universe": params["universe"],
+                        "input": _snapshot_input_meta(params),
                         "candidate_stats": {
                             "returned_count": len(rows),
                             "persisted_count": len(persisted_rows),
@@ -716,6 +740,7 @@ def refresh_precomputed_screener_snapshots(
                     "universe": params["universe"],
                     "market": params["market"],
                     "rows": len(persisted_rows),
+                    "duration_seconds": round(time.perf_counter() - template_started_at, 2),
                 }
             )
         except Exception as exc:
@@ -725,6 +750,7 @@ def refresh_precomputed_screener_snapshots(
                     "universe": params["universe"],
                     "market": params["market"],
                     "error": str(exc),
+                    "duration_seconds": round(time.perf_counter() - template_started_at, 2),
                 }
             )
 
@@ -734,6 +760,7 @@ def refresh_precomputed_screener_snapshots(
         "count": len(created),
         "failed_templates": failed,
         "failed_count": len(failed),
+        "duration_seconds": round(time.perf_counter() - started_at, 2),
     }
 
 
@@ -767,6 +794,7 @@ def refresh_precomputed_multi_screener_snapshots(
                         "preset_label": params.get("preset_label"),
                         "market": params["market"],
                         "universe": params["universe"],
+                        "input": _snapshot_input_meta(params),
                         "multi_model_templates": params.get("multi_model_templates") or [],
                         "meta": meta,
                     },
@@ -808,7 +836,7 @@ def _screen_with_lake_preferred(params: dict) -> list[dict]:
     ):
         rows = screen_cn_lake_momentum(limit=int(params.get("limit", 160)))
         if rows:
-            return rows
+            return ScreenerService().apply_candidate_governance(rows)
     if (
         str(params.get("market") or "").upper() == "US"
         and str(params.get("universe") or "") == "full_market"
@@ -816,7 +844,7 @@ def _screen_with_lake_preferred(params: dict) -> list[dict]:
     ):
         rows = screen_us_lake_momentum(limit=int(params.get("limit", 160)))
         if rows:
-            return rows
+            return ScreenerService().apply_candidate_governance(rows)
     return ScreenerService().screen(**params)
 
 

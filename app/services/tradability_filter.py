@@ -110,7 +110,7 @@ def _suggested_watch_action(bucket: str, status: str, entry_style: str | None) -
 
 def _market_context_summary(market_snapshot: dict[str, Any] | None, candidate: dict[str, Any]) -> dict[str, Any]:
     market_code = str(candidate.get("market") or "").strip().upper()
-    if not market_snapshot or market_code != "CN":
+    if not market_snapshot or market_code not in {"CN", "US"}:
         return {}
     if any(key in market_snapshot for key in ("regime", "breadth_pct", "crowded_theme", "breakout_tailwind")):
         if str(market_snapshot.get("market") or market_code).strip().upper() in {"", market_code}:
@@ -324,6 +324,8 @@ def evaluate_candidate_tradability(
     market_breadth_pct = _safe_float(market_context.get("breadth_pct"))
     market_crowded_theme = bool(market_context.get("crowded_theme"))
     breakout_tailwind = bool(market_context.get("breakout_tailwind"))
+    market_buy_gate = str(market_context.get("buy_gate") or "").strip().upper()
+    model_activation_status = str(candidate.get("model_activation_status") or "").strip().lower()
 
     risk_flags: list[str] = _safe_list(candidate.get("risk_flags")) + _safe_list(candidate.get("model_execution_tags"))
     block_reason: str | None = None
@@ -352,6 +354,23 @@ def evaluate_candidate_tradability(
         if status == "READY":
             status = "REVIEW"
         risk_flags.append("weak-signal-strength")
+
+    if market_buy_gate == "BLOCK":
+        status = "BLOCKED"
+        block_reason = block_reason or "market_buy_gate_blocked"
+        risk_flags.append("market-buy-gate-blocked")
+    elif market_buy_gate == "REVIEW":
+        risk_flags.append("market-risk-review")
+        if status == "READY" and entry_style in {"breakout", "momentum", "wait_for_breakout", "breakout_ready"}:
+            status = "DEFER"
+
+    # Governance is deliberately a second gate. A score can be technically
+    # strong while its model has not accumulated enough strict OOS evidence;
+    # such names remain visible for research but cannot appear as normal BUYs.
+    if model_activation_status.startswith("observation") or model_activation_status == "unverified":
+        risk_flags.append("model-observation-only")
+        if status == "READY":
+            status = "DEFER"
 
     normalized_flags = {str(flag).strip().lower() for flag in risk_flags if str(flag).strip()}
     if "rolled-over-after-spike" in normalized_flags:
@@ -468,5 +487,7 @@ def evaluate_candidate_tradability(
             "market_regime": market_regime or None,
             "market_breadth_pct": market_breadth_pct,
             "market_crowded_theme": market_crowded_theme,
+            "market_buy_gate": market_buy_gate or None,
+            "model_activation_status": model_activation_status or None,
         },
     )

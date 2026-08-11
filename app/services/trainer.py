@@ -11,7 +11,7 @@ from pathlib import Path
 
 from app.core.config import get_settings
 from app.core.db import SessionLocal
-from app.services.market_lake import load_lake_rows
+from app.services.market_lake import get_latest_lake_trade_date, load_lake_rows
 from app.services.model_signal_summary import enrich_model_output, summarize_model_output
 from app.services.repository import (
     ConceptSnapshotRepository,
@@ -28,6 +28,16 @@ try:
     import lightgbm as lgb  # type: ignore
 except ImportError:  # pragma: no cover - handled at runtime
     lgb = None
+
+try:
+    import xgboost as xgb  # type: ignore
+except ImportError:  # pragma: no cover - optional challenger
+    xgb = None
+
+try:
+    import catboost as cat  # type: ignore
+except ImportError:  # pragma: no cover - optional challenger
+    cat = None
 
 
 class SignalTrainer:
@@ -1101,9 +1111,14 @@ class SignalTrainer:
         market: str | None,
         universe: str | None,
         rows: list[dict],
+        model_family: str = "lightgbm",
     ) -> int:
-        if lgb is None:
+        if model_family == "lightgbm" and lgb is None:
             raise RuntimeError("LightGBM is not installed. Run `.venv/bin/pip install -r requirements.txt` first.")
+        if model_family == "xgboost" and xgb is None:
+            raise RuntimeError("XGBoost is not installed. Install the challenger dependencies before starting the race.")
+        if model_family == "catboost" and cat is None:
+            raise RuntimeError("CatBoost is not installed. Install the challenger dependencies before starting the race.")
         if signal_type != "momentum":
             raise RuntimeError("The LightGBM trainer currently supports `momentum` signal_type only.")
 
@@ -1153,7 +1168,15 @@ class SignalTrainer:
         if len(train_pool) < 1000:
             raise RuntimeError("LightGBM trainer needs more labeled history before the first prediction date.")
 
+        # A prediction's label is only visible after `horizon_days`.  Persist
+        # the split protocol so downstream evaluation can distinguish genuine
+        # walk-forward results from older runs that merely overlap a test date.
+        initial_train_end_index = max(0, prediction_start_index - horizon_days)
+        initial_train_end = all_dates[initial_train_end_index] if all_dates else None
+        universe_version = f"{str(universe or ('local_watchlist' if normalized_tickers else 'full_dataset')).lower()}:{len(normalized_tickers or []) or 'all'}"
+
         enhancement_meta = self._feature_enhancement_meta(symbol_feature_context)
+        input_market_date = get_latest_lake_trade_date(market=market) if str(market or "").upper() in {"CN", "US"} else None
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
             model_repo = ModelRunRepository(db)
@@ -1167,15 +1190,15 @@ class SignalTrainer:
             symbol_map = {symbol.ticker.upper(): symbol.id for symbol in symbol_repo.list_symbols()}
             run = model_repo.create_run(
                 name=run_name,
-                model_type="lightgbm_multifactor",
+                model_type=f"{model_family}_multifactor",
                 market=market or "US",
                 universe=universe or ("local_watchlist" if normalized_tickers else "full_dataset"),
                 train_start=all_dates[0] if all_dates else None,
-                train_end=prediction_dates[-1] if prediction_dates else None,
+                train_end=initial_train_end,
                 test_start=prediction_dates[0] if prediction_dates else None,
                 test_end=prediction_dates[-1] if prediction_dates else None,
                 config={
-                    "model_type": "lightgbm",
+                    "model_type": model_family,
                     "signal_type": signal_type,
                     "lookback_days": lookback_days,
                     "prediction_horizon_days": horizon_days,
@@ -1205,6 +1228,12 @@ class SignalTrainer:
                     "symbol_context_summary": enhancement_meta.get("coverage"),
                     "ticker_count": len(normalized_tickers or []),
                     "prediction_dates": len(prediction_dates),
+                    "input_market_date": input_market_date,
+                    "schema_version": 2,
+                    "evaluation_protocol": "walk_forward_purged_v1",
+                    "oos_start_date": first_prediction_date,
+                    "purge_gap_days": horizon_days,
+                    "universe_version": universe_version,
                 },
                 artifact_path=None,
                 status="running",
@@ -1248,19 +1277,26 @@ class SignalTrainer:
                         0.65 + (position / max(len(train_window) - 1, 1)) * 0.7
                         for position in range(len(train_window))
                     ]
-                    model = lgb.LGBMRegressor(
-                        objective="regression",
-                        n_estimators=260,
-                        learning_rate=0.05,
-                        num_leaves=63,
-                        min_child_samples=40,
-                        subsample=0.8,
-                        colsample_bytree=0.8,
-                        reg_alpha=0.05,
-                        reg_lambda=0.1,
-                        random_state=42,
-                        n_jobs=-1,
-                    )
+                    if model_family == "lightgbm":
+                        model = lgb.LGBMRegressor(
+                            objective="regression", n_estimators=260, learning_rate=0.05,
+                            num_leaves=63, min_child_samples=40, subsample=0.8,
+                            colsample_bytree=0.8, reg_alpha=0.05, reg_lambda=0.1,
+                            random_state=42, n_jobs=-1,
+                        )
+                    elif model_family == "xgboost":
+                        model = xgb.XGBRegressor(
+                            objective="reg:squarederror", n_estimators=260, learning_rate=0.05,
+                            max_depth=6, min_child_weight=40, subsample=0.8,
+                            colsample_bytree=0.8, reg_alpha=0.05, reg_lambda=0.1,
+                            random_state=42, n_jobs=-1,
+                        )
+                    else:
+                        model = cat.CatBoostRegressor(
+                            loss_function="RMSE", iterations=260, learning_rate=0.05,
+                            depth=6, l2_leaf_reg=3.0, random_seed=42,
+                            verbose=False, thread_count=-1,
+                        )
                     model.fit(x_train, y_train, sample_weight=sample_weights)
                     raw_importance_obj = getattr(model, "feature_importances_", None)
                     if raw_importance_obj is None:
@@ -1356,7 +1392,7 @@ class SignalTrainer:
                 json.dumps(
                     {
                         "model": run_name,
-                        "model_type": "lightgbm",
+                        "model_type": model_family,
                         "signal_type": signal_type,
                         "lookback_days": lookback_days,
                         "prediction_horizon_days": horizon_days,
@@ -1381,6 +1417,10 @@ class SignalTrainer:
                         "feature_enhancement_note": enhancement_meta.get("note"),
                         "symbol_context_summary": enhancement_meta.get("coverage"),
                         "prediction_dates": prediction_dates,
+                        "evaluation_protocol": "walk_forward_purged_v1",
+                        "oos_start_date": first_prediction_date,
+                        "purge_gap_days": horizon_days,
+                        "universe_version": universe_version,
                     },
                     ensure_ascii=False,
                 ),
@@ -1412,7 +1452,13 @@ class SignalTrainer:
             raise RuntimeError(
                 "The legacy baseline trainer has been retired. Use model_type=`lightgbm` for all new signal runs."
             )
-        if normalized_model_type in {"lightgbm", "lightgbm_multifactor", "lgbm"}:
+        model_family_map = {
+            "lightgbm": "lightgbm", "lightgbm_multifactor": "lightgbm", "lgbm": "lightgbm",
+            "xgboost": "xgboost", "xgboost_multifactor": "xgboost", "xgb": "xgboost",
+            "catboost": "catboost", "catboost_multifactor": "catboost", "cat": "catboost",
+        }
+        model_family = model_family_map.get(normalized_model_type)
+        if model_family:
             return self._train_lightgbm(
                 run_name=run_name,
                 signal_type=signal_type,
@@ -1421,5 +1467,6 @@ class SignalTrainer:
                 market=market,
                 universe=universe,
                 rows=rows,
+                model_family=model_family,
             )
         raise RuntimeError(f"Unsupported model_type `{model_type}`.")

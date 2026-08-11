@@ -354,6 +354,32 @@ class TushareClient:
             rows_by_ticker[ticker] = rows
         return rows_by_ticker
 
+    def is_cn_suspended_on_date(self, ticker: str, trade_date: str) -> bool | None:
+        """Return whether TuShare explicitly reports a suspension for a date.
+
+        ``None`` means the check could not be performed (missing credentials,
+        SDK support, or a provider error).  Callers must keep such symbols in
+        the normal stale/failed path rather than treating an unknown result as
+        a suspension.
+        """
+
+        if not self.token or not str(ticker or '').strip() or not str(trade_date or '').strip():
+            return None
+        try:
+            import tushare as ts  # type: ignore
+
+            pro = ts.pro_api(self.token)
+            if pro is None or not hasattr(pro, "suspend_d"):
+                return None
+            frame = pro.suspend_d(
+                ts_code=self._to_ts_code(ticker),
+                suspend_date=str(trade_date)[:10].replace("-", ""),
+                fields="ts_code,suspend_date,suspend_type,suspend_reason",
+            )
+            return frame is not None and not frame.empty
+        except Exception:
+            return None
+
     def fetch_cn_intraday_bars(
         self,
         ticker: str,

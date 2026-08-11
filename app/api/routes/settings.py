@@ -11,7 +11,6 @@ from app.core.db import SessionLocal
 from app.services.ai_chat import AI_CHAT_PROVIDER_PRESETS, load_ai_chat_config, masked_api_key, save_ai_chat_config
 from app.services.auto_analysis import auto_analysis_service
 from app.services.auth import is_authenticated, login_redirect
-from app.services.close_review_scheduler import close_review_scheduler_service
 from app.services.kronos_validation import load_latest_kronos_validation
 from app.services.push_notifications import PushNotificationService
 from app.services.repository import DataJobRepository, SymbolRepository
@@ -144,16 +143,22 @@ def _latest_cn_refresh_summary(lang: str) -> dict:
             (
                 item
                 for item in recent_jobs
-                if str(item.get("job_type") or "").lower() == "cn_close_review"
-                and str(item.get("status") or "").lower() == "success"
+                if str(item.get("job_type") or "").lower()
+                in {"refresh_cn_market_data_lake_only", "refresh_cn_market_data_daily", "refresh_cn_market_data"}
+                and str(item.get("status") or "").lower() in {"success", "partial"}
             ),
             None,
         )
         cn_total = len([symbol for symbol in SymbolRepository(db).list_symbols() if (symbol.market or "").upper() == "CN"])
     import re
+    result = (refresh_job or {}).get("result")
+    if not isinstance(result, dict):
+        result = {}
     message = str((refresh_job or {}).get("message") or "")
-    match = re.search(r"light CN refresh\s+(\d+)\s+symbol", message, re.IGNORECASE)
-    refreshed = int(match.group(1)) if match else None
+    refreshed = int(result.get("success_count") or result.get("rows_written") or 0) or None
+    if refreshed is None:
+        match = re.search(r"(?:wrote|Refreshed)\s+(\d+)\s+(?:row|stock)", message, re.IGNORECASE)
+        refreshed = int(match.group(1)) if match else None
     summary = f"{refreshed}/{cn_total}" if refreshed is not None and cn_total else (str(refreshed) if refreshed is not None else "-")
     label = (
         f"最近成功刷新 {refreshed}/{cn_total} 只 A 股" if refreshed is not None and lang == "zh"
@@ -207,7 +212,6 @@ def settings_home_page(request: Request) -> str:
     notifier = PushNotificationService()
     channels = notifier.available_channels()
     auto_status = auto_analysis_service.get_status()
-    close_review_status = close_review_scheduler_service.get_status()
     strategy = _provider_strategy_view(lang)
     latest_cn_refresh = _latest_cn_refresh_summary(lang)
     kronos = _kronos_config_summary(lang)
@@ -221,10 +225,7 @@ def settings_home_page(request: Request) -> str:
     }
     total_configured = sum(1 for value in configured.values() if value)
     auto_provider = str(auto_status.get("provider") or "auto")
-    close_provider = str(close_review_status.get("provider") or "auto")
-    refresh_limit = int(close_review_status.get("refresh_limit") or 0)
     auto_enabled_text = "已开启" if (lang == "zh" and auto_status.get("enabled")) else ("已关闭" if lang == "zh" else ("Enabled" if auto_status.get("enabled") else "Disabled"))
-    close_enabled_text = "已开启" if (lang == "zh" and close_review_status.get("enabled")) else ("已关闭" if lang == "zh" else ("Enabled" if close_review_status.get("enabled") else "Disabled"))
     auto_provider_options = "".join(
         f"<option value='{value}'{' selected' if auto_provider == value else ''}>{label}</option>"
         for value, label in (
@@ -232,14 +233,6 @@ def settings_home_page(request: Request) -> str:
             ("tushare", "TuShare"),
             ("yfinance", "yfinance"),
             ("openbb", "OpenBB"),
-        )
-    )
-    close_provider_options = "".join(
-        f"<option value='{value}'{' selected' if close_provider == value else ''}>{label}</option>"
-        for value, label in (
-            ("auto", "Auto"),
-            ("tushare", "TuShare"),
-            ("yfinance", "yfinance"),
         )
     )
     body_html = f"""
@@ -255,7 +248,6 @@ def settings_home_page(request: Request) -> str:
             <div><div class="subtle">{'已启用渠道' if lang == 'zh' else 'Enabled channels'}</div><div class="ticker">{", ".join(channels) if channels else ('无' if lang == 'zh' else 'None')}</div></div>
             <div><div class="subtle">{'已配置数量' if lang == 'zh' else 'Configured count'}</div><div class="ticker">{total_configured}</div></div>
             <div><div class="subtle">{'自动分析' if lang == 'zh' else 'Auto analysis'}</div><div class="ticker">{auto_enabled_text} · {auto_provider}</div></div>
-            <div><div class="subtle">{'收盘复盘' if lang == 'zh' else 'Close review'}</div><div class="ticker">{close_enabled_text} · {close_provider}</div></div>
             <div><div class="subtle">{'AI 问答' if lang == 'zh' else 'AI Q&A'}</div><div class="ticker">{('已配置' if lang == 'zh' else 'Configured') if ai_chat_config.is_configured else ('未配置' if lang == 'zh' else 'Missing')} · {ai_chat_config.provider_name}</div></div>
           </div>
         </article>
@@ -287,7 +279,7 @@ def settings_home_page(request: Request) -> str:
               </a>
               <a class="quick-link" href="/dashboard/ops?lang={lang}">
                 <div class="ticker">{'系统任务策略' if lang == 'zh' else 'Automation Policy'}</div>
-                <div class="section-copy">{'查看自动分析、收盘复盘和 provider 默认策略。' if lang == 'zh' else 'Review auto-analysis, close review, and provider defaults.'}</div>
+                <div class="section-copy">{'查看自动分析和 provider 默认策略。' if lang == 'zh' else 'Review auto-analysis and provider defaults.'}</div>
               </a>
             </div>
           </article>
@@ -317,7 +309,6 @@ def settings_home_page(request: Request) -> str:
             <span class="eyebrow">{'自动任务配置' if lang == 'zh' else 'Automation Configuration'}</span>
             <div class="list-stack">
               <div class="list-row"><div><div class="ticker">{'自动分析' if lang == 'zh' else 'Auto analysis'}</div><div class="subtle">{'默认 provider / 下次运行' if lang == 'zh' else 'Default provider / next run'}</div></div><div class="ticker">{auto_provider} · {_display_time(auto_status.get('next_run_at'))}</div></div>
-              <div class="list-row"><div><div class="ticker">{'收盘复盘' if lang == 'zh' else 'Close review'}</div><div class="subtle">{'默认 provider / 计划时间 / 全市场轻刷新范围' if lang == 'zh' else 'Default provider / schedule / market light refresh scope'}</div></div><div class="ticker">{close_provider} · {close_review_status.get('run_hour', 0):02d}:{close_review_status.get('run_minute', 0):02d} · {('全市场' if refresh_limit == 0 else f'前 {refresh_limit} 只') if lang == 'zh' else ('All CN' if refresh_limit == 0 else f'Top {refresh_limit}')}</div></div>
               <div class="list-row"><div><div class="ticker">{'最近全市场轻刷新结果' if lang == 'zh' else 'Latest light refresh result'}</div><div class="subtle">{latest_cn_refresh['label']}</div></div><div class="ticker">{latest_cn_refresh['summary']}</div></div>
               <div class="list-row"><div><div class="ticker">{'当前建议' if lang == 'zh' else 'Current guidance'}</div><div class="subtle">{'如果主要覆盖 A 股，优先用 TuShare 或 auto。' if lang == 'zh' else 'If CN coverage matters most, prefer TuShare or auto.'}</div></div></div>
             </div>
@@ -346,33 +337,6 @@ def settings_home_page(request: Request) -> str:
                 <div class="form-actions">
                   <label class="checkline"><input type="checkbox" name="enabled" value="1" {'checked' if auto_status.get('enabled') else ''} /> {'启用自动分析' if lang == 'zh' else 'Enable auto analysis'}</label>
                   <button type="submit">{'保存自动分析配置' if lang == 'zh' else 'Save auto analysis'}</button>
-                </div>
-              </form>
-              <form action="/jobs/close-review/config" method="post">
-                <input type="hidden" name="redirect_to" value="/settings?lang={lang}" />
-                <div class="ticker" style="margin-bottom:10px;">{'收盘复盘' if lang == 'zh' else 'Close review'}</div>
-                <div class="form-grid">
-                  <label>
-                    <div class="subtle">{'默认 provider' if lang == 'zh' else 'Default provider'}</div>
-                    <select name="provider">{close_provider_options}</select>
-                  </label>
-                  <label>
-                    <div class="subtle">{'运行小时' if lang == 'zh' else 'Run hour'}</div>
-                    <input type="text" name="run_hour" value="{close_review_status.get('run_hour', 18)}" />
-                  </label>
-                  <label>
-                    <div class="subtle">{'运行分钟' if lang == 'zh' else 'Run minute'}</div>
-                    <input type="text" name="run_minute" value="{close_review_status.get('run_minute', 0)}" />
-                  </label>
-                  <label>
-                    <div class="subtle">{'全市场轻刷新范围' if lang == 'zh' else 'Market light refresh scope'}</div>
-                    <input type="text" name="refresh_limit" value="{refresh_limit}" />
-                    <div class="subtle" style="margin-top:6px;">{'Parquet 模式下建议 0，全市场刷新会写入 lake，不再生成 CSV。' if lang == 'zh' else 'In Parquet mode, 0 is recommended: refresh the full market into the lake without generating CSV.'}</div>
-                  </label>
-                </div>
-                <div class="form-actions">
-                  <label class="checkline"><input type="checkbox" name="enabled" value="1" {'checked' if close_review_status.get('enabled') else ''} /> {'启用收盘复盘' if lang == 'zh' else 'Enable close review'}</label>
-                  <button type="submit">{'保存收盘复盘配置' if lang == 'zh' else 'Save close review'}</button>
                 </div>
               </form>
             </div>

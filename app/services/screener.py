@@ -20,6 +20,7 @@ from app.services.repository import (
     WatchlistRepository,
 )
 from app.services.model_signal_summary import build_model_state, enrich_model_output, summarize_explanations
+from app.services.model_evaluation import latest_model_activation_statuses
 from app.services.price_snapshot import load_latest_closes
 from app.services.technical_patterns import TechnicalPatternService
 from app.services.tradability_filter import evaluate_candidate_tradability
@@ -35,7 +36,10 @@ MODEL_TEMPLATES = {
         "market": "ALL",
         "mode": "model_ranking",
         "defaults": {
-            "min_trend_score": 55,
+            # Model ranking is deliberately broader than a pure technical
+            # momentum scan.  A technical score of 60 would erase valid
+            # LightGBM candidates before their model rank can be reviewed.
+            "min_trend_score": 10,
             "min_volume_ratio": 0.0,
         },
     },
@@ -427,7 +431,7 @@ class ScreenerService:
                 recent_snapshot_runs=recent_snapshot_runs,
                 min_snapshot_hits=min_snapshot_hits,
             )
-        results = self._apply_trade_readiness(results)
+        results = self.apply_candidate_governance(results)
         results = self._apply_model_signal_filter(
             results,
             model_signal_filter=model_signal_filter,
@@ -626,6 +630,8 @@ class ScreenerService:
                     "model_horizon_days": 5,
                     "model_reward_risk_ratio": item.get("model_reward_risk_ratio"),
                     "model_expected_drawdown_20d": item.get("expected_drawdown_20d"),
+                    "model_run_id": item.get("model_run_id"),
+                    "model_activation_status": item.get("model_activation_status") or "unverified",
                     "matched_patterns": [],
                     "selection_reason": ", ".join(selection_bits) if selection_bits else "LightGBM multifactor top pick.",
                 }
@@ -1316,6 +1322,7 @@ class ScreenerService:
                 "model_execution_tags": _sanitize_execution_tags(
                     row.get("model_execution_tags") or row.get("execution_tags") or []
                 ),
+                "model_activation_status": row.get("model_activation_status") or "unverified",
             }
             decision = evaluate_candidate_tradability(
                 candidate,
@@ -1334,6 +1341,26 @@ class ScreenerService:
             if row.get("risk_flags") and not row.get("model_execution_tags"):
                 row["model_execution_tags"] = list(row.get("risk_flags") or [])
         return results
+
+    def apply_candidate_governance(self, results: list[dict]) -> list[dict]:
+        """Attach model evidence state, then apply the common risk decision.
+
+        All full-market templates converge here, including technical and
+        fundamental templates. A template may discover a technically valid
+        stock, but it cannot bypass a missing or observation-only model record
+        when rendered as a trade candidate.
+        """
+        if not results:
+            return results
+        tickers = [str(row.get("ticker") or "").strip().upper() for row in results if str(row.get("ticker") or "").strip()]
+        context_map = self._load_model_context_map(tickers)
+        for row in results:
+            context = context_map.get(str(row.get("ticker") or "").strip().upper()) or {}
+            if not row.get("model_run_id"):
+                row["model_run_id"] = context.get("model_run_id")
+            if str(row.get("model_activation_status") or "").lower() in {"", "unverified"}:
+                row["model_activation_status"] = context.get("activation_status") or "unverified"
+        return self._apply_trade_readiness(results)
 
     def _default_sort_key(self, row: dict) -> tuple:
         readiness = -(row.get("trade_readiness_score") or 0)
@@ -1493,6 +1520,8 @@ class ScreenerService:
             "model_horizon_days": (model_context or {}).get("target_horizon_days"),
             "model_reward_risk_ratio": (model_context or {}).get("model_reward_risk_ratio"),
             "model_expected_drawdown_20d": (model_context or {}).get("expected_drawdown_20d"),
+            "model_run_id": (model_context or {}).get("model_run_id"),
+            "model_activation_status": (model_context or {}).get("activation_status") or "unverified",
             "matched_patterns": [],
             "risk_flags": risk_flags,
             "selection_reason": self._build_technical_reason(insight, model_context),
@@ -1529,6 +1558,8 @@ class ScreenerService:
             "model_horizon_days": (model_context or {}).get("target_horizon_days"),
             "model_reward_risk_ratio": (model_context or {}).get("model_reward_risk_ratio"),
             "model_expected_drawdown_20d": (model_context or {}).get("expected_drawdown_20d"),
+            "model_run_id": (model_context or {}).get("model_run_id"),
+            "model_activation_status": (model_context or {}).get("activation_status") or "unverified",
             "matched_patterns": [],
             "selection_reason": "Passed the selected fundamental template.",
         }
@@ -1565,6 +1596,8 @@ class ScreenerService:
             "model_horizon_days": (model_context or {}).get("target_horizon_days"),
             "model_reward_risk_ratio": (model_context or {}).get("model_reward_risk_ratio"),
             "model_expected_drawdown_20d": (model_context or {}).get("expected_drawdown_20d"),
+            "model_run_id": (model_context or {}).get("model_run_id"),
+            "model_activation_status": (model_context or {}).get("activation_status") or "unverified",
             "matched_patterns": list(snapshot.matched_patterns or []),
             "selection_reason": ", ".join(snapshot.matched_patterns or []) or "Matched the selected technical pattern.",
         }
@@ -1707,9 +1740,10 @@ class ScreenerService:
         model_output: dict | None,
         explanations: list[dict],
         trade_plan: dict | None,
+        activation_status: str = "unverified",
     ) -> dict:
         if not model_output:
-            return {"summary": None, "highlights": []}
+            return {"summary": None, "highlights": [], "activation_status": "unverified", "model_run_id": None}
         enriched = enrich_model_output(dict(model_output), lang="en") or model_output
         highlights = summarize_explanations(explanations, lang="en", limit=3)
         execution_tags = list((trade_plan or {}).get("execution_tags") or [])
@@ -1737,6 +1771,8 @@ class ScreenerService:
             "target_horizon_days": enriched.get("target_horizon_days"),
             "model_reward_risk_ratio": enriched.get("model_reward_risk_ratio"),
             "expected_drawdown_20d": enriched.get("expected_drawdown_20d"),
+            "activation_status": activation_status,
+            "model_run_id": (model_output.get("model_run") or {}).get("id"),
         }
 
     def _load_model_context_map(self, tickers: list[str]) -> dict[str, dict]:
@@ -1750,11 +1786,23 @@ class ScreenerService:
             model_outputs = model_repo.get_latest_model_outputs_for_tickers(normalized_tickers)
             explanation_map = explanation_repo.get_latest_for_tickers(normalized_tickers)
             trade_plan_map = trade_plan_repo.get_latest_for_tickers(normalized_tickers)
+            activation_by_run = latest_model_activation_statuses(
+                db,
+                model_run_ids=[
+                    int(((payload.get("model_run") or {}).get("id") or 0))
+                    for payload in model_outputs.values()
+                    if isinstance(payload, dict)
+                ],
+            )
         return {
             ticker: self._build_model_highlights(
                 model_outputs.get(ticker),
                 explanation_map.get(ticker, []),
                 trade_plan_map.get(ticker),
+                activation_status=activation_by_run.get(
+                    int((((model_outputs.get(ticker) or {}).get("model_run") or {}).get("id") or 0)),
+                    "unverified",
+                ),
             )
             for ticker in normalized_tickers
         }

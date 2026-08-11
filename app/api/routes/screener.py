@@ -15,6 +15,7 @@ from app.services.market_intelligence import build_market_sentiment_snapshot
 from app.services.market_context import load_market_context_snapshot
 from app.models.schema import SymbolCreate
 from app.services.market_sync import sync_market_data
+from app.services.market_freshness import is_snapshot_as_of_current
 from app.services.repository import AppSettingRepository, SymbolRepository, WatchlistRepository, WorkspaceSnapshotRepository
 from app.services.runtime_cache import get_or_set
 from app.services.ai_daily_report import build_trade_explain_text, format_trade_gate_reason, format_trade_status
@@ -2015,6 +2016,7 @@ def _detail_panel(item: dict, watchlist_map: dict[str, dict], current_params: di
     collapse_label = "Collapse" if lang == "en" else "收起"
     model_highlights = item.get("model_highlights") or []
     model_execution_tags = list(item.get("model_execution_tags") or [])
+    model_activation_status = str(item.get("model_activation_status") or "unverified")
     lightgbm_tactical_note = str(item.get("lightgbm_tactical_note") or "").strip()
     action_badge = _action_badge(item.get("action_label"), lang)
     trend_badge = _trend_badge(item.get("trend_score"))
@@ -2103,6 +2105,7 @@ def _model_cell(item: dict, lang: str) -> str:
     highlights = item.get("model_highlights") or []
     kronos_validation = item.get("kronos_validation") if isinstance(item.get("kronos_validation"), dict) else {}
     lightgbm_tactical_tag = str(item.get("lightgbm_tactical_tag") or "").strip()
+    model_activation_status = str(item.get("model_activation_status") or "unverified")
     raw_state = item.get("model_state")
     if isinstance(raw_state, dict):
         state = raw_state
@@ -2174,6 +2177,10 @@ def _model_cell(item: dict, lang: str) -> str:
         meta_bits.append(lightgbm_tactical_tag)
     if model_execution_tags:
         meta_bits.extend(model_execution_tags[:2])
+    if model_activation_status.startswith("observation") or model_activation_status == "unverified":
+        meta_bits.append("模型仅观察" if lang == "zh" else "Model observation-only")
+    elif model_activation_status == "eligible_for_champion_review":
+        meta_bits.append("模型待赛马审核" if lang == "zh" else "Model pending champion review")
     friendly_explain = build_trade_explain_text(item, lang=lang)
     if friendly_explain and friendly_explain != "-":
         meta_bits.append(friendly_explain)
@@ -2612,6 +2619,14 @@ def _normalize_multi_model_templates(values: object) -> list[str]:
     return normalized
 
 
+def _template_default_min_trend_score(template_key: str, fallback: int = 60) -> int:
+    defaults = (MODEL_TEMPLATES.get(str(template_key) or "") or {}).get("defaults") or {}
+    try:
+        return max(0, int(defaults.get("min_trend_score", fallback)))
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _normalize_screen_params(params: dict) -> dict:
     model_template = str(params.get("model_template", "technical_momentum"))
     template = MODEL_TEMPLATES.get(model_template, MODEL_TEMPLATES["technical_momentum"])
@@ -2625,7 +2640,10 @@ def _normalize_screen_params(params: dict) -> dict:
         "min_multi_model_hits": max(1, int(float(params.get("min_multi_model_hits", 2)))),
         "confluence_action_filter": str(params.get("confluence_action_filter", "ALL")),
         "lang": str(params.get("lang", "en")),
-        "universe": str(params.get("universe", "watchlist")),
+        # Model discovery is a full-market workflow.  Keeping the legacy
+        # watchlist default here made every newly selected A-share specialty
+        # model appear empty unless that ticker happened to be in the watchlist.
+        "universe": str(params.get("universe", "full_market")),
         "market": requested_market,
         "min_trend_score": int(float(params.get("min_trend_score", 60))),
         "action_filter": str(params.get("action_filter", "ALL")),
@@ -2904,7 +2922,7 @@ def _template_action_semantic_buckets(template_key: str, action_label: str | Non
 def _load_precomputed_screener_rows(service: ScreenerService, params: dict) -> list[dict] | None:
     base_params = build_base_precompute_params(
         model_template=str(params.get("model_template") or "technical_momentum"),
-        universe=str(params.get("universe") or "watchlist"),
+        universe=str(params.get("universe") or "full_market"),
         market=str(params.get("market") or "ALL"),
     )
     snapshot_rows = _load_screener_snapshot(base_params)
@@ -3025,6 +3043,9 @@ def _load_screener_snapshot(params: dict) -> list[dict] | None:
     payload = snapshot.get("payload") or {}
     if payload.get("key") != screener_snapshot_key(params):
         return None
+    market = str(params.get("market") or payload.get("market") or "").strip().upper()
+    if (payload.get("schema_version") or payload.get("input")) and not is_snapshot_as_of_current(snapshot.get("snapshot_date"), market):
+        return None
     created_at = str(snapshot.get("created_at") or "")
     try:
         created = datetime.fromisoformat(created_at)
@@ -3043,6 +3064,9 @@ def _load_screener_snapshot_record(params: dict) -> dict | None:
         return None
     payload = snapshot.get("payload") or {}
     if payload.get("key") != screener_snapshot_key(params):
+        return None
+    market = str(params.get("market") or payload.get("market") or "").strip().upper()
+    if (payload.get("schema_version") or payload.get("input")) and not is_snapshot_as_of_current(snapshot.get("snapshot_date"), market):
         return None
     return snapshot
 
@@ -3078,7 +3102,7 @@ def _screen_run_receipt_html(
     if snapshot is None and len(multi_templates_active) < 2:
         base_params = build_base_precompute_params(
             model_template=str(normalized.get("model_template") or "technical_momentum"),
-            universe=str(normalized.get("universe") or "watchlist"),
+            universe=str(normalized.get("universe") or "full_market"),
             market=str(normalized.get("market") or "ALL"),
         )
         snapshot = _load_screener_snapshot_record(base_params)
@@ -4054,7 +4078,7 @@ def screener_page(
     min_multi_model_hits: int = Query(2),
     confluence_action_filter: str = Query("ALL"),
     strategy_profile: str = Query(""),
-    universe: str = Query("watchlist"),
+    universe: str = Query("full_market"),
     market: str = Query("ALL"),
     min_trend_score: int = Query(60),
     action_filter: str = Query("ALL"),
@@ -4366,6 +4390,23 @@ def screener_page(
         )
         for _, meta, items in template_groups
     )
+
+    def _template_card_href(template_key: str, config: dict) -> str:
+        """Start a clean full-market discovery run from a model card.
+
+        Model cards used to inherit every parameter from the previous screen.
+        That made a selected A-share pattern look empty when an old watchlist,
+        confluence profile, or advanced rule remained in the URL.
+        """
+        card_market = str(config.get("market") or market or "ALL")
+        card_params = build_base_precompute_params(
+            model_template=template_key,
+            universe="full_market",
+            market=card_market,
+        )
+        card_params.update({"lang": lang, "run": 1})
+        return _build_screen_query(card_params)
+
     template_cards_html = "".join(
         (
             "<div style='margin-bottom:18px;'>"
@@ -4375,7 +4416,7 @@ def screener_page(
             "</div>"
             "<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;'>"
             + "".join(
-                f"<a class='template-card{' active' if value == model_template else ''}' href='{_build_screen_query({**current_params, 'model_template': value, 'market': config.get('market') or market})}'>"
+                f"<a class='template-card{' active' if value == model_template else ''}' href='{_template_card_href(value, config)}'>"
                 f"<div class='template-top'><span class='template-mode'>{config.get('mode', 'mixed')}</span><span class='template-market'>{html.escape(meta['badge'])}</span></div>"
                 f"<div class='template-title'>{_template_label(value, config['label'], lang)}</div>"
                 f"<div class='template-desc'>{config.get('description') or ''}</div>"
@@ -5100,6 +5141,15 @@ def screener_page(
         "HK": "港股" if lang == "zh" else "Hong Kong",
         "ALL": "全市场" if lang == "zh" else "All Markets",
     }.get(str(market or "ALL").upper(), str(market or "ALL").upper())
+    market_scope_switch_html = "".join(
+        f"<a class='market-scope-option{' active' if str(market or 'ALL').upper() == code else ''}' href='{_build_screen_query({**current_params, 'market': code})}'>"
+        f"{label}</a>"
+        for code, label in (
+            ("CN", "A 股" if lang == "zh" else "A-Shares"),
+            ("US", "美股" if lang == "zh" else "U.S. Stocks"),
+            ("ALL", "全市场" if lang == "zh" else "All Markets"),
+        )
+    )
     universe_scope_label = {
         "watchlist": "自选股" if lang == "zh" else "Watchlist",
         "synced": "已同步股票" if lang == "zh" else "Synced",
@@ -5342,6 +5392,27 @@ def screener_page(
           details.advanced-panel {{ border-top:1px solid var(--line); padding-top:12px; margin-top:12px; }}
           details.advanced-panel > summary {{ cursor:pointer; list-style:none; font-weight:800; color:var(--ink); }}
           details.advanced-panel > summary::-webkit-details-marker {{ display:none; }}
+          details.research-fold {{ margin:0 0 12px; border:1px solid var(--line); border-radius:10px; background:rgba(11,19,29,0.52); }}
+          details.research-fold > summary {{ display:flex; justify-content:space-between; gap:12px; align-items:center; padding:11px 12px; cursor:pointer; list-style:none; font-weight:850; }}
+          details.research-fold > summary::-webkit-details-marker {{ display:none; }}
+          details.research-fold > summary::after {{ content:"+"; color:var(--accent); font-size:18px; }}
+          details.research-fold[open] > summary::after {{ content:"−"; }}
+          .research-fold-body {{ display:grid; gap:10px; padding:0 10px 10px; }}
+          .market-scope-switch {{ display:flex; gap:8px; flex-wrap:wrap; margin:0 0 12px; }}
+          .market-scope-option {{ display:inline-flex; align-items:center; min-height:34px; padding:6px 11px; border:1px solid var(--line); border-radius:999px; color:var(--muted); text-decoration:none; font-size:12px; font-weight:850; background:rgba(11,19,29,0.54); }}
+          .market-scope-option.active {{ color:var(--accent); border-color:rgba(61,217,182,0.38); background:rgba(61,217,182,0.12); }}
+          .screen-flow {{ display:grid; gap:10px; grid-template-columns:repeat(3, minmax(0, 1fr)); margin:14px 0 8px; }}
+          .flow-step {{ display:grid; gap:7px; min-width:0; padding:12px; border:1px solid var(--line); border-radius:12px; background:rgba(11,19,29,0.56); }}
+          .flow-step-num {{ color:var(--accent); font-size:10px; font-weight:900; letter-spacing:0.08em; }}
+          .flow-step b {{ font-size:13px; }}
+          .flow-step small {{ color:var(--muted); font-size:11px; line-height:1.35; }}
+          .flow-step .run-screen {{ align-self:end; min-height:38px; background:linear-gradient(180deg, rgba(61,217,182,0.28), rgba(61,217,182,0.14)); border-color:rgba(61,217,182,0.34); color:var(--ink); font-weight:900; }}
+          details.selection-advanced {{ margin-top:12px; border:1px solid var(--line); border-radius:12px; background:rgba(11,19,29,0.42); }}
+          details.selection-advanced > summary {{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:11px 12px; cursor:pointer; list-style:none; font-weight:850; }}
+          details.selection-advanced > summary::-webkit-details-marker {{ display:none; }}
+          details.selection-advanced > summary::after {{ content:"+"; color:var(--accent); font-size:18px; }}
+          details.selection-advanced[open] > summary::after {{ content:"−"; }}
+          .selection-advanced-body {{ padding:0 12px 12px; }}
           .summary-note {{ color:var(--muted); font-size:13px; margin-top:8px; }}
           .rules-grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); align-items:end; }}
           .action-grid {{ display:grid; gap:12px; grid-template-columns:repeat(2, minmax(0, 1fr)); }}
@@ -5631,6 +5702,7 @@ def screener_page(
           @media (max-width: 920px) {{
             .rules-grid {{ grid-template-columns:1fr; }}
             .action-grid {{ grid-template-columns:1fr; }}
+            .screen-flow {{ grid-template-columns:repeat(2, minmax(0, 1fr)); }}
             h1 {{ font-size:30px; }}
             .sticky-col, .sticky-col-1, .sticky-col-2 {{ position:static; box-shadow:none; min-width:auto; }}
             .table-wrap th:nth-child(7), .table-wrap td:nth-child(7),
@@ -5645,6 +5717,7 @@ def screener_page(
             .results-table-wrap, .saved-strategies-wrap {{ display:none; }}
             .mobile-result-list, .mobile-preset-list {{ display:grid; }}
             .results-toolbar {{ align-items:flex-start; }}
+            .screen-flow {{ grid-template-columns:1fr; }}
           }}
           @media (max-width: 1120px) {{
             .app {{ grid-template-columns:1fr; }}
@@ -5668,11 +5741,16 @@ def screener_page(
           <div class="toolbar">
             <a href="/dashboard">← {_lang_text(lang, 'back_to_dashboard')}</a>
             <a href="/watchlist">{_lang_text(lang, 'open_watchlist')}</a>
-            <a href="/screeners/focus/today?lang={lang}">{_lang_text(lang, 'open_focus_pool')}</a>
-            <a href="/screeners/market-snapshot?lang={lang}">{_lang_text(lang, 'open_market_snapshot')}</a>
-            <a href="/dashboard/model-performance?lang={lang}&market={market if market in {'CN','US','ALL'} else 'ALL'}">{'模型评测总览' if lang == 'zh' else 'Model Evaluation Overview'}</a>
-            <a href="/screeners/kronos-validation?lang={lang}">{'Kronos 二次验证池' if lang == 'zh' else 'Kronos Validation Pool'}</a>
-            <a href="/dashboard#cn-fundamental-tickers">{_lang_text(lang, 'sync_cn_fundamentals')}</a>
+            <details style="position:relative;">
+              <summary style="display:inline-flex;align-items:center;min-height:32px;padding:6px 9px;border-radius:8px;border:1px solid rgba(255,255,255,0.05);background:rgba(17,28,40,0.52);color:var(--accent);font-size:12px;font-weight:800;cursor:pointer;">{'高级研究' if lang == 'zh' else 'Advanced research'}</summary>
+              <div style="position:absolute;z-index:5;top:calc(100% + 6px);left:0;display:grid;gap:6px;min-width:190px;padding:8px;border:1px solid var(--line);border-radius:10px;background:#101b27;box-shadow:0 14px 28px rgba(0,0,0,0.28);">
+                <a href="/screeners/focus/today?lang={lang}">{_lang_text(lang, 'open_focus_pool')}</a>
+                <a href="/screeners/market-snapshot?lang={lang}">{_lang_text(lang, 'open_market_snapshot')}</a>
+                <a href="/dashboard/model-performance?lang={lang}&market={market if market in {'CN','US','ALL'} else 'ALL'}">{'模型评测总览' if lang == 'zh' else 'Model Evaluation Overview'}</a>
+                <a href="/screeners/kronos-validation?lang={lang}">{'Kronos 二次验证池' if lang == 'zh' else 'Kronos Validation Pool'}</a>
+                <a href="/dashboard#cn-fundamental-tickers">{_lang_text(lang, 'sync_cn_fundamentals')}</a>
+              </div>
+            </details>
             <div class="lang-switch">
               <span class="muted">{_lang_text(lang, 'language')}:</span>
               {lang_switch_html}
@@ -5680,78 +5758,102 @@ def screener_page(
           </div>
           {banner_html}
           <div class="card">
-            <div class="eyebrow">{'Strategy Workbench' if lang == 'en' else '策略工作台'}</div>
-            <h1>{'先选打法，再看结果' if lang == 'zh' else 'Choose the playbook before the picks'}</h1>
-            <p class="lead">{'把单模型、策略模板、多模型共振和模型评测放在同一页，先确定今天用哪套打法，再决定是否加入自选或盯盘池。' if lang == 'zh' else 'Start with a single model, a strategy template, multi-model confluence, or the evaluation overview before moving names into watchlist or focus.'}</p>
+            <div class="eyebrow">{'第 2 步 · 发现候选' if lang == 'zh' else 'Step 2 · Find candidates'}</div>
+            <h1>{'先选择市场和打法，再验证候选' if lang == 'zh' else 'Choose market and playbook, then validate candidates'}</h1>
+            <p class="lead">{'默认先用预计算模板查看已通过交易治理的候选；模型、共振和评测用于研究优先级，不替代入场触发与失效条件。需要做实验时再展开高级研究。' if lang == 'zh' else 'Start with precomputed candidates that passed trade governance. Models, confluence, and evaluation rank research priority; they do not replace triggers and invalidation. Open advanced research only when needed.'}</p>
             <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;">
               <span class="default-chip">{'Active template' if lang == 'en' else '当前模板'}: {_template_label(model_template, active_template['label'], lang)}</span>
               {active_defaults_html}
             </div>
           </div>
           {screen_overview_html}
-          {run_receipt_html}
-          {template_read_html}
-          {template_overview_brief_html}
-          {lightgbm_bias_bar_html}
-          {template_evaluation_html}
-          {multi_template_summary_html}
-          {confluence_strength_html}
-          {confluence_leaderboard_html}
-          {confluence_bucket_groups_html}
-          {quality_profile_status_html}
+	          <section class="card" style="margin-bottom:12px;padding:12px;">
+	            <div class="eyebrow">{'第 1 步 · 选择市场' if lang == 'zh' else 'Step 1 · Choose market'}</div>
+	            <div class="muted">{'先只看一个市场。A 股与美股交易日、候选池和风险口径不同，不建议在同一次筛选中混用。' if lang == 'zh' else 'Start with one market. A-shares and U.S. stocks have different sessions, candidate pools, and risk context, so do not mix them in one screen.'}</div>
+	            <div class="market-scope-switch" style="margin:10px 0 0;">{market_scope_switch_html}</div>
+	          </section>
+	          <details class="research-fold">
+	            <summary>{'高级研究与模型证据' if lang == 'zh' else 'Advanced research and model evidence'}</summary>
+	            <div class="research-fold-body">
+                {run_receipt_html}
+                {template_read_html}
+                {template_overview_brief_html}
+                {lightgbm_bias_bar_html}
+                {template_evaluation_html}
+                {multi_template_summary_html}
+                {confluence_strength_html}
+                {confluence_leaderboard_html}
+                {confluence_bucket_groups_html}
+                {quality_profile_status_html}
+	            </div>
+	          </details>
 	          <section class="section-stack">
 	            <article id="single-model-rules" class="card">
-              <div class="eyebrow">{_lang_text(lang, 'rules')}</div>
-              <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;">{quick_confluence_presets_html}</div>
+              <div class="eyebrow">{'第 2 步 · 选择打法' if lang == 'zh' else 'Step 2 · Choose a playbook'}</div>
+              <h2 style="margin:0 0 6px;">{'先选一种可理解的机会形态' if lang == 'zh' else 'Start with one understandable setup'}</h2>
+              <div class="muted">{'趋势延续、回踩确认和防守观察对应不同市场环境。先选一个模板，不必一开始叠加多个模型。' if lang == 'zh' else 'Trend continuation, pullback confirmation, and defensive observation fit different market conditions. Choose one template before combining models.'}</div>
               <div class="template-group-stack">{template_cards_html}</div>
               <form class="stack" method="get" action="/screeners">
                 <input type="hidden" name="lang" value="{lang}" />
                 <input type="hidden" name="run" value="1" />
-                <div class="summary-note">{'先选模板，再决定是否展开高级规则。' if lang == 'zh' else 'Start with a template, then open advanced rules only if needed.'}</div>
-                <div class="rules-grid">
-                  <div>
-                    <label class="muted">{_lang_text(lang, 'model_template')}</label>
-                    <select name="model_template">{template_option_html}</select>
-                  </div>
-                  <div>
-                    <label class="muted">{'共振最少命中模型数' if lang == 'zh' else 'Minimum multi-model hits'}</label>
-                    <input type="number" name="min_multi_model_hits" min="1" max="{max(2, len(MODEL_TEMPLATES))}" value="{min_multi_model_hits}" />
-                  </div>
-                  <div>
-                    <label class="muted">{'共振动作桶' if lang == 'zh' else 'Confluence action bucket'}</label>
-                    <select name="confluence_action_filter">{confluence_option_html}</select>
-                  </div>
-                  <div>
-                    <label class="muted">{_lang_text(lang, 'universe')}</label>
+                <input type="hidden" name="market" value="{html.escape(str(market), quote=True)}" />
+                <div class="screen-flow">
+                  <div class="flow-step">
+                    <div class="flow-step-num">03</div>
+                    <b>{'限定候选范围' if lang == 'zh' else 'Set candidate scope'}</b>
+                    <small>{'全市场用于发现机会；自选用于复核已有想法。' if lang == 'zh' else 'Use full market to discover; use watchlist to review existing ideas.'}</small>
                     <select name="universe">{universe_option_html}</select>
                   </div>
-                  <div>
-                    <label class="muted">{_lang_text(lang, 'market')}</label>
-                    <select name="market">{market_option_html}</select>
-                  </div>
-                  <div>
-                    <label class="muted">{'结果排序' if lang == 'zh' else 'Result sort'}</label>
-                    <select name="sort_by">{sort_by_option_html}</select>
-                  </div>
-                  <div>
-                    <label class="muted">{'排序方向' if lang == 'zh' else 'Sort order'}</label>
-                    <select name="sort_order">{sort_order_option_html}</select>
-                  </div>
-                  <div>
-                    <label class="muted">{_lang_text(lang, 'min_trend_score')}</label>
-                    <input type="number" name="min_trend_score" min="1" max="99" value="{min_trend_score}" />
-                  </div>
-                  <div>
-                    <label class="muted">{_lang_text(lang, 'action_filter')}</label>
+                  <div class="flow-step">
+                    <div class="flow-step-num">04</div>
+                    <b>{'只看可行动的结果' if lang == 'zh' else 'Keep actionable results'}</b>
+                    <small>{'默认保留全部，先用结果里的交易条件判断是否进入自选。' if lang == 'zh' else 'Keep all by default, then use each result’s trade gates before adding it to watchlist.'}</small>
                     <select name="action_filter">{action_option_html}</select>
                   </div>
-                  <div>
-                    <label class="muted">{_lang_text(lang, 'min_volume_strength')}</label>
-                    <input type="number" name="min_volume_ratio" min="0" step="0.1" value="{min_volume_ratio}" />
+                  <div class="flow-step">
+                    <div class="flow-step-num">05</div>
+                    <b>{'运行并验证' if lang == 'zh' else 'Run and validate'}</b>
+                    <small>{'先查看触发条件、失效条件和风险，再加入自选。' if lang == 'zh' else 'Review triggers, invalidation, and risk before adding to watchlist.'}</small>
+                    <button class="run-screen" type="submit">{'运行筛选' if lang == 'zh' else 'Run screener'}</button>
                   </div>
                 </div>
-                <div id="multi-model-combos" class="summary-note">{'如果想做多模型共振，勾选两个或以上模板。系统会按同一只股票被多少个模型同时命中来排序。' if lang == 'zh' else 'For confluence screening, tick two or more templates. The screener will rank names by how many models hit the same ticker.'}</div>
-                <div class="multi-template-stack">{multi_template_picker_html}</div>
+                <details class="selection-advanced">
+                  <summary>{'高级筛选：多模型、阈值与基本面条件' if lang == 'zh' else 'Advanced filters: models, thresholds, fundamentals'}</summary>
+                  <div class="selection-advanced-body">
+                  <div class="summary-note">{'只有当你已明确要研究什么时，再调整这些参数；日常选股优先使用上方模板和默认规则。' if lang == 'zh' else 'Adjust these only when you have a specific research question. For daily selection, prefer the template and defaults above.'}</div>
+                  <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;">{quick_confluence_presets_html}</div>
+                  <div class="rules-grid" style="margin-top:12px;">
+                    <div>
+                      <label class="muted">{_lang_text(lang, 'model_template')}</label>
+                      <select name="model_template">{template_option_html}</select>
+                    </div>
+                    <div>
+                      <label class="muted">{'共振最少命中模型数' if lang == 'zh' else 'Minimum multi-model hits'}</label>
+                      <input type="number" name="min_multi_model_hits" min="1" max="{max(2, len(MODEL_TEMPLATES))}" value="{min_multi_model_hits}" />
+                    </div>
+                    <div>
+                      <label class="muted">{'共振动作桶' if lang == 'zh' else 'Confluence action bucket'}</label>
+                      <select name="confluence_action_filter">{confluence_option_html}</select>
+                    </div>
+                    <div>
+                      <label class="muted">{'结果排序' if lang == 'zh' else 'Result sort'}</label>
+                      <select name="sort_by">{sort_by_option_html}</select>
+                    </div>
+                    <div>
+                      <label class="muted">{'排序方向' if lang == 'zh' else 'Sort order'}</label>
+                      <select name="sort_order">{sort_order_option_html}</select>
+                    </div>
+                    <div>
+                      <label class="muted">{_lang_text(lang, 'min_trend_score')}</label>
+                      <input type="number" name="min_trend_score" min="1" max="99" value="{min_trend_score}" />
+                    </div>
+                    <div>
+                      <label class="muted">{_lang_text(lang, 'min_volume_strength')}</label>
+                      <input type="number" name="min_volume_ratio" min="0" step="0.1" value="{min_volume_ratio}" />
+                    </div>
+                  </div>
+                  <div id="multi-model-combos" class="summary-note">{'如果想做多模型共振，勾选两个或以上模板。系统会按同一只股票被多少个模型同时命中来排序。' if lang == 'zh' else 'For confluence screening, tick two or more templates. The screener will rank names by how many models hit the same ticker.'}</div>
+                  <div class="multi-template-stack">{multi_template_picker_html}</div>
                 <details class="advanced-panel">
                   <summary>{_lang_text(lang, 'cn_rules')}</summary>
                   <div class="summary-note">{'这些参数保留给需要做精细筛选的时候。' if lang == 'zh' else 'Use these only when you need a more precise filter pass.'}</div>
@@ -5833,7 +5935,9 @@ def screener_page(
                     <option value="thin-liquidity"></option>
                   </datalist>
                 </details>
-	                <button type="submit">{_lang_text(lang, 'run_screener')}</button>
+	                <button class="run-screen" type="submit">{'应用高级条件并运行' if lang == 'zh' else 'Apply advanced filters and run'}</button>
+	                </div>
+	                </details>
 	              </form>
 	            </article>
 	            {regression_discipline_html}
@@ -5855,6 +5959,9 @@ def screener_page(
               </div>
             </article>
             <article class="card">
+              <details class="selection-advanced" style="margin-top:0;">
+                <summary>{'运行结果后：加入自选、保存或同步' if lang == 'zh' else 'After reviewing results: add, save, or sync'}</summary>
+                <div class="selection-advanced-body">
               <div class="action-grid" style="margin-bottom:14px;">
                 <form class="action-form" method="post" action="/screeners/save">
                   <div class="action-head">
@@ -5937,6 +6044,8 @@ def screener_page(
                   </div>
                 </form>
               </div>
+                </div>
+              </details>
               <div class="eyebrow">{_lang_text(lang, 'results')}</div>
               <div class="results-toolbar">
                 <div class="muted">{total_results} {_lang_text(lang, 'stocks_matched')}</div>

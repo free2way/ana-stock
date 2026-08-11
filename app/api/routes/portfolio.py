@@ -729,6 +729,18 @@ def portfolio_page(
         f"{html.escape(str(row.get('market') or '-'))} {float(row.get('weight_pct') or 0.0):.1f}%"
         for row in market_rankings[:2]
     ) or ("暂无市场暴露" if lang == "zh" else "No market exposure yet")
+    market_position_context_html = "".join(
+        (
+            "<a class='pill' href='#portfolio-market-" + html.escape(market, quote=True) + "'>"
+            + html.escape(_portfolio_market_label(market, lang=lang))
+            + f" · {len([row for row in rows if str(row.get('market') or '').upper() == market])} "
+            + ("只 · 行情可用 " if lang == "zh" else " positions · prices available ")
+            + str(sum(1 for row in rows if str(row.get("market") or "").upper() == market and not bool(row.get("latest_price_missing"))))
+            + "</a>"
+        )
+        for market in ("CN", "US")
+        if any(str(row.get("market") or "").upper() == market for row in rows)
+    )
     market_value_summary_html = "".join(
         (
             "<article style='border:1px solid var(--line);border-radius:16px;padding:12px 14px;background:rgba(15,24,35,0.58);'>"
@@ -920,7 +932,7 @@ def portfolio_page(
     if rows:
         grouped_positions_html = "".join(
             (
-                f"<section class='market-position-section'>"
+                f"<section id='portfolio-market-{html.escape(market, quote=True)}' class='market-position-section'>"
                 f"<div class='market-position-head'>"
                 f"<div><div class='eyebrow'>{_portfolio_market_label(market, lang=lang)}</div>"
                 f"<div class='muted'>{len(grouped_rows.get(market, []))} {'只持仓' if lang == 'zh' else 'positions'} · "
@@ -1390,8 +1402,8 @@ def portfolio_page(
           <aside class="sidebar">
             <div class="brand">
               <span class="brand-tag">PQW</span>
-              <h1>Portfolio</h1>
-              <p>把持仓、盈亏和 AI 态度放进同一个执行面板。</p>
+              <h1>{'持仓与复盘' if lang == 'zh' else 'Holdings & Review'}</h1>
+              <p>{'先处理需要减风险或复核的仓位，再查看组合与历史复盘。' if lang == 'zh' else 'Handle trim and review positions first, then inspect the portfolio and history.'}</p>
             </div>
             <nav class="side-nav">{render_workspace_nav_html(lang=lang, active_key='portfolio')}</nav>
           </aside>
@@ -1467,6 +1479,21 @@ def portfolio_page(
                   <div style="margin-top:10px;">{risk_queue_html}</div>
                 </article>
               </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px;"><span class="muted">{'按市场查看持仓' if lang == 'zh' else 'View positions by market'}:</span>{market_position_context_html}</div>
+          </section>
+          <section class="card" style="margin-bottom:16px;border-color:rgba(255,180,192,0.26);background:linear-gradient(115deg,rgba(255,180,192,0.08),rgba(17,28,40,0.94) 48%);">
+            <div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;">
+              <div>
+                <div class="eyebrow">{'今日处理优先' if lang == 'zh' else 'Today’s priority actions'}</div>
+                <h2 style="margin:0 0 6px;font-size:21px;">{'先处理退出、减仓与复核，再查看完整持仓' if lang == 'zh' else 'Handle exits, trims, and reviews before the full positions list'}</h2>
+                <div class="muted">{'这些队列使用现有动作建议、风险标签、仓位偏离与盈亏计算生成；不构成自动交易指令。' if lang == 'zh' else 'These queues use existing action guidance, risk tags, weight drift, and PnL; they are not automated trade instructions.'}</div>
+                <div style="margin-top:10px;">{risk_queue_html}</div>
+              </div>
+              <a class="pill" href="#action-queue-detail">{'打开完整处理队列' if lang == 'zh' else 'Open full action queue'}</a>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-top:14px;">
+              {action_queue_cards_html}
             </div>
           </section>
           <section class="grid">

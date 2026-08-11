@@ -8,6 +8,7 @@ from unittest.mock import patch, MagicMock
 
 import pandas as pd
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 from app.services.tushare_client import CNFundamentalRow
 from app.models.schema import SymbolCreate
 from app.services.database_migration import DatabaseMigrationService
@@ -22,7 +23,9 @@ class AppFlowTests(unittest.TestCase):
         from app.services.runtime_cache import clear_namespace
 
         from app.core.config import reset_settings_cache
+        from app.core import db as db_module
         from app.core.db import configure_database, init_db
+        from app.models.base import Base
 
         for namespace in (
             "safe_symbol_analysis",
@@ -46,6 +49,12 @@ class AppFlowTests(unittest.TestCase):
         reset_settings_cache()
         configure_database()
         init_db()
+        # The application is PostgreSQL-only. Keep the suite isolated by
+        # truncating the dedicated test database between examples instead of
+        # relying on the removed SQLite fallback.
+        with db_module.engine.begin() as connection:
+            for table in reversed(Base.metadata.sorted_tables):
+                connection.execute(text(f'TRUNCATE TABLE "{table.name}" RESTART IDENTITY CASCADE'))
 
         from app.api.main import app
 
@@ -57,7 +66,6 @@ class AppFlowTests(unittest.TestCase):
         from app.services.runtime_cache import clear_namespace
 
         from app.core.config import reset_settings_cache
-        from app.core.db import configure_database
 
         for namespace in (
             "safe_symbol_analysis",
@@ -85,9 +93,7 @@ class AppFlowTests(unittest.TestCase):
             "PQW_NORMALIZED_DATA_DIR",
             "PQW_QLIB_DATA_DIR",
             "PQW_ARTIFACTS_DIR",
-            "PQW_SQLITE_PATH",
             "PQW_TUSHARE_TOKEN",
-            "PQW_DATABASE_URL",
             "PQW_POSTGRES_POOL_SIZE",
             "PQW_POSTGRES_MAX_OVERFLOW",
             "PQW_POSTGRES_POOL_TIMEOUT_SECONDS",
@@ -103,7 +109,6 @@ class AppFlowTests(unittest.TestCase):
             os.environ.pop(key, None)
 
         reset_settings_cache()
-        configure_database()
         self.temp_dir.cleanup()
 
     def _set_test_environment(self) -> None:
@@ -113,7 +118,6 @@ class AppFlowTests(unittest.TestCase):
         normalized_dir = data_dir / "normalized"
         qlib_dir = data_dir / "qlib"
         artifacts_dir = data_dir / "artifacts"
-        sqlite_path = storage_dir / "test.db"
 
         os.environ["PQW_STORAGE_DIR"] = str(storage_dir)
         os.environ["PQW_DATA_DIR"] = str(data_dir)
@@ -121,8 +125,10 @@ class AppFlowTests(unittest.TestCase):
         os.environ["PQW_NORMALIZED_DATA_DIR"] = str(normalized_dir)
         os.environ["PQW_QLIB_DATA_DIR"] = str(qlib_dir)
         os.environ["PQW_ARTIFACTS_DIR"] = str(artifacts_dir)
-        os.environ["PQW_SQLITE_PATH"] = str(sqlite_path)
-        os.environ["PQW_DATABASE_URL"] = ""
+        os.environ["PQW_DATABASE_URL"] = os.environ.get(
+            "PQW_TEST_DATABASE_URL",
+            "postgresql+psycopg://quant:quant!123@127.0.0.1:5432/quant_test",
+        )
         os.environ["PQW_AUTH_USERNAME"] = "admin"
         os.environ["PQW_AUTH_PASSWORD"] = "admin1234"
         os.environ["PQW_AUTH_SECRET"] = "test-secret"
@@ -1478,6 +1484,34 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("同步中心", response.text)
         self.assertIn("模型运行", response.text)
         self.assertIn("任务记录", response.text)
+
+    def test_dashboard_ops_has_pinned_today_job_report(self) -> None:
+        from app.core.db import SessionLocal
+        from app.services.repository import DataJobRepository
+
+        with SessionLocal() as db:
+            job = DataJobRepository(db).create_job(
+                job_type="train_cn_signals",
+                status="running",
+                params={"market": "CN"},
+            )
+            DataJobRepository(db).complete_job(
+                job.id,
+                status="partial",
+                message="test job receipt",
+                result={"success_count": 1},
+            )
+
+        task_center = self.client.get("/dashboard/ops?lang=zh&lookback_runs=3")
+        report = self.client.get("/dashboard/ops/today?lang=zh&lookback_runs=3")
+
+        self.assertEqual(200, task_center.status_code)
+        self.assertIn("今天所有 Job 运行情况", task_center.text)
+        self.assertIn("/dashboard/ops/today", task_center.text)
+        self.assertEqual(200, report.status_code)
+        self.assertIn("今天所有 Job 运行情况", report.text)
+        self.assertIn("test job receipt", report.text)
+        self.assertIn("部分完成", report.text)
 
     def test_dashboard_ops_sync_page_supports_chinese_language(self) -> None:
         from app.services.dataset_build import build_dataset
@@ -6050,90 +6084,6 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual("watchlist_auto_analysis", latest_job["job_type"])
         self.assertEqual("success", latest_job["status"])
 
-    def test_close_review_settings_and_manual_run(self) -> None:
-        from app.core.db import SessionLocal
-        from app.services.repository import DataJobRepository
-
-        config_response = self.client.post(
-            "/jobs/close-review/config",
-            data={
-                "enabled": "true",
-                "run_hour": "16",
-                "run_minute": "0",
-                "provider": "yfinance",
-                "days_back": "7",
-                "overlap_days": "3",
-                "refresh_limit": "0",
-                "stale_job_hours": "12",
-            },
-        )
-        self.assertEqual(200, config_response.status_code)
-        self.assertTrue(config_response.json()["config"]["enabled"])
-        self.assertEqual(16, config_response.json()["config"]["run_hour"])
-
-        with patch(
-            "app.services.close_review_scheduler.refresh_cn_market_data_daily",
-            return_value={"status": "success", "success_count": 12, "message": "ok"},
-        ), patch(
-            "app.services.close_review_scheduler.rebuild_technical_snapshots",
-            return_value={"status": "success", "snapshots_rebuilt": 34, "message": "ok"},
-        ), patch(
-            "app.services.close_review_scheduler.auto_analysis_service.run_watchlist_analysis",
-            return_value={"status": "success", "tickers": ["ASTS", "RKLB"]},
-        ):
-            run_response = self.client.post("/jobs/run-close-review")
-
-        self.assertEqual(200, run_response.status_code)
-        payload = run_response.json()
-        self.assertEqual("success", payload["status"])
-        self.assertEqual(12, payload["refresh_result"]["success_count"])
-
-        status_response = self.client.get("/jobs/close-review")
-        self.assertEqual(200, status_response.status_code)
-        self.assertTrue(status_response.json()["enabled"])
-
-        with SessionLocal() as db:
-            recent_jobs = DataJobRepository(db).list_recent_jobs(limit=10)
-        close_review_job = next(item for item in recent_jobs if item["job_type"] == "cn_close_review")
-        self.assertEqual("success", close_review_job["status"])
-
-    def test_close_review_refresh_falls_back_when_primary_result_fails(self) -> None:
-        with patch(
-            "app.services.close_review_scheduler.refresh_cn_market_data_lake_only",
-            return_value={"status": "success", "success_count": 12, "failure_count": 0, "message": "lake ok"},
-        ) as mocked_refresh, patch(
-            "app.services.close_review_scheduler.rebuild_technical_snapshots",
-            return_value={"status": "success", "snapshots_rebuilt": 34, "message": "ok"},
-        ), patch(
-            "app.services.close_review_scheduler.auto_analysis_service.run_watchlist_analysis",
-            return_value={"status": "success", "tickers": ["ASTS"]},
-        ):
-            response = self.client.post("/jobs/run-close-review")
-
-        self.assertEqual(200, response.status_code)
-        payload = response.json()
-        self.assertEqual("success", payload["status"])
-        self.assertEqual("tushare_lake", payload["refresh_result"]["provider_used"])
-        self.assertEqual(["tushare_lake"], payload["refresh_result"]["providers_attempted"])
-        self.assertEqual(1, mocked_refresh.call_count)
-
-    def test_close_review_runs_auto_analysis_for_cn_only(self) -> None:
-        with patch(
-            "app.services.close_review_scheduler.refresh_cn_market_data_lake_only",
-            return_value={"status": "success", "success_count": 12, "message": "ok"},
-        ), patch(
-            "app.services.close_review_scheduler.rebuild_technical_snapshots",
-            return_value={"status": "success", "rows_written": 34, "message": "ok"},
-        ), patch(
-            "app.services.close_review_scheduler.auto_analysis_service.run_watchlist_analysis",
-            return_value={"status": "success", "tickers": ["600330.SS", "300385.SZ"]},
-        ) as mocked_run:
-            response = self.client.post("/jobs/run-close-review")
-
-        self.assertEqual(200, response.status_code)
-        self.assertEqual("success", response.json()["status"])
-        self.assertEqual(["CN"], mocked_run.call_args.kwargs["allowed_markets"])
-
     def test_auto_analysis_defaults_to_cn_market_scope(self) -> None:
         from app.services.auto_analysis import auto_analysis_service
 
@@ -6150,177 +6100,6 @@ class AppFlowTests(unittest.TestCase):
             status = auto_analysis_service.get_status(db=db)
 
         self.assertEqual(["CN"], status["default_allowed_markets"])
-
-    def test_close_review_status_can_reuse_existing_db_session(self) -> None:
-        from app.core.db import SessionLocal
-        from app.services.close_review_scheduler import close_review_scheduler_service
-
-        with SessionLocal() as db:
-            status = close_review_scheduler_service.get_status(db=db)
-
-        self.assertIn("enabled", status)
-        self.assertIn("run_hour", status)
-        self.assertEqual("tushare", status["provider"])
-
-    def test_close_review_scheduler_can_retry_failed_runs_after_cooldown(self) -> None:
-        from unittest.mock import patch
-
-        from app.core.db import SessionLocal
-        from app.services.close_review_scheduler import close_review_scheduler_service
-        from app.services.repository import AppSettingRepository
-
-        with SessionLocal() as db:
-            AppSettingRepository(db).set(
-                "close_review_scheduler_config",
-                json.dumps(
-                    {
-                        "enabled": True,
-                        "run_hour": 16,
-                        "run_minute": 0,
-                        "provider": "tushare",
-                        "days_back": 7,
-                        "overlap_days": 3,
-                        "refresh_limit": 500,
-                        "stale_job_hours": 12,
-                        "retry_cooldown_minutes": 30,
-                        "max_attempts_per_day": 3,
-                        "last_run_date": None,
-                        "last_scheduler_attempt_date": "2026-04-10",
-                        "last_scheduler_attempt_at": "2026-04-10T16:00:00+08:00",
-                        "last_scheduler_attempt_count": 1,
-                    }
-                ),
-            )
-
-        fake_now = datetime.fromisoformat("2026-04-10T16:45:00+08:00")
-        with patch("app.services.close_review_scheduler.sh_now", return_value=fake_now), patch(
-            "app.services.close_review_scheduler.close_review_scheduler_service.run_close_review",
-            return_value={"status": "success"},
-        ) as mocked_run:
-            result = close_review_scheduler_service.run_due_job()
-
-        self.assertEqual({"status": "success"}, result)
-        mocked_run.assert_called_once_with(trigger="scheduler")
-
-    def test_close_review_scheduler_respects_retry_cooldown_and_attempt_cap(self) -> None:
-        from unittest.mock import patch
-
-        from app.core.db import SessionLocal
-        from app.services.close_review_scheduler import close_review_scheduler_service
-        from app.services.repository import AppSettingRepository
-
-        with SessionLocal() as db:
-            AppSettingRepository(db).set(
-                "close_review_scheduler_config",
-                json.dumps(
-                    {
-                        "enabled": True,
-                        "run_hour": 16,
-                        "run_minute": 0,
-                        "provider": "tushare",
-                        "days_back": 7,
-                        "overlap_days": 3,
-                        "refresh_limit": 500,
-                        "stale_job_hours": 12,
-                        "retry_cooldown_minutes": 60,
-                        "max_attempts_per_day": 2,
-                        "last_run_date": None,
-                        "last_scheduler_attempt_date": "2026-04-10",
-                        "last_scheduler_attempt_at": "2026-04-10T16:20:00+08:00",
-                        "last_scheduler_attempt_count": 1,
-                    }
-                ),
-            )
-
-        with patch(
-            "app.services.close_review_scheduler.sh_now",
-            return_value=datetime.fromisoformat("2026-04-10T16:45:00+08:00"),
-        ), patch(
-            "app.services.close_review_scheduler.close_review_scheduler_service.run_close_review"
-        ) as mocked_run:
-            result = close_review_scheduler_service.run_due_job()
-
-        self.assertIsNone(result)
-        mocked_run.assert_not_called()
-
-        with SessionLocal() as db:
-            AppSettingRepository(db).set(
-                "close_review_scheduler_config",
-                json.dumps(
-                    {
-                        "enabled": True,
-                        "run_hour": 16,
-                        "run_minute": 0,
-                        "provider": "tushare",
-                        "days_back": 7,
-                        "overlap_days": 3,
-                        "refresh_limit": 500,
-                        "stale_job_hours": 12,
-                        "retry_cooldown_minutes": 30,
-                        "max_attempts_per_day": 2,
-                        "last_run_date": None,
-                        "last_scheduler_attempt_date": "2026-04-10",
-                        "last_scheduler_attempt_at": "2026-04-10T15:00:00+08:00",
-                        "last_scheduler_attempt_count": 2,
-                    }
-                ),
-            )
-
-        with patch(
-            "app.services.close_review_scheduler.sh_now",
-            return_value=datetime.fromisoformat("2026-04-10T17:00:00+08:00"),
-        ), patch(
-            "app.services.close_review_scheduler.close_review_scheduler_service.run_close_review"
-        ) as mocked_run:
-            result = close_review_scheduler_service.run_due_job()
-
-        self.assertIsNone(result)
-        mocked_run.assert_not_called()
-
-    def test_manual_close_review_attempts_do_not_block_scheduler_retry(self) -> None:
-        from unittest.mock import patch
-
-        from app.core.db import SessionLocal
-        from app.services.close_review_scheduler import close_review_scheduler_service
-        from app.services.repository import AppSettingRepository
-
-        with SessionLocal() as db:
-            AppSettingRepository(db).set(
-                "close_review_scheduler_config",
-                json.dumps(
-                    {
-                        "enabled": True,
-                        "run_hour": 16,
-                        "run_minute": 0,
-                        "provider": "tushare",
-                        "days_back": 7,
-                        "overlap_days": 3,
-                        "refresh_limit": 500,
-                        "stale_job_hours": 12,
-                        "retry_cooldown_minutes": 30,
-                        "max_attempts_per_day": 2,
-                        "last_run_date": None,
-                        "last_attempt_date": "2026-04-10",
-                        "last_attempt_at": "2026-04-10T16:05:00+08:00",
-                        "last_attempt_count": 1,
-                        "last_scheduler_attempt_date": None,
-                        "last_scheduler_attempt_at": None,
-                        "last_scheduler_attempt_count": 0,
-                    }
-                ),
-            )
-
-        with patch(
-            "app.services.close_review_scheduler.sh_now",
-            return_value=datetime.fromisoformat("2026-04-10T16:45:00+08:00"),
-        ), patch(
-            "app.services.close_review_scheduler.close_review_scheduler_service.run_close_review",
-            return_value={"status": "success"},
-        ) as mocked_run:
-            result = close_review_scheduler_service.run_due_job()
-
-        self.assertEqual({"status": "success"}, result)
-        mocked_run.assert_called_once_with(trigger="scheduler")
 
     def test_ai_daily_report_defaults_to_cn_market_scope(self) -> None:
         from app.services.ai_daily_report import build_ai_daily_report
@@ -6510,29 +6289,11 @@ class AppFlowTests(unittest.TestCase):
             remaining = db.query(Prediction).filter(Prediction.model_run_id == model_run.id).count()
             self.assertEqual(len(rewritten_rows), remaining)
 
-    def test_sqlite_engine_uses_wal_mode(self) -> None:
-        from app.core.db import SessionLocal, engine
-        from sqlalchemy import text
-
-        with SessionLocal() as db:
-            journal_mode = db.execute(text("PRAGMA journal_mode")).scalar()
-        self.assertIn(str(journal_mode).lower(), {"wal"})
-        self.assertEqual(20, engine.pool.size())
-
     def test_settings_resolve_database_url(self) -> None:
         from app.core.config import Settings
 
-        sqlite_settings = Settings()
-        self.assertTrue(sqlite_settings.resolved_database_url.startswith("sqlite:///"))
-
         pg_settings = Settings(database_url="postgresql+psycopg://user:pass@localhost:5432/ana")
         self.assertEqual("postgresql+psycopg://user:pass@localhost:5432/ana", pg_settings.resolved_database_url)
-
-    def test_db_backend_detection_supports_sqlite_and_postgres(self) -> None:
-        from app.core.db import _is_sqlite_url
-
-        self.assertTrue(_is_sqlite_url("sqlite:////tmp/test.db"))
-        self.assertFalse(_is_sqlite_url("postgresql+psycopg://user:pass@localhost:5432/ana"))
 
     def test_postgres_connect_args_use_tuned_defaults(self) -> None:
         from app.core.db import _build_postgresql_connect_args
@@ -6543,38 +6304,6 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual("pqw-app", connect_args["application_name"])
         self.assertIn("statement_timeout=60000", connect_args["options"])
         self.assertIn("idle_in_transaction_session_timeout=60000", connect_args["options"])
-
-    def test_price_sync_state_upsert_retries_when_sqlite_is_locked(self) -> None:
-        from app.core.db import SessionLocal
-        from sqlalchemy.exc import OperationalError
-
-        from app.services.repository import PriceSyncStateRepository, SymbolRepository
-
-        self._seed_symbol("600000.SS", "浦发银行", "CN", "SSE")
-
-        with SessionLocal() as db:
-            symbol = SymbolRepository(db).get_by_ticker("600000.SS")
-            assert symbol is not None
-            original_commit = db.commit
-            attempts = {"count": 0}
-
-            def flaky_commit():
-                attempts["count"] += 1
-                if attempts["count"] == 1:
-                    raise OperationalError("UPDATE price_sync_state", {}, Exception("database is locked"))
-                return original_commit()
-
-            with patch.object(db, "commit", side_effect=flaky_commit):
-                row = PriceSyncStateRepository(db).upsert_state(
-                    symbol_id=symbol.id,
-                    provider="tushare",
-                    last_synced_date="2026-04-10",
-                    status="success",
-                    message="ok",
-                )
-
-            self.assertEqual(symbol.id, row.symbol_id)
-            self.assertEqual(2, attempts["count"])
 
     def test_prediction_repository_uses_latest_trade_date_per_market(self) -> None:
         from app.core.db import SessionLocal

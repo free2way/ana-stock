@@ -10,6 +10,7 @@ from app.services.cn_concepts import sync_cn_concepts
 from app.services.cn_fundamentals import sync_cn_fundamentals
 from app.services.dataset_build import build_dataset
 from app.services.market_lake import load_lake_price_history
+from app.services.market_risk import save_risk_guardrail_snapshots
 from app.services.market_sync import sync_market_data
 from app.services.push_notifications import PushNotificationService
 from app.services.repository import AppSettingRepository, DataJobRepository, WatchlistRepository
@@ -222,6 +223,20 @@ class AutoAnalysisService:
                 universe="local_watchlist",
             )
             daily_rows_written = BacktestRunner().run(top_n=config["top_n"])
+            risk_guardrail_result = None
+            try:
+                with SessionLocal() as db:
+                    risk_guardrail_result = save_risk_guardrail_snapshots(
+                        db,
+                        source_job_id=job_id,
+                        markets=sorted(normalized_markets) if normalized_markets else ["CN", "US"],
+                    )
+            except Exception as exc:
+                risk_guardrail_result = {
+                    "status": "failed",
+                    "message": f"Risk guardrail snapshot failed before AI report: {exc}",
+                    "error": str(exc),
+                }
             should_generate_ai_daily_report = "close_review" not in str(trigger or "").lower()
             ai_daily_report = None
             push_result = None
@@ -268,7 +283,20 @@ class AutoAnalysisService:
             if push_result and push_result.get("sent"):
                 message += f", pushed to {', '.join(push_result['sent'])}"
             with SessionLocal() as db:
-                DataJobRepository(db).complete_job(job_id, status="success", message=message)
+                DataJobRepository(db).complete_job(
+                    job_id,
+                    status="success",
+                    message=message,
+                    result={
+                        "tickers": tickers,
+                        "markets": sorted(normalized_markets),
+                        "run_name": run_name,
+                        "predictions_written": predictions_written,
+                        "daily_rows_written": daily_rows_written,
+                        "risk_guardrail_result": risk_guardrail_result,
+                        "push_result": push_result,
+                    },
+                )
                 self._persist_last_run(db)
             try:
                 with SessionLocal() as db:
@@ -286,6 +314,7 @@ class AutoAnalysisService:
                 "sync_results": sync_results,
                 "cn_fundamental_result": cn_fundamental_result,
                 "cn_concept_result": cn_concept_result,
+                "risk_guardrail_result": risk_guardrail_result,
                 "build_result": build_result,
                 "predictions_written": predictions_written,
                 "daily_rows_written": daily_rows_written,

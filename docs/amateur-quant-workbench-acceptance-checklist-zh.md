@@ -421,7 +421,7 @@
 ### 12.1 当前观察基线
 
 - 截至 `2026-04-24`，今日 recent jobs 统计约为：`success 90 / partial 1 / failed 2 / empty 2 / not_configured 1`。
-- 今日 `18:00` 主链路已成功跑通：`cn_close_review -> watchlist_auto_analysis -> train_cn_signals -> news_enrichment -> screener_precompute -> market_snapshot_refresh`。
+- 今日主链路已成功跑通：`refresh_cn_market_data_lake_only -> watchlist_auto_analysis -> train_cn_signals -> news_enrichment -> screener_precompute -> market_snapshot_refresh`。
 - 当前遗留的 `partial / failed` 主要是早盘历史残留：
   - `social_us_price_sync partial`：`H2` 单 ticker 失败
   - `social_signal_poll failed`：旧 running 被 stale cleanup 收口

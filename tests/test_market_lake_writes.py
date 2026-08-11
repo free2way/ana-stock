@@ -81,3 +81,18 @@ class MarketLakeWriteTests(TestCase):
             rows = pl.read_parquet(path).to_dicts()
             self.assertEqual(["000001.SZ"], [row["symbol"] for row in rows])
             self.assertEqual(12, rows[0]["close"])
+
+    def test_future_market_rows_are_rejected_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "app.services.market_lake.market_lake_root",
+            return_value=Path(temp_dir),
+        ), patch(
+            "app.services.market_lake.latest_completed_market_date",
+            return_value="2026-06-22",
+        ):
+            with self.assertRaisesRegex(ValueError, "future"):
+                write_ohlcv_rows_to_lake(
+                    market="US",
+                    rows=[_row("AAPL", 200, trade_date="2026-06-23")],
+                )
+            self.assertFalse(list(Path(temp_dir).rglob("*.parquet")))

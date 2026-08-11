@@ -107,8 +107,22 @@ def sync_market_data(
         if not symbols:
             raise RuntimeError("No symbols found. Add symbols first or pass tickers to sync.")
 
-        bulk_rows_by_ticker: dict[str, list[dict]] = {}
         normalized_provider = str(provider or "").strip().lower()
+        if normalized_provider in {"a_stock_data", "a_stock_data_tencent", "tencent"}:
+            if not tickers:
+                raise RuntimeError(
+                    "a-stock-data Tencent is a supplementary source. Select explicit A-share tickers; "
+                    "it is not permitted for an all-market lake refresh."
+                )
+            if len(symbols) > int(settings.a_stock_data_max_symbols):
+                raise RuntimeError(
+                    f"a-stock-data Tencent is limited to {int(settings.a_stock_data_max_symbols)} symbols per run. "
+                    "Use TuShare for the A-share full-market lake."
+                )
+            if any(str(symbol.market or "").upper() != "CN" for symbol in symbols):
+                raise RuntimeError("a-stock-data Tencent supports A-share tickers only.")
+
+        bulk_rows_by_ticker: dict[str, list[dict]] = {}
         use_cn_tushare_bulk = (
             len(symbols) >= 100
             and normalized_provider in {"", "auto", "tushare"}
@@ -133,6 +147,16 @@ def sync_market_data(
             lake_rows = [row for ticker_rows in bulk_rows_by_ticker.values() for row in ticker_rows]
             if lake_rows:
                 write_ohlcv_rows_to_lake(market="CN", rows=lake_rows)
+
+        # A-share daily endpoints omit suspended symbols instead of returning
+        # a zero-volume bar.  Keep the provider check optional and
+        # conservative: an unknown suspension state must remain stale/failed.
+        suspension_client = (
+            TushareClient()
+            if required_as_of_date
+            and all(str(symbol.market or "").upper() == "CN" for symbol in symbols)
+            else None
+        )
 
         for symbol in symbols:
             try:
@@ -178,7 +202,24 @@ def sync_market_data(
                             f"No new market data returned for {selected_provider_ticker}; "
                             f"retained existing lake history through {last_synced_date}."
                         )
-                        if not is_current:
+                        no_trade = False
+                        if (
+                            not is_current
+                            and suspension_client is not None
+                            and market_code == "CN"
+                            and required_as_of_date
+                        ):
+                            no_trade = suspension_client.is_cn_suspended_on_date(
+                                symbol.ticker,
+                                required_as_of_date,
+                            ) is True
+                        if no_trade:
+                            status = "no_trade"
+                            message = (
+                                f"No market bar for {required_as_of_date}; TuShare reports {symbol.ticker} "
+                                "as suspended/no-trade. Existing lake history was retained."
+                            )
+                        if not is_current and not no_trade:
                             message += f" Required as-of date is {required_as_of_date}; data remains stale."
                         sync_repo.upsert_state(
                             symbol_id=symbol.id,
@@ -195,6 +236,8 @@ def sync_market_data(
                                 "stored_rows": 0,
                                 "provider_ticker": selected_provider_ticker,
                                 "last_synced_date": last_synced_date,
+                                "no_trade": no_trade,
+                                "no_trade_reason": "suspended" if no_trade else None,
                                 "lake_paths": [],
                                 "raw_path": None,
                                 "normalized_path": None,

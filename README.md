@@ -161,6 +161,18 @@ Open:
 http://127.0.0.1:8000/dashboard
 ```
 
+Operational checks:
+
+```text
+http://127.0.0.1:8000/health/ready
+```
+
+`/health` only confirms that the web process is alive. `/health/ready` also checks
+PostgreSQL and whether the CN/US Parquet lake has reached the latest completed
+market session. The API rejects future-dated CN/US bars and all lake reads ignore
+future dates, so a provider clock error cannot silently become a model signal.
+
+
 ## Notes On Storage
 
 - PostgreSQL is the supported primary app database.

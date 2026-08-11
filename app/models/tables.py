@@ -194,6 +194,68 @@ class StrategyDailyMetric(Base):
     strategy_run: Mapped[StrategyRun] = relationship()
 
 
+class ModelEvaluation(Base):
+    """A reproducible, out-of-sample evaluation of one persisted model run."""
+
+    __tablename__ = "model_evaluations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    model_run_id: Mapped[int] = mapped_column(ForeignKey("model_runs.id"), nullable=False)
+    source_job_id: Mapped[int | None] = mapped_column(ForeignKey("data_jobs.id"), nullable=True)
+    market: Mapped[str] = mapped_column(Text, nullable=False)
+    evaluation_type: Mapped[str] = mapped_column(Text, nullable=False, default="prediction_forward_return")
+    input_as_of_date: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sample_start_date: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sample_end_date: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_out_of_sample: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    oos_sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    oos_coverage_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    purge_gap_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    benchmark_avg_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    universe_version: Mapped[str | None] = mapped_column(Text, nullable=True)
+    activation_status: Mapped[str] = mapped_column(Text, nullable=False, default="observation")
+    includes_costs: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    round_trip_cost_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    config_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    finished_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    model_run: Mapped[ModelRun] = relationship()
+
+
+class ModelEvaluationMetric(Base):
+    """One holding-period and market-state slice within a model evaluation."""
+
+    __tablename__ = "model_evaluation_metrics"
+    __table_args__ = (UniqueConstraint("model_evaluation_id", "horizon_days", "metric_scope"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    model_evaluation_id: Mapped[int] = mapped_column(ForeignKey("model_evaluations.id"), nullable=False)
+    horizon_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    metric_scope: Mapped[str] = mapped_column(Text, nullable=False, default="overall")
+    market_regime: Mapped[str | None] = mapped_column(Text, nullable=True)
+    risk_regime: Mapped[str | None] = mapped_column(Text, nullable=True)
+    buy_gate: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    hit_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    avg_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    median_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gross_avg_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    avg_drawdown: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_drawdown: Mapped[float | None] = mapped_column(Float, nullable=True)
+    profit_loss_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    turnover: Mapped[float | None] = mapped_column(Float, nullable=True)
+    confidence_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    confidence_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+    evaluation: Mapped[ModelEvaluation] = relationship()
+
+
 class Watchlist(Base, TimestampMixin):
     __tablename__ = "watchlists"
 
@@ -225,6 +287,81 @@ class DataJob(Base):
     finished_at: Mapped[str | None] = mapped_column(Text, nullable=True)
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
     params_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class JobDefinition(Base):
+    """Stable task metadata; ``DataJob`` remains the per-execution run record."""
+
+    __tablename__ = "job_definitions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_type: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    category: Mapped[str] = mapped_column(Text, nullable=False, default="maintenance")
+    markets_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    schedule_rule: Mapped[str | None] = mapped_column(Text, nullable=True)
+    timeout_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_retries: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    is_enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    config_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class JobRunDependency(Base):
+    __tablename__ = "job_run_dependencies"
+    __table_args__ = (UniqueConstraint("job_id", "upstream_job_id", "dependency_type"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("data_jobs.id"), nullable=False)
+    upstream_job_id: Mapped[int] = mapped_column(ForeignKey("data_jobs.id"), nullable=False)
+    dependency_type: Mapped[str] = mapped_column(Text, nullable=False, default="source_job")
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="waiting")
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    required_as_of_date: Mapped[str | None] = mapped_column(Text, nullable=True)
+    actual_as_of_date: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class JobRunAttempt(Base):
+    __tablename__ = "job_run_attempts"
+    __table_args__ = (UniqueConstraint("job_id", "attempt_no"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("data_jobs.id"), nullable=False)
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    provider: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[str] = mapped_column(Text, nullable=False)
+    finished_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+    duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class MarketRefreshBatch(Base):
+    __tablename__ = "market_refresh_batches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_job_id: Mapped[int | None] = mapped_column(ForeignKey("data_jobs.id"), nullable=True)
+    market: Mapped[str] = mapped_column(Text, nullable=False)
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    requested_as_of_date: Mapped[str] = mapped_column(Text, nullable=False)
+    actual_as_of_date: Mapped[str | None] = mapped_column(Text, nullable=True)
+    universe_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    success_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    no_trade_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    inactive_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    partial_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    missing_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    summary_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[str] = mapped_column(Text, nullable=False)
+    finished_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    source_job: Mapped[DataJob | None] = relationship()
 
 
 class WorkspaceSnapshot(Base):

@@ -123,17 +123,47 @@ def summarize_market_context_snapshot(
 
 def load_market_context_snapshot(db: Session, *, market: str) -> dict:
     from app.services.repository import WorkspaceSnapshotRepository
+    from app.services.market_risk import market_risk_snapshot_type
 
     repo = WorkspaceSnapshotRepository(db)
     workspace_snapshot = repo.get_latest_snapshot(MARKET_WORKSPACE_POSTMARKET_SNAPSHOT_TYPE) or {}
     heatmap_snapshot = repo.get_latest_snapshot(MARKET_HEATMAP_SNAPSHOT_TYPE) or {}
+    market_code = str(market or "").strip().upper()
+    risk_snapshot = repo.get_latest_snapshot(market_risk_snapshot_type(market_code)) or {}
+    risk_payload = risk_snapshot.get("payload") if isinstance(risk_snapshot, dict) else None
     summary = summarize_market_context_snapshot(
-        market=market,
+        market=market_code,
         workspace_payload=(workspace_snapshot.get("payload") if isinstance(workspace_snapshot, dict) else None) or {},
         heatmap_payload=(heatmap_snapshot.get("payload") if isinstance(heatmap_snapshot, dict) else None) or {},
         snapshot_date=workspace_snapshot.get("snapshot_date") if isinstance(workspace_snapshot, dict) else None,
         heatmap_snapshot_date=heatmap_snapshot.get("snapshot_date") if isinstance(heatmap_snapshot, dict) else None,
     )
+    if isinstance(risk_payload, dict):
+        risk_regime = str(risk_payload.get("risk_regime") or "").strip()
+        buy_gate = str(risk_payload.get("buy_gate") or "").strip().upper()
+        risk_regime_for_trade = str(risk_payload.get("regime") or "").strip().lower()
+        if risk_regime_for_trade in {"defensive", "watchful", "risk_on"}:
+            summary["regime"] = risk_regime_for_trade
+        if buy_gate == "BLOCK":
+            summary["regime"] = "defensive"
+        elif buy_gate == "REVIEW" and summary.get("regime") == "risk_on":
+            summary["regime"] = "watchful"
+        latest = risk_payload.get("latest") if isinstance(risk_payload.get("latest"), dict) else {}
+        if latest.get("up_pct") is not None:
+            summary["breadth_pct"] = latest.get("up_pct")
+        summary.update(
+            {
+                "risk_regime": risk_regime or None,
+                "buy_gate": buy_gate or None,
+                "risk_level": risk_payload.get("risk_level"),
+                "max_position_scale": risk_payload.get("max_position_scale"),
+                "risk_headline": risk_payload.get("headline"),
+                "risk_playbook": risk_payload.get("playbook"),
+                "risk_flags": risk_payload.get("flags") or [],
+                "market_risk_snapshot_date": risk_payload.get("snapshot_date"),
+            }
+        )
     summary["workspace_snapshot"] = workspace_snapshot
     summary["heatmap_snapshot"] = heatmap_snapshot
+    summary["risk_snapshot"] = risk_snapshot
     return summary

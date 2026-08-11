@@ -3,7 +3,7 @@ from dataclasses import asdict, dataclass
 from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
 from app.services.providers import resolve_fundamental_provider
-from app.services.repository import FundamentalSnapshotRepository, SymbolRepository
+from app.services.repository import FundamentalSnapshotRepository, SymbolRepository, WatchlistRepository
 from app.services.ticker_format import normalize_ticker_for_market
 
 
@@ -12,6 +12,7 @@ class GlobalFundamentalRow:
     ticker: str
     market: str
     report_date: str
+    source: str = "openbb_fundamentals"
     name: str | None = None
     exchange: str | None = None
     listing_date: str | None = None
@@ -25,12 +26,38 @@ class GlobalFundamentalRow:
     raw_data: dict | None = None
 
 
-def sync_global_fundamentals(tickers: list[str] | None = None) -> dict:
+def _priority_us_tickers() -> list[str]:
+    """Use the watchlist as the default scope for public official endpoints.
+
+    EDGAR is excellent for enrichment, but it is not a replacement for a
+    commercial fundamental bulk feed.  A bounded priority scope makes manual
+    maintenance predictable and respects the source's fair-access guidance.
+    """
+    with SessionLocal() as db:
+        watchlist = WatchlistRepository(db).get_or_create_default()
+        rows = WatchlistRepository(db).list_items(watchlist.id)
+    return sorted(
+        {
+            str(row.get("ticker") or "").strip().upper()
+            for row in rows
+            if str(row.get("market") or "").strip().upper() == "US" and str(row.get("ticker") or "").strip()
+        }
+    )
+
+
+def sync_global_fundamentals(tickers: list[str] | None = None, *, provider_name: str = "openbb") -> dict:
     normalized_tickers = [_normalize_any_ticker(ticker) for ticker in (tickers or []) if ticker.strip()]
+    normalized_provider = str(provider_name or "openbb").strip().lower()
+    if not normalized_tickers and normalized_provider in {"global_stock_data", "global_stock_data_sec", "sec", "sec_edgar"}:
+        normalized_tickers = _priority_us_tickers()
     if not normalized_tickers:
         return {
             "status": "empty",
-            "message": "No US/HK tickers were provided for global fundamental sync.",
+            "message": (
+                "No eligible U.S. watchlist tickers were found for SEC enrichment."
+                if normalized_provider in {"global_stock_data", "global_stock_data_sec", "sec", "sec_edgar"}
+                else "No US/HK tickers were provided for global fundamental sync."
+            ),
             "rows_written": 0,
             "tickers": [],
         }
@@ -39,7 +66,8 @@ def sync_global_fundamentals(tickers: list[str] | None = None) -> dict:
     failures: list[str] = []
     provider_sources: set[str] = set()
     for ticker in normalized_tickers:
-        provider = resolve_fundamental_provider("openbb", market=_infer_market(ticker))
+        market = _infer_market(ticker)
+        provider = resolve_fundamental_provider(normalized_provider, market=market)
         snapshot = provider.fetch_snapshot(ticker)
         provider_sources.add(getattr(provider, "last_source_used", "openbb"))
         if not snapshot:
@@ -50,6 +78,7 @@ def sync_global_fundamentals(tickers: list[str] | None = None) -> dict:
                 ticker=ticker,
                 market=_infer_market(ticker),
                 report_date=snapshot["report_date"],
+                source=getattr(provider, "last_source_used", "openbb_fundamentals") or "openbb_fundamentals",
                 name=snapshot.get("name"),
                 exchange=snapshot.get("exchange"),
                 listing_date=snapshot.get("listing_date"),
@@ -65,9 +94,14 @@ def sync_global_fundamentals(tickers: list[str] | None = None) -> dict:
         )
 
     if not rows:
+        not_configured = provider_sources == {"sec_edgar_not_configured"}
         return {
-            "status": "empty",
-            "message": "No US/HK fundamental rows returned from the live provider.",
+            "status": "not_configured" if not_configured else "empty",
+            "message": (
+                "Set PQW_SEC_USER_AGENT to a real name and contact email before using the official SEC EDGAR source."
+                if not_configured
+                else "No US/HK fundamental rows returned from the selected provider."
+            ),
             "rows_written": 0,
             "tickers": normalized_tickers,
             "failed_tickers": failures,
@@ -90,7 +124,7 @@ def sync_global_fundamentals(tickers: list[str] | None = None) -> dict:
             fundamental_repo.upsert_snapshot(
                 symbol_id=symbol.id,
                 report_date=row.report_date,
-                source=next(iter(provider_sources), "openbb_fundamentals"),
+                source=row.source,
                 listing_date=row.listing_date,
                 pe_ttm=row.pe_ttm,
                 dividend_yield=row.dividend_yield,

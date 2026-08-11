@@ -36,6 +36,7 @@ def refresh_us_grouped_daily(
     settings = get_settings()
     if not settings.polygon_api_key:
         return {
+            "market": "US",
             "status": "not_configured",
             "message": "PQW_POLYGON_API_KEY is not configured. Add a Polygon API key before running US grouped daily refresh.",
             "trade_date": trade_date or _default_us_grouped_trade_date(),
@@ -56,6 +57,7 @@ def refresh_us_grouped_daily(
         error_message = str(exc)
         if "today's data before end of day" in error_message.lower():
             return {
+                "market": "US",
                 "status": "empty",
                 "message": (
                     f"Polygon grouped daily {effective_trade_date} is not available yet. "
@@ -73,6 +75,7 @@ def refresh_us_grouped_daily(
                 "error": error_message,
             }
         return {
+            "market": "US",
             "status": "failed",
             "message": f"Polygon grouped daily {effective_trade_date} failed: {error_message}",
             "trade_date": effective_trade_date,
@@ -92,6 +95,7 @@ def refresh_us_grouped_daily(
         rows = rows[:limit]
     if not rows:
         return {
+            "market": "US",
             "status": "empty",
             "message": f"No Polygon grouped daily rows returned for {effective_trade_date}.",
             "trade_date": effective_trade_date,
@@ -123,6 +127,7 @@ def refresh_us_grouped_daily(
         failure_count = int(result.get("failure_count") or 0)
         status = "success" if success_count and failure_count == 0 else "partial" if success_count else "failed"
         return {
+            "market": "US",
             "status": status,
             "message": (
                 f"Polygon grouped daily {effective_trade_date}: {success_count} state row(s) upserted, "
@@ -188,6 +193,7 @@ def refresh_us_grouped_daily(
 
     status = "success" if success_count and failure_count == 0 else "partial" if success_count else "failed"
     return {
+        "market": "US",
         "status": status,
         "message": f"Polygon grouped daily {effective_trade_date}: {success_count} synced, {failure_count} failed.",
         "trade_date": effective_trade_date,

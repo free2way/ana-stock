@@ -8,6 +8,9 @@ from app.core.db import SessionLocal
 from app.services.backtester import BacktestRunner
 from app.services.market_calendar import previous_market_open_date
 from app.services.market_lake import count_lake_symbols_for_trade_date, get_latest_lake_trade_date, list_lake_symbols
+from app.services.market_refresh_audit import record_market_refresh_result
+from app.services.market_risk import save_risk_guardrail_snapshots
+from app.services.model_evaluation import evaluate_model_runs
 from app.services.market_sync import sync_market_data
 from app.services.portfolio_book import load_portfolio_positions
 from app.services.repository import AppSettingRepository, DataJobRepository, WatchlistRepository
@@ -199,6 +202,7 @@ class USMarketSchedulerService:
                     "lake_symbol_count": latest_lake_symbol_count,
                     "previous_lake_symbol_count": previous_lake_symbol_count,
                 }
+            record_market_refresh_result(source_job_id=job_id, result=result)
             with SessionLocal() as db:
                 DataJobRepository(db).complete_job(
                     job_id,
@@ -210,6 +214,9 @@ class USMarketSchedulerService:
                     self._persist_last_run(db, trade_date=str(result.get("trade_date") or latest_lake_trade_date or ""))
             if status == "success":
                 resolved_trade_date = str(result.get("trade_date") or latest_lake_trade_date or "")
+                # Persist the regime for this close before evaluating predictions
+                # generated from it; otherwise today would be labelled unknown.
+                self._run_risk_guardrail(source_job_id=job_id)
                 self._run_signal_training(source_job_id=job_id, trade_date=resolved_trade_date)
                 self._run_screener_precompute(source_job_id=job_id)
             return {"status": status, "job_id": job_id, "refresh_result": result}
@@ -364,6 +371,7 @@ class USMarketSchedulerService:
                 },
                 message="Training U.S. LightGBM signals after U.S. close refresh.",
             )
+            train_job_id = job.id
         trainer = SignalTrainer()
         runner = BacktestRunner()
         try:
@@ -379,7 +387,7 @@ class USMarketSchedulerService:
             daily_rows_written = runner.run(top_n=5)
             with SessionLocal() as db:
                 DataJobRepository(db).complete_job(
-                    job.id,
+                    train_job_id,
                     status="success",
                     message=(
                         f"Trained {len(us_tickers)} eligible U.S. common-stock symbols "
@@ -398,14 +406,54 @@ class USMarketSchedulerService:
                 )
             try:
                 with SessionLocal() as db:
-                    refresh_workspace_snapshots(db, source_job_id=job.id)
+                    refresh_workspace_snapshots(db, source_job_id=train_job_id)
             except Exception:
                 # Snapshot refresh is a presentation cache. Do not fail a completed
                 # U.S. training run after predictions/backtests have already landed.
                 pass
+            self._run_structured_evaluation(source_job_id=train_job_id)
         except Exception as exc:
             with SessionLocal() as db:
-                DataJobRepository(db).complete_job(job.id, status="failed", message=str(exc))
+                DataJobRepository(db).complete_job(train_job_id, status="failed", message=str(exc))
+
+    def _run_structured_evaluation(self, *, source_job_id: int) -> None:
+        with SessionLocal() as db:
+            job_repo = DataJobRepository(db)
+            if job_repo.has_running_job("evaluate_model_performance"):
+                return
+            job = job_repo.create_job(
+                job_type="evaluate_model_performance",
+                status="running",
+                params={
+                    "source_job_id": source_job_id,
+                    "markets": ["US"],
+                    "recent_runs": 1,
+                    "recent_trade_dates": 12,
+                    "top_n": 20,
+                    "horizons": [1, 3, 5, 10, 20],
+                    "round_trip_cost_bps": 20.0,
+                    "trigger": "us_market_scheduler",
+                },
+                message="Persisting scheduled structured evaluation after U.S. signal training.",
+            )
+            try:
+                result = evaluate_model_runs(
+                    db,
+                    markets=["US"],
+                    recent_runs=1,
+                    recent_trade_dates=12,
+                    top_n=20,
+                    round_trip_cost_bps=20.0,
+                    source_job_id=job.id,
+                )
+                job_repo.complete_job(
+                    job.id,
+                    status=str(result.get("status") or "partial"),
+                    message=result.get("message") or "Structured model evaluation finished.",
+                    result=result,
+                )
+            except Exception as exc:
+                job_repo.complete_job(job.id, status="failed", message=str(exc), result={"error": str(exc)})
 
     def _run_screener_precompute(self, *, source_job_id: int) -> None:
         with SessionLocal() as db:
@@ -423,6 +471,7 @@ class USMarketSchedulerService:
                 params={"source_job_id": source_job_id, "lake_only": True, "markets": ["US"]},
                 message="Precomputing U.S. screener model results after U.S. close refresh.",
             )
+            screener_job_id = job.id
         with SessionLocal() as db:
             result = refresh_precomputed_screener_snapshots(
                 db,
@@ -433,14 +482,44 @@ class USMarketSchedulerService:
             )
         with SessionLocal() as db:
             DataJobRepository(db).complete_job(
-                job.id,
+                screener_job_id,
                 status="success" if result.get("count", 0) > 0 else "failed",
                 message=f"Precomputed {result.get('count', 0)} U.S. screener snapshot(s) after U.S. close refresh.",
                 result=result,
             )
         if result.get("count", 0) > 0:
             with SessionLocal() as db:
-                save_market_workspace_snapshots(db, source_job_id=job.id)
+                save_market_workspace_snapshots(db, source_job_id=screener_job_id)
+
+    def _run_risk_guardrail(self, *, source_job_id: int) -> None:
+        with SessionLocal() as db:
+            job_repo = DataJobRepository(db)
+            if job_repo.has_running_job("risk_guardrail_snapshot"):
+                return
+            job = job_repo.create_job(
+                job_type="risk_guardrail_snapshot",
+                status="running",
+                params={"source_job_id": source_job_id, "markets": ["CN", "US"], "trigger": "us_market_close_refresh"},
+                message="Computing risk guardrail snapshots after U.S. close refresh.",
+            )
+            risk_job_id = job.id
+        try:
+            with SessionLocal() as db:
+                result = save_risk_guardrail_snapshots(db, source_job_id=risk_job_id, markets=["CN", "US"])
+                DataJobRepository(db).complete_job(
+                    risk_job_id,
+                    status=str(result.get("status") or "success"),
+                    message=result.get("message") or "Risk guardrail snapshot finished after U.S. close refresh.",
+                    result=result,
+                )
+        except Exception as exc:
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(
+                    risk_job_id,
+                    status="failed",
+                    message=f"Risk guardrail snapshot failed after U.S. close refresh: {exc}",
+                    result={"error": str(exc), "source_job_id": source_job_id},
+                )
 
     def _prepare_run(self, trigger: str) -> tuple[dict, int]:
         with SessionLocal() as db:

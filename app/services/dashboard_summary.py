@@ -36,6 +36,11 @@ def build_data_sources(sync_states: list[dict], concept_summary: dict | None = N
             "Track Top-N model concentration by concept over recent snapshots",
             "Treat stale concept data as lower confidence for resonance analysis",
         ],
+        "supplemental_source_strategy": [
+            "A 股：a-stock-data 的腾讯行情仅用于指定股票的补全与交叉核验，主行情湖仍由 TuShare 写入。",
+            "美股：global-stock-data 的 SEC EDGAR 仅写入官方申报基本面，主行情湖仍由 Polygon 写入。",
+            "补充数据保留来源和截至日期，且不会将不同复权口径的价格直接合并。",
+        ],
         "current_provider_breakdown": breakdown,
         "primary_provider": primary_provider,
         "concept_data": concept_summary

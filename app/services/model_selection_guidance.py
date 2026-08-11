@@ -9,6 +9,7 @@ from sqlalchemy import select
 from app.core.db import SessionLocal
 from app.models.tables import WorkspaceSnapshot
 from app.services.market_lake import load_lake_rows, query_lake_daily_movers
+from app.services.market_freshness import is_snapshot_as_of_current
 from app.services.repository import SymbolRepository, WorkspaceSnapshotRepository
 from app.services.runtime_cache import get_or_set
 from app.services.screener import MODEL_TEMPLATES
@@ -121,6 +122,7 @@ def save_model_selection_guidance_snapshots(
     created: dict[str, dict] = {}
     for market_code in normalized_markets:
         payload = build_model_selection_guidance(market=market_code)
+        payload["schema_version"] = 1
         payload["snapshot_meta"] = {
             "source": "snapshot",
             "market": market_code,
@@ -150,22 +152,33 @@ def load_model_selection_guidance_snapshot(
 ) -> dict:
     market_code = normalize_guidance_market(market)
     snapshot = WorkspaceSnapshotRepository(db).get_latest_snapshot(model_selection_guidance_snapshot_type(market_code))
+    stale_snapshot_detected = False
+    stale_snapshot_date = None
     if snapshot and isinstance(snapshot.get("payload"), dict):
         payload = dict(snapshot.get("payload") or {})
-        snapshot_meta = dict(payload.get("snapshot_meta") or {})
-        snapshot_meta.update(
-            {
-                "source": "snapshot",
-                "market": market_code,
-                "snapshot_id": snapshot.get("id"),
-                "snapshot_type": snapshot.get("snapshot_type"),
-                "snapshot_date": snapshot.get("snapshot_date"),
-                "created_at": snapshot.get("created_at"),
-                "source_job_id": snapshot.get("source_job_id"),
-            }
-        )
-        payload["snapshot_meta"] = snapshot_meta
-        return payload
+        if (payload.get("schema_version") or payload.get("input")) and not is_snapshot_as_of_current(snapshot.get("snapshot_date"), market_code):
+            stale_snapshot_detected = True
+            stale_snapshot_date = snapshot.get("snapshot_date")
+        else:
+            stale_snapshot_detected = False
+        if stale_snapshot_detected:
+            snapshot = None
+        else:
+            snapshot_meta = dict(payload.get("snapshot_meta") or {})
+            snapshot_meta.update(
+                {
+                    "source": "snapshot",
+                    "market": market_code,
+                    "snapshot_id": snapshot.get("id"),
+                    "snapshot_type": snapshot.get("snapshot_type"),
+                    "snapshot_date": snapshot.get("snapshot_date"),
+                    "created_at": snapshot.get("created_at"),
+                    "source_job_id": snapshot.get("source_job_id"),
+                    "freshness": "current",
+                }
+            )
+            payload["snapshot_meta"] = snapshot_meta
+            return payload
     payload = build_model_selection_guidance(market=market_code) if allow_fallback else {
         "markets": [market_code],
         "recommendations": [],
@@ -179,6 +192,8 @@ def load_model_selection_guidance_snapshot(
         "source": "live" if allow_fallback else "missing",
         "market": market_code,
         "generated_at": app_now_iso(),
+        "freshness": "recomputed_after_stale_snapshot" if stale_snapshot_detected else "missing",
+        "stale_snapshot_date": stale_snapshot_date,
     }
     return payload
 
@@ -701,12 +716,18 @@ def _recommendation_screener_href(item: dict, *, target_market: str) -> str:
     if not template:
         return "/screeners?lang=zh"
     action_bucket = str(item.get("action_bucket") or "").strip()
+    template_defaults = (MODEL_TEMPLATES.get(template) or {}).get("defaults") or {}
+    try:
+        min_trend_score = max(0, int(template_defaults.get("min_trend_score", 60)))
+    except (TypeError, ValueError):
+        min_trend_score = 60
     params = {
         "lang": "zh",
         "run": 1,
         "market": normalize_guidance_market(target_market),
         "universe": "full_market",
         "model_template": template,
+        "min_trend_score": min_trend_score,
         "sort_by": "trade_readiness_score",
         "sort_order": "desc",
     }

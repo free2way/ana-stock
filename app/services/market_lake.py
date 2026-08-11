@@ -10,6 +10,7 @@ import duckdb
 import polars as pl
 
 from app.core.config import get_settings
+from app.services.market_freshness import latest_completed_market_date
 
 
 LAKE_OHLCV_COLUMNS = [
@@ -62,7 +63,13 @@ def _lake_write_lock(path: Path) -> threading.Lock:
 
 def write_daily_ohlcv_parquet(*, market: str, trade_date: str, rows: list[dict], merge_existing: bool = True) -> Path:
     market_code = str(market or "").strip().lower() or "unknown"
-    path = market_lake_root() / f"{market_code}_daily" / f"date={trade_date}" / "part.parquet"
+    normalized_trade_date = str(trade_date or "").strip()[:10]
+    if market_code in {"cn", "us"} and normalized_trade_date > latest_completed_market_date(market_code.upper()):
+        raise ValueError(
+            f"Refusing to write future {market_code.upper()} market data for {normalized_trade_date}; "
+            f"latest completed session is {latest_completed_market_date(market_code.upper())}."
+        )
+    path = market_lake_root() / f"{market_code}_daily" / f"date={normalized_trade_date}" / "part.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
     normalized_rows = [_normalize_ohlcv_row(row, trade_date=trade_date) for row in rows]
     incoming = pl.DataFrame(normalized_rows, schema=LAKE_OHLCV_COLUMNS, orient="row")
@@ -94,8 +101,11 @@ def query_us_daily_summary(*, trade_date: str | None = None, limit: int = 10) ->
     parquet_files = _all_parquet_files("US")
     if not parquet_files:
         return {"status": "empty", "message": "No U.S. daily Parquet lake files found.", "rows": []}
-    where_clause = "WHERE date = ?" if trade_date else ""
-    params = [trade_date] if trade_date else []
+    where_clause = "WHERE CAST(date AS DATE) <= CAST(? AS DATE)"
+    params = [trade_date or latest_completed_market_date("US")]
+    if trade_date:
+        where_clause += " AND date = ?"
+        params.append(trade_date)
     sql = f"""
         SELECT
             date,
@@ -140,6 +150,7 @@ def query_lake_daily_movers(
                 LAG(close) OVER (PARTITION BY symbol ORDER BY CAST(date AS DATE)) AS prev_close
             FROM read_parquet(?, hive_partitioning = true)
             WHERE close IS NOT NULL
+              AND CAST(date AS DATE) <= CAST(? AS DATE)
         ),
         enriched AS (
             SELECT
@@ -178,7 +189,7 @@ def query_lake_daily_movers(
     """
     rows, columns = _duckdb_fetchall(
         sql,
-        [parquet_files, float(min_dollar_volume), float(min_dollar_volume), float(min_return_pct)],
+        [parquet_files, latest_completed_market_date(market_code), float(min_dollar_volume), float(min_dollar_volume), float(min_return_pct)],
         label="lake_daily_movers",
     )
     return [_json_ready_row(dict(zip(columns, row, strict=False))) for row in rows]
@@ -202,12 +213,17 @@ def load_lake_price_history(*, market: str, ticker: str, limit: int = 120) -> li
             adj_close
         FROM read_parquet(?, hive_partitioning = true)
         WHERE symbol = ?
+          AND CAST(date AS DATE) <= CAST(? AS DATE)
         ORDER BY CAST(date AS DATE) DESC
     """
     history: list[dict] = []
     columns: list[str] = []
     for file_chunk in _chunked_paths(parquet_files):
-        rows, chunk_columns = _duckdb_fetchall(sql, [file_chunk, symbol], label="lake_price_history")
+        rows, chunk_columns = _duckdb_fetchall(
+            sql,
+            [file_chunk, symbol, latest_completed_market_date(market_code)],
+            label="lake_price_history",
+        )
         if not columns:
             columns = chunk_columns
         history.extend(_json_ready_row(dict(zip(columns, row, strict=False))) for row in rows)
@@ -244,6 +260,7 @@ def load_lake_latest_closes(*, market: str, tickers: list[str]) -> dict[str, flo
                     ) AS row_num
                 FROM read_parquet(?, hive_partitioning = true)
                 WHERE symbol IN ({placeholders})
+                  AND CAST(date AS DATE) <= CAST(? AS DATE)
             )
             SELECT symbol, close, adj_close
             FROM ranked
@@ -251,7 +268,7 @@ def load_lake_latest_closes(*, market: str, tickers: list[str]) -> dict[str, flo
         """
         rows, _columns = _duckdb_fetchall(
             sql,
-            [parquet_files, *ticker_chunk],
+            [parquet_files, *ticker_chunk, latest_completed_market_date(market_code)],
             label="lake_latest_closes",
         )
         for symbol, close_value, adj_close_value in rows:
@@ -285,12 +302,13 @@ def load_lake_latest_metrics(
     payload: dict[str, dict] = {}
     chunks = [normalized[index : index + 800] for index in range(0, len(normalized), 800)] if normalized else [[]]
     for ticker_chunk in chunks:
-        ticker_filter = ""
-        params: list[object] = [parquet_files]
+        where_parts = ["CAST(date AS DATE) <= CAST(? AS DATE)"]
+        params: list[object] = [parquet_files, latest_completed_market_date(market_code)]
         if ticker_chunk:
             placeholders = ", ".join("?" for _ in ticker_chunk)
-            ticker_filter = f"WHERE symbol IN ({placeholders})"
+            where_parts.append(f"symbol IN ({placeholders})")
             params.extend(ticker_chunk)
+        ticker_filter = "WHERE " + " AND ".join(where_parts)
         sql = f"""
             WITH base AS (
                 SELECT
@@ -382,10 +400,13 @@ def get_latest_lake_trade_date(*, market: str, ticker: str | None = None) -> str
     if market_code not in {"CN", "US"} or not parquet_files:
         return None
     normalized_ticker = str(ticker or "").strip().upper()
-    where_clause = "WHERE symbol = ?" if normalized_ticker else ""
-    params: list[object] = [parquet_files]
+    expected_as_of = latest_completed_market_date(market_code)
+    where_parts = ["CAST(date AS DATE) <= CAST(? AS DATE)"]
+    params: list[object] = [parquet_files, expected_as_of]
     if normalized_ticker:
+        where_parts.append("symbol = ?")
         params.append(normalized_ticker)
+    where_clause = "WHERE " + " AND ".join(where_parts)
     sql = f"""
         SELECT CAST(MAX(CAST(date AS DATE)) AS VARCHAR) AS trade_date
         FROM read_parquet(?, hive_partitioning = true)
@@ -652,7 +673,10 @@ def load_lake_rows(*, markets: list[str] | None = None, tickers: set[str] | None
         parquet_files = _all_parquet_files(market_code)
         if not parquet_files:
             continue
-        ticker_filter = "WHERE symbol = ANY(?)" if normalized_tickers else ""
+        where_parts = ["CAST(date AS DATE) <= CAST(? AS DATE)"]
+        if normalized_tickers:
+            where_parts.append("symbol = ANY(?)")
+        ticker_filter = "WHERE " + " AND ".join(where_parts)
         sql = f"""
             SELECT
                 CAST(date AS VARCHAR) AS date,
@@ -669,7 +693,7 @@ def load_lake_rows(*, markets: list[str] | None = None, tickers: set[str] | None
         """
         columns: list[str] = []
         for file_chunk in _chunked_paths(parquet_files):
-            params = [file_chunk]
+            params = [file_chunk, latest_completed_market_date(market_code)]
             if normalized_tickers:
                 params.append(sorted(normalized_tickers))
             rows, chunk_columns = _duckdb_fetchall(sql, params, label="lake_load_rows")
@@ -716,6 +740,13 @@ def write_ohlcv_rows_to_lake(*, market: str, rows: list[dict], merge_existing: b
         trade_date = str(row.get("date") or "").strip()
         if not trade_date:
             continue
+        if str(market or "").strip().upper() in {"CN", "US"} and trade_date[:10] > latest_completed_market_date(str(market).strip().upper()):
+            # Reject the whole batch before any partition is written. This makes
+            # provider clock/data errors visible in the job instead of silently
+            # creating a future partition that later poisons model freshness.
+            raise ValueError(
+                f"Refusing to write future {str(market).strip().upper()} market row for {trade_date[:10]}."
+            )
         rows_by_date.setdefault(trade_date, []).append(row)
     return [
         write_daily_ohlcv_parquet(market=market, trade_date=trade_date, rows=date_rows, merge_existing=merge_existing)
@@ -736,8 +767,9 @@ def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: i
     parquet_files = _recent_parquet_files(market_code, limit=260)
     if not parquet_files:
         return []
-    date_filter = "WHERE date <= ?" if trade_date else ""
-    params = [trade_date] if trade_date else []
+    # Never let provider clock errors create future model samples.
+    date_filter = "WHERE CAST(date AS DATE) <= CAST(? AS DATE)"
+    params = [trade_date or latest_completed_market_date(market_code)]
     sql = f"""
         WITH base AS (
             SELECT

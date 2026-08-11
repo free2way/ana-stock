@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from app.core.db import SessionLocal
 
@@ -1019,7 +1020,9 @@ def build_pipeline_status_snapshot(db: Session, *, lang: str = "zh") -> dict:
     close_review_action_feed = build_close_review_action_feed(load_ai_daily_report(db=db), lang=lang)
     sync_states = PriceSyncStateRepository(db).list_states_with_symbols()
     job_repo = DataJobRepository(db)
-    refresh_job = job_repo.get_latest_job("cn_close_review")
+    refresh_job = job_repo.get_latest_job(
+        {"refresh_cn_market_data_lake_only", "refresh_cn_market_data_daily", "refresh_cn_market_data"}
+    )
     analysis_job = job_repo.get_latest_job("watchlist_auto_analysis")
     news_job = job_repo.get_latest_job("news_enrichment")
     us_train_job = job_repo.get_latest_job({"us_signal_train", "train_us_signals"})
@@ -1241,6 +1244,17 @@ def build_pipeline_status_snapshot(db: Session, *, lang: str = "zh") -> dict:
 
 
 def refresh_workspace_snapshots(db: Session, *, source_job_id: int | None = None, lang: str = "zh") -> dict:
+    try:
+        # Snapshot builders can spend a long time assembling JSON after their
+        # initial read queries. On PostgreSQL, that can otherwise trip
+        # idle_in_transaction_session_timeout before the later cache writes.
+        db.execute(text("SET SESSION idle_in_transaction_session_timeout = 0"))
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
     repo = WorkspaceSnapshotRepository(db)
     snapshot_date = app_today_iso()
     created: dict[str, dict] = {}
@@ -1256,20 +1270,35 @@ def refresh_workspace_snapshots(db: Session, *, source_job_id: int | None = None
         SNAPSHOT_PORTFOLIO_NLP: build_portfolio_news_snapshot,
         SNAPSHOT_DASHBOARD_NLP: build_dashboard_nlp_snapshot,
     }
-    for snapshot_type, builder in builders.items():
-        payload = builder(db, lang=lang)
-        row = repo.create_snapshot(
-            snapshot_type=snapshot_type,
-            snapshot_date=snapshot_date,
-            payload=payload,
-            source_job_id=source_job_id,
-        )
-        created[snapshot_type] = {
-            "id": row.id,
-            "snapshot_date": row.snapshot_date,
-            "created_at": row.created_at,
-        }
-    return created
+    try:
+        for snapshot_type, builder in builders.items():
+            payload = builder(db, lang=lang)
+            # Builders are read-heavy and can leave PostgreSQL sessions sitting
+            # in an open read transaction while Python assembles large JSON
+            # payloads. End that transaction before the short write transaction
+            # below.
+            db.rollback()
+            row = repo.create_snapshot(
+                snapshot_type=snapshot_type,
+                snapshot_date=snapshot_date,
+                payload=payload,
+                source_job_id=source_job_id,
+            )
+            created[snapshot_type] = {
+                "id": row.id,
+                "snapshot_date": row.snapshot_date,
+                "created_at": row.created_at,
+            }
+        return created
+    finally:
+        try:
+            db.execute(text("SET SESSION idle_in_transaction_session_timeout = DEFAULT"))
+            db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
 
 def load_latest_workspace_snapshot(db: Session, snapshot_type: str) -> dict | None:

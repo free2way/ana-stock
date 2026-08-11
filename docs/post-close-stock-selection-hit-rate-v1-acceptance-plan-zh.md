@@ -243,7 +243,7 @@ build_recommendation_gate_config(market_snapshot, candidate)
 
 每日 18 点 A 股收盘主链路应包括：
 
-1. `cn_close_review`
+1. `refresh_cn_market_data_lake_only`
 2. `technical_snapshot_refresh`
 3. `train_cn_signals`
 4. `screener_precompute_core`

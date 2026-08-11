@@ -40,28 +40,16 @@
 
 ## 3. 核心生产 Job
 
-### 3.1 `cn_close_review`
+### 3.1 `refresh_cn_market_data_lake_only`
 
-定位：A 股收盘后的主入口 job，也是 A 股生产链路的总开关。  
-代码位置：[app/services/close_review_scheduler.py](/Volumes/STORAGE_Jackyhu/code/ana/app/services/close_review_scheduler.py:42)
+定位：A 股行情 lake-only 全量刷新 job。  
+代码位置：[app/services/cn_market_universe.py](/Volumes/STORAGE_Jackyhu/code/ana/app/services/cn_market_universe.py)
 
 当前职责：
 
 - 刷新 A 股行情到本地 lake
-- 重建自选相关技术快照
-- 运行自选股分析
-- 触发后续的 A 股训练、预计算、概念、基本面、新闻、市场快照等跟进 job
-
-当前配置状态：
-
-- 已启用
-- 当前计划时间：`20:30 Asia/Shanghai`
-- 当前 `refresh_limit=0`
-
-这表示：
-
-- 会跑
-- 跑的是 A 股全市场，不只是自选股
+- 记录刷新结果和 provider fallback 信息
+- 为后续技术快照、模型训练、预计算和 AI 日报提供行情基础
 
 最近实测耗时：
 
@@ -69,13 +57,13 @@
 - `2026-04-24 18:02:44` 完成
 - 约 `145 秒`
 
-这是 A 股生产链最核心的 job。  
+这是 A 股行情生产链最核心的 job。  
 如果它没跑，后面很多结果都会停在昨天。
 
 ### 3.2 `train_cn_signals`
 
 定位：A 股 LightGBM 多因子训练 job。  
-代码位置：[app/services/close_review_scheduler.py](/Volumes/STORAGE_Jackyhu/code/ana/app/services/close_review_scheduler.py:483)
+代码位置：[app/api/routes/jobs.py](/Volumes/STORAGE_Jackyhu/code/ana/app/api/routes/jobs.py)
 
 当前职责：
 
@@ -100,7 +88,7 @@
 ### 3.3 `screener_precompute`
 
 定位：把重型模型筛选结果提前算好并落库，避免页面实时计算。  
-代码位置：[app/services/close_review_scheduler.py](/Volumes/STORAGE_Jackyhu/code/ana/app/services/close_review_scheduler.py:338)
+代码位置：[app/services/auto_analysis.py](/Volumes/STORAGE_Jackyhu/code/ana/app/services/auto_analysis.py)
 
 当前职责：
 
@@ -127,7 +115,7 @@
 ### 3.4 `market_snapshot_refresh`
 
 定位：首页和市场概览等快照页面的快速缓存刷新。  
-代码位置：[app/services/close_review_scheduler.py](/Volumes/STORAGE_Jackyhu/code/ana/app/services/close_review_scheduler.py:686)
+代码位置：[app/api/routes/jobs.py](/Volumes/STORAGE_Jackyhu/code/ana/app/api/routes/jobs.py)
 
 当前职责：
 
@@ -157,7 +145,7 @@
 - 已启用
 - 默认时间：`10:00`（本地应用时区）
 
-这是美股生产链的总开关，作用和 A 股的 `cn_close_review` 对应。
+这是美股生产链的总开关，作用和 A 股的 `refresh_cn_market_data_lake_only` 对应。
 
 ### 3.6 `us_signal_train`
 
@@ -255,7 +243,7 @@
 ### 4.4 `sync_cn_fundamentals`
 
 定位：同步 A 股基本面。  
-代码位置：[app/services/close_review_scheduler.py](/Volumes/STORAGE_Jackyhu/code/ana/app/services/close_review_scheduler.py:528)
+代码位置：[app/api/routes/jobs.py](/Volumes/STORAGE_Jackyhu/code/ana/app/api/routes/jobs.py)
 
 影响范围：
 
@@ -266,7 +254,7 @@
 ### 4.5 `sync_cn_concepts`
 
 定位：同步 A 股概念映射。  
-代码位置：[app/services/close_review_scheduler.py](/Volumes/STORAGE_Jackyhu/code/ana/app/services/close_review_scheduler.py:587)
+代码位置：[app/api/routes/jobs.py](/Volumes/STORAGE_Jackyhu/code/ana/app/api/routes/jobs.py)
 
 影响范围：
 
@@ -277,7 +265,7 @@
 ### 4.6 `news_enrichment`
 
 定位：新闻增强与新闻快照。  
-代码位置：[app/services/close_review_scheduler.py](/Volumes/STORAGE_Jackyhu/code/ana/app/services/close_review_scheduler.py:643)
+代码位置：[app/api/routes/jobs.py](/Volumes/STORAGE_Jackyhu/code/ana/app/api/routes/jobs.py)
 
 影响范围：
 
@@ -363,7 +351,7 @@
 
 ### A 股
 
-1. `cn_close_review`
+1. `refresh_cn_market_data_lake_only`
 2. `train_cn_signals`
 3. `screener_precompute`
 4. `market_snapshot_refresh`
@@ -384,7 +372,7 @@
 
 根据最近实测：
 
-- `cn_close_review`：约 `2~3 分钟`
+- `refresh_cn_market_data_lake_only`：约 `1~3 分钟`
 - `train_cn_signals`：约 `3~4 分钟`
 - `screener_precompute`：约 `68 分钟`
 
@@ -427,7 +415,7 @@
 
 ### 主生产链
 
-- `cn_close_review`
+- `refresh_cn_market_data_lake_only`
 - `train_cn_signals`
 - `screener_precompute`
 - `screener_precompute_core`

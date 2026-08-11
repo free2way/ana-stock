@@ -1,5 +1,6 @@
 from app.services.providers.price import (
     BasePriceProvider,
+    AStockDataTencentPriceProvider,
     OpenBBPriceProvider,
     TusharePriceProvider,
     YFinancePriceProvider,
@@ -7,6 +8,7 @@ from app.services.providers.price import (
 )
 from app.services.providers.fundamental import (
     BaseFundamentalProvider,
+    GlobalStockDataSECFundamentalProvider,
     OpenBBFundamentalProvider,
     TushareFundamentalProvider,
     resolve_fundamental_provider,
@@ -19,7 +21,9 @@ from app.services.providers.concept import (
 
 __all__ = [
     "BasePriceProvider",
+    "AStockDataTencentPriceProvider",
     "BaseFundamentalProvider",
+    "GlobalStockDataSECFundamentalProvider",
     "BaseConceptProvider",
     "OpenBBPriceProvider",
     "OpenBBFundamentalProvider",

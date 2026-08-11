@@ -13,6 +13,12 @@ from app.models.tables import (
     ConceptSnapshot,
     DataJob,
     FundamentalSnapshot,
+    JobDefinition,
+    JobRunAttempt,
+    JobRunDependency,
+    MarketRefreshBatch,
+    ModelEvaluation,
+    ModelEvaluationMetric,
     ModelRun,
     ModelChartSignal,
     Prediction,
@@ -30,8 +36,12 @@ from app.models.tables import (
 )
 from app.services.market_context import load_market_context_snapshot
 from app.services.market_freshness import summarize_market_freshness
+from app.services.market_lake import count_lake_symbols_for_trade_date, get_latest_lake_trade_date
 from app.services.tradability_filter import evaluate_candidate_tradability
 from app.services.time_utils import app_now, app_now_iso
+
+
+DECOMMISSIONED_CN_REVIEW_JOB_TYPE = "cn" + "_close" + "_review"
 
 
 def utc_now_iso() -> str:
@@ -46,6 +56,16 @@ def _loads_json_object(raw: str | None) -> dict | None:
     except json.JSONDecodeError:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _loads_json_list(raw: str | None) -> list:
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return payload if isinstance(payload, list) else []
 
 
 def _safe_parse_iso(value: str | None) -> datetime | None:
@@ -476,6 +496,14 @@ class PredictionRepository:
             stmt = stmt.where(Symbol.market == normalized_market)
 
         rows = self.db.execute(stmt).all()
+        latest_evaluation = self.db.scalar(
+            select(ModelEvaluation)
+            .where(ModelEvaluation.model_run_id == latest_model_run_id)
+            .where(ModelEvaluation.market == normalized_market if normalized_market in {"CN", "US"} else True)
+            .order_by(ModelEvaluation.id.desc())
+            .limit(1)
+        )
+        activation_status = str((latest_evaluation.activation_status if latest_evaluation else None) or "unverified")
         return [
             {
                 "prediction_id": prediction.id,
@@ -499,6 +527,7 @@ class PredictionRepository:
                 "sector": symbol.sector,
                 "industry": symbol.industry,
                 "summary_text": (detail.summary_text if detail is not None else None),
+                "model_activation_status": activation_status,
             }
             for prediction, symbol, detail in rows
         ]
@@ -530,6 +559,15 @@ class PredictionRepository:
             effective_trade_date = self.db.scalar(latest_date_stmt)
         if effective_trade_date is None:
             return []
+
+        latest_evaluation = self.db.scalar(
+            select(ModelEvaluation)
+            .where(ModelEvaluation.model_run_id == run_id)
+            .where(ModelEvaluation.status.in_(("success", "partial")))
+            .order_by(ModelEvaluation.id.desc())
+            .limit(1)
+        )
+        activation_status = str((latest_evaluation.activation_status if latest_evaluation else None) or "unverified")
 
         stmt = (
             select(Prediction, Symbol, PredictionDetail)
@@ -571,6 +609,7 @@ class PredictionRepository:
                 "summary_text": (detail.summary_text if detail is not None else None),
                 "sector": symbol.sector,
                 "industry": symbol.industry,
+                "model_activation_status": activation_status,
             }
             for prediction, symbol, detail in rows
         ]
@@ -1350,6 +1389,134 @@ class BacktestRepository:
         return self.get_daily_metrics(latest.id)
 
 
+class MarketRefreshBatchRepository:
+    def __init__(self, db: Session) -> None:
+        self.db = db
+
+    def create_batch(
+        self,
+        *,
+        source_job_id: int | None,
+        market: str,
+        provider: str,
+        requested_as_of_date: str,
+        universe_count: int,
+        started_at: str | None = None,
+    ) -> MarketRefreshBatch:
+        row = MarketRefreshBatch(
+            source_job_id=source_job_id,
+            market=str(market or "").strip().upper(),
+            provider=str(provider or "").strip() or "unknown",
+            requested_as_of_date=str(requested_as_of_date or "")[:10],
+            universe_count=max(0, int(universe_count)),
+            status="running",
+            started_at=started_at or app_now_iso(),
+        )
+        self.db.add(row)
+        self.db.commit()
+        self.db.refresh(row)
+        return row
+
+    def complete_batch(self, batch_id: int, *, result: dict, finished_at: str | None = None) -> MarketRefreshBatch | None:
+        row = self.db.get(MarketRefreshBatch, int(batch_id))
+        if row is None:
+            return None
+        row.actual_as_of_date = str(result.get("actual_as_of_date") or result.get("trade_date") or "")[:10] or None
+        row.universe_count = int(
+            result.get("total_symbols")
+            or result.get("universe_count")
+            or result.get("rows_returned")
+            or result.get("rows_written")
+            or row.universe_count
+            or 0
+        )
+        row.success_count = int(result.get("success_count") or 0)
+        row.no_trade_count = int(result.get("no_trade_count") or 0)
+        row.inactive_count = int(result.get("inactive_count") or 0)
+        row.partial_count = int(result.get("stale_count") or result.get("partial_count") or 0)
+        row.missing_count = int(result.get("missing_count") or 0)
+        row.failed_count = int(result.get("failure_count") or result.get("failed_count") or 0)
+        row.status = str(result.get("status") or "partial")
+        row.summary_json = json.dumps(result, ensure_ascii=False)
+        row.finished_at = finished_at or app_now_iso()
+        self.db.commit()
+        self.db.refresh(row)
+        return row
+
+    @staticmethod
+    def _serialize(row: MarketRefreshBatch) -> dict:
+        return {
+            "id": row.id,
+            "source_job_id": row.source_job_id,
+            "market": row.market,
+            "provider": row.provider,
+            "requested_as_of_date": row.requested_as_of_date,
+            "actual_as_of_date": row.actual_as_of_date,
+            "universe_count": row.universe_count,
+            "success_count": row.success_count,
+            "no_trade_count": row.no_trade_count,
+            "inactive_count": row.inactive_count,
+            "partial_count": row.partial_count,
+            "missing_count": row.missing_count,
+            "failed_count": row.failed_count,
+            "status": row.status,
+            "summary": _loads_json_object(row.summary_json),
+            "started_at": row.started_at,
+            "finished_at": row.finished_at,
+        }
+
+    def record_result(
+        self,
+        *,
+        source_job_id: int,
+        market: str,
+        provider: str,
+        requested_as_of_date: str,
+        result: dict,
+    ) -> dict:
+        """Create or update the one audit batch owned by a Job and market."""
+
+        market_code = str(market or "").strip().upper()
+        row = self.db.scalar(
+            select(MarketRefreshBatch)
+            .where(MarketRefreshBatch.source_job_id == int(source_job_id))
+            .where(MarketRefreshBatch.market == market_code)
+            .order_by(MarketRefreshBatch.id.desc())
+            .limit(1)
+        )
+        if row is None:
+            row = self.create_batch(
+                source_job_id=source_job_id,
+                market=market_code,
+                provider=provider,
+                requested_as_of_date=requested_as_of_date,
+                universe_count=int(
+                    result.get("total_symbols")
+                    or result.get("universe_count")
+                    or result.get("rows_returned")
+                    or result.get("rows_written")
+                    or 0
+                ),
+            )
+        else:
+            row.provider = str(provider or "").strip() or row.provider
+            row.requested_as_of_date = str(requested_as_of_date or row.requested_as_of_date)[:10]
+            self.db.commit()
+        completed = self.complete_batch(row.id, result=result)
+        return self._serialize(completed or row)
+
+    def get_latest(self, *, market: str) -> dict | None:
+        row = self.db.scalar(
+            select(MarketRefreshBatch)
+            .where(MarketRefreshBatch.market == str(market or "").strip().upper())
+            .order_by(MarketRefreshBatch.id.desc())
+            .limit(1)
+        )
+        if row is None:
+            return None
+        return self._serialize(row)
+
+
 class PriceSyncStateRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -1438,21 +1605,61 @@ class PriceSyncStateRepository:
             "latest_updated_at": latest_updated_at,
         }
 
-    def get_market_freshness_overview(self, markets: tuple[str, ...] = ("CN", "US")) -> dict[str, dict]:
+    def get_market_freshness_overview(
+        self,
+        markets: tuple[str, ...] = ("CN", "US"),
+        *,
+        tickers_by_market: dict[str, set[str]] | None = None,
+    ) -> dict[str, dict]:
         normalized_markets = tuple(str(market or "").strip().upper() for market in markets)
         rows = self.db.execute(
-            select(Symbol.market, PriceSyncState.last_synced_date)
+            select(Symbol.ticker, Symbol.market, Symbol.is_active, PriceSyncState.last_synced_date, PriceSyncState.status)
             .outerjoin(PriceSyncState, PriceSyncState.symbol_id == Symbol.id)
             .where(Symbol.market.in_(normalized_markets))
         ).all()
         states = [
-            {"market": market, "last_synced_date": last_synced_date}
-            for market, last_synced_date in rows
+            {
+                "market": market,
+                "last_synced_date": last_synced_date,
+                "status": status or ("inactive" if not is_active else None),
+                "is_active": bool(is_active),
+            }
+            for ticker, market, is_active, last_synced_date, status in rows
+            if not tickers_by_market
+            or str(market or "").strip().upper() not in tickers_by_market
+            or str(ticker or "").strip().upper() in tickers_by_market.get(str(market or "").strip().upper(), set())
         ]
-        return {
-            market: summarize_market_freshness(states, market=market)
-            for market in normalized_markets
-        }
+        overview: dict[str, dict] = {}
+        for market in normalized_markets:
+            summary = summarize_market_freshness(states, market=market)
+            try:
+                lake_latest = get_latest_lake_trade_date(market=market)
+            except Exception:
+                lake_latest = None
+            lake_expected = summary.get("expected_as_of_date")
+            lake_status = (
+                "fresh" if lake_latest and lake_expected and lake_latest >= lake_expected
+                else "stale" if lake_latest
+                else "missing"
+            )
+            lake_symbol_count = 0
+            if lake_latest:
+                try:
+                    lake_symbol_count = count_lake_symbols_for_trade_date(market=market, trade_date=lake_latest)
+                except Exception:
+                    lake_symbol_count = 0
+            # Keep per-symbol state diagnostics intact, but expose the lake's
+            # authoritative as-of date separately. A bulk lake refresh may be
+            # current even when an old per-symbol sync row has not been touched.
+            overview[market] = {
+                **summary,
+                "symbol_state_status": summary.get("status"),
+                "lake_status": lake_status,
+                "lake_latest_as_of_date": lake_latest,
+                "lake_symbol_count": lake_symbol_count,
+                "authoritative_as_of_date": lake_latest or summary.get("latest_as_of_date"),
+            }
+        return overview
 
     def get_state_for_ticker(self, ticker: str) -> dict | None:
         stmt = (
@@ -1519,9 +1726,167 @@ class PriceSyncStateRepository:
         raise RuntimeError("Price sync state upsert exhausted retries.")
 
 
+def _job_markets_from_params(job_type: str, params: dict | None) -> list[str]:
+    payload = params or {}
+    markets: list[str] = []
+    direct = payload.get("market")
+    if direct:
+        markets.append(str(direct).strip().upper())
+    configured = payload.get("markets")
+    if isinstance(configured, str):
+        markets.extend(item.strip().upper() for item in configured.split(","))
+    elif isinstance(configured, (list, tuple, set)):
+        markets.extend(str(item).strip().upper() for item in configured)
+    normalized_type = str(job_type or "").lower()
+    if not markets:
+        if "cn" in normalized_type or "a_share" in normalized_type:
+            markets.append("CN")
+        elif "us" in normalized_type or "polygon" in normalized_type:
+            markets.append("US")
+    return sorted({market for market in markets if market in {"CN", "US", "HK"}})
+
+
+def _job_category(job_type: str) -> str:
+    normalized = str(job_type or "").lower()
+    if any(token in normalized for token in ("refresh", "train", "screener", "report", "risk", "backtest")):
+        return "daily_pipeline"
+    if any(token in normalized for token in ("cleanup", "sync", "retention", "metadata", "universe")):
+        return "maintenance"
+    return "ad_hoc"
+
+
+def _job_provider(params: dict | None) -> str | None:
+    payload = params or {}
+    for key in ("provider", "provider_used", "source"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _declared_upstream_job_ids(params: dict | None) -> list[int]:
+    payload = params or {}
+    raw: list[object] = [payload.get("source_job_id")]
+    raw.extend(payload.get("source_job_ids") or [])
+    raw.extend(payload.get("depends_on") or [])
+    values: list[int] = []
+    for item in raw:
+        value = item.get("job_id", item.get("id")) if isinstance(item, dict) else item
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0 and parsed not in values:
+            values.append(parsed)
+    return values
+
+
+def _dependency_status(upstream: DataJob | None) -> tuple[str, str | None]:
+    if upstream is None:
+        return "unknown", "Referenced upstream Job was not found."
+    normalized = str(upstream.status or "").lower()
+    if normalized == "success":
+        return "satisfied", None
+    if normalized in {"partial", "not_configured", "empty"}:
+        return "degraded", upstream.message or "Upstream Job completed with degraded output."
+    if normalized == "running":
+        return "waiting", upstream.message or "Upstream Job is still running."
+    return "blocked", upstream.message or f"Upstream Job status is {normalized or 'unknown'}."
+
+
 class DataJobRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
+
+    def _ensure_run_metadata(self, job: DataJob, params: dict | None) -> None:
+        """Create the definition, initial attempt, and declared lineage once.
+
+        This intentionally treats the existing ``DataJob`` table as the
+        job-run table, so rollout does not invalidate historical jobs.
+        """
+
+        now = utc_now_iso()
+        definition = self.db.scalar(select(JobDefinition).where(JobDefinition.job_type == job.job_type))
+        if definition is None:
+            self.db.add(
+                JobDefinition(
+                    job_type=job.job_type,
+                    display_name=job.job_type.replace("_", " "),
+                    category=_job_category(job.job_type),
+                    markets_json=json.dumps(_job_markets_from_params(job.job_type, params), ensure_ascii=False),
+                    max_retries=0,
+                    is_enabled=1,
+                    config_json=json.dumps({"observed_from_run": True}, ensure_ascii=False),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        attempt = self.db.scalar(
+            select(JobRunAttempt)
+            .where(JobRunAttempt.job_id == job.id)
+            .order_by(JobRunAttempt.attempt_no.desc())
+            .limit(1)
+        )
+        if attempt is None:
+            self.db.add(
+                JobRunAttempt(
+                    job_id=job.id,
+                    attempt_no=1,
+                    status=job.status,
+                    provider=_job_provider(params),
+                    started_at=job.started_at,
+                )
+            )
+        for upstream_id in _declared_upstream_job_ids(params):
+            if upstream_id == job.id:
+                continue
+            exists = self.db.scalar(
+                select(JobRunDependency.id)
+                .where(JobRunDependency.job_id == job.id)
+                .where(JobRunDependency.upstream_job_id == upstream_id)
+                .where(JobRunDependency.dependency_type == "source_job")
+                .limit(1)
+            )
+            if exists is not None:
+                continue
+            status, reason = _dependency_status(self.db.get(DataJob, upstream_id))
+            self.db.add(
+                JobRunDependency(
+                    job_id=job.id,
+                    upstream_job_id=upstream_id,
+                    dependency_type="source_job",
+                    status=status,
+                    reason=reason,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        self.db.commit()
+
+    def _complete_latest_attempt(self, job: DataJob, *, status: str, result: dict | None) -> None:
+        attempt = self.db.scalar(
+            select(JobRunAttempt)
+            .where(JobRunAttempt.job_id == job.id)
+            .order_by(JobRunAttempt.attempt_no.desc())
+            .limit(1)
+        )
+        if attempt is None:
+            attempt = JobRunAttempt(
+                job_id=job.id,
+                attempt_no=1,
+                status=status,
+                provider=_job_provider(_loads_json_object(job.params_json)),
+                started_at=job.started_at,
+            )
+            self.db.add(attempt)
+        attempt.status = status
+        attempt.finished_at = job.finished_at
+        attempt.duration_seconds = _job_duration_seconds(job.started_at, job.finished_at)
+        if status in {"failed", "failed_timeout"}:
+            attempt.error_message = job.message
+        if result is not None:
+            attempt.summary_json = json.dumps(result, ensure_ascii=False)
+        self.db.commit()
 
     def _serialize_job(self, row: DataJob) -> dict:
         params = _loads_json_object(row.params_json)
@@ -1565,6 +1930,15 @@ class DataJobRepository:
             try:
                 self.db.commit()
                 self.db.refresh(job)
+                for metadata_attempt in range(1, attempts + 1):
+                    try:
+                        self._ensure_run_metadata(job, params)
+                        break
+                    except OperationalError as exc:
+                        self.db.rollback()
+                        if metadata_attempt >= attempts or not _is_database_locked_error(exc):
+                            break
+                        _sleep_for_lock_retry(metadata_attempt)
                 return job
             except OperationalError as exc:
                 self.db.rollback()
@@ -1601,6 +1975,7 @@ class DataJobRepository:
             try:
                 self.db.commit()
                 self.db.refresh(job)
+                self._complete_latest_attempt(job, status=status, result=result)
                 return job
             except OperationalError as exc:
                 self.db.rollback()
@@ -1647,15 +2022,93 @@ class DataJobRepository:
         raise RuntimeError("Data job progress update exhausted retries.")
 
     def list_recent_jobs(self, limit: int = 20) -> list[dict]:
-        stmt = select(DataJob).order_by(DataJob.id.desc()).limit(limit)
+        stmt = (
+            select(DataJob)
+            .where(DataJob.job_type != DECOMMISSIONED_CN_REVIEW_JOB_TYPE)
+            .order_by(DataJob.id.desc())
+            .limit(max(limit * 2, limit))
+        )
         rows = self.db.scalars(stmt).all()
-        return [self._serialize_job(row) for row in rows]
+        return [self._serialize_job(row) for row in rows][:limit]
+
+    def get_job_detail(self, job_id: int) -> dict | None:
+        row = self.db.get(DataJob, int(job_id))
+        if row is None:
+            return None
+        payload = self._serialize_job(row)
+        definition = self.db.scalar(select(JobDefinition).where(JobDefinition.job_type == row.job_type))
+        dependencies = self.db.scalars(
+            select(JobRunDependency)
+            .where(JobRunDependency.job_id == row.id)
+            .order_by(JobRunDependency.id.asc())
+        ).all()
+        attempts = self.db.scalars(
+            select(JobRunAttempt)
+            .where(JobRunAttempt.job_id == row.id)
+            .order_by(JobRunAttempt.attempt_no.asc())
+        ).all()
+        batches = self.db.scalars(
+            select(MarketRefreshBatch)
+            .where(MarketRefreshBatch.source_job_id == row.id)
+            .order_by(MarketRefreshBatch.id.asc())
+        ).all()
+        payload["definition"] = (
+            {
+                "id": definition.id,
+                "job_type": definition.job_type,
+                "display_name": definition.display_name,
+                "category": definition.category,
+                "markets": _loads_json_list(definition.markets_json),
+                "schedule_rule": definition.schedule_rule,
+                "timeout_minutes": definition.timeout_minutes,
+                "max_retries": definition.max_retries,
+                "is_enabled": bool(definition.is_enabled),
+            }
+            if definition is not None
+            else None
+        )
+        upstream_by_id = {
+            dependency.upstream_job_id: self.db.get(DataJob, dependency.upstream_job_id)
+            for dependency in dependencies
+        }
+        payload["dependencies"] = []
+        for dependency in dependencies:
+            upstream = upstream_by_id.get(dependency.upstream_job_id)
+            payload["dependencies"].append(
+                {
+                    "id": dependency.id,
+                    "upstream_job_id": dependency.upstream_job_id,
+                    "upstream_job_type": upstream.job_type if upstream is not None else None,
+                    "upstream_status": upstream.status if upstream is not None else "unknown",
+                    "dependency_type": dependency.dependency_type,
+                    "status": dependency.status,
+                    "reason": dependency.reason,
+                    "required_as_of_date": dependency.required_as_of_date,
+                    "actual_as_of_date": dependency.actual_as_of_date,
+                }
+            )
+        payload["attempts"] = [
+            {
+                "attempt_no": attempt.attempt_no,
+                "status": attempt.status,
+                "provider": attempt.provider,
+                "started_at": attempt.started_at,
+                "finished_at": attempt.finished_at,
+                "duration_seconds": attempt.duration_seconds,
+                "error_message": attempt.error_message,
+                "summary": _loads_json_object(attempt.summary_json),
+            }
+            for attempt in attempts
+        ]
+        payload["market_refresh_batches"] = [MarketRefreshBatchRepository._serialize(batch) for batch in batches]
+        return payload
 
     def get_latest_job(self, job_type: str | list[str] | tuple[str, ...] | set[str]) -> dict | None:
         if isinstance(job_type, (list, tuple, set)):
             job_types = [str(item or "").strip() for item in job_type if str(item or "").strip()]
         else:
             job_types = [str(job_type or "").strip()] if str(job_type or "").strip() else []
+        job_types = [job_type for job_type in job_types if job_type != DECOMMISSIONED_CN_REVIEW_JOB_TYPE]
         if not job_types:
             return None
         stmt = (
@@ -1676,6 +2129,24 @@ class DataJobRepository:
         )
         return self.db.scalar(stmt) is not None
 
+    def get_running_job(self, job_types: str | list[str] | tuple[str, ...] | set[str]) -> dict | None:
+        """Return the oldest active job for a type set so UI retries are idempotent."""
+        if isinstance(job_types, str):
+            normalized = [job_types.strip()]
+        else:
+            normalized = [str(item or "").strip() for item in job_types]
+        normalized = [item for item in normalized if item]
+        if not normalized:
+            return None
+        row = self.db.scalar(
+            select(DataJob)
+            .where(DataJob.job_type.in_(normalized))
+            .where(DataJob.status == "running")
+            .order_by(DataJob.id.asc())
+            .limit(1)
+        )
+        return self._serialize_job(row) if row is not None else None
+
     def complete_stale_running_jobs(
         self,
         *,
@@ -1689,6 +2160,7 @@ class DataJobRepository:
             stmt = stmt.where(DataJob.job_type.in_(job_types))
         rows = self.db.scalars(stmt).all()
         updated = 0
+        completed_rows: list[DataJob] = []
         now_iso = utc_now_iso()
         for row in rows:
             try:
@@ -1706,8 +2178,11 @@ class DataJobRepository:
                 else f"{message_prefix} {original_message}"
             )
             updated += 1
+            completed_rows.append(row)
         if updated:
             self.db.commit()
+            for row in completed_rows:
+                self._complete_latest_attempt(row, status="failed_timeout", result={"timeout": True})
         return updated
 
 

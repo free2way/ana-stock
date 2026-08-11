@@ -20,7 +20,16 @@ WORKSPACE_SIDEBAR_STYLE = """
           .brand-tag { display:inline-flex; padding:4px 8px; border-radius:7px; background:rgba(61,217,182,0.11); color:var(--accent); font-size:10px; font-weight:900; letter-spacing:0.06em; text-transform:uppercase; }
           .brand h1 { margin:9px 0 5px; font-size:21px; line-height:1.08; letter-spacing:0; }
           .brand p { margin:0; color:var(--muted); font-size:12px; line-height:1.45; }
-          .side-nav { display:grid; gap:4px; margin-top:12px; }
+          .side-nav { display:grid; gap:8px; margin-top:14px; }
+          .nav-section-label {
+            padding:0 10px;
+            color:var(--muted);
+            font-size:10px;
+            font-weight:900;
+            letter-spacing:0.10em;
+            text-transform:uppercase;
+          }
+          .nav-flow, .nav-tools-list { display:grid; gap:4px; }
           .side-link {
             position:relative;
             display:grid;
@@ -46,8 +55,34 @@ WORKSPACE_SIDEBAR_STYLE = """
           .side-link:hover { border-color:rgba(255,255,255,0.06); background:rgba(21,34,49,0.62); transform:translateX(1px); }
           .side-link.active { border-color:rgba(61,217,182,0.24); background:linear-gradient(90deg, rgba(61,217,182,0.16), rgba(82,168,255,0.06)); }
           .side-link.active::before { background:var(--accent); }
+          .side-link.workflow-link { background:rgba(255,255,255,0.018); }
+          .side-link.workflow-link:hover { background:rgba(21,34,49,0.74); }
           .side-label { font-size:13px; font-weight:850; letter-spacing:0; }
           .side-meta { font-size:10.5px; color:var(--muted); line-height:1.3; }
+          .nav-tools {
+            margin-top:4px;
+            border-top:1px solid rgba(255,255,255,0.07);
+            padding-top:8px;
+          }
+          .nav-tools summary {
+            display:flex;
+            align-items:center;
+            justify-content:space-between;
+            gap:8px;
+            padding:7px 10px;
+            border-radius:8px;
+            cursor:pointer;
+            color:var(--muted);
+            font-size:12px;
+            font-weight:850;
+            list-style:none;
+          }
+          .nav-tools summary::-webkit-details-marker { display:none; }
+          .nav-tools summary::after { content:"+"; color:var(--accent); font-size:16px; line-height:1; }
+          .nav-tools[open] summary::after { content:"−"; }
+          .nav-tools summary:hover { background:rgba(21,34,49,0.56); color:var(--ink); }
+          .nav-tools-list { margin-top:4px; }
+          .nav-tools-list .side-link { padding-top:8px; padding-bottom:8px; }
           .sidebar-foot { margin-top:12px; padding:10px; border:1px solid rgba(255,255,255,0.06); border-radius:8px; background:rgba(17,28,40,0.48); color:var(--muted); font-size:11.5px; line-height:1.5; }
 """
 
@@ -175,6 +210,9 @@ WORKSPACE_COMPACT_STYLE = """
             .app { grid-template-columns:1fr; }
             .sidebar { position:relative; height:auto; border-right:none; border-bottom:1px solid var(--line); }
             .side-nav { grid-template-columns:repeat(auto-fit, minmax(148px, 1fr)); }
+            .nav-section-label, .nav-tools { grid-column:1 / -1; }
+            .nav-flow { display:contents; }
+            .nav-tools-list { grid-template-columns:repeat(auto-fit, minmax(148px, 1fr)); }
           }
           @media (max-width: 720px) {
             .main, .content { padding:12px 8px 20px; }
@@ -189,21 +227,42 @@ WORKSPACE_COMPACT_STYLE = """
 
 
 def render_workspace_nav_html(*, lang: str, active_key: str | None = None, lookback_runs: int = 20) -> str:
-    items = [
-        ("home", f"/dashboard?lang={lang}&lookback_runs={lookback_runs}", "首页" if lang == "zh" else "Home", "工作台" if lang == "zh" else "Workspace"),
-        ("watchlist", f"/watchlist?lang={lang}", "自选股" if lang == "zh" else "Watchlist", "观察池与同步" if lang == "zh" else "Tracking and sync"),
-        ("portfolio", f"/portfolio?lang={lang}", "持仓" if lang == "zh" else "Portfolio", "组合风险与动作" if lang == "zh" else "Risk and actions"),
-        ("monitor", f"/dashboard/realtime-monitor?lang={lang}", "重点监控台" if lang == "zh" else "Live Monitor", "买点与风险触发" if lang == "zh" else "Buy-zone and risk triggers"),
-        ("screeners", f"/screeners?lang={lang}", "模型选股" if lang == "zh" else "Model Picks", "模板化选股" if lang == "zh" else "Template-driven screening"),
-        ("market", f"/dashboard/market?lang={lang}&lookback_runs={lookback_runs}", "市场概览" if lang == "zh" else "Market", "热力与脉冲" if lang == "zh" else "Pulse and breadth"),
-        ("social", f"/social-signals?lang={lang}", "社交信号" if lang == "zh" else "Social", "X观点验证" if lang == "zh" else "X idea validation"),
-        ("ai_chat", f"/ai-chat?lang={lang}", "AI 问答" if lang == "zh" else "AI Q&A", "股票问题助手" if lang == "zh" else "Stock question assistant"),
-        ("journal", f"/review-journal?lang={lang}", "复盘心得" if lang == "zh" else "Review Journal", "计划、得失与纪律" if lang == "zh" else "Plans, lessons, discipline"),
-        ("ops", f"/dashboard/ops?lang={lang}&lookback_runs={lookback_runs}", "任务中心" if lang == "zh" else "Jobs", "自动任务与结果" if lang == "zh" else "Automation and results"),
-        ("data", f"/dashboard/data-sources?lang={lang}", "数据状态" if lang == "zh" else "Data", "新鲜度与来源" if lang == "zh" else "Freshness and providers"),
-        ("settings", f"/settings?lang={lang}", "设置" if lang == "zh" else "Settings", "通知与系统入口" if lang == "zh" else "Notifications and system entry"),
+    core_items = [
+        ("home", f"/dashboard?lang={lang}&lookback_runs={lookback_runs}", "今日决策" if lang == "zh" else "Today", "从市场判断开始" if lang == "zh" else "Start with market posture"),
+        ("market", f"/dashboard/market?lang={lang}&lookback_runs={lookback_runs}", "市场判断" if lang == "zh" else "Market", "A 股 / 美股环境" if lang == "zh" else "A-share / US context"),
+        ("screeners", f"/screeners?lang={lang}", "发现候选" if lang == "zh" else "Find Candidates", "模型候选与交易条件" if lang == "zh" else "Candidates and trade gates"),
+        ("watchlist", f"/watchlist?lang={lang}", "自选与执行" if lang == "zh" else "Watch & Execute", "观察、触发与风险" if lang == "zh" else "Watch, triggers, risk"),
+        ("portfolio", f"/portfolio?lang={lang}", "持仓与复盘" if lang == "zh" else "Holdings & Review", "仓位动作与复盘" if lang == "zh" else "Actions and review"),
     ]
-    return "".join(
-        f"<a class='side-link{' active' if key == active_key else ''}' href='{href}'><span class='side-label'>{label}</span><span class='side-meta'>{meta}</span></a>"
-        for key, href, label, meta in items
+    tool_items = [
+        ("monitor", f"/dashboard/realtime-monitor?lang={lang}", "盘中重点监控" if lang == "zh" else "Live Monitor", "买点与风险触发" if lang == "zh" else "Buy-zone and risk triggers"),
+        ("daily_report", f"/dashboard/ai-daily-report?lang={lang}", "AI 日报" if lang == "zh" else "AI Daily Report", "复盘输出与历史" if lang == "zh" else "Review output and history"),
+        ("model_eval", f"/dashboard/model-performance?lang={lang}", "模型评测" if lang == "zh" else "Model Evaluation", "OOS 与模型赛马" if lang == "zh" else "OOS and model race"),
+        ("social", f"/social-signals?lang={lang}", "社交信号" if lang == "zh" else "Social", "外部观点验证" if lang == "zh" else "Validate external ideas"),
+        ("ai_chat", f"/ai-chat?lang={lang}", "AI 问答" if lang == "zh" else "AI Q&A", "股票研究助手" if lang == "zh" else "Research assistant"),
+        ("journal", f"/review-journal?lang={lang}", "复盘心得" if lang == "zh" else "Review Journal", "计划、得失与纪律" if lang == "zh" else "Plans and lessons"),
+        ("ops", f"/dashboard/ops?lang={lang}&lookback_runs={lookback_runs}", "任务中心" if lang == "zh" else "Jobs", "运行、维护与历史" if lang == "zh" else "Runs, maintenance, history"),
+        ("data", f"/dashboard/data-sources?lang={lang}", "数据健康" if lang == "zh" else "Data Health", "新鲜度与数据源" if lang == "zh" else "Freshness and providers"),
+        ("settings", f"/settings?lang={lang}", "设置" if lang == "zh" else "Settings", "通知与系统入口" if lang == "zh" else "Notifications and system"),
+    ]
+
+    def render_link(item: tuple[str, str, str, str], *, workflow: bool = False) -> str:
+        key, href, label, meta = item
+        classes = "side-link"
+        if workflow:
+            classes += " workflow-link"
+        if key == active_key:
+            classes += " active"
+        return f"<a class='{classes}' href='{href}'><span class='side-label'>{label}</span><span class='side-meta'>{meta}</span></a>"
+
+    tools_open = active_key in {item[0] for item in tool_items}
+    primary_label = "每日选股流程" if lang == "zh" else "Daily Selection Flow"
+    tools_label = "研究与系统工具" if lang == "zh" else "Research & System Tools"
+    return (
+        f"<div class='nav-section-label'>{primary_label}</div>"
+        f"<div class='nav-flow'>{''.join(render_link(item, workflow=True) for item in core_items)}</div>"
+        f"<details class='nav-tools'{' open' if tools_open else ''}>"
+        f"<summary>{tools_label}</summary>"
+        f"<div class='nav-tools-list'>{''.join(render_link(item) for item in tool_items)}</div>"
+        "</details>"
     )

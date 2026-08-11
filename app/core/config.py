@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     alpaca_data_feed: str = Field(default="iex")
     polygon_api_key: str | None = Field(default=None)
     polygon_endpoint: str = Field(default="https://api.polygon.io")
+    # SEC asks automated clients to identify a real contact.  Keep the
+    # official EDGAR integration disabled until this is explicitly provided.
+    sec_user_agent: str | None = Field(default=None)
+    sec_data_endpoint: str = Field(default="https://data.sec.gov")
+    sec_company_tickers_endpoint: str = Field(default="https://www.sec.gov/files/company_tickers.json")
+    sec_timeout_seconds: float = Field(default=15.0)
+    a_stock_data_max_symbols: int = Field(default=50)
     us_trade_universe_min_price: float = Field(default=3.0)
     us_trade_universe_min_avg_dollar_volume: float = Field(default=2_000_000.0)
     us_trade_universe_min_avg_volume: float = Field(default=200_000.0)
@@ -94,8 +101,8 @@ class Settings(BaseSettings):
 
     @property
     def resolved_database_url(self) -> str:
-        if self.database_url:
-            return self.database_url
+        if self.database_url and str(self.database_url).strip():
+            return str(self.database_url).strip()
         raise RuntimeError("PQW_DATABASE_URL is required. This application is PostgreSQL-only at runtime.")
 
 

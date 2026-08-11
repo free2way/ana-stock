@@ -11,6 +11,7 @@ from app.models.schema import SymbolCreate
 from app.services.auth import is_authenticated, login_redirect
 from app.services.market_sync import sync_market_data
 from app.services.market_lake import load_lake_price_history
+from app.services.market_freshness import summarize_market_freshness
 from app.services.price_snapshot import load_latest_closes
 from app.services.repository import PredictionRepository, PredictionTradePlanRepository, SymbolRepository, WatchlistRepository
 from app.services.model_signal_summary import build_signal_label, model_confidence, signal_strength
@@ -547,6 +548,48 @@ def _watchlist_render_signature(items: list[dict]) -> str:
     return urlencode({"payload": str(payload)})[:2000]
 
 
+def _render_watchlist_market_context(*, items: list[dict], lang: str) -> str:
+    cards: list[str] = []
+    for market, label in (("CN", "A 股" if lang == "zh" else "A-Shares"), ("US", "美股" if lang == "zh" else "U.S. Stocks")):
+        market_items = [item for item in items if str(item.get("market") or "").upper() == market]
+        if not market_items:
+            continue
+        freshness = summarize_market_freshness(
+            [
+                {
+                    "market": market,
+                    "last_synced_date": item.get("last_synced_date"),
+                    "status": "inactive" if not bool(item.get("sync_enabled", True)) else item.get("sync_status"),
+                }
+                for item in market_items
+            ],
+            market=market,
+        )
+        is_fresh = freshness.get("status") == "fresh"
+        tone = "fresh" if is_fresh else "attention"
+        freshness_text = (
+            f"{freshness.get('fresh_count', 0)}/{freshness.get('eligible_count', 0)} 只行情已确认"
+            if lang == "zh"
+            else f"{freshness.get('fresh_count', 0)}/{freshness.get('eligible_count', 0)} names confirmed"
+        )
+        cards.append(
+            f"<a class='market-context-card {tone}' href='#watchlist-market-{market}'>"
+            f"<span>{label} · {len(market_items)}</span>"
+            f"<b>{freshness_text}</b>"
+            f"<small>{'目标交易日' if lang == 'zh' else 'Expected session'} {html.escape(str(freshness.get('expected_as_of_date') or '-'))}</small>"
+            "</a>"
+        )
+    if not cards:
+        return ""
+    return (
+        "<section class='market-context'>"
+        f"<div><div class='eyebrow'>{'市场上下文' if lang == 'zh' else 'Market context'}</div>"
+        f"<div class='muted'>{'先确认当前市场的行情可用性，再处理对应的自选队列。' if lang == 'zh' else 'Confirm market freshness before acting on that market’s watch queue.'}</div></div>"
+        f"<div class='market-context-cards'>{''.join(cards)}</div>"
+        "</section>"
+    )
+
+
 def _is_news_risk_item(item: dict) -> bool:
     label = str(item.get("news_sentiment_label") or "").strip().lower()
     score = float(item.get("news_sentiment_score") or 0.0)
@@ -655,6 +698,18 @@ def _render_watchlist_news_panel(
 
     cn_meta = market_meta.get("CN") or {}
     us_meta = market_meta.get("US") or {}
+    refresh_params = {
+        "lang": lang,
+        "mode": mode,
+        "news_view": news_view,
+        "sort_by": sort_by,
+        "sort_order": sort_order,
+    }
+    if execution_tag_filter and execution_tag_filter.upper() != "ALL":
+        refresh_params["execution_tag_filter"] = execution_tag_filter
+    if exclude_execution_tag_filter and exclude_execution_tag_filter.upper() != "ALL":
+        refresh_params["exclude_execution_tag_filter"] = exclude_execution_tag_filter
+    refresh_redirect = "/watchlist?" + urlencode(refresh_params) + "#news"
     return f"""
       <section class="card news-console" id="news">
         <div class="eyebrow">{'自选股新闻' if lang == 'zh' else 'Watchlist News'}</div>
@@ -662,6 +717,10 @@ def _render_watchlist_news_panel(
           <div>
             <h2>{'新闻只跟踪自选股' if lang == 'zh' else 'News tracks watchlist names only'}</h2>
             <p class="muted">{'首页只保留新闻状态，具体新闻机会、风险和覆盖诊断都收在这里。' if lang == 'zh' else 'The dashboard only keeps a news status; opportunities, risks, and coverage diagnostics live here.'}</p>
+            <form action="/jobs/refresh-news-opportunities" method="post" style="margin-top:10px;">
+              <input type="hidden" name="redirect_to" value="{html.escape(refresh_redirect, quote=True)}" />
+              <button type="submit" class="news-tab">{'刷新新闻机会' if lang == 'zh' else 'Refresh news opportunities'}</button>
+            </form>
           </div>
           <div class="news-score"><strong>{meta.get('coverage_pct', 0)}%</strong><span>{'覆盖率' if lang == 'zh' else 'coverage'}</span></div>
         </div>
@@ -680,6 +739,19 @@ def _render_watchlist_news_panel(
         <div class="news-list">{body}</div>
       </section>
     """
+
+
+def _watchlist_queue_bucket(item: dict) -> str:
+    """Classify a tracked name by its next human action, not by data source."""
+    decision = str((item.get("combined_analysis") or {}).get("decision") or "").strip().upper()
+    execution_tags = [str(tag).strip() for tag in (item.get("execution_tags") or []) if str(tag).strip()]
+    if execution_tags or decision in {"SELL", "STRONG SELL"}:
+        return "risk"
+    if not bool(item.get("sync_enabled", True)):
+        return "archive"
+    if decision in {"BUY", "STRONG BUY"}:
+        return "primary"
+    return "observe"
 
 
 def _render_watchlist_analysis_fragment(
@@ -730,17 +802,6 @@ def _render_watchlist_analysis_fragment(
             )
         detailed_items.append(enriched)
 
-    risk_counts: dict[str, int] = {}
-    risk_examples: list[dict] = []
-    for item in detailed_items:
-        tags = [str(tag).strip() for tag in (item.get("execution_tags") or []) if str(tag).strip()]
-        if not tags:
-            continue
-        for tag in tags:
-            risk_counts[tag] = risk_counts.get(tag, 0) + 1
-        risk_examples.append({"ticker": item["ticker"], "name": item.get("name"), "tags": tags[:2]})
-    risk_examples = risk_examples[:3]
-    risk_top_tags = sorted(risk_counts.items(), key=lambda pair: (-pair[1], pair[0]))[:3]
     ranked_items = sorted(
         detailed_items,
         key=lambda item: (
@@ -749,71 +810,67 @@ def _render_watchlist_analysis_fragment(
             item["ticker"],
         ),
     )
-    high_priority = sum(
-        1
-        for item in ranked_items
-        if str((item.get("combined_analysis") or {}).get("decision") or "").upper() in {"BUY", "STRONG BUY"}
-    )
-    caution_count = sum(
-        1
-        for item in ranked_items
-        if str((item.get("combined_analysis") or {}).get("decision") or "").upper() in {"SELL", "STRONG SELL"}
-    )
-    observation_rows = "".join(
-        "<article class='watch-row'>"
-        f"<div><div class='watch-ticker'>{item['ticker']}</div><div class='muted' style='margin-top:4px;'>{item.get('name') or item['ticker']}</div><div class='muted' style='margin-top:4px;'>{item.get('decision_brief', {}).get('headline') or '-'}</div><div class='muted' style='margin-top:4px;'>{item.get('action_reason') or '-'}</div></div>"
-        f"<div style='text-align:right;'><div class='watch-priority'>{int((item.get('combined_analysis') or {}).get('confidence') or 0)}%</div><div class='muted'>{item.get('action_hint') or '-'}</div></div>"
-        "</article>"
-        for item in ranked_items[:5]
-    ) or f"<div class='muted'>{'暂无观察池项目' if lang == 'zh' else 'No observation items yet'}</div>"
+    queues: dict[str, list[dict]] = {"primary": [], "observe": [], "risk": [], "archive": []}
+    for item in ranked_items:
+        queues[_watchlist_queue_bucket(item)].append(item)
+
+    queue_meta = {
+        "primary": (
+            "主攻" if lang == "zh" else "Primary",
+            "已偏多且没有当前执行风险；仍需等待自己的触发条件。" if lang == "zh" else "Constructive and clear of current execution risk; still wait for the trigger.",
+            "sig-buy",
+            True,
+        ),
+        "observe": (
+            "观察" if lang == "zh" else "Observe",
+            "逻辑尚未完整确认，保持跟踪但不把它当作立即执行。" if lang == "zh" else "The setup is not fully confirmed; track it, but do not treat it as immediate execution.",
+            "sig-watch",
+            False,
+        ),
+        "risk": (
+            "风险" if lang == "zh" else "Risk",
+            "先处理风险标签或偏弱信号，再决定是否保留在观察池。" if lang == "zh" else "Resolve risk tags or weak signals before keeping the name in the active watchlist.",
+            "sig-sell",
+            True,
+        ),
+        "archive": (
+            "归档" if lang == "zh" else "Archived",
+            "已关闭持续同步，不再占用日常行动队列。" if lang == "zh" else "Continuous sync is disabled, so the name no longer consumes the daily action queue.",
+            "sig-hold",
+            False,
+        ),
+    }
+
+    def _queue_rows(bucket: str) -> str:
+        label, detail, tone, is_open = queue_meta[bucket]
+        entries = queues[bucket]
+        rows = "".join(
+            "<article class='watch-row'>"
+            f"<div><a class='watch-ticker' href='/watchlist/open/{int(item.get('item_id') or 0)}'>{html.escape(str(item.get('ticker') or '-'))}</a>"
+            f"<div class='muted' style='margin-top:4px;'>{html.escape(str(item.get('name') or item.get('ticker') or '-'))} · {html.escape(str(item.get('market') or '-'))}</div>"
+            f"<div class='muted' style='margin-top:4px;'>{html.escape(str(item.get('action_reason') or item.get('ai_brief') or '-'))}</div></div>"
+            f"<div style='text-align:right;'><span class='signal {tone}'>{html.escape(str(item.get('action_hint') or label))}</span>"
+            f"<div class='muted' style='margin-top:6px;'>{int((item.get('combined_analysis') or {}).get('confidence') or 0)}%</div></div>"
+            "</article>"
+            for item in entries[:5]
+        ) or f"<div class='muted'>{'暂无项目' if lang == 'zh' else 'No names'}</div>"
+        return (
+            f"<details class='watch-queue'{' open' if is_open else ''}>"
+            "<summary>"
+            f"<span><b>{label}</b><small>{detail}</small></span>"
+            f"<span class='signal {tone}'>{len(entries)}</span>"
+            "</summary>"
+            f"<div class='watch-queue-body'>{rows}</div>"
+            "</details>"
+        )
+
+    queue_html = "".join(_queue_rows(bucket) for bucket in ("risk", "primary", "observe", "archive"))
     return f"""
       <section class="card" style="margin-bottom:16px;">
-        <div class="eyebrow">{'决策面板' if lang == 'zh' else 'Decision Console'}</div>
-        <div class="muted" style="margin-bottom:10px;">{'基于最新模型输出和执行标签生成的轻量决策视图。' if lang == 'zh' else 'A lightweight decision view built from the latest model output and execution tags.'}</div>
-        <div style="display:grid;gap:16px;grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));">
-          <article class="card" style="margin:0;">
-            <div class="eyebrow">{'高优先级' if lang == 'zh' else 'High Priority'}</div>
-            <div style="font-size:28px;font-weight:800;margin:6px 0;">{high_priority}</div>
-            <div class="muted">{'当前模型判定为 BUY 的自选标的数量。' if lang == 'zh' else 'Watchlist names currently rated BUY.'}</div>
-          </article>
-          <article class="card" style="margin:0;">
-            <div class="eyebrow">{'谨慎处理' if lang == 'zh' else 'Caution'}</div>
-            <div style="font-size:28px;font-weight:800;margin:6px 0;">{caution_count}</div>
-            <div class="muted">{'当前模型判定偏弱，需要降级关注的名字。' if lang == 'zh' else 'Names where the current posture is weak and needs caution.'}</div>
-          </article>
-          <article class="card" style="margin:0;">
-            <div class="eyebrow">{'顶部摘要' if lang == 'zh' else 'Top Briefs'}</div>
-            <div class="muted">{"<br/>".join(f"{item['ticker']} · {item.get('name') or item['ticker']}: {item.get('decision_brief', {}).get('headline')}" for item in ranked_items[:3]) or "-"}</div>
-          </article>
-          <article class="card" style="margin:0;">
-            <div class="eyebrow">{'执行提示' if lang == 'zh' else 'Execution Notes'}</div>
-            <div class="muted">{"<br/>".join(f"{item['ticker']} · {item.get('name') or item['ticker']}: {item.get('ai_brief')}" for item in ranked_items[:3]) or "-"}</div>
-          </article>
-        </div>
-      </section>
-
-      <section class="card" style="margin-bottom:16px;">
-        <div class="eyebrow">{'观察池' if lang == 'zh' else 'Observation Pool'}</div>
-        <div class="muted" style="margin-bottom:10px;">{'先看优先级最高、模型最明确的名字，再决定是否进入分析页。' if lang == 'zh' else 'Start with the clearest, highest-priority names before opening full analysis pages.'}</div>
-        <div class="stack">{observation_rows}</div>
-      </section>
-
-      <section class="card" style="margin-bottom:16px;">
-        <div class="eyebrow">{'风险概览' if lang == 'zh' else 'Risk Overview'}</div>
-        <div style="display:grid;gap:16px;grid-template-columns:repeat(auto-fit, minmax(240px, 1fr));">
-          <article class="card" style="margin:0;">
-            <div class="eyebrow">{'带风险标签' if lang == 'zh' else 'Tagged Names'}</div>
-            <div style="font-size:28px;font-weight:800;margin:6px 0;">{len(risk_examples)}</div>
-            <div class="muted">{'当前携带执行风险标签的自选标的数量。' if lang == 'zh' else 'Watchlist names that currently carry execution warnings.'}</div>
-          </article>
-          <article class="card" style="margin:0;">
-            <div class="eyebrow">{'常见风险' if lang == 'zh' else 'Common Risks'}</div>
-            <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
-              {"".join(f"<span class='linkbtn'>{tag} · {count}</span>" for tag, count in risk_top_tags) or "<span class='muted'>No execution warnings in the current watchlist view.</span>"}
-            </div>
-            <div class="muted">{'示例：' if lang == 'zh' else 'Examples: '}{" · ".join(f"{item['ticker']} · {item.get('name') or item['ticker']} ({' / '.join(item['tags'])})" for item in risk_examples) or "-"}</div>
-          </article>
-        </div>
+        <div class="eyebrow">{'行动队列' if lang == 'zh' else 'Action Queue'}</div>
+        <h2 style="margin:0 0 6px;font-size:20px;">{'先处理风险，再推进主攻候选' if lang == 'zh' else 'Resolve risk first, then advance primary candidates'}</h2>
+        <div class="muted" style="margin-bottom:10px;">{'分类只使用已有模型结论、执行风险和同步状态；它帮助排定顺序，不替代人工判断。' if lang == 'zh' else 'Classification uses existing model posture, execution risk, and sync state. It orders attention; it does not replace judgement.'}</div>
+        <div class="watch-queue-stack">{queue_html}</div>
       </section>
     """
 
@@ -915,7 +972,7 @@ def _render_watchlist_table_fragment(
         label = _market_section_label(None if market_code == "OTHER" else market_code)
         table_rows = "".join(render_row(item) for item in market_items)
         section_blocks.append(
-            "<section style='margin-bottom:16px;'>"
+            f"<section id='watchlist-market-{market_code}' style='margin-bottom:16px;'>"
             f"<div class='market-section-label' style='margin:0 0 8px;font-weight:900;color:var(--accent);'>{label} · {len(market_items)}</div>"
             "<div class='table-wrap'>"
             "<table>"
@@ -928,7 +985,7 @@ def _render_watchlist_table_fragment(
             "</section>"
         )
         mobile_section_blocks.append(
-            "<section style='margin-bottom:16px;'>"
+            f"<section id='watchlist-mobile-market-{market_code}' style='margin-bottom:16px;'>"
             f"<div class='market-section-label' style='margin:0 0 8px;font-weight:900;color:var(--accent);'>{label} · {len(market_items)}</div>"
             "<div class='watchlist-mobile-market-grid'>"
             + "".join(render_mobile_card(item) for item in market_items)
@@ -1107,6 +1164,7 @@ def watchlist_page(
           </section>
         """
     )
+    market_context_html = _render_watchlist_market_context(items=items, lang=lang)
     if news_view == "risk":
         display_items = [item for item in items if _is_news_risk_item(item)]
     elif news_view == "opportunity":
@@ -1222,6 +1280,33 @@ def watchlist_page(
           .topbar a {{ color: var(--accent); text-decoration:none; }}
           .banner {{ margin-bottom:12px; padding:12px 14px; border-radius:14px; background:rgba(61,217,182,0.14); color:var(--accent); font-weight:700; }}
           .hero {{ display:grid; gap:12px; grid-template-columns: minmax(280px, 1.05fr) minmax(320px, 0.95fr); margin-bottom:12px; }}
+          .watch-queue-stack {{ display:grid; gap:8px; }}
+          .watch-queue {{ border:1px solid var(--line); border-radius:12px; background:rgba(11,19,29,0.62); overflow:hidden; }}
+          .watch-queue summary {{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:11px 12px; cursor:pointer; list-style:none; }}
+          .watch-queue summary::-webkit-details-marker {{ display:none; }}
+          .watch-queue summary > span:first-child {{ display:grid; gap:3px; }}
+          .watch-queue summary b {{ font-size:14px; }}
+          .watch-queue summary small {{ color:var(--muted); font-size:11px; line-height:1.35; }}
+          .watch-queue-body {{ display:grid; gap:7px; padding:0 10px 10px; }}
+          .watch-row {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; padding:10px; border-radius:10px; background:rgba(21,34,49,0.72); border:1px solid rgba(255,255,255,0.04); }}
+          .watch-ticker {{ color:var(--accent); font-weight:900; text-decoration:none; font-size:14px; }}
+          .signal {{ display:inline-flex; align-items:center; padding:5px 8px; border-radius:999px; font-size:11px; font-weight:850; white-space:nowrap; }}
+          .sig-buy {{ color:#8df0aa; background:rgba(74,222,128,0.12); }}
+          .sig-watch {{ color:#9fcaff; background:rgba(82,168,255,0.14); }}
+          .sig-sell {{ color:#ff9aaa; background:rgba(255,107,129,0.12); }}
+          .sig-hold {{ color:#ffd982; background:rgba(246,200,95,0.14); }}
+          .market-context {{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; margin:0 0 12px; padding:12px; border:1px solid var(--line); border-radius:12px; background:rgba(11,19,29,0.54); }}
+          .market-context-cards {{ display:flex; gap:8px; flex-wrap:wrap; }}
+          .market-context-card {{ display:grid; gap:3px; min-width:168px; padding:9px 10px; border:1px solid var(--line); border-radius:10px; color:var(--ink); text-decoration:none; background:rgba(21,34,49,0.66); }}
+          .market-context-card span {{ color:var(--muted); font-size:11px; font-weight:800; }}
+          .market-context-card b {{ font-size:13px; }}
+          .market-context-card small {{ color:var(--muted); font-size:10px; }}
+          .market-context-card.fresh {{ border-color:rgba(74,222,128,0.26); }}
+          .market-context-card.attention {{ border-color:rgba(246,200,95,0.34); }}
+          details.maintenance-fold {{ margin:0 0 12px; border:1px solid var(--line); border-radius:12px; background:rgba(11,19,29,0.48); }}
+          details.maintenance-fold > summary {{ padding:11px 12px; cursor:pointer; color:var(--muted); font-weight:850; list-style:none; }}
+          details.maintenance-fold > summary::-webkit-details-marker {{ display:none; }}
+          .maintenance-body {{ padding:0 12px 12px; }}
           .nav-grid {{ display:grid; gap:8px; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); margin-bottom:10px; }}
           .nav-card {{
             display:block;
@@ -1453,43 +1538,11 @@ def watchlist_page(
             <a href="/screeners?lang={lang}">{'打开模型选股' if lang == 'zh' else 'Open Screener'}</a>
           </div>
           {banner}
-          <section class="nav-grid">
-            <a class="nav-card" href="/dashboard">
-              <div class="nav-head">
-                <span class="nav-icon">HOME</span>
-                <div>
-                  <div class="nav-kicker">{'总览' if lang == 'zh' else 'Overview'}</div>
-                  <div class="nav-title">{'首页' if lang == 'zh' else 'Dashboard'}</div>
-                </div>
-              </div>
-              <div class="muted">{'返回工作台，并继续进入市场、连续强势股或任务中心。' if lang == 'zh' else 'Return to the lightweight hub and navigate to Market Pulse, Continuous Leaders, or Operations.'}</div>
-            </a>
-            <a class="nav-card" href="/screeners?lang={lang}">
-              <div class="nav-head">
-                <span class="nav-icon">SCAN</span>
-                <div>
-                  <div class="nav-kicker">{'发现' if lang == 'zh' else 'Discovery'}</div>
-                  <div class="nav-title">{'模型选股' if lang == 'zh' else 'Screeners'}</div>
-                </div>
-              </div>
-              <div class="muted">{'打开规则选股，把候选标的加入自选。' if lang == 'zh' else 'Open rule-based stock selection and turn candidates into watchlist names.'}</div>
-            </a>
-            <a class="nav-card" href="/dashboard/data-sources?lang={lang}">
-              <div class="nav-head">
-                <span class="nav-icon">DATA</span>
-                <div>
-                  <div class="nav-kicker">{'新鲜度' if lang == 'zh' else 'Freshness'}</div>
-                  <div class="nav-title">{'数据来源' if lang == 'zh' else 'Data Sources'}</div>
-                </div>
-              </div>
-              <div class="muted">{'行动前先检查数据源、概念映射和逐股同步状态。' if lang == 'zh' else 'Check provider freshness, concept mapping, and per-symbol sync source before acting.'}</div>
-            </a>
-          </section>
           <section class="hero">
             <article class="card">
-              <div class="eyebrow">{'我的自选' if lang == 'zh' else 'My Watchlist'}</div>
-              <h1>{'跨市场跟踪股票' if lang == 'zh' else 'Follow Stocks Across Markets'}</h1>
-              <p class="muted">{'把美股、A 股、港股放到这里统一跟踪，点击任意股票即可进入分析页。' if lang == 'zh' else 'Add U.S. stocks, China A-shares, or Hong Kong stocks here. Then click any ticker to jump straight into its insight page.'}</p>
+              <div class="eyebrow">{'第 3 步 · 自选与执行' if lang == 'zh' else 'Step 3 · Watch & Execute'}</div>
+              <h1>{'把候选变成有条件的观察计划' if lang == 'zh' else 'Turn candidates into conditional watch plans'}</h1>
+              <p class="muted">{'只保留需要持续跟踪的股票；进入详情确认触发、失效条件和最新风险后再执行。A 股与美股会保留各自的市场标记。' if lang == 'zh' else 'Keep only names that need ongoing attention. Confirm triggers, invalidation, and fresh risk in the detail view before acting. Market labels remain explicit.'}</p>
             </article>
             <article class="card">
               <div class="eyebrow">{'添加股票' if lang == 'zh' else 'Add A Stock'}</div>
@@ -1516,7 +1569,11 @@ def watchlist_page(
           </section>
 
           {watchlist_overview_html}
+          {market_context_html}
 
+          <details class="maintenance-fold">
+            <summary>{'维护与高级过滤' if lang == 'zh' else 'Maintenance and advanced filters'}</summary>
+            <div class="maintenance-body">
           <section class="card" style="margin-bottom:16px;">
             <div class="eyebrow">{'数据同步' if lang == 'zh' else 'Data Sync'}</div>
             <form class="stack" action="/watchlist/sync-enabled" method="post" style="max-width:360px;">
@@ -1561,6 +1618,8 @@ def watchlist_page(
               <button type="submit">{'应用过滤' if lang == 'zh' else 'Apply Filters'}</button>
             </form>
           </section>
+            </div>
+          </details>
 
           <section class="card" style="margin-bottom:16px;">
             <div class="eyebrow">{'决策面板' if lang == 'zh' else 'Decision Console'}</div>

@@ -705,7 +705,15 @@ def _hydrate_security_names(symbol_repo: SymbolRepository, *row_groups: list[dic
                 tickers.append(ticker)
     if not tickers:
         return
-    overviews = symbol_repo.list_overviews_for_tickers(list(dict.fromkeys(tickers)))
+    overview_loader = getattr(symbol_repo, "list_overviews_for_tickers", None)
+    if callable(overview_loader):
+        overviews = overview_loader(list(dict.fromkeys(tickers)))
+    else:
+        overviews = {
+            ticker: (symbol_repo.get_overview(ticker) or {})
+            for ticker in dict.fromkeys(tickers)
+            if callable(getattr(symbol_repo, "get_overview", None))
+        }
     for rows in row_groups:
         for item in rows or []:
             ticker = str(item.get("ticker") or "").strip().upper()
@@ -962,9 +970,14 @@ def _build_market_recommendation_rows(
                 }
             )
     if not candidates and not prefer_snapshot:
+        signal_loader = getattr(prediction_repo, "list_latest_signal_decisions", None)
+        if not callable(signal_loader):
+            signal_loader = getattr(prediction_repo, "list_latest_predictions_for_market", None)
+        if not callable(signal_loader):
+            signal_loader = lambda **_kwargs: []
         fallback_candidates = [
             item
-            for item in prediction_repo.list_latest_signal_decisions(limit=candidate_limit, market=market)
+            for item in signal_loader(limit=candidate_limit, market=market)
             if str(item.get("ticker") or "").upper() not in excluded_tickers
         ]
         candidates = fallback_candidates
@@ -2055,12 +2068,21 @@ def save_ai_daily_report(payload: dict, *, db=None) -> None:
             save_ai_daily_report(payload, db=own_db)
         return
     enriched_payload = dict(payload or {})
+    try:
+        latest_cn_trade_date = get_latest_lake_trade_date(market="CN")
+    except Exception:
+        latest_cn_trade_date = None
     default_report_date = (
         str(enriched_payload.get("market_recommendations_meta", {}).get("target_snapshot_date") or "").strip()
-        or get_latest_lake_trade_date(market="CN")
+        or latest_cn_trade_date
         or app_today_iso()
     )
     enriched_payload.setdefault("report_date", default_report_date)
+    enriched_payload.setdefault("schema_version", 1)
+    enriched_payload["input_market_dates"] = {
+        "CN": str((enriched_payload.get("market_recommendations_meta") or {}).get("target_snapshot_date") or "")[:10] or None,
+        "US": str((enriched_payload.get("us_model_recommendations_meta") or {}).get("target_snapshot_date") or "")[:10] or None,
+    }
     enriched_payload["saved_at"] = app_now_iso()
     AppSettingRepository(db).set(AI_DAILY_REPORT_KEY, json.dumps(enriched_payload, ensure_ascii=False))
     WorkspaceSnapshotRepository(db).create_snapshot(
@@ -2801,7 +2823,11 @@ def _build_portfolio_report_rows(*, db, symbol_repo: SymbolRepository, predictio
     positions = load_portfolio_positions()
     tickers = [str(item.get("ticker") or "").strip().upper() for item in positions if item.get("ticker")]
     latest_closes = load_latest_closes(tickers)
-    latest_outputs = prediction_repo.get_latest_model_outputs_for_tickers(tickers)
+    # Keep report generation compatible with lightweight repository doubles used
+    # by maintenance/preview flows; a missing model-output lookup should degrade
+    # to an empty signal section rather than abort the entire daily report.
+    output_loader = getattr(prediction_repo, "get_latest_model_outputs_for_tickers", None)
+    latest_outputs = output_loader(tickers) if callable(output_loader) else {}
     total_market_value = 0.0
     base_rows: list[dict] = []
     for position in positions:
@@ -3029,6 +3055,8 @@ def _load_full_market_report_candidates(
         "snapshot_templates_ready": 0,
         "snapshot_rows": 0,
         "blocked_candidates": 0,
+        "snapshot_stale": False,
+        "stale_snapshot_days": [],
         "target_snapshot_date": None,
         "latest_trade_date": latest_trade_date,
         "snapshot_sources": [
@@ -3049,6 +3077,13 @@ def _load_full_market_report_candidates(
     available_snapshot_days = {snapshot_day for _source, _snapshot, snapshot_day, _rows in snapshot_batches}
     if latest_trade_date and latest_trade_date in available_snapshot_days:
         target_snapshot_date = latest_trade_date
+    elif latest_trade_date and snapshot_batches:
+        # Never silently downgrade to an older candidate pool.  A stale
+        # screener snapshot is useful for history, but must not feed today's
+        # report when the market lake has a newer completed session.
+        target_snapshot_date = ""
+        meta["snapshot_stale"] = True
+        meta["stale_snapshot_days"] = sorted(available_snapshot_days)
     elif snapshot_batches:
         target_snapshot_date = max(snapshot_day for _source, _snapshot, snapshot_day, _rows in snapshot_batches)
         meta["target_snapshot_date"] = target_snapshot_date
@@ -3375,7 +3410,10 @@ def _build_buy_the_dip_rows(*, rows: list[dict], markets: list[str]) -> list[dic
         symbol_repo = SymbolRepository(db)
         prediction_repo = PredictionRepository(db)
         service = AIAnalysisService()
-        candidates = prediction_repo.list_latest_signal_decisions(limit=200, market=market)
+        signal_loader = getattr(prediction_repo, "list_latest_signal_decisions", None)
+        if not callable(signal_loader):
+            signal_loader = getattr(prediction_repo, "list_latest_predictions_for_market", None)
+        candidates = signal_loader(limit=200, market=market) if callable(signal_loader) else []
         ranked: list[dict] = []
         for candidate in candidates:
             ticker = str(candidate.get("ticker") or "").upper()

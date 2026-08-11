@@ -15,6 +15,7 @@ from app.services.recommendation_regression import (
 )
 from app.services.market_lake import load_lake_rows
 from app.services.repository import WorkspaceSnapshotRepository
+from app.services.market_freshness import is_snapshot_as_of_current
 from app.services.runtime_cache import clear_namespace, get_or_set
 from app.services.time_utils import app_now_iso, app_today_iso
 
@@ -336,6 +337,7 @@ def build_selection_quality(*, db, ai_history_limit: int = 60, factor_run_limit:
 
 def save_selection_quality_snapshot(*, db, source_job_id: int | None = None) -> dict[str, Any]:
     payload = build_selection_quality(db=db)
+    payload["schema_version"] = 1
     snapshot = WorkspaceSnapshotRepository(db).create_snapshot(
         snapshot_type=SELECTION_QUALITY_SNAPSHOT_TYPE,
         snapshot_date=app_today_iso(),
@@ -353,7 +355,20 @@ def save_selection_quality_snapshot(*, db, source_job_id: int | None = None) -> 
 
 
 def load_latest_selection_quality_snapshot(*, db) -> dict[str, Any] | None:
-    return WorkspaceSnapshotRepository(db).get_latest_snapshot(SELECTION_QUALITY_SNAPSHOT_TYPE)
+    snapshot = WorkspaceSnapshotRepository(db).get_latest_snapshot(SELECTION_QUALITY_SNAPSHOT_TYPE)
+    if not snapshot:
+        return None
+    payload = snapshot.get("payload") or {}
+    if not payload.get("schema_version"):
+        return snapshot
+    # This ledger is consumed by both CN and US recommendations.  Do not let
+    # an old successful job silently influence today's ranking policy.
+    if not all(
+        is_snapshot_as_of_current(snapshot.get("snapshot_date"), market)
+        for market in ("CN", "US")
+    ):
+        return None
+    return snapshot
 
 
 def load_or_build_selection_quality(*, db) -> dict[str, Any]:

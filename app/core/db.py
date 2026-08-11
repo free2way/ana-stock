@@ -95,6 +95,21 @@ def _run_migrations() -> None:
                 connection.execute(text("ALTER TABLE prediction_details ADD COLUMN position_size_hint TEXT"))
             if "entry_style" not in columns:
                 connection.execute(text("ALTER TABLE prediction_details ADD COLUMN entry_style TEXT"))
+    if "model_evaluations" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("model_evaluations")}
+        with engine.begin() as connection:
+            if "oos_sample_count" not in columns:
+                connection.execute(text("ALTER TABLE model_evaluations ADD COLUMN oos_sample_count INTEGER NOT NULL DEFAULT 0"))
+            if "oos_coverage_days" not in columns:
+                connection.execute(text("ALTER TABLE model_evaluations ADD COLUMN oos_coverage_days INTEGER NOT NULL DEFAULT 0"))
+            if "purge_gap_days" not in columns:
+                connection.execute(text("ALTER TABLE model_evaluations ADD COLUMN purge_gap_days INTEGER"))
+            if "benchmark_avg_return" not in columns:
+                connection.execute(text("ALTER TABLE model_evaluations ADD COLUMN benchmark_avg_return FLOAT"))
+            if "universe_version" not in columns:
+                connection.execute(text("ALTER TABLE model_evaluations ADD COLUMN universe_version TEXT"))
+            if "activation_status" not in columns:
+                connection.execute(text("ALTER TABLE model_evaluations ADD COLUMN activation_status TEXT NOT NULL DEFAULT 'observation'"))
     if "watchlist_items" in inspector.get_table_names():
         columns = {column["name"] for column in inspector.get_columns("watchlist_items")}
         if "sync_enabled" not in columns:
@@ -146,6 +161,35 @@ def _run_index_migrations(inspector) -> None:
         statements.append(
             "CREATE INDEX IF NOT EXISTS ix_data_jobs_type_status_started "
             "ON data_jobs (job_type, status, started_at DESC)"
+        )
+    if "job_run_dependencies" in table_names:
+        statements.extend(
+            [
+                "CREATE INDEX IF NOT EXISTS ix_job_run_dependencies_job_id "
+                "ON job_run_dependencies (job_id, id DESC)",
+                "CREATE INDEX IF NOT EXISTS ix_job_run_dependencies_upstream_id "
+                "ON job_run_dependencies (upstream_job_id, id DESC)",
+            ]
+        )
+    if "job_run_attempts" in table_names:
+        statements.append(
+            "CREATE INDEX IF NOT EXISTS ix_job_run_attempts_job_attempt "
+            "ON job_run_attempts (job_id, attempt_no DESC)"
+        )
+    if "market_refresh_batches" in table_names:
+        statements.append(
+            "CREATE INDEX IF NOT EXISTS ix_market_refresh_batches_market_id "
+            "ON market_refresh_batches (market, id DESC)"
+        )
+    if "model_evaluations" in table_names:
+        statements.append(
+            "CREATE INDEX IF NOT EXISTS ix_model_evaluations_run_market_id "
+            "ON model_evaluations (model_run_id, market, id DESC)"
+        )
+    if "model_evaluation_metrics" in table_names:
+        statements.append(
+            "CREATE INDEX IF NOT EXISTS ix_model_evaluation_metrics_eval_horizon "
+            "ON model_evaluation_metrics (model_evaluation_id, horizon_days, metric_scope)"
         )
     if "workspace_snapshots" in table_names:
         statements.extend(
