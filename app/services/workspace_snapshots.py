@@ -4,7 +4,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from app.core.db import SessionLocal
 
-from app.services.model_signal_summary import build_signal_label, model_confidence
+from app.services.model_signal_summary import build_signal_label
 from app.services.nlp_snapshots import (
     SNAPSHOT_DASHBOARD_NLP,
     SNAPSHOT_PORTFOLIO_NLP,
@@ -226,12 +226,12 @@ def _watchlist_combined_analysis(model_output: dict | None) -> dict:
         decision = "WATCH"
     else:
         decision = "HOLD"
-    confidence = (model_output or {}).get("confidence") or model_confidence(score) or 45
+    confidence = (model_output or {}).get("confidence")
     strength = (model_output or {}).get("signal_strength") or 0
     return {
         "status": "snapshot",
         "decision": decision,
-        "confidence": int(confidence),
+        "confidence": int(confidence) if confidence is not None else None,
         "score": int(round(float(score or 0.0) * 10)),
         "signal_strength": int(strength),
     }
@@ -300,7 +300,7 @@ def build_home_watchlist_snapshot(db: Session, *, lang: str = "zh") -> dict:
     for item in items:
         output = prediction_repo._build_signal_decision(outputs.get(item["ticker"]) or {})
         score = output.get("score")
-        confidence = int(output.get("confidence") or model_confidence(score) or 0)
+        confidence = output.get("confidence")
         signal_label = output.get("signal_label") or build_signal_label(score, lang=lang) or ("观察" if lang == "zh" else "Watch")
         rows.append(
             {
@@ -311,7 +311,7 @@ def build_home_watchlist_snapshot(db: Session, *, lang: str = "zh") -> dict:
                 "confidence": confidence,
                 "signal_label": signal_label,
                 "signal_tone": _signal_tone_for_score(score),
-                "priority": confidence,
+                "priority": confidence if confidence is not None else 0,
                 "action_hint": _action_hint_for_score(score, lang=lang),
                 "tradability_status": output.get("tradability_status"),
                 "target_weight": output.get("target_weight"),
@@ -417,7 +417,7 @@ def build_model_candidates_snapshot(db: Session, *, lang: str = "zh") -> dict:
                 "ticker": row.get("ticker"),
                 "name": row.get("name") or row.get("ticker"),
                 "score": score,
-                "confidence": int(row.get("confidence") or model_confidence(score) or 0),
+                "confidence": row.get("confidence"),
                 "signal_label": row.get("signal_label") or build_signal_label(score, lang=lang),
                 "tradability_status": row.get("tradability_status"),
                 "action_bucket": row.get("action_bucket"),

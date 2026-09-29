@@ -1,8 +1,6 @@
-import csv
-
-from app.core.config import get_settings
 from app.core.db import SessionLocal, init_db
 from app.models.schema import SymbolCreate
+from app.services.market_lake import write_ohlcv_rows_to_lake
 from app.services.repository import PriceSyncStateRepository, SymbolRepository
 
 
@@ -36,18 +34,7 @@ SAMPLE_DATA = {
 }
 
 
-def write_csv(path, rows: list[dict]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as output_file:
-        writer = csv.DictWriter(
-            output_file,
-            fieldnames=["date", "symbol", "open", "high", "low", "close", "volume", "adj_close", "dividend", "split_ratio"],
-        )
-        writer.writeheader()
-        writer.writerows(rows)
-
-
 def seed_sample_data() -> list[dict]:
-    settings = get_settings()
     init_db()
     results: list[dict] = []
 
@@ -60,10 +47,7 @@ def seed_sample_data() -> list[dict]:
             if symbol is None:
                 symbol = symbol_repo.create_symbol(SymbolCreate(ticker=ticker, name=ticker, market="US"))
 
-            raw_path = settings.raw_data_dir / f"{ticker}.csv"
-            normalized_path = settings.normalized_data_dir / f"{ticker}.csv"
-            write_csv(raw_path, rows)
-            write_csv(normalized_path, rows)
+            lake_paths = write_ohlcv_rows_to_lake(market="US", rows=rows)
 
             sync_repo.upsert_state(
                 symbol_id=symbol.id,
@@ -72,6 +56,6 @@ def seed_sample_data() -> list[dict]:
                 status="success",
                 message=f"Seeded {len(rows)} rows",
             )
-            results.append({"ticker": ticker, "rows": len(rows), "raw_path": str(raw_path), "normalized_path": str(normalized_path)})
+            results.append({"ticker": ticker, "rows": len(rows), "lake_paths": [str(path) for path in lake_paths]})
 
     return results

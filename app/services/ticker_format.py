@@ -69,3 +69,14 @@ def provider_ticker_candidates(ticker: str, market: str | None) -> list[str]:
         if dashed not in candidates:
             candidates.append(dashed)
     return candidates
+
+
+def lake_ticker_candidates(ticker: str) -> list[tuple[str, str]]:
+    upper = ticker.upper().strip()
+    if not upper:
+        return []
+    if upper.endswith((".SS", ".SZ", ".SH", ".BJ")) or (upper.isdigit() and len(upper) == 6):
+        return [("CN", candidate) for candidate in market_ticker_candidates(upper, "CN")]
+    if upper.endswith(".HK"):
+        return []
+    return [("US", upper)]

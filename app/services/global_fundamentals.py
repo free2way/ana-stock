@@ -3,8 +3,15 @@ from dataclasses import asdict, dataclass
 from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
 from app.services.providers import resolve_fundamental_provider
-from app.services.repository import FundamentalSnapshotRepository, SymbolRepository, WatchlistRepository
+from app.services.repository import (
+    FundamentalSnapshotRepository,
+    PointInTimeFeatureSnapshotRepository,
+    SymbolRepository,
+    WatchlistRepository,
+)
+from app.services.stock_selection.feature_availability import adapt_fundamental_snapshots
 from app.services.ticker_format import normalize_ticker_for_market
+from app.services.time_utils import app_now_iso
 
 
 @dataclass(slots=True)
@@ -108,10 +115,13 @@ def sync_global_fundamentals(tickers: list[str] | None = None, *, provider_name:
         }
 
     written = 0
+    point_in_time_values_written = 0
     touched: list[str] = []
+    observed_at = app_now_iso()
     with SessionLocal() as db:
         symbol_repo = SymbolRepository(db)
         fundamental_repo = FundamentalSnapshotRepository(db)
+        point_in_time_repo = PointInTimeFeatureSnapshotRepository(db)
         for row in rows:
             symbol = symbol_repo.get_or_create_symbol(
                 SymbolCreate(
@@ -135,9 +145,37 @@ def sync_global_fundamentals(tickers: list[str] | None = None, *, provider_name:
                 debt_to_assets=row.debt_to_assets,
                 data=row.raw_data or asdict(row),
             )
+            adapted = adapt_fundamental_snapshots(
+                (
+                    {
+                        **asdict(row),
+                        "created_at": observed_at,
+                        "updated_at": observed_at,
+                    },
+                ),
+                market=row.market,
+            )
+            for record in adapted.records:
+                _, inserted = point_in_time_repo.append_snapshot(
+                    symbol_id=symbol.id,
+                    feature_name=record.feature_name,
+                    feature_value=record.value,
+                    event_time=record.event_time.isoformat(),
+                    available_time=record.available_time.isoformat(),
+                    ingested_time=record.ingested_time.isoformat(),
+                    source=record.source,
+                    source_record_id=(
+                        f"{row.ticker}:{row.report_date}:{record.feature_name}"
+                    ),
+                    revision_id=record.revision_id,
+                    payload={"report_date": row.report_date},
+                    commit=False,
+                )
+                point_in_time_values_written += int(inserted)
             written += 1
             if row.ticker not in touched:
                 touched.append(row.ticker)
+        db.commit()
 
     status = "success" if not failures else "partial"
     failure_text = f" {len(failures)} failed." if failures else ""
@@ -146,6 +184,7 @@ def sync_global_fundamentals(tickers: list[str] | None = None, *, provider_name:
         "status": status,
         "message": f"Synced {written} US/HK fundamental row(s) for {len(touched)} stock(s) via {provider_text}.{failure_text}",
         "rows_written": written,
+        "point_in_time_values_written": point_in_time_values_written,
         "tickers": touched,
         "failed_tickers": failures,
     }

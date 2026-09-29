@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from collections import Counter
 
 from app.services.market_calendar import (
     is_market_open_date,
@@ -103,4 +104,78 @@ def summarize_market_freshness(
         "inactive_count": inactive_count,
         "manual_approved_count": manual_approved_count,
         "status": status,
+    }
+
+
+def classify_market_symbol_anomalies(
+    states: list[dict],
+    *,
+    market: str,
+    expected_as_of_date: str,
+    lake_symbols: set[str] | None = None,
+    sample_limit: int = 20,
+) -> dict:
+    """Classify symbol freshness gaps without treating metadata lag as missing data.
+
+    A current lake partition is authoritative for price availability.  A symbol
+    present in that partition but carrying an older ``price_sync_state`` row is
+    bookkeeping lag, not a provider/data failure.  Unknown symbols absent from
+    both the state table and current lake remain fail-closed.
+    """
+
+    market_code = normalize_market(market)
+    target = str(expected_as_of_date or "").strip()[:10]
+    current_lake_symbols = {
+        str(value or "").strip().upper()
+        for value in (lake_symbols or set())
+        if str(value or "").strip()
+    }
+    categories: Counter[str] = Counter()
+    samples: dict[str, list[str]] = {}
+    blocking_categories = {
+        "provider_failed",
+        "stale_unclassified",
+        "missing_unclassified",
+    }
+    for row in states:
+        if normalize_market(row.get("market")) != market_code:
+            continue
+        ticker = str(row.get("ticker") or "").strip().upper()
+        status = str(row.get("status") or "").strip().lower()
+        last_date = str(row.get("last_synced_date") or "").strip()[:10]
+        is_active = bool(row.get("is_active", True))
+        if not is_active or status == "inactive":
+            category = "inactive"
+        elif status == "manual_approved":
+            category = "manual_approved"
+        elif status in {"no_trade", "suspended"}:
+            category = "provider_confirmed_no_trade"
+        elif target and last_date >= target:
+            category = "fresh"
+        elif ticker and ticker in current_lake_symbols:
+            category = "lake_present_state_lag"
+        elif status in {"failed", "error", "provider_failed"}:
+            category = "provider_failed"
+        elif last_date:
+            category = "stale_unclassified"
+        else:
+            category = "missing_unclassified"
+        categories[category] += 1
+        if ticker and len(samples.setdefault(category, [])) < max(0, int(sample_limit)):
+            samples[category].append(ticker)
+
+    blocking_count = sum(categories[name] for name in blocking_categories)
+    accounted_count = sum(categories.values()) - blocking_count
+    total_count = sum(categories.values())
+    return {
+        "classification_version": "market-symbol-anomaly-v1",
+        "market": market_code,
+        "expected_as_of_date": target or None,
+        "counts": dict(sorted(categories.items())),
+        "samples": {name: values for name, values in sorted(samples.items())},
+        "total_count": total_count,
+        "accounted_count": accounted_count,
+        "blocking_anomaly_count": blocking_count,
+        "blocking_categories": sorted(blocking_categories),
+        "status": "pass" if blocking_count == 0 else "partial",
     }

@@ -10,7 +10,7 @@ from app.core.db import SessionLocal
 from app.models.tables import ModelRun, Prediction, PredictionDetail, Symbol
 from app.services.market_lake import load_lake_price_history
 from app.services.repository import SymbolRepository, WorkspaceSnapshotRepository
-from app.services.runtime_cache import get_or_set
+from app.services.runtime_cache import get_cached, get_or_set
 from app.services.screener_snapshots import build_base_precompute_params, screener_snapshot_type
 
 
@@ -339,7 +339,7 @@ def _load_snapshot_batches_with_symbol_meta(
     return snapshot_batches, symbol_meta
 
 
-def build_next_tesla_evaluation(*, market: str, lookback_snapshots: int = 15, top_n: int = 20) -> dict:
+def build_next_tesla_evaluation(*, market: str, lookback_snapshots: int = 15, top_n: int = 20, allow_compute: bool = True) -> dict:
     target_markets = ["CN", "US"] if str(market or "ALL").upper() == "ALL" else [str(market or "CN").upper()]
     cache_key = json.dumps(
         {
@@ -473,6 +473,8 @@ def build_next_tesla_evaluation(*, market: str, lookback_snapshots: int = 15, to
             },
         }
 
+    if not allow_compute:
+        return get_cached("template_eval_next_tesla", cache_key) or {}
     return get_or_set("template_eval_next_tesla", cache_key, ttl_seconds=600.0, loader=_loader)
 
 
@@ -518,7 +520,7 @@ def next_tesla_market_bias(payload: dict, *, lang: str) -> str:
     return "两类并存" if lang == "zh" else "Mixed"
 
 
-def build_technical_momentum_evaluation(*, market: str, lookback_snapshots: int = 15, top_n: int = 40) -> dict:
+def build_technical_momentum_evaluation(*, market: str, lookback_snapshots: int = 15, top_n: int = 40, allow_compute: bool = True) -> dict:
     target_markets = ["CN", "US"] if str(market or "ALL").upper() == "ALL" else [str(market or "CN").upper()]
     cache_key = json.dumps(
         {
@@ -666,10 +668,12 @@ def build_technical_momentum_evaluation(*, market: str, lookback_snapshots: int 
             },
         }
 
+    if not allow_compute:
+        return get_cached("template_eval_technical_momentum", cache_key) or {}
     return get_or_set("template_eval_technical_momentum", cache_key, ttl_seconds=600.0, loader=_loader)
 
 
-def build_lightgbm_evaluation(*, market: str, lookback_snapshots: int = 15, top_n: int = 40) -> dict:
+def build_lightgbm_evaluation(*, market: str, lookback_snapshots: int = 15, top_n: int = 40, allow_compute: bool = True) -> dict:
     target_markets = ["CN", "US"] if str(market or "ALL").upper() == "ALL" else [str(market or "CN").upper()]
     cache_key = json.dumps(
         {
@@ -819,6 +823,8 @@ def build_lightgbm_evaluation(*, market: str, lookback_snapshots: int = 15, top_
             },
         }
 
+    if not allow_compute:
+        return get_cached("template_eval_lightgbm", cache_key) or {}
     return get_or_set("template_eval_lightgbm", cache_key, ttl_seconds=600.0, loader=_loader)
 
 
@@ -1057,7 +1063,7 @@ def pattern_template_bias(payload: dict, *, lang: str) -> str:
     return f"5D currently leans {label} with a {hit_rate:.1f}% hit rate"
 
 
-def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, top_n: int = 40) -> dict:
+def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, top_n: int = 40, allow_compute: bool = True) -> dict:
     target_markets = ["CN", "US"] if str(market or "ALL").upper() == "ALL" else [str(market or "CN").upper()]
     cache_key = json.dumps(
         {
@@ -1298,6 +1304,8 @@ def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, t
             },
         }
 
+    if not allow_compute:
+        return get_cached("template_eval_lightgbm_prediction", cache_key) or {}
     return get_or_set("template_eval_lightgbm_prediction", cache_key, ttl_seconds=600.0, loader=_loader)
 
 

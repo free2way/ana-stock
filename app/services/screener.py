@@ -2,6 +2,10 @@ from datetime import date, datetime
 from dataclasses import asdict
 import json
 
+from app.services.execution_tag_filters import (
+    matches_execution_tag_filter as _matches_execution_tag_filter,
+    excludes_execution_tag_filter as _excludes_execution_tag_filter,
+)
 from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
 from app.services.insight_engine import InsightEngine
@@ -21,9 +25,10 @@ from app.services.repository import (
 )
 from app.services.model_signal_summary import build_model_state, enrich_model_output, summarize_explanations
 from app.services.model_evaluation import latest_model_activation_statuses
-from app.services.price_snapshot import load_latest_closes
+from app.services.price_snapshot import load_latest_closes, load_latest_open_gaps
 from app.services.technical_patterns import TechnicalPatternService
 from app.services.tradability_filter import evaluate_candidate_tradability
+from app.services.model_score_contract import first_present
 from app.services.tradingview_client import TradingViewClient
 from app.services.tushare_client import TushareClient
 from app.services.us_trade_universe import build_us_trade_universe
@@ -242,28 +247,6 @@ PATTERN_MATCH_LABELS = {
     "bullish_engulfing": "看涨吞没",
     "hammer_reversal": "锤子线",
 }
-
-
-def _matches_execution_tag_filter(tags: list[str] | None, execution_tag_filter: str) -> bool:
-    normalized = str(execution_tag_filter or "").strip().lower()
-    if not normalized or normalized == "all":
-        return True
-    requested = [part.strip() for part in normalized.split(",") if part.strip() and part.strip() != "all"]
-    if not requested:
-        return True
-    values = [str(tag).strip().lower() for tag in (tags or []) if str(tag).strip()]
-    return any(tag in values for tag in requested)
-
-
-def _excludes_execution_tag_filter(tags: list[str] | None, exclude_execution_tag_filter: str) -> bool:
-    normalized = str(exclude_execution_tag_filter or "").strip().lower()
-    if not normalized or normalized == "all":
-        return True
-    requested = [part.strip() for part in normalized.split(",") if part.strip() and part.strip() != "all"]
-    if not requested:
-        return True
-    values = [str(tag).strip().lower() for tag in (tags or []) if str(tag).strip()]
-    return not any(tag in values for tag in requested)
 
 
 TRANSIENT_TRADABILITY_FLAGS = {
@@ -1171,7 +1154,6 @@ class ScreenerService:
     def _next_tesla_context(self, insight: dict) -> dict:
         history = insight.get("history") or []
         highs = [float(row.get("high") or row.get("close") or 0.0) for row in history[-252:] if (row.get("high") or row.get("close"))]
-        lows = [float(row.get("low") or row.get("close") or 0.0) for row in history[-20:] if (row.get("low") or row.get("close"))]
         latest_close = float(insight.get("latest_close") or 0.0)
         ma20 = float(insight.get("ma20") or 0.0)
         breakout_distance = float(insight.get("distance_to_breakout_pct") or 0.0)
@@ -1310,20 +1292,30 @@ class ScreenerService:
             with SessionLocal() as db:
                 for market_code in markets:
                     market_context_map[market_code] = load_market_context_snapshot(db, market=market_code)
+        signal_open_gaps = (
+            load_latest_open_gaps([str(row.get("ticker") or "") for row in results])
+            if results
+            else {}
+        )
         for row in results:
             candidate = {
                 **row,
-                "score": row.get("score") or row.get("model_score") or row.get("model_confidence"),
+                "score": first_present(row, "score", "model_score"),
                 "signal_label": row.get("model_signal_label") or row.get("signal_label"),
-                "signal_strength": row.get("model_signal_strength") or row.get("trend_score"),
-                "expected_drawdown_20d": row.get("model_expected_drawdown_20d") or row.get("expected_drawdown_20d"),
+                "signal_strength": first_present(row, "model_signal_strength", "trend_score"),
+                "expected_drawdown_20d": first_present(row, "model_expected_drawdown_20d", "expected_drawdown_20d"),
                 "entry_style": row.get("model_entry_style") or row.get("entry_style") or row.get("action_label"),
+                "signal_open_gap_pct": signal_open_gaps.get(str(row.get("ticker") or "").strip().upper()),
                 "risk_flags": [],
                 "model_execution_tags": _sanitize_execution_tags(
                     row.get("model_execution_tags") or row.get("execution_tags") or []
                 ),
                 "model_activation_status": row.get("model_activation_status") or "unverified",
             }
+            # Persist the gap so downstream snapshot consumers (daily report
+            # re-evaluation) re-run the gap-chase rule without re-querying the
+            # lake; None means "unknown" and must never trigger the rule.
+            row["signal_open_gap_pct"] = candidate.get("signal_open_gap_pct")
             decision = evaluate_candidate_tradability(
                 candidate,
                 market_snapshot=market_context_map.get(str(row.get("market") or "").strip().upper()),
@@ -1331,9 +1323,7 @@ class ScreenerService:
             decision_payload = asdict(decision)
             diagnostics = decision_payload.pop("diagnostics", None)
             for key, value in decision_payload.items():
-                if value is None:
-                    continue
-                if key == "risk_flags" and not value:
+                if value is None and key not in {"block_reason", "trade_readiness_score"}:
                     continue
                 row[key] = value
             if diagnostics:

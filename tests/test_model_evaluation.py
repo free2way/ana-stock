@@ -1,33 +1,77 @@
-import os
+from tests.postgres_safety import ApplicationPostgresTestCase
 from unittest import TestCase
 from unittest.mock import patch
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 
-from app.core.config import get_settings
-from app.core.db import SessionLocal, configure_database, init_db
-from app.models.base import Base
+from app.core.db import SessionLocal
 from app.models.tables import ModelEvaluation, ModelEvaluationMetric, ModelRun, Prediction, Symbol, WorkspaceSnapshot
-from app.services.model_evaluation import _history_outcome, evaluate_model_runs, latest_model_activation_statuses, list_latest_model_evaluations, summarize_evaluation_samples
+from app.services.model_evaluation import (
+    DEFAULT_HORIZONS,
+    SCHEDULED_EVALUATION_TRADE_DATES,
+    STRICT_OOS_MIN_COVERAGE_DAYS,
+    _history_outcome,
+    cost_sensitivity_ladder,
+    evaluate_model_runs,
+    latest_model_activation_statuses,
+    list_latest_model_evaluations,
+    summarize_evaluation_samples,
+)
 from app.services.model_challenger import challenger_race_readiness
 
 
-TEST_DATABASE_URL = "postgresql+psycopg://quant:quant!123@127.0.0.1:5432/quant_test"
+class EvaluationWindowTests(TestCase):
+    def test_scheduled_window_can_mature_the_challenger_gate_for_longest_horizon(self) -> None:
+        matured_dates = SCHEDULED_EVALUATION_TRADE_DATES - max(DEFAULT_HORIZONS)
+
+        self.assertGreaterEqual(matured_dates, STRICT_OOS_MIN_COVERAGE_DAYS)
 
 
-class ModelEvaluationTests(TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        os.environ["PQW_DATABASE_URL"] = os.getenv("PQW_TEST_DATABASE_URL", TEST_DATABASE_URL)
-        get_settings.cache_clear()
-        configure_database()
-        init_db()
+class CostSensitivityLadderTests(TestCase):
+    """P0 #3 acceptance: one measured path set, repriced at escalating costs."""
 
-    def setUp(self) -> None:
-        with SessionLocal() as db:
-            for table in reversed(Base.metadata.sorted_tables):
-                db.execute(text(f'TRUNCATE TABLE "{table.name}" RESTART IDENTITY CASCADE'))
-            db.commit()
+    SAMPLES = [
+        {"gross_return_pct": 6.0, "drawdown_pct": -1.0},
+        {"gross_return_pct": 1.0, "drawdown_pct": -2.0},
+        {"gross_return_pct": 0.5, "drawdown_pct": -1.5},
+        {"gross_return_pct": -3.0, "drawdown_pct": -5.0},
+    ]
+
+    def test_ladder_keeps_gross_fixed_and_decays_net_monotonically(self) -> None:
+        rows = cost_sensitivity_ladder(self.SAMPLES, horizon_days=5, round_trip_cost_bps=50.0)
+        self.assertEqual([20.0, 50.0, 80.0], [row["round_trip_cost_bps"] for row in rows])
+        gross_values = [row["gross_avg_return"] for row in rows]
+        net_values = [row["net_avg_return"] for row in rows]
+        for value in gross_values[1:]:
+            self.assertAlmostEqual(gross_values[0], value, places=9)
+        self.assertTrue(all(earlier > later for earlier, later in zip(net_values, net_values[1:])))
+        self.assertAlmostEqual(0.3, rows[0]["net_avg_return_delta_vs_base"], places=9)
+        self.assertAlmostEqual(0.0, rows[1]["net_avg_return_delta_vs_base"], places=9)
+        self.assertAlmostEqual(-0.3, rows[2]["net_avg_return_delta_vs_base"], places=9)
+
+    def test_ladder_hit_rate_never_increases_with_cost(self) -> None:
+        rows = cost_sensitivity_ladder(self.SAMPLES, horizon_days=5, round_trip_cost_bps=50.0)
+        hit_rates = [row["hit_rate"] for row in rows]
+        self.assertTrue(all(earlier >= later for earlier, later in zip(hit_rates, hit_rates[1:])))
+
+    def test_ladder_rejects_invalid_cost_levels(self) -> None:
+        with self.assertRaises(ValueError):
+            cost_sensitivity_ladder(self.SAMPLES, horizon_days=1, round_trip_cost_bps=-1)
+        with self.assertRaises(ValueError):
+            cost_sensitivity_ladder(
+                self.SAMPLES, horizon_days=1, round_trip_cost_bps=50.0, ladder_bps=(10.0, float("nan"))
+            )
+
+    def test_ladder_handles_empty_samples_without_base_delta(self) -> None:
+        rows = cost_sensitivity_ladder([], horizon_days=5, round_trip_cost_bps=50.0)
+        self.assertTrue(rows)
+        self.assertTrue(
+            all(row["hit_rate"] is None and row["net_avg_return_delta_vs_base"] is None for row in rows)
+        )
+
+
+class ModelEvaluationTests(ApplicationPostgresTestCase):
+
 
     def test_summary_is_net_of_cost_and_reports_drawdown(self) -> None:
         result = summarize_evaluation_samples(
@@ -104,6 +148,13 @@ class ModelEvaluationTests(TestCase):
             evaluation = db.scalar(select(ModelEvaluation))
             metrics = list(db.scalars(select(ModelEvaluationMetric).order_by(ModelEvaluationMetric.horizon_days, ModelEvaluationMetric.metric_scope)).all())
             api_rows = list_latest_model_evaluations(db, market="CN", limit=1)
+            # These two reads MUST stay inside the session context: reusing a
+            # closed Session lazily checks out a fresh connection with an open
+            # transaction that nothing ever rolls back, leaving an idle-in-
+            # transaction connection that blocks the next setUp() TRUNCATE
+            # until the 60s statement timeout fires.
+            activation_by_run = latest_model_activation_statuses(db, model_run_ids=[run.id])
+            readiness = challenger_race_readiness(db, markets=["CN"])
 
         self.assertEqual("success", result["status"])
         self.assertEqual("success", evaluation.status)
@@ -117,14 +168,15 @@ class ModelEvaluationTests(TestCase):
         self.assertEqual(2, len(state_metrics))
         self.assertTrue(all(row.market_regime == "risk_on" for row in state_metrics))
         overall_2d = next(row for row in metrics if row.horizon_days == 2 and row.metric_scope == "overall")
-        self.assertAlmostEqual(4.8, overall_2d.avg_return, places=6)
+        # P0 closeout entry basis: the T+1 tradable price, carried onto the
+        # adjusted close series.  This fixture has no `open` fields, so the
+        # gap ratio falls back to the next close: entry 102 -> exit 105 gives
+        # gross +2.941176...%, net of the 20bps round trip +2.741176...%.
+        # The pre-closeout signal-close basis (5.0 gross) is no longer valid.
+        self.assertAlmostEqual(2.7411764705882247, overall_2d.avg_return, places=6)
         self.assertEqual("risk_on", api_rows[0]["market_state_metrics"][0]["market_regime"])
         self.assertEqual("observation_insufficient_oos", api_rows[0]["activation_status"])
-        self.assertEqual(
-            "observation_insufficient_oos",
-            latest_model_activation_statuses(db, model_run_ids=[run.id])[run.id],
-        )
-        readiness = challenger_race_readiness(db, markets=["CN"])
+        self.assertEqual("observation_insufficient_oos", activation_by_run[run.id])
         self.assertEqual("waiting_for_oos", readiness["status"])
         self.assertEqual("strict_oos_evidence_insufficient", readiness["markets"]["CN"]["reason"])
 

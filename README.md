@@ -1,199 +1,108 @@
-# Personal Quant Workbench
+<div align="center">
 
-Local-first post-close research, screening, and review workspace for amateur stock traders.
+# ANA
+### From market close to a clearer research agenda.
 
-Personal Quant Workbench is a local-first daily review and model screening platform for amateur stock traders.
+**A local-first quantitative research workspace for A-shares and U.S. equities.**
 
-It focuses on one thing: after the market close, refresh the data, run the models, generate actionable review output, and let the user make better next-day decisions from one place.
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-## Highlights
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=flat-square&logo=postgresql&logoColor=white)
+![Workflow](https://img.shields.io/badge/Workflow-Post--close-0F766E?style=flat-square)
 
-- Action-first dashboard for watchlist, holdings, jobs, and next-day candidates
-- LightGBM multifactor scoring plus template-driven and multi-model screening
-- Watchlist and portfolio review flows with `HOLD`, `REVIEW`, `TRIM`, and `EXIT` suggestions
-- Precomputed snapshots and background jobs instead of heavy page-time calculations
-- AI daily reports with portfolio review, full-market ideas, and social signal cross-validation
-- A-share and U.S. market support on one local-first workflow
+**Collect → Screen → Evaluate → Review**
 
-## English UI Preview
+</div>
 
-![English homepage UI](docs/assets/dashboard-home-en.png)
+---
 
-## Positioning
+## One workspace for the next trading day
 
-- Not a broker
-- Not an auto-trading system
-- Not an intraday high-frequency platform
-- A post-close quantitative review workbench for A-shares and U.S. equities
+ANA brings end-of-day market data, quantitative screening, watchlists, portfolio review, and AI-assisted reports into a single workspace. Background jobs prepare results; the interface helps you inspect them and decide what deserves further research.
 
-The product goal is to turn "what is worth researching" into "what should I review, track, trim, or prepare for tomorrow".
+Built for deliberate post-close analysis—not high-frequency execution or automated brokerage trading.
 
-## What The App Does
+| Discover | Understand | Stay in control |
+| :--- | :--- | :--- |
+| Explore model-ranked candidates and market context. | Inspect evaluations, data quality, and research history. | Review holdings, job status, and daily summaries together. |
 
-- Refresh A-share and U.S. daily market data
-- Store market history in a local Parquet lake
-- Use DuckDB and Polars for fast cross-sectional scans
-- Train and score LightGBM multifactor signals
-- Precompute screener snapshots instead of doing heavy calculations in page requests
-- Manage watchlists and holdings separately
-- Generate portfolio review suggestions such as `HOLD`, `REVIEW`, `TRIM`, and `EXIT`
-- Produce AI daily reports with market summary, portfolio review, full-market top ideas, and social cross-validation
-- Track jobs, failures, stale runs, and post-close automation status from the ops center
+## What you can do
 
-## Current Stack
+- **Follow two markets.** Separate A-share and U.S. refresh workflows and market-quality checks.
+- **Screen with context.** Model-driven candidate lists alongside market, sector, and watchlist views.
+- **Review your portfolio.** Holdings, performance, and review suggestions, with sensitive amounts hidden until revealed.
+- **Read the daily picture.** AI-assisted summaries and configurable Feishu notifications.
+- **Inspect the process.** Background job status, model evaluations, failures, and source diagnostics.
+- **Keep research local.** PostgreSQL for application state; a Parquet lake for market history.
 
-- FastAPI for routes and HTML pages
-- PostgreSQL for application state and audit records
-- Parquet as the market data lake
-- DuckDB + Polars for scanning and snapshot computation
-- LightGBM for multifactor signal training and scoring
-- Background jobs for post-close refresh, training, screening, and report generation
+Availability depends on provider permissions, configuration, data freshness, and completed jobs. AI reports may be unavailable when their inputs are not ready.
 
-## Data Source Strategy
+## System logic
 
-### China
-
-- Price data: TuShare
-- Fundamentals and symbol metadata: TuShare
-- Concept data: TuShare concept endpoints when the account has permission
-
-### U.S.
-
-- Price data: Alpaca by default
-- Full-market grouped daily expansion: Polygon when configured
-- Fallback for limited cases: yfinance
-
-### News And Social
-
-- U.S. market news enrichment: Polygon news
-- Social signal tracking: tracked X accounts with local parsing and validation
-
-## Product Modules
-
-- `/dashboard`: action-first home page
-- `/watchlist`: watchlist and decision panel
-- `/portfolio`: holding review and action table
-- `/screeners`: model screening and saved model presets
-- `/dashboard/model-performance`: model evaluation overview
-- `/dashboard/market`: market overview, sector heatmap, concept tracking
-- `/dashboard/ai-daily-report`: current AI daily report
-- `/dashboard/ai-daily-report/history`: historical report archive
-- `/dashboard/ops`: jobs, pipeline status, sync health, and operational diagnostics
-- `/social`: tracked accounts, parsed mentions, and validation results
-
-## Daily Workflow
-
-The intended workflow is:
-
-1. Refresh full-market end-of-day data after the close.
-2. Update factors and market snapshots.
-3. Train or update LightGBM signal runs.
-4. Precompute screener outputs for model templates.
-5. Refresh watchlist and portfolio review suggestions.
-6. Generate the AI daily report and push-ready text.
-7. Let the user review the dashboard, watchlist, holdings, and next-day candidates.
-
-Heavy computations are designed to run in background jobs, while pages should mainly read precomputed snapshots.
-
-## Repository Layout
-
-```text
-app/
-  api/
-    routes/
-  core/
-  models/
-  services/
-data/
-  lake/
-  artifacts/
-docs/
-scripts/
-storage/
-tests/
+```mermaid
+flowchart TD
+    A[Market Data Providers] --> B[Scheduled Collection]
+    B --> C[Normalization and Quality Checks]
+    C --> D[(Market-separated Parquet Lake)]
+    C --> E[(PostgreSQL: State and Audit)]
+    D --> F[Features and Research Pipelines]
+    F --> G[Model Training and Scoring]
+    G --> H[Candidate Snapshots]
+    H --> I[Screeners and Watchlists]
+    H --> J[Portfolio Review]
+    I --> K[AI-assisted Daily Report]
+    J --> K
+    K --> L[Dashboard and Optional Notifications]
+    E --> L
+    D -.-> M[Execution Facts and Provenance]
+    M -.-> N{Evidence Complete?}
+    N -. No .-> O[Blocked or Unverified]
+    N -. Yes .-> P[New-contract Evaluation and Replay]
+    P -.-> L
+    classDef data fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e;
+    classDef work fill:#eef2ff,stroke:#6366f1,color:#312e81;
+    classDef view fill:#ccfbf1,stroke:#0d9488,color:#134e4a;
+    classDef gate fill:#fff7ed,stroke:#ea580c,color:#7c2d12;
+    class A,D,E data;
+    class B,C,F,G,H work;
+    class I,J,K,L view;
+    class M,N,O,P gate;
 ```
 
-## Quick Start
+Solid paths summarize the application workflow. Dashed paths show the execution-evidence work **under validation**, not completed production acceptance. Each market must qualify independently.
 
-### 1. Create a virtual environment
+## Designed for inspection, not promises
 
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-```
+ANA is a research tool. Model scores are not guaranteed win probabilities, historical performance does not promise future returns, and AI-generated narratives need human review.
 
-### 2. Configure environment variables
+The stricter training/evaluation/replay contract remains under validation. Incomplete execution evidence must remain blocked or unverified; legacy results must not be presented as newly validated results. This project does not claim a proven profitable strategy or fully certified execution simulation.
 
-Create `.env` and set at least:
+## Built with
 
-```env
-PQW_DATABASE_URL=postgresql+psycopg://ana_user:your_password@127.0.0.1:5432/ana_prod
-PQW_AUTH_PASSWORD=change_me
-PQW_TUSHARE_TOKEN=your_tushare_token
-```
+| Layer | Technology |
+| :--- | :--- |
+| Application | Python · FastAPI · server-rendered HTML |
+| State and audit | PostgreSQL |
+| Historical data and analytics | Parquet · DuckDB · Polars |
+| Quantitative research | LightGBM and supporting research pipelines |
+| Operations | Background jobs · scheduled refreshes · notifications |
 
-Optional but recommended:
+Provider support includes Tushare, HiThink Financial API, Alpaca, Polygon, and selected fallbacks. Support does not imply that every account has all historical fields or full-market coverage.
 
-```env
-PQW_ALPACA_API_KEY=your_alpaca_key
-PQW_ALPACA_API_SECRET=your_alpaca_secret
-PQW_POLYGON_API_KEY=your_polygon_key
-PQW_X_BEARER_TOKEN=your_x_bearer_token
-PQW_TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-PQW_TELEGRAM_CHAT_ID=your_telegram_chat_id
-```
+## Repository scope
 
-### 3. Initialize the database schema
+Explore [application source](app/), [tests](tests/), and [scripts](scripts/).
 
-```bash
-.venv/bin/python scripts/init_db.py
-```
+This repository includes source, tests, dependency manifests, and generic runtime files. Internal development plans, acceptance reports, detailed deployment/configuration guides, credentials, market datasets, model artifacts, and machine-specific deployment files are intentionally excluded. Some operational scripts require local evidence or environment-specific resources not distributed here.
 
-### 4. Start the app
+---
 
-```bash
-.venv/bin/uvicorn app.api.main:app --host 127.0.0.1 --port 8000
-```
+<div align="center">
 
-Open:
+**Better research starts with visible evidence.**
 
-```text
-http://127.0.0.1:8000/dashboard
-```
+Research software · Human decisions · No return guarantees
 
-Operational checks:
-
-```text
-http://127.0.0.1:8000/health/ready
-```
-
-`/health` only confirms that the web process is alive. `/health/ready` also checks
-PostgreSQL and whether the CN/US Parquet lake has reached the latest completed
-market session. The API rejects future-dated CN/US bars and all lake reads ignore
-future dates, so a provider clock error cannot silently become a model signal.
-
-
-## Notes On Storage
-
-- PostgreSQL is the supported primary app database.
-- Parquet is the primary market history storage format.
-- DuckDB queries the Parquet lake directly for fast scans.
-- The application is PostgreSQL-only at runtime. Set `PQW_DATABASE_URL` before starting the app or jobs.
-
-## Documentation
-
-- [项目介绍（中文）](docs/project-introduction-zh.md)
-- [产品目标方案（中文）](docs/amateur-quant-workbench-roadmap-zh.md)
-- [验收清单（中文）](docs/amateur-quant-workbench-acceptance-checklist-zh.md)
-
-## Current Status
-
-The project has reached a stage where it can be used as an amateur trader's daily review workbench:
-
-- the main post-close pipeline is in place
-- model screening is largely precomputed
-- watchlist and portfolio workflows are connected
-- AI daily reports and history are available
-- ops pages can be used to inspect failures and stale jobs
-
-The remaining work is mainly around deeper attribution, broader concept coverage, and continued data-quality hardening, not basic workflow completeness.
+</div>

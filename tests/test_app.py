@@ -1,4 +1,5 @@
 import os
+from tests.postgres_safety import require_test_database_url, check_test_engine, truncate_test_tables
 import tempfile
 import unittest
 import json
@@ -17,8 +18,12 @@ from app.services.repository import DashboardReadRepository
 
 class AppFlowTests(unittest.TestCase):
     def setUp(self) -> None:
+        require_test_database_url()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.temp_path = Path(self.temp_dir.name)
+        # Snapshot the process environment before any test mutates it, so the
+        # tearDown restore also undoes leaks from individual test methods.
+        self._environ_snapshot = dict(os.environ)
         self._set_test_environment()
         from app.services.runtime_cache import clear_namespace
 
@@ -48,13 +53,13 @@ class AppFlowTests(unittest.TestCase):
             clear_namespace(namespace)
         reset_settings_cache()
         configure_database()
+        check_test_engine(db_module.engine)
         init_db()
         # The application is PostgreSQL-only. Keep the suite isolated by
         # truncating the dedicated test database between examples instead of
         # relying on the removed SQLite fallback.
         with db_module.engine.begin() as connection:
-            for table in reversed(Base.metadata.sorted_tables):
-                connection.execute(text(f'TRUNCATE TABLE "{table.name}" RESTART IDENTITY CASCADE'))
+            truncate_test_tables(connection, Base.metadata)
 
         from app.api.main import app
 
@@ -86,27 +91,11 @@ class AppFlowTests(unittest.TestCase):
             "watchlist_table_fragment",
         ):
             clear_namespace(namespace)
-        for key in (
-            "PQW_STORAGE_DIR",
-            "PQW_DATA_DIR",
-            "PQW_RAW_DATA_DIR",
-            "PQW_NORMALIZED_DATA_DIR",
-            "PQW_QLIB_DATA_DIR",
-            "PQW_ARTIFACTS_DIR",
-            "PQW_TUSHARE_TOKEN",
-            "PQW_POSTGRES_POOL_SIZE",
-            "PQW_POSTGRES_MAX_OVERFLOW",
-            "PQW_POSTGRES_POOL_TIMEOUT_SECONDS",
-            "PQW_POSTGRES_POOL_RECYCLE_SECONDS",
-            "PQW_POSTGRES_CONNECT_TIMEOUT_SECONDS",
-            "PQW_POSTGRES_STATEMENT_TIMEOUT_MS",
-            "PQW_POSTGRES_IDLE_TRANSACTION_TIMEOUT_MS",
-            "PQW_POSTGRES_APPLICATION_NAME",
-            "PQW_AUTH_USERNAME",
-            "PQW_AUTH_PASSWORD",
-            "PQW_AUTH_SECRET",
-        ):
-            os.environ.pop(key, None)
+        # Full restore instead of a fixed pop list: individual test methods
+        # set extra PQW_* variables (notifications, provider tokens, ...) that
+        # previously leaked into later test modules and flipped their settings.
+        os.environ.clear()
+        os.environ.update(self._environ_snapshot)
 
         reset_settings_cache()
         self.temp_dir.cleanup()
@@ -125,13 +114,11 @@ class AppFlowTests(unittest.TestCase):
         os.environ["PQW_NORMALIZED_DATA_DIR"] = str(normalized_dir)
         os.environ["PQW_QLIB_DATA_DIR"] = str(qlib_dir)
         os.environ["PQW_ARTIFACTS_DIR"] = str(artifacts_dir)
-        os.environ["PQW_DATABASE_URL"] = os.environ.get(
-            "PQW_TEST_DATABASE_URL",
-            "postgresql+psycopg://quant:quant!123@127.0.0.1:5432/quant_test",
-        )
+        os.environ["PQW_DATABASE_URL"] = require_test_database_url()
         os.environ["PQW_AUTH_USERNAME"] = "admin"
         os.environ["PQW_AUTH_PASSWORD"] = "admin1234"
         os.environ["PQW_AUTH_SECRET"] = "test-secret"
+        os.environ["PQW_STORAGE_CAPACITY_MONITOR_ENABLED"] = "false"
 
     def _login(self) -> None:
         response = self.client.post(
@@ -151,11 +138,12 @@ class AppFlowTests(unittest.TestCase):
             )
 
     def _write_price_history(self, ticker: str, rows: list[dict]) -> None:
-        raw_path = self.temp_path / "data" / "raw" / f"{ticker}.csv"
-        normalized_path = self.temp_path / "data" / "normalized" / f"{ticker}.csv"
-        frame = pd.DataFrame(rows)
-        frame.to_csv(raw_path, index=False)
-        frame.to_csv(normalized_path, index=False)
+        from app.services.market_lake import write_ohlcv_rows_to_lake
+        from app.services.ticker_format import infer_market_from_ticker, normalize_ticker_for_market
+
+        market = infer_market_from_ticker(ticker)
+        symbol = normalize_ticker_for_market(ticker, market)
+        write_ohlcv_rows_to_lake(market=market, rows=[{**row, "symbol": symbol} for row in rows])
 
     def _build_bullish_cn_history(self) -> list[dict]:
         rows: list[dict] = []
@@ -185,7 +173,7 @@ class AppFlowTests(unittest.TestCase):
             low = round(min(open_value, close) - 0.05, 2)
             rows.append(
                 {
-                    "date": f"2026-03-{index + 1:02d}",
+                    "date": (pd.Timestamp("2026-03-01") + pd.Timedelta(days=index)).strftime("%Y-%m-%d"),
                     "open": open_value,
                     "high": high,
                     "low": low,
@@ -219,7 +207,7 @@ class AppFlowTests(unittest.TestCase):
             close = round(12.0 - index * 0.04, 2)
             rows.append(
                 {
-                    "date": f"2026-03-{index + 1:02d}",
+                    "date": (pd.Timestamp("2026-03-01") + pd.Timedelta(days=index)).strftime("%Y-%m-%d"),
                     "open": round(close + 0.06, 2),
                     "high": round(close + 0.12, 2),
                     "low": round(close - 0.12, 2),
@@ -242,7 +230,7 @@ class AppFlowTests(unittest.TestCase):
             close = round(11.8 - index * 0.05, 2)
             rows.append(
                 {
-                    "date": f"2026-03-{index + 1:02d}",
+                    "date": (pd.Timestamp("2026-03-01") + pd.Timedelta(days=index)).strftime("%Y-%m-%d"),
                     "open": round(close + 0.05, 2),
                     "high": round(close + 0.1, 2),
                     "low": round(close - 0.1, 2),
@@ -343,17 +331,15 @@ class AppFlowTests(unittest.TestCase):
 
     def test_sample_workflow_populates_dashboard_and_symbol_pages(self) -> None:
         from app.services.backtester import BacktestRunner
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seeded = seed_sample_data()
-        build_result = build_dataset(normalize_only=True)
         predictions_written = SignalTrainer().train(run_name="sample_flow", signal_type="momentum", lookback_days=3)
         daily_rows_written = BacktestRunner().run(top_n=1)
 
         self.assertGreaterEqual(len(seeded), 3)
-        self.assertGreaterEqual(len(build_result["normalized_files"]), 3)
+        self.assertTrue(all(item["lake_paths"] for item in seeded))
         self.assertGreater(predictions_written, 0)
         self.assertGreater(daily_rows_written, 0)
 
@@ -378,6 +364,7 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("text/html", data_sources_response.headers.get("content-type", ""))
         self.assertIn("Where This App Gets Data", data_sources_response.text)
         self.assertIn("Per Symbol Sync Source", data_sources_response.text)
+
         self.assertIn("CN Concepts", data_sources_response.text)
 
         insight_response = self.client.get("/insights/ASTS")
@@ -393,15 +380,159 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("趋势评分", insight_zh_response.text)
         self.assertIn("买入观察区", insight_zh_response.text)
 
+    def test_manual_backtest_defaults_to_event_driven_v2(self) -> None:
+        with patch("app.api.routes.jobs.BacktestRunner.run", return_value=4) as mocked_run:
+            response = self.client.post(
+                "/jobs/backtest",
+                data={"top_n": "3", "model_run_id": "latest"},
+            )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual("success", payload["status"])
+        self.assertEqual("event_driven_daily_v2", payload["engine_version"])
+        self.assertEqual(
+            "event_driven_daily_v2",
+            mocked_run.call_args.kwargs["engine_version"],
+        )
+
+    def test_model_performance_page_does_not_scan_market_lake_inline(self) -> None:
+        from app.services.runtime_cache import clear_namespace
+
+        for namespace in (
+            "dashboard_model_run_performance",
+            "dashboard_watchlist_post_add_performance",
+            "dashboard_recommendation_validation",
+            "template_eval_next_tesla",
+            "template_eval_technical_momentum",
+            "template_eval_lightgbm",
+            "template_eval_lightgbm_prediction",
+        ):
+            clear_namespace(namespace)
+        with patch(
+            "app.api.routes.dashboard.load_lake_rows",
+            side_effect=AssertionError("model performance page must not scan the lake inline"),
+        ), patch(
+            "app.api.routes.dashboard.load_lake_price_history",
+            side_effect=AssertionError("model performance page must not load price history inline"),
+        ):
+            response = self.client.get("/dashboard/model-performance?lang=zh&market=CN")
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn("模型评测总览", response.text)
+
+    def test_backtest_execution_audit_tables_and_detail_routes(self) -> None:
+        from app.core.db import SessionLocal
+        from app.services.repository import StrategyRunRepository
+
+        with SessionLocal() as db:
+            repo = StrategyRunRepository(db)
+            run = repo.create_run(
+                model_run_id=None,
+                name="event_audit_fixture",
+                strategy_type="event_driven_top_n",
+                start_date="2026-01-05",
+                end_date="2026-01-06",
+                config={"engine_version": "event_driven_daily_v2"},
+                status="running",
+            )
+            run_id = run.id
+            counts = repo.replace_execution_audit(
+                run_id,
+                orders=[
+                    {
+                        "order_id": "order-1",
+                        "insight_id": "prediction:1",
+                        "ticker": "000001.SZ",
+                        "side": "buy",
+                        "signal_date": "2026-01-05",
+                        "effective_date": "2026-01-06",
+                        "order_type": "market_on_open",
+                    },
+                    {
+                        "order_id": "order-2",
+                        "insight_id": "prediction:2",
+                        "ticker": "000002.SZ",
+                        "side": "buy",
+                        "signal_date": "2026-01-05",
+                        "effective_date": "2026-01-06",
+                        "order_type": "market_on_open",
+                    },
+                ],
+                fills=[
+                    {
+                        "order_id": "order-1",
+                        "insight_id": "prediction:1",
+                        "ticker": "000001.SZ",
+                        "side": "buy",
+                        "fill_date": "2026-01-06",
+                        "quantity": 100.0,
+                        "reference_price": 10.0,
+                        "fill_price": 10.01,
+                        "fee": 0.8,
+                        "slippage": 1.0,
+                        "notional": 1001.0,
+                    }
+                ],
+                rejects=[
+                    {
+                        "order_id": "order-2",
+                        "ticker": "000002.SZ",
+                        "side": "buy",
+                        "effective_date": "2026-01-06",
+                        "reject_reason": "suspended_or_no_volume",
+                    }
+                ],
+                portfolio_states=[
+                    {
+                        "trade_date": "2026-01-06",
+                        "cash": 8998.2,
+                        "position_market_value": 1000.0,
+                        "nav": 9998.2,
+                        "gross_exposure": 0.100018,
+                        "net_exposure": 0.100018,
+                        "cumulative_fees": 0.8,
+                        "cumulative_slippage": 1.0,
+                        "open_lots": 1,
+                    }
+                ],
+            )
+            repo.complete_run(
+                run_id,
+                status="success",
+                summary={
+                    "engine_version": "event_driven_daily_v2",
+                    "total_return": -0.00018,
+                    "audit_storage": "normalized_tables_v1",
+                },
+            )
+
+        self.assertEqual(
+            {"orders": 2, "fills": 1, "rejects": 1, "portfolio_states": 1},
+            counts,
+        )
+        detail = self.client.get(f"/backtests/{run_id}")
+        self.assertEqual(200, detail.status_code)
+        self.assertEqual(2, detail.json()["audit_counts"]["orders"])
+        trades = self.client.get(f"/backtests/{run_id}/trades")
+        self.assertEqual(200, trades.status_code)
+        self.assertEqual(["filled", "rejected"], [row["status"] for row in trades.json()])
+        rejected = self.client.get(f"/backtests/{run_id}/trades?status=rejected")
+        self.assertEqual("suspended_or_no_volume", rejected.json()[0]["reject_reason"])
+        states = self.client.get(f"/backtests/{run_id}/portfolio-states")
+        self.assertEqual(9998.2, states.json()[0]["nav"])
+        page = self.client.get(f"/backtests/{run_id}/view?lang=zh")
+        self.assertEqual(200, page.status_code)
+        self.assertIn("回测执行审计", page.text)
+        self.assertIn("000002.SZ", page.text)
+
     def test_dashboard_summary_includes_market_context(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="dashboard_context_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol = SymbolRepository(db).get_by_ticker("AAPL")
@@ -441,14 +572,12 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("top_tags", payload["market_context"]["risk_overview"])
 
     def test_dashboard_page_supports_lookback_snapshot_window(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="dashboard_lookback_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol = SymbolRepository(db).get_by_ticker("AAPL")
@@ -467,12 +596,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("Continuous Leaders", response.text)
 
     def test_dashboard_page_supports_chinese_language(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="dashboard_zh_demo", signal_type="momentum", lookback_days=3)
 
         with patch(
@@ -501,12 +628,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("dashboard-top-panels", response.text)
 
     def test_dashboard_home_panels_fragment_renders_market_headlines(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="dashboard_fragment_demo", signal_type="momentum", lookback_days=3)
 
         with patch(
@@ -522,12 +647,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("Asia equities hold gains into the close", response.text)
 
     def test_dashboard_top_fragment_renders_risk_and_signals(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="dashboard_top_fragment_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/top-fragment?lang=zh&lookback_runs=3")
@@ -538,12 +661,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("ASTS", response.text)
 
     def test_dashboard_home_panels_are_cached_between_requests(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="dashboard_cache_demo", signal_type="momentum", lookback_days=3)
 
         with patch(
@@ -562,12 +683,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual(1, headline_mock.call_count)
 
     def test_dashboard_summary_is_cached_between_requests(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="dashboard_summary_cache_demo", signal_type="momentum", lookback_days=3)
 
         with patch(
@@ -582,12 +701,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual(1, market_context_mock.call_count)
 
     def test_dashboard_watchlist_derived_context_is_cached_between_requests(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="dashboard_watchlist_cache_demo", signal_type="momentum", lookback_days=3)
 
         with patch(
@@ -643,15 +760,16 @@ class AppFlowTests(unittest.TestCase):
             }
         )
 
-        response = self.client.get("/dashboard/ai-daily-report")
+        response = self.client.get("/dashboard/ai-daily-report?lang=zh")
 
         self.assertEqual(200, response.status_code)
         self.assertIn("AI 每日决策面板", response.text)
         self.assertIn("ASTS", response.text)
         self.assertIn("偏进攻", response.text)
         self.assertIn("市场更适合围绕强势股做顺势交易", response.text)
-        self.assertIn("Buy The Dip 10", response.text)
-        self.assertIn("600330.SS", response.text)
+        self.assertIn("二、明日可执行买入池", response.text)
+        self.assertIn("AST SpaceMobile", response.text)
+        self.assertNotIn("强势观察池", response.text)
 
     def test_dashboard_ai_daily_report_message_page_renders(self) -> None:
         from app.services.ai_daily_report import render_ai_daily_report_message, save_ai_daily_report
@@ -697,7 +815,9 @@ class AppFlowTests(unittest.TestCase):
 
         self.assertEqual(200, response.status_code)
         self.assertIn("Push Ready", response.text)
-        self.assertIn("AI 每日决策面板", response.text)
+        self.assertIn("今日 AI 决策面板偏进攻", response.text)
+        self.assertIn("AST SpaceMobile（ASTS）", response.text)
+        self.assertNotIn("强势观察池", response.text)
         self.assertIn("ASTS", response.text)
         message = render_ai_daily_report_message(
             {
@@ -736,8 +856,8 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("买入区：10.2 - 10.6", message)
         self.assertIn("止盈区：11.2 - 11.8", message)
         self.assertIn("策略主线：市场更适合围绕强势股做顺势交易", message)
-        self.assertIn("Buy The Dip 候选", message)
-        self.assertIn("600330.SS", message)
+        self.assertIn("AST SpaceMobile（ASTS）", message)
+        self.assertNotIn("强势观察池", message)
 
     def test_send_ai_daily_report_endpoint_uses_notifier(self) -> None:
         from app.services.ai_daily_report import save_ai_daily_report
@@ -1136,12 +1256,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("布林带收口", focus_page.text)
 
     def test_dashboard_market_page_supports_chinese_language(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="dashboard_market_zh_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/market?lang=zh&lookback_runs=3")
@@ -1157,12 +1275,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("最少买点数", response.text)
 
     def test_dashboard_market_heatmap_page_supports_chinese_language(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="dashboard_market_heatmap_zh_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/market/heatmap?lang=zh&lookback_runs=3")
@@ -1179,12 +1295,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("最强", response.text)
 
     def test_dashboard_market_concepts_page_supports_chinese_language(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="dashboard_market_concepts_zh_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/market/concepts?lang=zh&lookback_runs=3")
@@ -1199,14 +1313,12 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("执行提醒", response.text)
 
     def test_dashboard_market_concepts_page_supports_signal_filter(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="market_concepts_signal_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -1225,14 +1337,12 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("signal_filter=BUY", response.text)
 
     def test_dashboard_market_concepts_page_supports_min_buy_signal_count(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="market_concepts_buy_count_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -1253,13 +1363,11 @@ class AppFlowTests(unittest.TestCase):
 
         from app.core.db import SessionLocal
         from app.models.tables import ModelRun, Prediction
-        from app.services.dataset_build import build_dataset
         from app.services.repository import ConceptSnapshotRepository, PredictionTradePlanRepository, SymbolRepository
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="market_execution_tag_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -1313,13 +1421,11 @@ class AppFlowTests(unittest.TestCase):
 
         from app.core.db import SessionLocal
         from app.models.tables import ModelRun, Prediction
-        from app.services.dataset_build import build_dataset
         from app.services.repository import ConceptSnapshotRepository, PredictionTradePlanRepository, SymbolRepository
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="market_execution_tag_exclude_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -1354,13 +1460,11 @@ class AppFlowTests(unittest.TestCase):
 
         from app.core.db import SessionLocal
         from app.models.tables import ModelRun, Prediction
-        from app.services.dataset_build import build_dataset
         from app.services.repository import ConceptSnapshotRepository, PredictionTradePlanRepository, SymbolRepository, WatchlistRepository
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="multi_execution_tag_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -1417,14 +1521,12 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("No concept heatmap yet", market_heatmap.text)
 
     def test_dashboard_market_concepts_page_supports_sorting_links(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="market_concepts_sort_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -1441,14 +1543,12 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("concept_sort_order=asc", response.text)
 
     def test_dashboard_market_concepts_export_csv_returns_rows(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="market_concepts_export_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -1469,12 +1569,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("Consumer Electronics", response.text)
 
     def test_dashboard_ops_page_supports_chinese_language(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="dashboard_ops_zh_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/ops?lang=zh&lookback_runs=3")
@@ -1514,11 +1612,9 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("部分完成", report.text)
 
     def test_dashboard_ops_sync_page_supports_chinese_language(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
 
         response = self.client.get("/dashboard/ops/sync?lang=zh&lookback_runs=3")
 
@@ -1534,6 +1630,14 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("offset", response.text)
         self.assertIn("batch_size", response.text)
         self.assertIn("去全市场技术选股", response.text)
+        self.assertIn("七项齐全股票", response.text)
+        self.assertIn("横截面采集门禁", response.text)
+        self.assertIn("最近收盘严格可用门禁", response.text)
+        self.assertIn("七项在该截点全部可用", response.text)
+        self.assertIn("A股前瞻 Shadow", response.text)
+        self.assertIn("仅观察，不进入生产推荐", response.text)
+        self.assertIn("分批回填点时基本面", response.text)
+        self.assertIn("max_batches", response.text)
 
     def test_jobs_can_sync_cn_symbol_universe_and_init_cn_market_data(self) -> None:
         with patch(
@@ -1940,12 +2044,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertNotIn("830001.BJ", tickers)
 
     def test_dashboard_ops_models_page_supports_chinese_language(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="dashboard_ops_models_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/ops/models?lang=zh&lookback_runs=3")
@@ -1956,11 +2058,9 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("最近模型运行", response.text)
 
     def test_dashboard_ops_jobs_page_supports_chinese_language(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
 
         response = self.client.get("/dashboard/ops/jobs?lang=zh&lookback_runs=3")
 
@@ -1969,11 +2069,9 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("最近任务", response.text)
 
     def test_dashboard_data_sources_supports_chinese_language(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
 
         response = self.client.get("/dashboard/data-sources?lang=zh")
 
@@ -1984,14 +2082,12 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("A股概念", response.text)
 
     def test_dashboard_continuous_leader_action_adds_watchlist_item(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
         from app.services.repository import WatchlistRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="continuous_leader_action_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.post(
@@ -2010,14 +2106,12 @@ class AppFlowTests(unittest.TestCase):
             self.assertIn("AAPL", watchlist_map)
 
     def test_dashboard_can_add_top_continuous_leaders_to_watchlist(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
         from app.services.repository import WatchlistRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="continuous_leader_bulk_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.post(
@@ -2042,12 +2136,10 @@ class AppFlowTests(unittest.TestCase):
             self.assertEqual(1, only_item["sync_enabled"])
 
     def test_dashboard_continuous_leaders_page_supports_chinese_language(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="continuous_leaders_page_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/continuous-leaders?lang=zh&lookback_runs=3")
@@ -2060,12 +2152,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("最低强度", response.text)
 
     def test_dashboard_continuous_leaders_page_supports_signal_filter(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="continuous_leaders_signal_filter_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get(
@@ -2077,12 +2167,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("Min Strength", response.text)
 
     def test_dashboard_continuous_leaders_export_csv_returns_rows(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="continuous_leaders_export_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/continuous-leaders/export?lookback_runs=3")
@@ -2106,13 +2194,11 @@ class AppFlowTests(unittest.TestCase):
 
         from app.core.db import SessionLocal
         from app.models.tables import ModelRun, Prediction
-        from app.services.dataset_build import build_dataset
         from app.services.repository import PredictionTradePlanRepository, SymbolRepository
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="screener_execution_tag_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -2147,13 +2233,11 @@ class AppFlowTests(unittest.TestCase):
 
         from app.core.db import SessionLocal
         from app.models.tables import ModelRun, Prediction
-        from app.services.dataset_build import build_dataset
         from app.services.repository import PredictionTradePlanRepository, SymbolRepository
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="continuous_execution_tag_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -2186,7 +2270,6 @@ class AppFlowTests(unittest.TestCase):
         self.assertNotIn("/insights/AAPL?lang=en", exclude_response.text)
 
     def test_dashboard_concept_detail_adds_tickers_to_watchlist_and_syncs(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
@@ -2194,7 +2277,6 @@ class AppFlowTests(unittest.TestCase):
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository, WatchlistRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="concept_watchlist_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol = SymbolRepository(db).get_by_ticker("AAPL")
@@ -2252,14 +2334,12 @@ class AppFlowTests(unittest.TestCase):
             self.assertEqual(1, watchlist_map["AAPL"]["sync_enabled"])
 
     def test_dashboard_concept_detail_single_ticker_action_adds_watchlist_item(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository, WatchlistRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="concept_single_action_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol = SymbolRepository(db).get_by_ticker("AAPL")
@@ -2288,14 +2368,12 @@ class AppFlowTests(unittest.TestCase):
             self.assertIn("AAPL", watchlist_map)
 
     def test_dashboard_concept_detail_shows_sortable_columns_and_five_day_metric(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="concept_sort_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol = SymbolRepository(db).get_by_ticker("AAPL")
@@ -2317,7 +2395,6 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("sort_by=five_day", response.text)
 
     def test_dashboard_concept_detail_add_top_n_to_watchlist(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
@@ -2325,7 +2402,6 @@ class AppFlowTests(unittest.TestCase):
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository, WatchlistRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="concept_topn_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -2383,14 +2459,12 @@ class AppFlowTests(unittest.TestCase):
             self.assertNotIn("MSFT", watchlist_map)
 
     def test_dashboard_concept_detail_shows_top_movers_comparison(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="concept_compare_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -2419,14 +2493,12 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("20D %", response.text)
 
     def test_dashboard_concept_detail_supports_chinese_language(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="concept_zh_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol = SymbolRepository(db).get_by_ticker("AAPL")
@@ -2455,14 +2527,12 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("R/R ", response.text)
 
     def test_dashboard_concept_detail_supports_signal_strength_filter(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="concept_signal_strength_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -2479,15 +2549,51 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("Min Strength", response.text)
 
     def test_insight_model_output_endpoint_and_page(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
         from app.core.db import SessionLocal
         from app.services.repository import FundamentalSnapshotRepository, SymbolRepository
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
-        SignalTrainer().train(run_name="insight_model_demo", signal_type="momentum", lookback_days=3)
+        fixture_tickers = ["AAPL", "MSFT", "ASTS", *[f"QF{index:02d}" for index in range(7)]]
+        fixture_dates = pd.bdate_range("2025-06-02", periods=180)
+        for ticker_index, fixture_ticker in enumerate(fixture_tickers):
+            self._write_price_history(
+                fixture_ticker,
+                [
+                    {
+                        "date": day.date().isoformat(),
+                        "symbol": fixture_ticker,
+                        "open": 100.0 + ticker_index + index * 0.2,
+                        "high": 100.8 + ticker_index + index * 0.2,
+                        "low": 99.6 + ticker_index + index * 0.2,
+                        "close": 100.4 + ticker_index + index * 0.2,
+                        "volume": 1_000_000 + ticker_index * 10_000 + index * 1_000,
+                        "adj_close": 100.4 + ticker_index + index * 0.2,
+                    }
+                    for index, day in enumerate(fixture_dates)
+                ],
+            )
+        with SessionLocal() as db:
+            symbol_repo = SymbolRepository(db)
+            for fixture_ticker in fixture_tickers:
+                symbol_repo.get_or_create_symbol(
+                    SymbolCreate(
+                        ticker=fixture_ticker,
+                        name=fixture_ticker,
+                        market="US",
+                        exchange="NASDAQ",
+                    )
+                )
+        SignalTrainer().train(
+            run_name="insight_model_demo",
+            model_type="lightgbm",
+            signal_type="momentum",
+            lookback_days=3,
+            tickers=fixture_tickers,
+            market="US",
+            universe="insight_test_fixture",
+        )
         with SessionLocal() as db:
             symbol = SymbolRepository(db).get_by_ticker("AAPL")
             self.assertIsNotNone(symbol)
@@ -2538,32 +2644,29 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("feature_contributions", payload)
         self.assertIn("positive", payload["feature_contributions"])
         self.assertTrue(payload["feature_contributions"]["positive"])
+        self.assertIn(
+            payload["feature_contributions"]["availability_status"],
+            {"materialized_hot", "loaded_cold"},
+        )
+        self.assertTrue(payload["feature_contributions"]["source_layer"])
         self.assertIsNotNone(payload["expected_drawdown_20d"])
         self.assertIsNotNone(payload["model_reward_risk_ratio"])
         self.assertIsNotNone(payload["target_horizon_days"])
+        contribution_names = {
+            item["feature_name"]
+            for item in payload["feature_contributions"]["positive"]
+            + payload["feature_contributions"]["negative"]
+        }
         self.assertTrue(
-            any(
-                item["feature_name"] == "recent_daily_return"
-                for item in payload["feature_contributions"]["positive"] + payload["feature_contributions"]["negative"]
-            )
-        )
-        self.assertTrue(
-            any(
-                item["feature_name"].startswith("lag_return_")
-                for item in payload["feature_contributions"]["positive"] + payload["feature_contributions"]["negative"]
-            )
-        )
-        self.assertTrue(
-            any(
-                item["feature_name"] == "price_vs_ma20"
-                for item in payload["feature_contributions"]["positive"] + payload["feature_contributions"]["negative"]
-            )
-        )
-        self.assertTrue(
-            any(
-                item["feature_name"] == "volume_ratio_20d"
-                for item in payload["feature_contributions"]["positive"] + payload["feature_contributions"]["negative"]
-            )
+            contribution_names
+            & {
+                "recent_daily_return",
+                "price_vs_ma20",
+                "volume_ratio_20d",
+                "lag_return_1",
+                "lag_return_2",
+                "lag_return_3",
+            }
         )
 
         chart_response = self.client.get("/insights/AAPL/chart-data?lang=en")
@@ -2591,28 +2694,15 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("Top Drivers", page_response.text)
         self.assertIn("Feature Contributions", page_response.text)
         self.assertIn("Positive Drivers", page_response.text)
+        self.assertIn("Loaded from the online materialized explanation layer.", page_response.text)
         self.assertIn("Recent Daily Return", page_response.text)
-        self.assertIn("Lagged Return", page_response.text)
-        self.assertIn("Price vs MA20", page_response.text)
-        self.assertIn("Volume Ratio (20D)", page_response.text)
-        self.assertIn("PE TTM stays reasonable", page_response.text)
+        self.assertIn("Net profit growth is strong", page_response.text)
         self.assertIn("interactive-chart", page_response.text)
 
     def test_insight_page_renders_when_model_output_is_missing(self) -> None:
-        from app.core.config import get_settings
         from app.core.db import SessionLocal
         from app.models.schema import SymbolCreate
         from app.services.repository import SymbolRepository
-
-        settings = get_settings()
-        path = settings.normalized_data_dir / "0100.HK.csv"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            "date,symbol,open,high,low,close,volume,adj_close,dividend,split_ratio\n"
-            "2026-04-01,0100.HK,1160,1221,1072,1084,1634305,1084,,\n"
-            "2026-04-02,0100.HK,1100,1124,992,1010,1297992,1010,,\n",
-            encoding="utf-8",
-        )
 
         with SessionLocal() as db:
             SymbolRepository(db).get_or_create_symbol(
@@ -3297,13 +3387,11 @@ class AppFlowTests(unittest.TestCase):
 
         from app.core.db import SessionLocal
         from app.models.tables import ModelRun, Prediction
-        from app.services.dataset_build import build_dataset
         from app.services.repository import PredictionTradePlanRepository, SymbolRepository, WatchlistRepository
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="watchlist_execution_tag_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -3402,12 +3490,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("美股", response.text)
 
     def test_screener_page_filters_watchlist_rules(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="screener_model_context", signal_type="momentum", lookback_days=3)
         self.client.post(
             "/watchlist/add",
@@ -3728,23 +3814,19 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual(303, add_response.status_code)
 
         with patch(
-            "app.api.routes.portfolio.safe_symbol_analysis",
-            return_value={"latest_close": 21.0, "decision": "BUY", "confidence": 80, "score": 6},
+            "app.api.routes.portfolio.load_latest_closes",
+            return_value={"ASTS": 21.0},
         ), patch(
-            "app.api.routes.portfolio.AIAnalysisService.analyze_symbol",
-            return_value={
-                "headline": "ASTS remains constructive",
-                "verdict": "BUY",
-                "strategy": "进攻/顺势跟踪",
-            },
+            "app.api.routes.portfolio.PredictionRepository.get_latest_model_outputs_for_tickers",
+            return_value={"ASTS": {"score": 0.20}},
         ):
             response = self.client.get("/portfolio")
 
         self.assertEqual(200, response.status_code)
         self.assertIn("持仓", response.text)
         self.assertIn("ASTS", response.text)
-        self.assertIn("ASTS remains constructive", response.text)
-        self.assertIn("进攻/顺势跟踪", response.text)
+        self.assertIn("已有较好浮盈", response.text)
+        self.assertIn("持有跟踪", response.text)
 
     def test_portfolio_export_and_import_round_trip(self) -> None:
         add_response = self.client.post(
@@ -3777,11 +3859,8 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual(303, import_response.status_code)
 
         with patch(
-            "app.api.routes.portfolio.safe_symbol_analysis",
-            return_value={"latest_close": 21.0, "decision": "BUY", "confidence": 80, "score": 6},
-        ), patch(
-            "app.api.routes.portfolio.AIAnalysisService.analyze_symbol",
-            return_value={"headline": "ASTS remains constructive", "verdict": "BUY", "strategy": "进攻/顺势跟踪"},
+            "app.api.routes.portfolio.load_latest_closes",
+            return_value={"ASTS": 21.0},
         ):
             page = self.client.get("/portfolio")
 
@@ -3839,12 +3918,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("Auto-enable Sync for added stocks", response.text)
 
     def test_screener_page_supports_chinese_language(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="screener_model_context_zh", signal_type="momentum", lookback_days=3)
 
         response = self.client.get(
@@ -3869,12 +3946,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertIn("最低信号强度", response.text)
 
     def test_screener_page_supports_snapshot_persistence_filter(self) -> None:
-        from app.services.dataset_build import build_dataset
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
         seed_sample_data()
-        build_dataset(normalize_only=True)
         SignalTrainer().train(run_name="snapshot_filter_one", signal_type="momentum", lookback_days=3)
         SignalTrainer().train(run_name="snapshot_filter_two", signal_type="momentum", lookback_days=4)
 
@@ -4661,7 +4736,7 @@ class AppFlowTests(unittest.TestCase):
             with patch.object(TushareClient, "fetch_cn_growth_value_candidates", return_value=fake_rows):
                 response = self.client.post(
                     "/jobs/sync-cn-fundamentals",
-                    data={"tickers": "600519.SH"},
+                    data={"tickers": "600519.SH", "provider": "tushare"},
                 )
 
         self.assertEqual(200, response.status_code)
@@ -4675,6 +4750,260 @@ class AppFlowTests(unittest.TestCase):
         self.assertIsNotNone(latest)
         self.assertEqual(24.3, latest["pe_ttm"])
         self.assertEqual(28.5, latest["roe_avg_3y"])
+
+    def test_cn_snapshot_repositories_can_write_physical_tables_only(self) -> None:
+        from app.core.config import reset_settings_cache
+        from app.core.db import SessionLocal
+        from app.services.repository import (
+            FundamentalSnapshotRepository,
+            PointInTimeFeatureSnapshotRepository,
+            SymbolRepository,
+            TechnicalSnapshotRepository,
+        )
+
+        os.environ["PQW_MARKET_PHYSICAL_SNAPSHOT_DUAL_WRITE_LEGACY"] = "false"
+        reset_settings_cache()
+        try:
+            with SessionLocal() as db:
+                symbol = SymbolRepository(db).get_or_create_symbol(
+                    SymbolCreate(
+                        ticker="600519.SS",
+                        name="Kweichow Moutai",
+                        market="CN",
+                        exchange="SSE",
+                    )
+                )
+                fundamental = FundamentalSnapshotRepository(db).upsert_snapshot(
+                    symbol_id=int(symbol.id),
+                    report_date="2026-06-30",
+                    source="physical-only-test",
+                    pe_ttm=22.5,
+                )
+                point_in_time, inserted = PointInTimeFeatureSnapshotRepository(
+                    db
+                ).append_snapshot(
+                    symbol_id=int(symbol.id),
+                    feature_name="pe_ttm",
+                    feature_value=22.5,
+                    event_time="2026-06-30T15:00:00+08:00",
+                    available_time="2026-07-01T09:00:00+08:00",
+                    ingested_time="2026-07-01T09:01:00+08:00",
+                    source="physical-only-test",
+                    source_record_id="600519.SS:2026-06-30",
+                    revision_id="r1",
+                )
+                technical = TechnicalSnapshotRepository(db).upsert_snapshot(
+                    symbol_id=int(symbol.id),
+                    as_of_date="2026-08-21",
+                    source="physical-only-test",
+                    limit_up_yesterday=False,
+                    volume_breakout=True,
+                    ma_cluster=False,
+                    bullish_ma_stack=True,
+                    macd_underwater_cross=False,
+                )
+                counts = dict(
+                    db.execute(
+                        text(
+                            "SELECT 'fundamental_snapshots', count(*) FROM fundamental_snapshots "
+                            "UNION ALL SELECT 'point_in_time_feature_snapshots', count(*) FROM point_in_time_feature_snapshots "
+                            "UNION ALL SELECT 'technical_snapshots', count(*) FROM technical_snapshots "
+                            "UNION ALL SELECT 'cn_fundamental_snapshots', count(*) FROM cn_fundamental_snapshots "
+                            "UNION ALL SELECT 'cn_point_in_time_features', count(*) FROM cn_point_in_time_features "
+                            "UNION ALL SELECT 'cn_technical_snapshots', count(*) FROM cn_technical_snapshots"
+                        )
+                    ).all()
+                )
+
+            self.assertEqual("cn_fundamental_snapshots", fundamental.__tablename__)
+            self.assertEqual("cn_point_in_time_features", point_in_time.__tablename__)
+            self.assertEqual("cn_technical_snapshots", technical.__tablename__)
+            self.assertTrue(inserted)
+            self.assertEqual(0, counts["fundamental_snapshots"])
+            self.assertEqual(0, counts["point_in_time_feature_snapshots"])
+            self.assertEqual(0, counts["technical_snapshots"])
+            self.assertEqual(1, counts["cn_fundamental_snapshots"])
+            self.assertEqual(1, counts["cn_point_in_time_features"])
+            self.assertEqual(1, counts["cn_technical_snapshots"])
+        finally:
+            os.environ.pop(
+                "PQW_MARKET_PHYSICAL_SNAPSHOT_DUAL_WRITE_LEGACY",
+                None,
+            )
+            reset_settings_cache()
+
+    def test_cn_point_in_time_fundamental_backfill_resumes_in_bounded_batches(self) -> None:
+        from app.core.db import SessionLocal
+        from app.services.cn_fundamentals import sync_cn_fundamentals
+        from app.services.repository import PointInTimeFeatureSnapshotRepository, SymbolRepository
+        from app.services.stock_selection.feature_availability import FUNDAMENTAL_FEATURE_NAMES
+
+        tickers = ["000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ"]
+        with SessionLocal() as db:
+            symbol_repo = SymbolRepository(db)
+            for ticker in tickers:
+                symbol_repo.get_or_create_symbol(
+                    SymbolCreate(ticker=ticker, name=ticker, market="CN", exchange="SZSE")
+                )
+
+        class FakeProvider:
+            name = "fixture_cn_fundamentals"
+            last_source_used = name
+            last_error = None
+            last_diagnostics = {}
+
+            def __init__(self) -> None:
+                self.calls: list[list[str]] = []
+
+            def is_configured(self) -> bool:
+                return True
+
+            def fetch_snapshots(self, requested: list[str], metadata=None) -> list[dict]:
+                self.calls.append(list(requested))
+                self.last_diagnostics = {"requested_tickers": len(requested)}
+                return [
+                    {
+                        "ticker": ticker,
+                        "report_date": "2026-03-31",
+                        "available_time": "2026-04-25T23:59:59+08:00",
+                        "ingested_time": "2026-04-25T23:59:59+08:00",
+                        "source_record_id": f"fixture:{ticker}:2026-03-31",
+                        "revision_id": "fixture-r1",
+                        "revision_history_preserved": True,
+                        "pe_ttm": 10.0,
+                        "dividend_yield": 2.0,
+                        "market_cap": 1000000000.0,
+                        "roe_avg_3y": 12.0,
+                        "net_profit_yoy": 8.0,
+                        "revenue_yoy": 6.0,
+                        "debt_to_assets": 35.0,
+                        "raw_data": {"fixture": True},
+                    }
+                    for ticker in requested
+                ]
+
+        provider = FakeProvider()
+        progress_rows: list[dict] = []
+        with patch("app.services.cn_fundamentals.list_lake_symbols", return_value=tickers), patch(
+            "app.services.cn_fundamentals.resolve_fundamental_provider", return_value=provider
+        ):
+            result = sync_cn_fundamentals(
+                provider_name="community",
+                offset=1,
+                batch_size=2,
+                max_batches=1,
+                progress_callback=progress_rows.append,
+            )
+
+        self.assertEqual([["000002.SZ", "000003.SZ"]], provider.calls)
+        self.assertEqual("partial", result["status"])
+        self.assertEqual(3, result["next_offset"])
+        self.assertEqual(1, result["remaining_tickers"])
+        self.assertFalse(result["complete"])
+        self.assertEqual(14, result["point_in_time_values_written"])
+        self.assertEqual(3, progress_rows[-1]["next_offset"])
+
+        with SessionLocal() as db:
+            point_in_time_repo = PointInTimeFeatureSnapshotRepository(db)
+            coverage = point_in_time_repo.summarize_market_coverage(
+                "CN",
+                required_features=FUNDAMENTAL_FEATURE_NAMES,
+            )
+            as_of_coverage = point_in_time_repo.summarize_market_coverage_as_of(
+                "CN",
+                cutoff=datetime.fromisoformat("2026-04-26T16:00:00+08:00"),
+                required_features=FUNDAMENTAL_FEATURE_NAMES,
+                max_age_days={
+                    "pe_ttm": 7,
+                    "dividend_yield": 7,
+                    "market_cap": 7,
+                    "roe_avg_3y": 550,
+                    "net_profit_yoy": 550,
+                    "revenue_yoy": 550,
+                    "debt_to_assets": 550,
+                },
+            )
+            before_available = point_in_time_repo.summarize_market_coverage_as_of(
+                "CN",
+                cutoff=datetime.fromisoformat("2026-04-25T16:00:00+08:00"),
+                required_features=FUNDAMENTAL_FEATURE_NAMES,
+                max_age_days={name: 550 for name in FUNDAMENTAL_FEATURE_NAMES},
+            )
+
+        self.assertEqual(4, coverage["total_symbols"])
+        self.assertEqual(2, coverage["ready_symbol_count"])
+        self.assertEqual(50.0, coverage["ready_symbol_pct"])
+        self.assertEqual("COLLECTING", coverage["cross_section_gate"])
+        self.assertEqual(2, as_of_coverage["ready_symbol_count"])
+        self.assertEqual(50.0, as_of_coverage["ready_symbol_pct"])
+        self.assertEqual("COLLECTING", as_of_coverage["as_of_gate"])
+        self.assertEqual(0, before_available["ready_symbol_count"])
+
+        class EmptyProvider(FakeProvider):
+            def fetch_snapshots(self, requested: list[str], metadata=None) -> list[dict]:
+                self.calls.append(list(requested))
+                self.last_error = "fixture rate limit"
+                self.last_diagnostics = {"requested_tickers": len(requested)}
+                return []
+
+        empty_provider = EmptyProvider()
+        with patch("app.services.cn_fundamentals.list_lake_symbols", return_value=tickers), patch(
+            "app.services.cn_fundamentals.resolve_fundamental_provider", return_value=empty_provider
+        ):
+            failed = sync_cn_fundamentals(
+                provider_name="community",
+                offset=1,
+                batch_size=2,
+                max_batches=1,
+            )
+
+        self.assertEqual("failed", failed["status"])
+        self.assertEqual(3, failed["scanned_through_offset"])
+        self.assertEqual(1, failed["next_offset"])
+        self.assertFalse(failed["complete"])
+
+    def test_cn_post_close_shadow_fundamental_collection_has_an_independent_job_receipt(self) -> None:
+        from app.core.db import SessionLocal
+        from app.services.cn_market_scheduler import CNMarketSchedulerService
+        from app.services.repository import DataJobRepository
+
+        with SessionLocal() as db:
+            job = DataJobRepository(db).create_job(
+                job_type="sync_cn_fundamentals",
+                status="running",
+                params={"scope": "full_market_shadow", "trade_date": "2026-08-21"},
+            )
+            job_id = job.id
+
+        with patch(
+            "app.services.cn_market_scheduler.sync_cn_fundamentals",
+            return_value={
+                "status": "success",
+                "message": "fixture shadow collection complete",
+                "total_tickers": 4,
+                "next_offset": 4,
+                "remaining_tickers": 0,
+                "complete": True,
+                "failed_batch_count": 0,
+            },
+        ) as mocked_sync, patch.object(
+            CNMarketSchedulerService,
+            "_run_stock_selection_forward_shadow",
+            return_value={"status": "success"},
+        ) as mocked_shadow:
+            CNMarketSchedulerService._run_point_in_time_fundamental_collection(
+                job_id=job_id,
+                trade_date="2026-08-21",
+            )
+
+        mocked_sync.assert_called_once()
+        mocked_shadow.assert_called_once_with(source_job_id=job_id, feature_date="2026-08-21")
+        with SessionLocal() as db:
+            detail = DataJobRepository(db).get_job_detail(job_id)
+
+        self.assertEqual("success", detail["status"])
+        self.assertEqual("2026-08-21", detail["result"]["trade_date"])
+        self.assertTrue(detail["result"]["complete"])
 
     def test_sync_global_fundamentals_job_writes_snapshots(self) -> None:
         from app.core.db import SessionLocal
@@ -5006,26 +5335,6 @@ class AppFlowTests(unittest.TestCase):
         self.assertIsNotNone(record)
         self.assertEqual("MINIMAX-W", record["name"])
         self.assertEqual("0100.HK", record["ticker"])
-
-    def test_symbol_history_alias_reads_00100_from_0100_file(self) -> None:
-        from app.core.config import get_settings
-        from app.services.symbol_details import SymbolDataService
-
-        settings = get_settings()
-        path = settings.normalized_data_dir / "0100.HK.csv"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            "date,symbol,open,high,low,close,volume,adj_close,dividend,split_ratio\n"
-            "2026-03-12,0100.HK,1160,1221,1072,1084,1634305,1084,,\n"
-            "2026-03-13,0100.HK,1100,1124,992,1010,1297992,1010,,\n",
-            encoding="utf-8",
-        )
-
-        rows = SymbolDataService().get_history("00100.HK", limit=10)
-
-        self.assertEqual(2, len(rows))
-        self.assertEqual("2026-03-13", rows[-1]["date"])
-        self.assertEqual(1010.0, rows[-1]["close"])
 
     def test_hk_sync_retries_with_five_digit_alias(self) -> None:
         from app.core.db import SessionLocal
@@ -5808,10 +6117,12 @@ class AppFlowTests(unittest.TestCase):
 
         self.assertEqual("success", results[0]["status"])
         self.assertEqual(2, results[0]["rows"])
-        self.assertEqual(3, results[0]["stored_rows"])
-        merged = pd.read_csv(self.temp_path / "data" / "raw" / "600004.SS.csv")
-        self.assertEqual(["2026-04-01", "2026-04-02", "2026-04-03"], merged["date"].tolist())
-        self.assertEqual(10.35, round(float(merged.loc[merged["date"] == "2026-04-02", "close"].iloc[0]), 2))
+        self.assertTrue(results[0]["lake_paths"])
+        from app.services.market_lake import load_lake_price_history
+
+        merged = load_lake_price_history(market="CN", ticker="600004.SS", limit=10)
+        self.assertEqual(["2026-04-01", "2026-04-02", "2026-04-03"], [row["date"] for row in merged])
+        self.assertEqual(10.35, round(float(merged[1]["close"]), 2))
 
     def test_hk_history_falls_back_to_stockanalysis_when_other_sources_are_too_short(self) -> None:
         from app.services.openbb_client import HistoricalPriceRequest, OpenBBClient
@@ -6243,6 +6554,31 @@ class AppFlowTests(unittest.TestCase):
             self.assertIsNotNone(row.finished_at)
             self.assertIn("Manual cleanup closed a stale running job.", row.message or "")
 
+    def test_storage_retention_web_endpoint_blocks_destructive_apply(self) -> None:
+        from app.core.db import SessionLocal
+        from app.models.tables import DataJob
+        from sqlalchemy import func, select
+
+        with SessionLocal() as db:
+            before = int(db.scalar(select(func.count(DataJob.id))) or 0)
+
+        response = self.client.post(
+            "/jobs/cleanup-storage-retention",
+            data={
+                "confirm": "PURGE",
+                "keep_model_runs_per_market": "1",
+                "keep_workspace_snapshots_per_type": "1",
+            },
+        )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual("blocked", payload["status"])
+        self.assertIn("CLI-only", payload["message"])
+        with SessionLocal() as db:
+            after = int(db.scalar(select(func.count(DataJob.id))) or 0)
+        self.assertEqual(before, after)
+
     def test_prediction_replace_for_model_run_bulk_deletes_without_sqlite_variable_blowup(self) -> None:
         from app.core.db import SessionLocal
         from app.models.tables import Prediction
@@ -6316,7 +6652,7 @@ class AppFlowTests(unittest.TestCase):
         with SessionLocal() as db:
             run = ModelRunRepository(db).create_run(
                 name="market_date_scope_test",
-                model_type="local_baseline",
+                model_type="lightgbm_multifactor",
                 market="ALL",
                 universe="full_market",
                 train_start="2026-04-01",
@@ -6327,6 +6663,7 @@ class AppFlowTests(unittest.TestCase):
                 artifact_path=None,
                 status="success",
             )
+            production_run_id = run.id
             symbol_repo = SymbolRepository(db)
             cn_symbol = symbol_repo.get_by_ticker("600330.SS")
             us_symbol = symbol_repo.get_by_ticker("AAPL")
@@ -6354,9 +6691,35 @@ class AppFlowTests(unittest.TestCase):
             )
             db.commit()
 
+            research_run = ModelRunRepository(db).create_run(
+                name="newer_research_run_must_not_serve",
+                model_type="kronos_mini_validator",
+                market="CN",
+                universe="historical_candidate_pool",
+                train_start=None,
+                train_end=None,
+                test_start="2026-04-10",
+                test_end="2026-04-10",
+                config={"serving_role": "research"},
+                artifact_path=None,
+                status="success",
+            )
+            db.add(
+                Prediction(
+                    model_run_id=research_run.id,
+                    symbol_id=cn_symbol.id,
+                    trade_date="2026-04-10",
+                    score=0.99,
+                    rank_value=1,
+                    created_at=utc_now_iso(),
+                )
+            )
+            db.commit()
+
             rows = PredictionRepository(db).list_latest_predictions_for_market("CN", limit=10)
 
         self.assertEqual(["600330.SS"], [row["ticker"] for row in rows])
+        self.assertEqual(production_run_id, rows[0]["model_run_id"])
 
     def test_openbb_client_yfinance_download_uses_timeout(self) -> None:
         from app.services.openbb_client import HistoricalPriceRequest, OpenBBClient

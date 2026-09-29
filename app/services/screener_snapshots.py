@@ -10,15 +10,13 @@ from sqlalchemy.orm import Session
 from app.core.db import SessionLocal
 from app.models.tables import WorkspaceSnapshot
 from app.services.repository import (
-    PredictionRepository,
-    SymbolRepository,
     WorkspaceSnapshotRepository,
 )
 from app.services.market_lake import get_latest_lake_trade_date, screen_cn_lake_momentum, screen_us_lake_momentum
 from app.services.market_freshness import is_snapshot_as_of_current
 from app.services.market_freshness import latest_completed_market_date
 from app.services.screener import MODEL_TEMPLATES, ScreenerService
-from app.services.technical_patterns import TechnicalPatternService
+from app.services.stock_selection.screener_regime import build_screener_regime_diagnostics
 from app.services.time_utils import app_now_iso
 
 
@@ -177,6 +175,7 @@ SNAPSHOT_ROW_FIELDS = {
     "model_reward_risk_ratio",
     "model_expected_drawdown_20d",
     "tradability_status",
+    "is_tradable",
     "trade_readiness_score",
     "readiness_bucket",
     "readiness_reason",
@@ -713,18 +712,33 @@ def refresh_precomputed_screener_snapshots(
         try:
             rows = _screen_with_lake_preferred(params)
             persisted_rows = _compact_snapshot_rows(rows, limit=int(params.get("limit", 5000)))
+            updated_at = app_now_iso()
+            input_meta = _snapshot_input_meta(params)
             with SessionLocal() as snapshot_db:
+                stored_regime = (
+                    WorkspaceSnapshotRepository(snapshot_db).get_latest_snapshot("market_regime_snapshot:CN")
+                    if str(params.get("market") or "").strip().upper() == "CN"
+                    else None
+                ) or {}
+                regime_diagnostics = build_screener_regime_diagnostics(
+                    persisted_rows,
+                    market=str(params.get("market") or ""),
+                    input_market_date=input_meta.get("input_as_of_date"),
+                    decision_cutoff_at=updated_at,
+                    regime_snapshot=stored_regime.get("payload") if isinstance(stored_regime, dict) else None,
+                )
                 row = WorkspaceSnapshotRepository(snapshot_db).create_snapshot(
                     snapshot_type=screener_snapshot_type(params),
                     snapshot_date=app_now_iso(),
                     payload={
                         "key": screener_snapshot_key(params),
                         "rows": persisted_rows,
-                        "updated_at": app_now_iso(),
+                        "updated_at": updated_at,
                         "model_template": params["model_template"],
                         "market": params["market"],
                         "universe": params["universe"],
-                        "input": _snapshot_input_meta(params),
+                        "input": input_meta,
+                        "regime_diagnostics": regime_diagnostics,
                         "candidate_stats": {
                             "returned_count": len(rows),
                             "persisted_count": len(persisted_rows),
@@ -782,19 +796,34 @@ def refresh_precomputed_multi_screener_snapshots(
                     "Missing prerequisite snapshots: " + ", ".join(str(item) for item in meta.get("missing_templates") or [])
                 )
             persisted_rows = _compact_snapshot_rows(rows, limit=int(params.get("limit", 500)))
+            updated_at = app_now_iso()
+            input_meta = _snapshot_input_meta(params)
             with SessionLocal() as snapshot_db:
+                stored_regime = (
+                    WorkspaceSnapshotRepository(snapshot_db).get_latest_snapshot("market_regime_snapshot:CN")
+                    if str(params.get("market") or "").strip().upper() == "CN"
+                    else None
+                ) or {}
+                regime_diagnostics = build_screener_regime_diagnostics(
+                    persisted_rows,
+                    market=str(params.get("market") or ""),
+                    input_market_date=input_meta.get("input_as_of_date"),
+                    decision_cutoff_at=updated_at,
+                    regime_snapshot=stored_regime.get("payload") if isinstance(stored_regime, dict) else None,
+                )
                 row = WorkspaceSnapshotRepository(snapshot_db).create_snapshot(
                     snapshot_type=screener_snapshot_type(params),
                     snapshot_date=app_now_iso(),
                     payload={
                         "key": screener_snapshot_key(params),
                         "rows": persisted_rows,
-                        "updated_at": app_now_iso(),
+                        "updated_at": updated_at,
                         "preset_key": preset_key,
                         "preset_label": params.get("preset_label"),
                         "market": params["market"],
                         "universe": params["universe"],
-                        "input": _snapshot_input_meta(params),
+                        "input": input_meta,
+                        "regime_diagnostics": regime_diagnostics,
                         "multi_model_templates": params.get("multi_model_templates") or [],
                         "meta": meta,
                     },
@@ -846,105 +875,3 @@ def _screen_with_lake_preferred(params: dict) -> list[dict]:
         if rows:
             return ScreenerService().apply_candidate_governance(rows)
     return ScreenerService().screen(**params)
-
-
-def _build_limit_up_watch_snapshot_rows(db: Session) -> list[dict]:
-    symbol_repo = SymbolRepository(db)
-    prediction_repo = PredictionRepository(db)
-    technical_service = TechnicalPatternService()
-    symbols = [item for item in symbol_repo.list_symbols() if str(item.market or "").upper() == "CN"]
-    filtered: list[dict] = []
-    for symbol in symbols:
-        snapshot = technical_service.evaluate_ticker(symbol.ticker)
-        if snapshot is None:
-            continue
-        matched_patterns = [str(pattern).strip() for pattern in (snapshot.matched_patterns or []) if str(pattern).strip()]
-        if "今日涨停" not in matched_patterns:
-            continue
-        filtered.append(
-            {
-                "ticker": symbol.ticker,
-                "name": symbol.name,
-                "market": symbol.market,
-                "as_of_date": snapshot.as_of_date,
-                "matched_patterns": matched_patterns,
-                "volume_breakout": bool(snapshot.volume_breakout),
-                "bullish_ma_stack": bool(snapshot.bullish_ma_stack),
-            }
-        )
-    filtered.sort(
-        key=lambda item: (
-            -int(bool(item.get("volume_breakout"))),
-            -int(bool(item.get("bullish_ma_stack"))),
-            -len(item.get("matched_patterns") or []),
-            item.get("ticker") or "",
-        )
-    )
-    filtered = filtered[:120]
-    tickers = [item["ticker"] for item in filtered if item.get("ticker")]
-    symbol_map = symbol_repo.list_overviews_for_tickers(tickers)
-    model_outputs = prediction_repo.get_latest_model_outputs_for_tickers(tickers)
-
-    rows: list[dict] = []
-    for item in filtered:
-        ticker = item.get("ticker")
-        if not ticker:
-            continue
-        symbol = symbol_map.get(ticker) or {}
-        model_output = model_outputs.get(ticker) or {}
-        decision = prediction_repo._build_signal_decision(model_output) if model_output else {}
-        matched_patterns = list(item.get("matched_patterns") or [])
-        rows.append(
-            {
-                "ticker": ticker,
-                "name": symbol.get("name") or ticker,
-                "market": symbol.get("market") or "CN",
-                "as_of_date": item.get("as_of_date"),
-                "trend_score": None,
-                "action_label": "technical_pattern",
-                "action_summary": "Matched the selected technical pattern.",
-                "latest_close": None,
-                "momentum_5": None,
-                "momentum_20": None,
-                "volume_ratio": None,
-                "distance_to_breakout_pct": None,
-                "snapshot_hits": 0,
-                "snapshot_runs": 0,
-                "matched_patterns": matched_patterns,
-                "selection_reason": ", ".join(matched_patterns or ["今日涨停"]),
-                "model_summary": decision.get("summary_text"),
-                "model_highlights": [],
-                "model_state": decision.get("action_bucket"),
-                "model_confidence": decision.get("confidence"),
-                "model_signal_label": decision.get("signal_label"),
-                "model_signal_strength": decision.get("signal_strength"),
-                "model_conviction_bucket": decision.get("conviction_bucket"),
-                "model_position_size_hint": decision.get("position_size_hint"),
-                "model_entry_style": decision.get("entry_style"),
-                "model_execution_tags": decision.get("execution_tags", []) or [],
-                "model_percentile": decision.get("percentile"),
-                "model_horizon_days": decision.get("target_horizon_days"),
-                "model_reward_risk_ratio": decision.get("model_reward_risk_ratio"),
-                "model_expected_drawdown_20d": decision.get("expected_drawdown_20d"),
-                "tradability_status": decision.get("tradability_status"),
-                "target_weight": decision.get("target_weight"),
-                "priority": decision.get("priority"),
-                "action_bucket": decision.get("action_bucket"),
-                "entry_trigger": decision.get("entry_trigger"),
-                "invalidation_condition": decision.get("invalidation_condition"),
-                "time_horizon": decision.get("time_horizon"),
-                "max_slippage_bps": decision.get("max_slippage_bps"),
-                "liquidity_bucket": decision.get("liquidity_bucket"),
-                "stop_loss_type": decision.get("stop_loss_type"),
-                "execution_note": decision.get("execution_note"),
-                "risk_flags": decision.get("risk_flags") or [],
-            }
-        )
-    rows.sort(
-        key=lambda item: (
-            -(item.get("model_signal_strength") or 0),
-            -(item.get("priority") or 0),
-            item.get("ticker") or "",
-        )
-    )
-    return rows

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
-from app.services.cn_market_scheduler import _post_refresh_ready
+from app.services.cn_market_scheduler import (
+    CNMarketSchedulerService,
+    _post_refresh_ready,
+    _refresh_cn_price_lake,
+)
 
 
 class CNMarketSchedulerTests(unittest.TestCase):
@@ -32,6 +38,121 @@ class CNMarketSchedulerTests(unittest.TestCase):
                 latest_lake_trade_date="2026-07-23",
             )
         )
+
+    def test_current_hithink_dump_is_preferred_without_per_symbol_refresh(self) -> None:
+        dump = {
+            "status": "success",
+            "last_trade_date": "2026-07-23",
+            "latest_symbol_count": 5540,
+            "rows_written": 55400,
+        }
+        with patch(
+            "app.services.cn_market_scheduler.get_settings",
+            return_value=SimpleNamespace(
+                hithink_finance_daily_dump_enabled=True,
+                hithink_finance_api_key="fixture",
+            ),
+        ), patch(
+            "app.services.cn_market_scheduler.import_hithink_market_dump",
+            return_value=dump,
+        ), patch(
+            "app.services.cn_market_scheduler.refresh_cn_market_data_lake_only"
+        ) as fallback:
+            result = _refresh_cn_price_lake("2026-07-23")
+
+        self.assertEqual("hithink_finance_dump", result["provider_used"])
+        self.assertEqual(5540, result["success_count"])
+        fallback.assert_not_called()
+
+    def test_stale_hithink_dump_falls_back_to_existing_cn_refresh(self) -> None:
+        with patch(
+            "app.services.cn_market_scheduler.get_settings",
+            return_value=SimpleNamespace(
+                hithink_finance_daily_dump_enabled=True,
+                hithink_finance_api_key="fixture",
+            ),
+        ), patch(
+            "app.services.cn_market_scheduler.import_hithink_market_dump",
+            return_value={"status": "success", "last_trade_date": "2026-07-22"},
+        ), patch(
+            "app.services.cn_market_scheduler.refresh_cn_market_data_lake_only",
+            return_value={"status": "success", "providers_attempted": ["tushare_lake"]},
+        ) as fallback:
+            result = _refresh_cn_price_lake("2026-07-23")
+
+        fallback.assert_called_once_with(start_date="2026-07-23", end_date="2026-07-23")
+        self.assertEqual(["hithink_finance_dump", "tushare_lake"], result["providers_attempted"])
+
+    def test_structured_evaluation_persists_storage_acceptance_progress(self) -> None:
+        service = CNMarketSchedulerService()
+        fake_db = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = fake_db
+        context.__exit__.return_value = False
+        job_repo = MagicMock()
+        evaluation = {"status": "success", "message": "Evaluation complete."}
+        acceptance = {
+            "status": "pending",
+            "required_runs": 5,
+            "passed_runs": [301],
+        }
+        with patch.object(service, "_create_stage_job", return_value=99), patch(
+            "app.services.cn_market_scheduler.SessionLocal",
+            return_value=context,
+        ), patch(
+            "app.services.cn_market_scheduler.evaluate_model_runs",
+            return_value=evaluation,
+        ), patch(
+            "app.services.cn_market_scheduler.audit_recent_compact_dual_writes",
+            return_value=acceptance,
+        ) as audit, patch(
+            "app.services.cn_market_scheduler.DataJobRepository",
+            return_value=job_repo,
+        ):
+            service._run_structured_evaluation(source_job_id=77)
+
+        audit.assert_called_once_with(
+            fake_db,
+            market="CN",
+            required_runs=5,
+            scan_limit=50,
+        )
+        completed = job_repo.complete_job.call_args.kwargs
+        self.assertEqual("success", completed["status"])
+        self.assertIn("1/5 consecutive trading days", completed["message"])
+        self.assertEqual(
+            acceptance,
+            completed["result"]["prediction_storage_acceptance"],
+        )
+
+    def test_cn_risk_guardrail_does_not_process_us_as_side_effect(self) -> None:
+        service = CNMarketSchedulerService()
+        fake_db = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = fake_db
+        context.__exit__.return_value = False
+        job_repo = MagicMock()
+        job_repo.has_running_job.return_value = False
+        job_repo.create_job.return_value = SimpleNamespace(id=88)
+        with patch(
+            "app.services.cn_market_scheduler.SessionLocal",
+            return_value=context,
+        ), patch(
+            "app.services.cn_market_scheduler.DataJobRepository",
+            return_value=job_repo,
+        ), patch(
+            "app.services.cn_market_scheduler.save_risk_guardrail_snapshots",
+            return_value={"status": "success"},
+        ) as save:
+            service._run_risk_guardrail(source_job_id=77)
+
+        save.assert_called_once_with(
+            fake_db,
+            source_job_id=88,
+            markets=["CN"],
+        )
+        created = job_repo.create_job.call_args.kwargs
+        self.assertEqual(["CN"], created["params"]["markets"])
 
 
 if __name__ == "__main__":

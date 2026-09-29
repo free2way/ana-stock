@@ -35,6 +35,7 @@ class TushareClient:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.token = self.settings.tushare_token
+        self.last_error: str | None = None
 
     def is_configured(self) -> bool:
         return bool(self.token)
@@ -44,6 +45,7 @@ class TushareClient:
         tickers: list[str] | None = None,
         *,
         stock_meta_by_ticker: dict[str, dict] | None = None,
+        as_of_date: str | None = None,
     ) -> list[CNFundamentalRow]:
         if not self.token:
             return []
@@ -84,7 +86,29 @@ class TushareClient:
                     if row_ts_code and row_ts_code not in stock_meta_by_code:
                         stock_meta_by_code[row_ts_code] = row_dict
 
+        batch_daily_by_code: dict[str, dict] = {}
+        daily_basic_unavailable = False
+        normalized_as_of = str(as_of_date or "").replace("-", "")
+        if normalized_as_of:
+            try:
+                batch_daily = pro.daily_basic(
+                    trade_date=normalized_as_of,
+                    fields="ts_code,trade_date,pe_ttm,dv_ttm,dv_ratio,total_mv",
+                )
+            except Exception as exc:
+                if not self._is_endpoint_permission_error(exc, "daily_basic"):
+                    raise
+                batch_daily = None
+                daily_basic_unavailable = True
+            if batch_daily is not None and not batch_daily.empty:
+                batch_daily_by_code = {
+                    str(item.get("ts_code") or "").strip().upper(): item
+                    for item in batch_daily.to_dict("records")
+                    if str(item.get("ts_code") or "").strip()
+                }
+
         rows: list[CNFundamentalRow] = []
+        fina_indicator_unavailable = False
         for ts_code in normalized:
             stock_row = stock_meta_by_code.get(ts_code)
             if not stock_row:
@@ -92,18 +116,40 @@ class TushareClient:
 
             price_start = (date.today() - timedelta(days=45)).strftime("%Y%m%d")
             price_end = date.today().strftime("%Y%m%d")
-            daily_df = pro.daily_basic(
-                ts_code=ts_code,
-                start_date=price_start,
-                end_date=price_end,
-                fields="ts_code,trade_date,pe_ttm,dv_ttm,dv_ratio,total_mv",
-            )
-            fina_df = pro.fina_indicator(
-                ts_code=ts_code,
-                fields="ts_code,end_date,roe,roe_avg,netprofit_yoy,q_netprofit_yoy,q_dtprofit_yoy,q_sales_yoy,tr_yoy,debt_asset_ratio",
-            )
+            unavailable_endpoints: list[str] = []
+            latest_daily = batch_daily_by_code.get(ts_code)
+            if not normalized_as_of:
+                try:
+                    daily_df = pro.daily_basic(
+                        ts_code=ts_code,
+                        start_date=price_start,
+                        end_date=price_end,
+                        fields="ts_code,trade_date,pe_ttm,dv_ttm,dv_ratio,total_mv",
+                    )
+                except Exception as exc:
+                    if not self._is_endpoint_permission_error(exc, "daily_basic"):
+                        raise
+                    daily_df = None
+                    daily_basic_unavailable = True
+                latest_daily = self._latest_row_by_date(daily_df, "trade_date")
+            if latest_daily is None and daily_basic_unavailable:
+                unavailable_endpoints.append("daily_basic")
+            if fina_indicator_unavailable:
+                fina_df = None
+                unavailable_endpoints.append("fina_indicator")
+            else:
+                try:
+                    fina_df = pro.fina_indicator(
+                        ts_code=ts_code,
+                        fields="ts_code,end_date,roe,roe_avg,netprofit_yoy,q_netprofit_yoy,q_dtprofit_yoy,q_sales_yoy,tr_yoy,debt_asset_ratio",
+                    )
+                except Exception as exc:
+                    if not self._is_endpoint_permission_error(exc, "fina_indicator"):
+                        raise
+                    fina_df = None
+                    fina_indicator_unavailable = True
+                    unavailable_endpoints.append("fina_indicator")
 
-            latest_daily = self._latest_row_by_date(daily_df, "trade_date")
             latest_fina = self._latest_row_by_date(fina_df, "end_date")
             if latest_daily is None and latest_fina is None:
                 continue
@@ -148,6 +194,7 @@ class TushareClient:
                         "stock_basic": stock_row,
                         "daily_basic": latest_daily,
                         "fina_indicator": latest_fina,
+                        "unavailable_endpoints": unavailable_endpoints,
                     },
                 )
             )
@@ -277,16 +324,20 @@ class TushareClient:
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> dict[str, list[dict]]:
+        self.last_error = None
         if not self.token:
+            self.last_error = "TuShare token is not configured"
             return {}
 
         try:
             import tushare as ts  # type: ignore
-        except ImportError:
+        except ImportError as exc:
+            self.last_error = f"TuShare SDK is unavailable: {exc}"
             return {}
 
         pro = ts.pro_api(self.token)
         if pro is None:
+            self.last_error = "TuShare client initialization returned no client"
             return {}
 
         normalized_tickers = {
@@ -316,7 +367,8 @@ class TushareClient:
                         offset=offset,
                         limit=page_size,
                     )
-                except Exception:
+                except Exception as exc:
+                    self.last_error = f"{type(exc).__name__}: {exc}"
                     daily_df = None
                 if daily_df is None or daily_df.empty:
                     break
@@ -589,6 +641,14 @@ class TushareClient:
             return None
         sorted_df = dataframe.sort_values(by=date_column, ascending=False)
         return sorted_df.iloc[0].to_dict()
+
+    @staticmethod
+    def _is_endpoint_permission_error(exc: Exception, endpoint: str) -> bool:
+        message = str(exc)
+        lowered = message.lower()
+        return endpoint.lower() in lowered and (
+            "权限" in message or "permission" in lowered or "access" in lowered
+        )
 
     def _average_recent_annual_roe(self, dataframe) -> float | None:
         if dataframe is None or dataframe.empty or "end_date" not in dataframe.columns:

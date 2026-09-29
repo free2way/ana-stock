@@ -5,6 +5,8 @@ import re
 from datetime import datetime, timedelta
 from math import isnan
 
+from sqlalchemy import text
+
 from app.core.db import SessionLocal
 from app.services.ai_analysis import AIAnalysisService
 from app.services.kronos_validation import annotate_rows_with_kronos, load_latest_kronos_validation
@@ -12,7 +14,7 @@ from app.services.market_context import load_market_context_snapshot
 from app.services.market_lake import get_latest_lake_trade_date
 from app.services.portfolio_book import load_portfolio_positions
 from app.services.portfolio_intelligence import build_portfolio_ai_summary, build_position_management_fields
-from app.services.price_snapshot import load_latest_closes
+from app.services.price_snapshot import load_latest_closes, load_latest_open_gaps
 from app.services.recommendation_regression import load_or_build_recommendation_regression
 from app.services.repository import AppSettingRepository, PredictionRepository, SymbolRepository, WatchlistRepository, WorkspaceSnapshotRepository
 from app.services.selection_quality import load_or_build_selection_quality
@@ -28,8 +30,10 @@ from app.services.template_evaluation import (
     build_pattern_template_evaluation,
     resolve_template_group_label,
 )
+from app.services.ticker_format import infer_market_from_ticker, normalize_ticker_for_market
 from app.services.time_utils import app_now_iso, app_today_iso
 from app.services.tradability_filter import evaluate_candidate_tradability
+from app.services.model_score_contract import SCORE_CONTRACT_VERSION, first_present, rank_ratio
 
 
 AI_DAILY_REPORT_KEY = "ai_daily_report"
@@ -523,47 +527,69 @@ def _recommendation_gate(candidate: dict) -> dict[str, object]:
 
 def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, markets: list[str] | None = None) -> dict:
     with SessionLocal() as db:
+        if db.get_bind().dialect.name == "postgresql":
+            # Full-market candidate interpretation performs substantial CPU
+            # work between read queries. Keep the global safety timeout strict,
+            # but allow this bounded read-only report transaction to finish.
+            db.execute(text("SET LOCAL idle_in_transaction_session_timeout = '600s'"))
         watchlist_repo = WatchlistRepository(db)
         symbol_repo = SymbolRepository(db)
         prediction_repo = PredictionRepository(db)
         effective_markets = markets if markets is not None else DEFAULT_AI_DAILY_REPORT_MARKETS
         normalized_markets = {str(item).strip().upper() for item in (effective_markets or []) if str(item).strip()}
-        service = AIAnalysisService()
+        include_cn = "CN" in normalized_markets
+        include_us = "US" in normalized_markets
         portfolio_rows, portfolio_summary = _build_portfolio_report_rows(
             db=db,
             symbol_repo=symbol_repo,
             prediction_repo=prediction_repo,
         )
-        social_summary = social_signal_summary(db)
-        us_hotspot_validation = _build_us_hotspot_validation(db=db, social_summary=social_summary)
+        social_summary = social_signal_summary(db) if include_us else {"accounts": [], "actionable": []}
+        us_hotspot_validation = (
+            _build_us_hotspot_validation(db=db, social_summary=social_summary)
+            if include_us
+            else []
+        )
 
-        market = next(iter(normalized_markets), "CN")
-        market_report_date = get_latest_lake_trade_date(market=market)
+        # The primary recommendation fields are a CN contract, regardless of
+        # set iteration order or a US-only caller's requested scope.
+        market = "CN"
+        market_report_date = get_latest_lake_trade_date(market="CN") if include_cn else None
         recommendation_limit = 5
         evaluation_limit = max(recommendation_limit * 4, 20)
         excluded_tickers = _load_owned_or_watched_tickers(watchlist_repo)
-        rows, market_recommendation_meta = _build_market_recommendation_rows(
-            db=db,
-            symbol_repo=symbol_repo,
-            prediction_repo=prediction_repo,
-            market=market,
-            excluded_tickers=excluded_tickers,
-            recommendation_limit=evaluation_limit,
-            prefer_snapshot=True,
-        )
-        us_model_rows, us_market_recommendation_meta = _build_market_recommendation_rows(
-            db=db,
-            symbol_repo=symbol_repo,
-            prediction_repo=prediction_repo,
-            market="US",
-            excluded_tickers=excluded_tickers,
-            recommendation_limit=evaluation_limit,
-            prefer_snapshot=False,
-        )
-        us_report_date = get_latest_lake_trade_date(market="US")
+        if include_cn:
+            rows, market_recommendation_meta = _build_market_recommendation_rows(
+                db=db, symbol_repo=symbol_repo, prediction_repo=prediction_repo,
+                market="CN", excluded_tickers=excluded_tickers,
+                recommendation_limit=evaluation_limit, prefer_snapshot=True,
+            )
+        else:
+            rows, market_recommendation_meta = [], {"status": "not_requested"}
+        # Candidate analysis can take longer than PostgreSQL's configured
+        # idle-in-transaction timeout. End the read transaction before the
+        # next independent query block so daily report generation remains
+        # reliable without weakening the database-wide timeout.
+        db.rollback()
+        if include_us:
+            us_model_rows, us_market_recommendation_meta = _build_market_recommendation_rows(
+                db=db,
+                symbol_repo=symbol_repo,
+                prediction_repo=prediction_repo,
+                market="US",
+                excluded_tickers=excluded_tickers,
+                recommendation_limit=evaluation_limit,
+                prefer_snapshot=False,
+            )
+            us_report_date = get_latest_lake_trade_date(market="US")
+            db.rollback()
+        else:
+            us_model_rows = []
+            us_market_recommendation_meta = {"status": "not_requested"}
+            us_report_date = None
         market_heatmap_snapshot = (
             WorkspaceSnapshotRepository(db).get_latest_snapshot(MARKET_HEATMAP_SNAPSHOT_TYPE)
-            if market == "CN"
+            if include_cn
             else None
         )
         model_selection_guidance = load_model_selection_guidance_snapshot(db, market=market, allow_fallback=True)
@@ -577,9 +603,10 @@ def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, m
                 excluded_tickers=set(),
                 limit=max(recommendation_limit * 24, 120),
             )
-            if market == "CN"
+            if include_cn
             else rows
         )
+        db.rollback()
         _hydrate_security_names(
             symbol_repo,
             portfolio_rows,
@@ -620,7 +647,7 @@ def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, m
         selection_quality_policy=selection_quality_policy,
         lightgbm_execution_bias=lightgbm_execution_bias,
     )
-    if not actionable_rows and not watch_rows:
+    if include_cn and not actionable_rows and not watch_rows:
         kronos_payload = (kronos_snapshot or {}).get("payload") if isinstance(kronos_snapshot, dict) else {}
         watch_rows = _build_kronos_watch_fallback_rows(kronos_payload if isinstance(kronos_payload, dict) else {}, limit=recommendation_limit)
         if watch_rows:
@@ -648,7 +675,7 @@ def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, m
         )
     market_recommendation_meta["note"] = (
         f"{market_recommendation_meta.get('note') or ''} "
-        f"可执行买入池 {report_pool_meta.get('actionable_count') or 0} 只，强势观察池 {report_pool_meta.get('watch_count') or 0} 只。"
+        f"可执行买入池 {report_pool_meta.get('actionable_count') or 0} 只。"
         f"Kronos 已验证 {report_pool_meta.get('kronos_ready_count') or 0} 只，其中支持 {report_pool_meta.get('kronos_support_count') or 0} 只。"
         f"{selection_quality_note}"
         f"{'当前为 Kronos 观察兜底，不代表交易纪律已放行。' if report_pool_meta.get('kronos_watch_fallback') else ''}"
@@ -665,7 +692,11 @@ def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, m
         "report_date": report_date,
         "count": len(rows),
         "mood": mood,
-        "headline": f"今日 AI 日报：先复核持仓库，再从主市场与美股模型里筛出可验证候选。",
+        "headline": (
+            "今日 AI 日报：先复核持仓库，再从 A股全市场候选中筛出可验证标的。"
+            if not include_us
+            else "今日 AI 日报：先复核持仓库，再从主市场与美股模型里筛出可验证候选。"
+        ),
         "scope": "portfolio_plus_cn_full_market_top5",
         "strategy": strategy,
         "portfolio_summary": portfolio_summary,
@@ -698,11 +729,16 @@ def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, m
 
 def _hydrate_security_names(symbol_repo: SymbolRepository, *row_groups: list[dict]) -> None:
     tickers: list[str] = []
+    canonical_by_ticker: dict[str, str] = {}
     for rows in row_groups:
         for item in rows or []:
             ticker = str(item.get("ticker") or "").strip().upper()
             if ticker:
                 tickers.append(ticker)
+                market = str(item.get("market") or "").strip().upper() or infer_market_from_ticker(ticker)
+                canonical = normalize_ticker_for_market(ticker, market)
+                canonical_by_ticker[ticker] = canonical
+                tickers.append(canonical)
     if not tickers:
         return
     overview_loader = getattr(symbol_repo, "list_overviews_for_tickers", None)
@@ -719,11 +755,33 @@ def _hydrate_security_names(symbol_repo: SymbolRepository, *row_groups: list[dic
             ticker = str(item.get("ticker") or "").strip().upper()
             if not ticker:
                 continue
-            overview = overviews.get(ticker) or {}
-            candidate_name = str(item.get("name") or "").strip()
+            canonical = canonical_by_ticker.get(ticker) or ticker
+            overview = overviews.get(ticker) or overviews.get(canonical) or {}
+            candidate_name = str(
+                item.get("name")
+                or item.get("stock_name")
+                or item.get("security_name")
+                or item.get("display_name")
+                or ""
+            ).strip()
             resolved_name = str(overview.get("name") or "").strip()
-            if resolved_name and (not candidate_name or candidate_name == ticker):
+            if resolved_name and _security_name_is_code(candidate_name, ticker):
                 item["name"] = resolved_name
+            elif candidate_name:
+                item["name"] = candidate_name
+
+
+def _security_name_is_code(name: str | None, ticker: str | None) -> bool:
+    candidate = str(name or "").strip().upper()
+    normalized_ticker = str(ticker or "").strip().upper()
+    if not candidate:
+        return True
+    ticker_core = normalized_ticker.split(".", 1)[0]
+    candidate_core = candidate.split(".", 1)[0]
+    return candidate in {normalized_ticker, ticker_core} or (
+        candidate_core == ticker_core
+        and candidate.replace(candidate_core, "", 1) in {"", ".SS", ".SH", ".SZ", ".BJ"}
+    )
 
 
 def _build_lightgbm_execution_bias(*, lang: str = "zh") -> dict:
@@ -939,6 +997,8 @@ def _build_market_recommendation_rows(
         "snapshot_templates_considered": 0,
         "snapshot_templates_ready": 0,
         "snapshot_rows": 0,
+        "unique_candidates_scored": 0,
+        "deep_review_candidate_count": 0,
         "candidate_count": 0,
         "blocked_candidates": 0,
         "note": "",
@@ -964,6 +1024,9 @@ def _build_market_recommendation_rows(
                         source="fresh_snapshot",
                         market=market,
                         candidate_count=len(candidates),
+                        snapshot_rows=int(snapshot_meta.get("snapshot_rows") or 0),
+                        unique_candidates_scored=int(snapshot_meta.get("unique_candidates_scored") or 0),
+                        deep_review_candidate_count=int(snapshot_meta.get("deep_review_candidate_count") or len(candidates)),
                         snapshot_templates_ready=int(snapshot_meta.get("snapshot_templates_ready") or 0),
                         snapshot_date=target_snapshot_date or None,
                     ),
@@ -1117,8 +1180,14 @@ def _build_market_recommendation_rows(
     if str(market or "").upper() == "CN" and prefer_snapshot:
         output_row_limit = max(recommendation_limit * 4, 80)
 
+    output_candidates = ranked_candidates[:output_row_limit]
+    signal_open_gaps = (
+        load_latest_open_gaps([str(item.get("ticker") or "") for item in output_candidates])
+        if output_candidates
+        else {}
+    )
     rows: list[dict] = []
-    for item in ranked_candidates[:output_row_limit]:
+    for item in output_candidates:
         overview = item.get("overview") or symbol_repo.get_overview(item["ticker"])
         if overview is None:
             continue
@@ -1132,7 +1201,12 @@ def _build_market_recommendation_rows(
             or not str(latest_signal.get("tradability_status") or "").strip()
         ):
             decision = evaluate_candidate_tradability(
-                latest_signal,
+                {
+                    **latest_signal,
+                    "signal_open_gap_pct": signal_open_gaps.get(
+                        str(item.get("ticker") or "").strip().upper()
+                    ),
+                },
                 market_snapshot=market_snapshot_context,
             )
             latest_signal = {
@@ -1159,7 +1233,7 @@ def _build_market_recommendation_rows(
             latest_signal=latest_signal,
             combined_analysis={
                 "decision": "WATCH" if combined is None else "BUY" if (combined.get("trend_label") == "bullish") else "HOLD",
-                "confidence": 55 if combined is None else int(round(float(combined.get("confidence") or 0.55) * 100)),
+                "confidence": _ratio_percent((combined or {}).get("confidence"), default=0.55),
                 "score": 0 if combined is None else int(round(((combined.get("trend_score") or 50) - 50) / 10)),
                 "reasons": list((combined or {}).get("explanation") or [])[:3],
                 "technical_rating": {},
@@ -1252,11 +1326,21 @@ def _render_market_candidate_note(
     candidate_count: int,
     snapshot_templates_ready: int,
     snapshot_date: str | None = None,
+    snapshot_rows: int | None = None,
+    unique_candidates_scored: int | None = None,
+    deep_review_candidate_count: int | None = None,
 ) -> str:
     market_label = {"CN": "A股", "US": "美股", "HK": "港股"}.get(str(market or "").upper(), str(market or "市场"))
     snapshot_hint = f"{snapshot_date} 收盘后" if snapshot_date else "最近交易日"
     if source == "fresh_snapshot":
-        return f"{market_label} Top 5 使用 {snapshot_hint} 的全市场快照候选；已命中 {candidate_count} 个可排序候选，快照模板 {snapshot_templates_ready} 个已就绪。"
+        scanned = int(snapshot_rows or 0)
+        unique = int(unique_candidates_scored or candidate_count)
+        deep = int(deep_review_candidate_count or candidate_count)
+        return (
+            f"{market_label} Top 5 使用 {snapshot_hint} 的全市场快照；"
+            f"扫描 {scanned} 条模板结果，覆盖并评分 {unique} 只证券，"
+            f"排名前 {deep} 只进入深度复核，快照模板 {snapshot_templates_ready} 个已就绪。"
+        )
     if source == "predictions_fallback":
         return f"{market_label} 全市场快照未完全就绪，当前已降级到最新模型预测候选；可用候选 {candidate_count} 个。"
     return f"{market_label} 全市场候选尚未就绪，当前没有可用于日报的候选。"
@@ -1606,7 +1690,7 @@ def _split_market_recommendation_rows(
             item["report_pool_reason"] = _market_pool_reason(item, lang="zh")
         watch = excess + watch
 
-    actionable.sort(key=_ai_report_kronos_rank_key)
+    actionable.sort(key=_ai_report_delivery_rank_key)
     max_actionable_count = (policy or {}).get("max_actionable_count")
     try:
         max_actionable_count_value = int(max_actionable_count) if max_actionable_count is not None else None
@@ -1622,7 +1706,7 @@ def _split_market_recommendation_rows(
             item["report_pool_reason"] = _market_pool_reason(item, lang="zh")
         watch = excess + watch
 
-    watch.sort(key=_ai_report_kronos_rank_key)
+    watch.sort(key=_ai_report_delivery_rank_key)
     kronos_support_count = sum(1 for item in actionable + watch if _kronos_report_decision(item) == "support")
     kronos_ready_count = sum(1 for item in actionable + watch if _kronos_report_status(item) == "READY")
     return (
@@ -1721,29 +1805,29 @@ def _kronos_report_decision(row: dict) -> str:
     return ""
 
 
-def _ai_report_kronos_rank_key(row: dict) -> tuple[float, float, float, str]:
-    validation = row.get("kronos_validation") if isinstance(row.get("kronos_validation"), dict) else {}
-    try:
-        score = float((validation or {}).get("kronos_score") or 0.0)
-    except (TypeError, ValueError):
-        score = 0.0
-    try:
-        expected = float((validation or {}).get("kronos_expected_return_3d_pct") or 0.0)
-    except (TypeError, ValueError):
-        expected = 0.0
-    try:
-        drawdown = float((validation or {}).get("kronos_max_drawdown_pct") or 0.0)
-    except (TypeError, ValueError):
-        drawdown = 0.0
+def _ai_report_delivery_rank_key(row: dict) -> tuple[float, float, float, float, str]:
+    """Model-evidence-first ordering; Kronos is only a secondary confirmation.
+
+    P0 closeout: the delivered daily list must match the ranking whose hit rate
+    the evaluation actually measured (the LightGBM quant rank and its quality
+    gates). The previous ±10000 Kronos decision bonus buried top-ranked model
+    candidates behind untested heuristic scores, so backtest results could not
+    describe the names users were told to buy. Kronos support/reject may now
+    only re-order near-ties, never override the model order.
+    """
+    def _number(key: str) -> float:
+        try:
+            return float(row.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
     decision = _kronos_report_decision(row)
-    decision_bonus = 10000.0 if decision == "support" else -10000.0 if decision == "reject" else 0.0
-    ready_bonus = 500.0 if _kronos_report_status(row) == "READY" else 0.0
-    kronos_score = decision_bonus + ready_bonus + score * 20.0 + expected * 60.0 + drawdown * 10.0
+    kronos_tiebreak = 1.0 if decision == "support" else -1.0 if decision == "reject" else 0.0
     return (
-        -kronos_score,
-        -float(row.get("quality_gate_score") or 0.0),
-        -float(row.get("verification_score") or 0.0),
-        -float(row.get("quant_rank") or 0.0),
+        -_number("quant_rank"),
+        -_number("quality_gate_score"),
+        -_number("verification_score"),
+        -kronos_tiebreak,
         str(row.get("ticker") or ""),
     )
 
@@ -2062,12 +2146,46 @@ def _market_structure_label_for_row(row: dict, *, market: str, market_label: str
     return f"{market_label}综合"
 
 
-def save_ai_daily_report(payload: dict, *, db=None) -> None:
+def save_ai_daily_report(
+    payload: dict, *, db=None,
+    publication_messages: list[dict] | None = None,
+    publication_channels: list[str] | None = None,
+) -> dict:
     if db is None:
         with SessionLocal() as own_db:
-            save_ai_daily_report(payload, db=own_db)
-        return
-    enriched_payload = dict(payload or {})
+            return save_ai_daily_report(
+                payload, db=own_db, publication_messages=publication_messages,
+                publication_channels=publication_channels,
+            )
+    from app.services.stock_selection.publication_guard import (
+        load_trusted_model_qualifications, load_trusted_regime_snapshots, prepare_report_for_publication,
+    )
+
+    publication_input = dict(payload or {})
+    publication_input.setdefault("decision_cutoff_at", app_now_iso())
+    enriched_payload = prepare_report_for_publication(
+        publication_input, approved_qualifications=load_trusted_model_qualifications(db=db),
+        trusted_regime_snapshots=load_trusted_regime_snapshots(db=db),
+    )
+    if publication_messages:
+        # A qualification can be revoked between rendering a message and this
+        # final save. Never freeze an old actionable text beside a new blocked
+        # decision; the caller must render again from the newly gated report.
+        identity_keys = (
+            "model_qualification", "decision_cutoff_at",
+            "market_recommendations", "market_recommendations_meta",
+            "us_model_recommendations", "us_model_recommendations_meta",
+            "hk_model_recommendations", "hk_model_recommendations_meta",
+        )
+        if any((payload or {}).get(key) != enriched_payload.get(key) for key in identity_keys):
+            if hasattr(db, "rollback"):
+                db.rollback()
+            raise RuntimeError("publication report changed during model qualification; render again")
+        canonical = iter(render_ai_daily_report_push_messages(enriched_payload))
+        if not all(any(message == expected for expected in canonical) for message in publication_messages):
+            if hasattr(db, "rollback"):
+                db.rollback()
+            raise RuntimeError("publication message does not match guarded report; render again")
     try:
         latest_cn_trade_date = get_latest_lake_trade_date(market="CN")
     except Exception:
@@ -2080,16 +2198,38 @@ def save_ai_daily_report(payload: dict, *, db=None) -> None:
     enriched_payload.setdefault("report_date", default_report_date)
     enriched_payload.setdefault("schema_version", 1)
     enriched_payload["input_market_dates"] = {
-        "CN": str((enriched_payload.get("market_recommendations_meta") or {}).get("target_snapshot_date") or "")[:10] or None,
-        "US": str((enriched_payload.get("us_model_recommendations_meta") or {}).get("target_snapshot_date") or "")[:10] or None,
+        market: str((enriched_payload.get("input_market_dates") or {}).get(market) or
+                    (enriched_payload.get(meta_key) or {}).get("target_snapshot_date") or "")[:10] or None
+        for market, meta_key in (("CN", "market_recommendations_meta"), ("US", "us_model_recommendations_meta"),
+                                 ("HK", "hk_model_recommendations_meta"))
     }
     enriched_payload["saved_at"] = app_now_iso()
-    AppSettingRepository(db).set(AI_DAILY_REPORT_KEY, json.dumps(enriched_payload, ensure_ascii=False))
-    WorkspaceSnapshotRepository(db).create_snapshot(
-        snapshot_type=AI_DAILY_REPORT_SNAPSHOT_TYPE,
-        snapshot_date=str(enriched_payload.get("report_date") or app_today_iso()),
-        payload=enriched_payload,
-    )
+    from app.services.stock_selection.decision_ledger import freeze_final_decisions
+
+    try:
+        receipt = freeze_final_decisions(
+            enriched_payload, db=db, commit=False,
+            publication_messages=publication_messages,
+            publication_channels=publication_channels,
+        )
+        enriched_payload["final_decision_receipt"] = receipt
+        AppSettingRepository(db).set(
+            AI_DAILY_REPORT_KEY, json.dumps(enriched_payload, ensure_ascii=False), commit=False,
+        )
+        WorkspaceSnapshotRepository(db).create_snapshot(
+            snapshot_type=AI_DAILY_REPORT_SNAPSHOT_TYPE,
+            snapshot_date=str(enriched_payload.get("report_date") or app_today_iso()),
+            payload=enriched_payload, commit=False,
+        )
+        if hasattr(db, "commit"):
+            db.commit()
+    except Exception:
+        if hasattr(db, "rollback"):
+            db.rollback()
+        raise
+    payload.clear()
+    payload.update(enriched_payload)
+    return receipt
 
 
 def load_ai_daily_report(*, db=None) -> dict | None:
@@ -2212,7 +2352,6 @@ def render_ai_daily_report_message(report: dict | None) -> str:
         if isinstance(payload.get("market_recommendations"), list)
         else payload.get("rows") or []
     )
-    market_watch_rows = payload.get("market_watch_recommendations") or []
     market_meta = payload.get("market_recommendations_meta") or {}
     market_structure = payload.get("market_structure") or {}
     market_template_attribution = payload.get("market_template_attribution") or {}
@@ -2226,7 +2365,7 @@ def render_ai_daily_report_message(report: dict | None) -> str:
     social_rows = social_payload.get("actionable") or []
     us_hotspot_rows = payload.get("us_hotspot_validation") or []
     lines = [
-        f"AI 每日复盘",
+        "AI 每日复盘",
         f"市场状态：{payload.get('mood') or '-'}",
         f"摘要：{payload.get('headline') or '-'}",
         "",
@@ -2248,11 +2387,17 @@ def render_ai_daily_report_message(report: dict | None) -> str:
                 "",
             ]
         )
+    if str(market_meta.get("status") or "").lower() in {"not_ready", "fallback", "not_requested", "observation_ready"}:
+        lines.extend([_render_market_top5_push_message(payload), ""])
+        if us_model_rows or str(us_market_meta.get("status") or "").lower() in {"not_ready", "fallback"}:
+            lines.extend([_render_us_market_top5_push_message(payload), ""])
+        return "\n".join(lines).strip()
     lines.extend(
         [
         "二、明日可执行买入池",
         "以下候选来自收盘后全市场模型扫描，只保留更接近计划买点、且交易状态更适合次日执行的股票。",
         _render_market_meta_line(market_meta),
+        f"体制与预算：{market_meta.get('regime_position_hint') or '未记录'}",
         "",
         f"策略主线：{strategy.get('headline') or '-'}",
         f"执行建议：{strategy.get('playbook') or '-'}",
@@ -2270,11 +2415,11 @@ def render_ai_daily_report_message(report: dict | None) -> str:
         lines.append("来源归因：")
         lines.append(market_template_attribution.get("headline") or "-")
         for item in (market_template_attribution.get("leaders") or [])[:4]:
-            tickers = " / ".join(item.get("tickers") or []) or "-"
+            tickers = " / ".join(_report_ticker_labels(item.get("tickers") or [], payload)) or "-"
             lines.append(f"- {item.get('label') or '-'}：{int(item.get('count') or 0)} 只 · 量化均分 {item.get('avg_quant_rank') or '-'} · {tickers}")
         lines.append("")
     if strategy.get("bullets"):
-        lines.extend([f"- {item}" for item in strategy.get("bullets")[:4]])
+        lines.extend([f"- {_report_text_with_security_names(item, payload)}" for item in strategy.get("bullets")[:4]])
         lines.append("")
     if not market_rows:
         lines.append("当前没有满足条件的可执行买入池，今天更适合少做或只观察。")
@@ -2287,7 +2432,7 @@ def render_ai_daily_report_message(report: dict | None) -> str:
             [
                 f"{index}. {_report_security_label(item)}",
                 f"量化分：{item.get('quant_rank') or '-'} | 验证分：{item.get('verification_score') or '-'} | 模型分：{_fmt_number(item.get('model_score'))} | 趋势分：{item.get('trend_score') or '-'}",
-                f"结论：{item.get('verdict') or '-'} | 置信度：{item.get('confidence') or '-'} | 策略：{item.get('strategy') or '-'}",
+                f"结论：{item.get('verdict') or '-'} | 置信度：{_fmt_scalar(item.get('confidence'))} | 策略：{item.get('strategy') or '-'}",
                 build_trade_summary_text(item, lang="zh", include_execution_note=True) + f" | 建议仓位：{item.get('target_weight') or '-'}",
                 f"验证依据：{item.get('verification_note') or '-'}",
                 f"触发条件：{item.get('entry_trigger') or '-'}",
@@ -2302,33 +2447,10 @@ def render_ai_daily_report_message(report: dict | None) -> str:
                 "",
             ]
         )
-    lines.extend(
-        [
-            "三、强势观察池",
-            "以下股票更像强势观察对象：通常已经脱离计划买点，或者仍处于 REVIEW 状态，不适合直接追。",
-            "",
-        ]
-    )
-    if not market_watch_rows:
-        lines.append("当前没有需要单独列出的强势观察池股票。")
-        lines.append("")
-    for index, item in enumerate(market_watch_rows[:5], start=1):
-        buy_zone = item.get("buy_zone") or {}
-        risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
-        lines.extend(
-            [
-                f"{index}. {_report_security_label(item)}",
-                f"结论：{item.get('verdict') or '-'} | 可交易性：{format_trade_status(item.get('tradability_status'), lang='zh')} | 趋势分：{item.get('trend_score') or '-'}",
-                f"当前价：{_fmt_number(item.get('latest_price') or item.get('latest_close'))} | 买入区：{buy_zone.get('low', '-')} - {buy_zone.get('high', '-')}",
-                f"偏离买点：{_fmt_number(item.get('close_vs_buy_zone_high_pct'))}% | 风险：{risk_flags}",
-                f"观察理由：{item.get('report_pool_reason') or '-'}",
-                "",
-            ]
-        )
     if us_model_rows:
         lines.extend(
             [
-                "四、美股模型 Top 5",
+                "三、美股模型 Top 5",
                 "以下候选来自最新美股模型训练结果，优先展示验证分高、交易条件清楚、且未进入当前持仓/自选的名字。",
                 _render_market_meta_line(us_market_meta),
                 "",
@@ -2343,7 +2465,7 @@ def render_ai_daily_report_message(report: dict | None) -> str:
                 [
                     f"{index}. {_report_security_label(item)}",
                     f"量化分：{item.get('quant_rank') or '-'} | 验证分：{item.get('verification_score') or '-'} | 模型分：{_fmt_number(item.get('model_score'))} | 趋势分：{item.get('trend_score') or '-'}",
-                    f"结论：{item.get('verdict') or '-'} | 置信度：{item.get('confidence') or '-'} | 策略：{item.get('strategy') or '-'}",
+                    f"结论：{item.get('verdict') or '-'} | 置信度：{_fmt_scalar(item.get('confidence'))} | 策略：{item.get('strategy') or '-'}",
                     build_trade_summary_text(item, lang="zh", include_execution_note=True) + f" | 建议仓位：{item.get('target_weight') or '-'}",
                     f"验证依据：{item.get('verification_note') or '-'}",
                     f"触发条件：{item.get('entry_trigger') or '-'}",
@@ -2360,7 +2482,7 @@ def render_ai_daily_report_message(report: dict | None) -> str:
     if social_rows:
         lines.extend(
             [
-                "五、X 账户社交信号验证",
+                "四、X 账户社交信号验证",
                 "以下只作为社交观点和模型共振参考，不直接作为买卖依据。",
                 "",
             ]
@@ -2378,7 +2500,7 @@ def render_ai_daily_report_message(report: dict | None) -> str:
     if us_hotspot_rows:
         lines.extend(
             [
-                "六、X 热点美股验证",
+                "五、X 热点美股验证",
                 "以下是 X 提及美股与美股模型候选快照的交叉验证，仅作为复核清单。",
                 "",
             ]
@@ -2398,25 +2520,40 @@ def render_ai_daily_report_message(report: dict | None) -> str:
 
 def render_ai_daily_report_push_messages(report: dict | None) -> list[dict]:
     payload = report or {}
+    active_markets = [
+        market for market, list_key, meta_key in (
+            ("CN", "market_recommendations", "market_recommendations_meta"),
+            ("US", "us_model_recommendations", "us_model_recommendations_meta"),
+            ("HK", "hk_model_recommendations", "hk_model_recommendations_meta"),
+        )
+        if (list_key in payload or meta_key in payload)
+        and str((payload.get(meta_key) or {}).get("status") or "").lower() != "not_requested"
+    ]
     messages = [
         {
-            "title": "AI 日报 1/2：持仓股总结",
+            "title": "持仓股总结",
             "body": _render_portfolio_push_message(payload),
-        },
-        {
-            "title": "AI 日报 2/2：可执行买入池 + 强势观察池",
-            "body": _render_market_top5_push_message(payload),
+            "market": active_markets[0] if active_markets else None,
         },
     ]
-    if payload.get("us_model_recommendations"):
-        messages[0]["title"] = "AI 日报 1/3：持仓股总结"
-        messages[1]["title"] = "AI 日报 2/3：A股可执行买入池 + 观察池"
+    if "CN" in active_markets:
+        cn_status = str((payload.get("market_recommendations_meta") or {}).get("status") or "").lower()
+        messages.append({
+            "title": "A股研究观察日报" if cn_status == "observation_ready" else
+                     "A股选股状态：未就绪" if cn_status in {"not_ready", "fallback"} else "A股可执行买入池",
+            "body": _render_market_top5_push_message(payload),
+            "market": "CN",
+        })
+    if "US" in active_markets and payload.get("us_model_recommendations"):
         messages.append(
             {
-                "title": "AI 日报 3/3：美股模型 Top 5",
+                "title": "美股模型 Top 5",
                 "body": _render_us_market_top5_push_message(payload),
+                "market": "US",
             }
         )
+    for ordinal, message in enumerate(messages, start=1):
+        message["title"] = f"AI 日报 {ordinal}/{len(messages)}：{message['title']}"
     return messages
 
 
@@ -2456,8 +2593,36 @@ def _render_market_top5_push_message(payload: dict) -> str:
         if isinstance(payload.get("market_recommendations"), list)
         else payload.get("rows") or []
     )
-    market_watch_rows = payload.get("market_watch_recommendations") or []
     market_meta = payload.get("market_recommendations_meta") or {}
+    if str(market_meta.get("status") or "").lower() == "observation_ready":
+        watch_rows = payload.get("market_watch_recommendations") or []
+        lines = [
+            "二、A股研究观察日报（不可执行）",
+            str(market_meta.get("note") or "全市场扫描已完成，但模型尚未通过冻结回测协议。"),
+            _render_market_meta_line(market_meta),
+            "以下仅为研究候选，不是买入建议，不提供可执行仓位。",
+            "",
+        ]
+        if not watch_rows:
+            lines.append("今日没有通过基础数据与交易纪律复核的研究候选。")
+        for index, item in enumerate(watch_rows[:5], start=1):
+            risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
+            percentile = item.get("percentile") if item.get("percentile") is not None else item.get("model_percentile")
+            lines.extend([
+                f"{index}. {_report_security_label(item)}",
+                f"研究就绪度：{_fmt_scalar(item.get('trade_readiness_score'))} | 状态：{item.get('tradability_status') or '-'}",
+                f"模型分位：{_fmt_scalar(percentile)} | 趋势分：{_fmt_scalar(item.get('trend_score'))}",
+                f"观察原因：{item.get('report_pool_reason') or item.get('readiness_reason') or item.get('verification_note') or '-'}",
+                f"风险：{risk_flags}",
+                "",
+            ])
+        return "\n".join(lines).strip()
+    if str(market_meta.get("status") or "").lower() in {"not_ready", "fallback", "not_requested"}:
+        return "\n".join([
+            "二、A股选股研究状态：暂不可发布可执行买入池",
+            str(market_meta.get("note") or "模型或数据尚未通过门禁，今天保持观察。"),
+            "本消息不包含可执行股票名单；不从观察池或持仓列表递补。",
+        ])
     market_structure = payload.get("market_structure") or {}
     market_template_attribution = payload.get("market_template_attribution") or {}
     guidance_summary = payload.get("model_selection_guidance_summary") or {}
@@ -2469,6 +2634,7 @@ def _render_market_top5_push_message(payload: dict) -> str:
         "",
         _render_market_meta_line(market_meta),
         f"市场状态：{payload.get('mood') or '-'}",
+        f"体制与预算：{market_meta.get('regime_position_hint') or '未记录'}",
         f"策略主线：{strategy.get('headline') or '-'}",
         f"执行建议：{strategy.get('playbook') or '-'}",
         f"{guidance_summary.get('top_model_summary') or '优先模型：当前样本还不够，先继续观察。'}",
@@ -2483,11 +2649,11 @@ def _render_market_top5_push_message(payload: dict) -> str:
     if market_template_attribution.get("leaders"):
         lines.append("来源归因：")
         for item in (market_template_attribution.get("leaders") or [])[:3]:
-            tickers = " / ".join(item.get("tickers") or []) or "-"
+            tickers = " / ".join(_report_ticker_labels(item.get("tickers") or [], payload)) or "-"
             lines.append(f"- {item.get('label') or '-'}：{int(item.get('count') or 0)} 只 · {tickers}")
         lines.append("")
     if strategy.get("bullets"):
-        lines.extend([f"- {item}" for item in strategy.get("bullets")[:3]])
+        lines.extend([f"- {_report_text_with_security_names(item, payload)}" for item in strategy.get("bullets")[:3]])
         lines.append("")
     if not market_rows:
         lines.append("当前没有满足条件的可执行买入池，今天更适合少做或只观察。")
@@ -2500,7 +2666,7 @@ def _render_market_top5_push_message(payload: dict) -> str:
             [
                 f"{index}. {_report_security_label(item)}",
                 f"量化分：{item.get('quant_rank') or '-'} | 验证分：{item.get('verification_score') or '-'} | 趋势分：{item.get('trend_score') or '-'}",
-                f"结论：{item.get('verdict') or '-'} | 置信度：{item.get('confidence') or '-'} | 策略：{item.get('strategy') or '-'}",
+                f"结论：{item.get('verdict') or '-'} | 置信度：{_fmt_scalar(item.get('confidence'))} | 策略：{item.get('strategy') or '-'}",
                 build_trade_summary_text(item, lang="zh") + f" | 建议仓位：{item.get('target_weight') or '-'}",
                 f"触发条件：{item.get('entry_trigger') or '-'}",
                 f"失效条件：{item.get('invalidation_condition') or '-'}",
@@ -2513,35 +2679,18 @@ def _render_market_top5_push_message(payload: dict) -> str:
                 "",
             ]
         )
-    lines.extend(
-        [
-            "三、强势观察池",
-            "以下股票更像强势观察对象：要么仍待复核，要么已经偏离买点，不适合直接追。",
-            "",
-        ]
-    )
-    if not market_watch_rows:
-        lines.append("当前没有需要单独列出的强势观察池股票。")
-        return "\n".join(lines).strip()
-    for index, item in enumerate(market_watch_rows[:5], start=1):
-        buy_zone = item.get("buy_zone") or {}
-        risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
-        lines.extend(
-            [
-                f"{index}. {_report_security_label(item)}",
-                f"结论：{item.get('verdict') or '-'} | 可交易性：{format_trade_status(item.get('tradability_status'), lang='zh')}",
-                f"当前价：{_fmt_number(item.get('latest_price') or item.get('latest_close'))} | 买入区：{buy_zone.get('low', '-')} - {buy_zone.get('high', '-')}",
-                f"偏离买点：{_fmt_number(item.get('close_vs_buy_zone_high_pct'))}% | 风险：{risk_flags}",
-                f"观察理由：{item.get('report_pool_reason') or '-'}",
-                "",
-            ]
-        )
     return "\n".join(lines).strip()
 
 
 def _render_us_market_top5_push_message(payload: dict) -> str:
     us_rows = payload.get("us_model_recommendations") or []
     us_market_meta = payload.get("us_model_recommendations_meta") or {}
+    if str(us_market_meta.get("status") or "").lower() in {"not_ready", "fallback", "not_requested"}:
+        return "\n".join([
+            "三、美股选股研究状态：暂不可发布可执行模型名单",
+            str(us_market_meta.get("note") or "模型或数据尚未通过门禁，今天保持观察。"),
+            "本消息不包含可执行股票名单。",
+        ])
     us_market_structure = payload.get("us_market_structure") or {}
     lines = [
         "三、美股模型 Top 5",
@@ -2561,7 +2710,7 @@ def _render_us_market_top5_push_message(payload: dict) -> str:
             [
                 f"{index}. {_report_security_label(item)}",
                 f"量化分：{item.get('quant_rank') or '-'} | 验证分：{item.get('verification_score') or '-'} | 趋势分：{item.get('trend_score') or '-'}",
-                f"结论：{item.get('verdict') or '-'} | 置信度：{item.get('confidence') or '-'} | 策略：{item.get('strategy') or '-'}",
+                f"结论：{item.get('verdict') or '-'} | 置信度：{_fmt_scalar(item.get('confidence'))} | 策略：{item.get('strategy') or '-'}",
                 build_trade_summary_text(item, lang="zh") + f" | 建议仓位：{item.get('target_weight') or '-'}",
                 f"触发条件：{item.get('entry_trigger') or '-'}",
                 f"失效条件：{item.get('invalidation_condition') or '-'}",
@@ -2574,65 +2723,6 @@ def _render_us_market_top5_push_message(payload: dict) -> str:
         )
     return "\n".join(lines).strip()
 
-
-def _render_legacy_ai_daily_report_message(report: dict | None) -> str:
-    payload = report or {}
-    strategy = payload.get("strategy") or {}
-    lines = [
-        f"A股 AI 每日决策面板",
-        f"市场状态：{payload.get('mood') or '-'}",
-        f"摘要：{payload.get('headline') or '-'}",
-        f"策略主线：{strategy.get('headline') or '-'}",
-        f"执行建议：{strategy.get('playbook') or '-'}",
-        "",
-    ]
-    if strategy.get("bullets"):
-        lines.extend([f"- {item}" for item in strategy.get("bullets")[:4]])
-        lines.append("")
-    for index, item in enumerate(payload.get("rows") or [], start=1):
-        buy_zone = item.get("buy_zone") or {}
-        take_profit = item.get("take_profit") or {}
-        risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
-        lines.extend(
-            [
-                f"{index}. {_report_security_label(item)}",
-                f"量化分：{item.get('quant_rank') or '-'} | 模型分：{_fmt_number(item.get('model_score'))} | 趋势分：{item.get('trend_score') or '-'} | Setup：{item.get('setup_label') or '-'}",
-                f"结论：{item.get('verdict') or '-'} | 置信度：{item.get('confidence') or '-'} | 策略：{item.get('strategy') or '-'}",
-                build_trade_summary_text(item, lang="zh", include_execution_note=True) + f" | 建议仓位：{item.get('target_weight') or '-'}",
-                f"参与率：{_fmt_percent(item.get('suggested_participation_rate'))} | 执行计划：{item.get('execution_plan') or '-'}",
-                f"触发条件：{item.get('entry_trigger') or '-'}",
-                f"失效条件：{item.get('invalidation_condition') or '-'}",
-                f"持有周期：{item.get('time_horizon') or '-'} | 流动性桶：{item.get('liquidity_bucket') or '-'} | 最大滑点：{item.get('max_slippage_bps') or '-'}bps",
-                f"风险标记：{risk_flags}",
-                f"Headline：{item.get('headline') or '-'}",
-                f"Summary：{item.get('summary') or '-'}",
-                f"买入区：{buy_zone.get('low', '-')} - {buy_zone.get('high', '-')}",
-                f"止损位：{item.get('stop_loss', '-')} | 止损类型：{item.get('stop_loss_type') or '-'}",
-                f"止盈区：{take_profit.get('low', '-')} - {take_profit.get('high', '-')}",
-                "",
-            ]
-        )
-    buy_the_dip_rows = payload.get("buy_the_dip_rows") or []
-    if buy_the_dip_rows:
-        lines.extend(["Buy The Dip 候选:", ""])
-        for index, item in enumerate(buy_the_dip_rows, start=1):
-            buy_zone = item.get("buy_zone") or {}
-            risk_flags = format_risk_flags(item.get("risk_flags") or [], lang="zh")
-            lines.extend(
-                [
-                    f"{index}. {_report_security_label(item)}",
-                    f"量化分：{item.get('quant_rank') or '-'} | 模型分：{_fmt_number(item.get('model_score'))} | 趋势分：{item.get('trend_score') or '-'}",
-                    f"结论：{item.get('verdict') or '-'} | Setup：{item.get('setup_label') or '-'}",
-                    build_trade_summary_text(item, lang="zh") + f" | 建议仓位：{item.get('target_weight') or '-'} | 风险标记：{risk_flags}",
-                    f"参与率：{_fmt_percent(item.get('suggested_participation_rate'))} | 执行计划：{item.get('execution_plan') or '-'}",
-                    f"触发条件：{item.get('entry_trigger') or '-'} | 失效条件：{item.get('invalidation_condition') or '-'}",
-                    f"持有周期：{item.get('time_horizon') or '-'} | 流动性桶：{item.get('liquidity_bucket') or '-'} | 最大滑点：{item.get('max_slippage_bps') or '-'}bps",
-                    f"止损位：{item.get('stop_loss', '-')} | 止损类型：{item.get('stop_loss_type') or '-'}",
-                    f"回踩区：{buy_zone.get('low', '-')} - {buy_zone.get('high', '-')}",
-                    "",
-                ]
-            )
-    return "\n".join(lines).strip()
 
 
 def _render_market_structure_lines(structure: dict, *, title: str) -> list[str]:
@@ -2675,11 +2765,47 @@ def _report_security_label(item: dict | None) -> str:
     return name or ticker or "-"
 
 
+def _report_ticker_labels(tickers: list[str], report: dict | None) -> list[str]:
+    payload = report or {}
+    names: dict[str, str] = {}
+    row_groups = [
+        payload.get("market_recommendations") or [],
+        payload.get("market_watch_recommendations") or [],
+        payload.get("market_candidates_all") or [],
+        payload.get("rows") or [],
+        payload.get("us_model_recommendations") or [],
+    ]
+    for rows in row_groups:
+        for item in rows:
+            ticker = str(item.get("ticker") or "").strip().upper()
+            if ticker and ticker not in names:
+                names[ticker] = _report_security_label(item)
+    return [names.get(str(ticker).strip().upper(), str(ticker).strip()) for ticker in tickers if str(ticker).strip()]
+
+
+def _report_text_with_security_names(text: str | None, report: dict | None) -> str:
+    rendered = str(text or "")
+    payload = report or {}
+    tickers: list[str] = []
+    for key in ("market_recommendations", "market_watch_recommendations", "market_candidates_all", "rows", "us_model_recommendations"):
+        tickers.extend(
+            ticker
+            for item in (payload.get(key) or [])
+            if (ticker := str(item.get("ticker") or "").strip())
+        )
+    for ticker, label in zip(tickers, _report_ticker_labels(tickers, payload)):
+        if ticker and label != ticker and label not in rendered:
+            rendered = rendered.replace(ticker, label)
+    return rendered
+
+
 def _render_market_meta_line(meta: dict | None) -> str:
     payload = meta or {}
     status = str(payload.get("status") or "").strip().lower()
-    note = str(payload.get("note") or "").strip()
+    note = re.sub(r"，?强势观察池\s+\d+\s*只", "", str(payload.get("note") or "")).strip()
     if note:
+        if status == "observation_ready":
+            return f"候选状态：观察日报已就绪（模型未获可执行资格）。{note}"
         if status == "fallback":
             return f"候选状态：降级中。{note}"
         if status == "not_ready":
@@ -2689,6 +2815,8 @@ def _render_market_meta_line(meta: dict | None) -> str:
         return "候选状态：今日快照未完全就绪，当前使用最新模型预测降级候选。"
     if status == "not_ready":
         return "候选状态：今日全市场候选尚未就绪。"
+    if status == "observation_ready":
+        return "候选状态：全市场扫描已完成，仅供研究观察，当前不可执行。"
     return "候选状态：已使用今日全市场候选。"
 
 
@@ -2709,9 +2837,9 @@ def _build_market_strategy(*, rows: list[dict], mood: str) -> dict:
 
     bullets: list[str] = []
     if top_buy:
-        bullets.append("优先跟踪: " + " / ".join(row.get("ticker") or "-" for row in top_buy))
+        bullets.append("优先跟踪: " + " / ".join(_report_security_label(row) for row in top_buy))
     if top_caution:
-        bullets.append("谨慎对待: " + " / ".join(row.get("ticker") or "-" for row in top_caution))
+        bullets.append("谨慎对待: " + " / ".join(_report_security_label(row) for row in top_caution))
     if bullish_rows and not cautious_rows:
         bullets.append("当前日报里偏多结论明显更多，说明短线环境对趋势延续更友好。")
     elif cautious_rows and not bullish_rows:
@@ -3054,6 +3182,8 @@ def _load_full_market_report_candidates(
         "snapshot_templates_considered": len(snapshot_sources),
         "snapshot_templates_ready": 0,
         "snapshot_rows": 0,
+        "unique_candidates_scored": 0,
+        "deep_review_candidate_count": 0,
         "blocked_candidates": 0,
         "snapshot_stale": False,
         "stale_snapshot_days": [],
@@ -3142,6 +3272,8 @@ def _load_full_market_report_candidates(
         )
     )
     trimmed = candidates[:limit]
+    meta["unique_candidates_scored"] = len(candidates)
+    meta["deep_review_candidate_count"] = len(trimmed)
     if with_meta:
         return trimmed, meta
     return trimmed
@@ -3238,13 +3370,16 @@ def _candidate_from_full_market_row(
     market: str,
     market_snapshot: dict | None = None,
 ) -> dict:
-    if row.get("trade_readiness_score") is None:
+    # Re-evaluate model-backed rows at report time so snapshots created under
+    # an older tradability policy cannot preserve obsolete score semantics.
+    if (row.get("trade_readiness_score") is None or row.get("model_percentile") is not None
+        or row.get("rank_percentile") is not None):
         decision = evaluate_candidate_tradability(
             {
                 **row,
-                "score": row.get("model_score") or row.get("model_confidence"),
+                "score": first_present(row, "model_score", "score"),
                 "signal_label": row.get("model_signal_label") or row.get("signal_label"),
-                "signal_strength": row.get("model_signal_strength") or row.get("trend_score"),
+                "signal_strength": first_present(row, "model_signal_strength", "trend_score"),
                 "expected_drawdown_20d": row.get("model_expected_drawdown_20d"),
                 "entry_style": row.get("model_entry_style") or row.get("action_label"),
                 "risk_flags": row.get("risk_flags") or row.get("model_execution_tags") or [],
@@ -3254,6 +3389,8 @@ def _candidate_from_full_market_row(
         row = {
             **row,
             "tradability_status": decision.tradability_status,
+            "block_reason": decision.block_reason,
+            "tradability_diagnostics": decision.diagnostics,
             "trade_readiness_score": decision.trade_readiness_score,
             "readiness_bucket": decision.readiness_bucket,
             "readiness_reason": decision.readiness_reason,
@@ -3275,7 +3412,11 @@ def _candidate_from_full_market_row(
     signal_strength = _safe_float(row.get("model_signal_strength"))
     if signal_strength is None:
         signal_strength = trend_score
-    percentile = _safe_float(row.get("model_percentile"))
+    try:
+        canonical_rank = rank_ratio(row)
+    except ValueError:
+        canonical_rank = None  # The evaluator above has blocked invalid scores.
+    percentile = canonical_rank * 100.0 if canonical_rank is not None else 0.0
     confidence = _safe_float(row.get("model_confidence"))
     reward_risk = _safe_float(row.get("model_reward_risk_ratio"))
     volume_ratio = _safe_float(row.get("volume_ratio"))
@@ -3287,12 +3428,11 @@ def _candidate_from_full_market_row(
         + trend_score
         + signal_strength * 0.7
         + percentile * 0.25
-        + confidence * 0.25
         + readiness * 1.05
         + min(volume_ratio, 8.0) * 2.0
         + min(reward_risk, 4.0) * 6.0
     )
-    execution_tags = row.get("model_execution_tags") or row.get("execution_tags") or row.get("risk_flags") or []
+    execution_tags = first_present(row, "risk_flags", "model_execution_tags", "execution_tags") or []
     tradability_status = row.get("tradability_status") or row.get("model_tradability_status")
     if not tradability_status:
         tradability_status = "REVIEW" if execution_tags else "READY"
@@ -3312,23 +3452,27 @@ def _candidate_from_full_market_row(
         "market": row.get("market") or market,
         "score": model_score,
         "rank_value": row.get("rank_value"),
-        "confidence": confidence or None,
+        "confidence": confidence if row.get("model_confidence") is not None else None,
         "signal_label": row.get("model_signal_label") or row.get("signal_label"),
         "signal_strength": signal_strength,
         "expected_drawdown_20d": row.get("model_expected_drawdown_20d"),
-        "model_reward_risk_ratio": reward_risk or None,
-        "percentile": percentile or None,
+        "model_reward_risk_ratio": reward_risk if row.get("model_reward_risk_ratio") is not None else None,
+        "percentile": percentile if canonical_rank is not None else None,
+        "rank_percentile": canonical_rank,
+        "score_contract_version": SCORE_CONTRACT_VERSION,
+        "score_semantics": row.get("score_semantics"),
+        "model_activation_status": row.get("model_activation_status") or "unverified",
         "conviction_bucket": row.get("model_conviction_bucket"),
         "position_size_hint": row.get("model_position_size_hint"),
         "entry_style": row.get("model_entry_style"),
         "tradability_status": tradability_status,
         "block_reason": row.get("block_reason"),
-        "trade_readiness_score": readiness or None,
+        "trade_readiness_score": readiness if row.get("trade_readiness_score") is not None else None,
         "readiness_bucket": readiness_bucket,
         "readiness_reason": row.get("readiness_reason"),
         "preferred_entry_style": row.get("preferred_entry_style"),
         "suggested_watch_action": row.get("suggested_watch_action"),
-        "target_weight": row.get("target_weight") or row.get("model_target_weight"),
+        "target_weight": first_present(row, "target_weight", "model_target_weight"),
         "suggested_participation_rate": row.get("suggested_participation_rate"),
         "entry_trigger": entry_trigger,
         "invalidation_condition": invalidation,
@@ -3439,7 +3583,7 @@ def _build_buy_the_dip_rows(*, rows: list[dict], markets: list[str]) -> list[dic
                 latest_signal=candidate,
                 combined_analysis={
                     "decision": "BUY" if combined.get("trend_label") == "bullish" else "HOLD",
-                    "confidence": int(round(float(combined.get("confidence") or 0.55) * 100)),
+                    "confidence": _ratio_percent(combined.get("confidence"), default=0.55),
                     "score": int(round(((combined.get("trend_score") or 50) - 50) / 10)),
                     "reasons": list((combined or {}).get("explanation") or [])[:3],
                     "technical_rating": {},
@@ -3551,3 +3695,12 @@ def _fmt_number(value) -> str:
         return f"{float(value):.3f}"
     except (TypeError, ValueError):
         return "-"
+
+
+def _fmt_scalar(value) -> str:
+    return "-" if value is None else str(value)
+
+
+def _ratio_percent(value, *, default: float) -> int:
+    effective = default if value is None else value
+    return int(round(float(effective) * 100))

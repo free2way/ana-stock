@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any
+
+from app.services.model_score_contract import (
+    SCORE_CONTRACT_VERSION, finite_number, first_present, ordering_strength, rank_ratio,
+)
 
 
 @dataclass(slots=True)
@@ -10,6 +15,11 @@ class TradabilityRuleConfig:
     strong_score: float = 0.75
     review_score: float = 0.55
     max_expected_drawdown_20d: float = 0.15
+    # Signal-day open-gap ceiling (percent).  The executable-label regime
+    # enters at the NEXT open, so a large signal-day gap hands back the modeled
+    # edge before the position even exists; gap-heavy names must not be
+    # delivered as chase-ready buys.
+    max_signal_open_gap_pct: float = 4.0
 
 
 @dataclass(slots=True)
@@ -38,7 +48,8 @@ def _safe_float(value: Any) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
@@ -56,10 +67,9 @@ def _safe_list(value: Any) -> list[str]:
     return [str(value).strip()] if str(value).strip() else []
 
 
-def _normalize_score(value: float | None) -> float | None:
-    if value is None:
-        return None
-    return value / 100.0 if value > 1.5 else value
+def _conviction_score(candidate: dict[str, Any], raw_score: float | None) -> tuple[float | None, str | None]:
+    """Compatibility entry point: raw margins never supply confidence."""
+    return ordering_strength(candidate)
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
@@ -129,8 +139,11 @@ def _calculate_readiness_score(
     entry_style: str | None,
 ) -> tuple[float, str]:
     trend_score = _safe_float(candidate.get("trend_score"))
-    percentile = _safe_float(candidate.get("model_percentile") or candidate.get("percentile"))
-    confidence = _safe_float(candidate.get("model_confidence") or candidate.get("confidence"))
+    try:
+        rank = rank_ratio(candidate)
+    except ValueError:
+        rank = None
+    percentile = rank * 100.0 if rank is not None else None
     reward_risk = _safe_float(candidate.get("model_reward_risk_ratio") or candidate.get("reward_risk_ratio"))
     volume_ratio = _safe_float(candidate.get("volume_ratio"))
     momentum_5 = _safe_float(candidate.get("momentum_5"))
@@ -155,8 +168,6 @@ def _calculate_readiness_score(
         reasons.append("trend")
     if percentile is not None:
         readiness += _clamp(percentile, 0, 100) * 0.06
-    if confidence is not None:
-        readiness += _clamp(confidence, 0, 100) * 0.05
     if reward_risk is not None:
         readiness += min(4.0, max(0.0, reward_risk)) * 4.0
         reasons.append("reward_risk")
@@ -221,9 +232,6 @@ def _infer_time_horizon(candidate: dict[str, Any], status: str) -> str:
         return "3-10d"
     if entry_style in {"pullback", "buy_the_dip"}:
         return "2-8d"
-    score = _safe_float(candidate.get("score"))
-    if score is not None and score >= 0.85:
-        return "5-15d"
     if status == "DEFER":
         return "1-5d"
     return "3-12d"
@@ -308,10 +316,16 @@ def evaluate_candidate_tradability(
     config: TradabilityRuleConfig | None = None,
 ) -> TradabilityDecision:
     rules = config or TradabilityRuleConfig()
-    score = _normalize_score(_safe_float(candidate.get("score") or candidate.get("model_score")))
+    contract_error = None
+    try:
+        raw_score = finite_number(first_present(candidate, "raw_score", "score", "model_score"))
+        conviction_score, conviction_source = _conviction_score(candidate, raw_score)
+    except ValueError as exc:
+        raw_score = conviction_score = conviction_source = None
+        contract_error = str(exc)
     signal_strength = _safe_float(candidate.get("signal_strength"))
     if signal_strength is None:
-        signal_strength = _safe_float(candidate.get("model_signal_strength") or candidate.get("trend_score"))
+        signal_strength = _safe_float(first_present(candidate, "model_signal_strength", "trend_score"))
     expected_drawdown_20d = _safe_float(candidate.get("expected_drawdown_20d"))
     if expected_drawdown_20d is None:
         expected_drawdown_20d = _safe_float(candidate.get("model_expected_drawdown_20d"))
@@ -327,21 +341,41 @@ def evaluate_candidate_tradability(
     market_buy_gate = str(market_context.get("buy_gate") or "").strip().upper()
     model_activation_status = str(candidate.get("model_activation_status") or "").strip().lower()
 
-    risk_flags: list[str] = _safe_list(candidate.get("risk_flags")) + _safe_list(candidate.get("model_execution_tags"))
+    # These flags are outputs of this evaluator.  Remove persisted copies so
+    # re-evaluating an older snapshot is idempotent after policy changes.
+    derived_risk_flags = {
+        "missing-model-score", "low-conviction", "needs-better-entry",
+        "drawdown-risk", "weak-signal-strength", "market-buy-gate-blocked",
+        "market-risk-review", "model-observation-only", "confirmation-needed",
+        "missing-latest-price", "chase-risk", "weak-market", "weak-breadth",
+        "crowded-theme", "portfolio-risk-budget", "invalid-score-contract",
+    }
+    risk_flags = [
+        flag
+        for flag in (_safe_list(candidate.get("risk_flags")) + _safe_list(candidate.get("model_execution_tags")))
+        if flag.strip().lower() not in derived_risk_flags
+    ]
     block_reason: str | None = None
     status = "READY"
 
-    if score is None:
-        risk_flags.append("missing-model-score")
-        if signal_strength is None or signal_strength < 70:
-            status = "REVIEW"
-    elif score < rules.min_score or signal_label in {"SELL", "STRONG_SELL"}:
+    if contract_error:
+        status = "BLOCKED"
+        block_reason = "invalid_score_contract"
+        risk_flags.append("invalid-score-contract")
+    elif signal_label in {"SELL", "STRONG_SELL"}:
         status = "BLOCKED"
         block_reason = "signal_not_actionable"
-    elif score < rules.review_score:
+    elif (raw_score is not None and raw_score < rules.min_score
+          and str(candidate.get("score_semantics") or "") not in {"rank_margin", "cross_sectional_rank"}):
+        status = "BLOCKED"
+        block_reason = "signal_not_actionable"
+    elif conviction_score is None:
+        risk_flags.append("missing-model-score")
+        status = "REVIEW"
+    elif conviction_score is not None and conviction_score < rules.review_score:
         status = "REVIEW"
         risk_flags.append("low-conviction")
-    elif score < rules.strong_score:
+    elif conviction_score is not None and conviction_score < rules.strong_score:
         status = "DEFER"
         risk_flags.append("needs-better-entry")
 
@@ -395,6 +429,18 @@ def evaluate_candidate_tradability(
             status = "REVIEW"
         risk_flags.append("chase-risk")
 
+    # Hard gap-chase gate, mirroring the momentum chase rule above.  Values are
+    # in percent (5.2 == +5.2%); absence of a gap reading must never trigger.
+    signal_open_gap_pct = _safe_float(first_present(candidate, "signal_open_gap_pct", "open_gap_pct"))
+    if (
+        signal_open_gap_pct is not None
+        and signal_open_gap_pct >= rules.max_signal_open_gap_pct
+        and entry_style not in {"pullback", "buy_the_dip", "support_hold"}
+    ):
+        risk_flags.append("gap-chase-risk")
+        if status in {"READY", "DEFER"}:
+            status = "REVIEW"
+
     if market_regime == "defensive":
         risk_flags.append("weak-market")
         if entry_style in {"breakout", "momentum", "wait_for_breakout", "breakout_ready"}:
@@ -432,7 +478,7 @@ def evaluate_candidate_tradability(
             "market_breadth_pct": market_breadth_pct,
             "market_crowded_theme": market_crowded_theme,
         },
-        score=score,
+        score=conviction_score,
         signal_strength=signal_strength,
         expected_drawdown_20d=expected_drawdown_20d,
         status=status,
@@ -477,7 +523,12 @@ def evaluate_candidate_tradability(
             market_regime,
         ),
         diagnostics={
-            "score": score,
+            "score": raw_score,
+            "raw_model_score": raw_score,
+            "conviction_score": conviction_score,
+            "conviction_source": conviction_source,
+            "score_contract_version": SCORE_CONTRACT_VERSION,
+            "score_contract_error": contract_error,
             "signal_strength": signal_strength,
             "expected_drawdown_20d": expected_drawdown_20d,
             "trade_readiness_score": readiness_score,

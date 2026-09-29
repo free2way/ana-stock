@@ -92,6 +92,17 @@ def _classify_market(market: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     latest_up_pct = _safe_float(latest.get("up_pct")) or 0.0
     prev_avg = _safe_float(previous.get("avg_ret_pct")) or 0.0
     dispersion = abs((_safe_float(latest.get("avg_ret_pct")) or 0.0) - (_safe_float(latest.get("median_ret_pct")) or 0.0))
+    # A-share index masking: index heavyweights are walked up to hold the
+    # index while the median stock falls and breadth collapses.  CN limit
+    # bands (+/-10/20%) compress the cross-sectional avg-median gap, so on CN
+    # breadth itself must be able to flag the regime, not only the dispersion
+    # statistic that was originally calibrated on US data.
+    cn_breadth_masked = (
+        market == "CN"
+        and latest_avg > 0.0
+        and latest_median <= 0.0
+        and 0.0 < latest_up_pct < 45.0
+    )
 
     flags: list[str] = []
     if latest_score >= 6:
@@ -106,7 +117,17 @@ def _classify_market(market: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     elif latest_score >= 3 or recent_crash_days >= 2:
         risk_regime = "high_volatility"
         flags.append("high-volatility")
-    elif market == "US" and (dispersion >= 2.0 and latest_median <= 0.0 or recent_high_dispersion):
+    # P0-6: index-masking-weak-breadth is not US-specific. CN structural
+    # rallies (large caps holding the index while breadth collapses) must
+    # land here too, otherwise the model keeps attacking the worst regime.
+    # `cn_breadth_masked` is the CN breadth channel: +/-10/20% limit bands
+    # compress the avg-median gap, so a positive average over a non-positive
+    # median with fewer than 45% of stocks up must flag the regime on its own.
+    elif (
+        (dispersion >= 2.0 and latest_median <= 0.0)
+        or recent_high_dispersion
+        or cn_breadth_masked
+    ):
         risk_regime = "high_dispersion"
         flags.append("index-masking-weak-breadth")
     elif latest_avg > 0.3 and latest_median > 0.0 and latest_up_pct >= 58.0:
@@ -114,9 +135,9 @@ def _classify_market(market: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     else:
         risk_regime = "watchful"
 
-    if market == "US" and dispersion >= 2.0:
+    if dispersion >= 2.0:
         flags.append("high-dispersion")
-    if market == "US" and recent_high_dispersion:
+    if recent_high_dispersion:
         flags.append("recent-high-dispersion")
     if latest_median < 0.0 and latest_avg > 0.0:
         flags.append("average-masks-weak-median")

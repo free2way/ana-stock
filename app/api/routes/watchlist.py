@@ -6,11 +6,15 @@ from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
+from app.services.execution_tag_filters import (
+    matches_execution_tag_filter as _matches_execution_tag_filter,
+    excludes_execution_tag_filter as _excludes_execution_tag_filter,
+)
 from app.core.db import SessionLocal, get_db_session
 from app.models.schema import SymbolCreate
 from app.services.auth import is_authenticated, login_redirect
 from app.services.market_sync import sync_market_data
-from app.services.market_lake import load_lake_price_history
+from app.services.price_snapshot import load_daily_change_pct as _load_watchlist_daily_change_pct
 from app.services.market_freshness import summarize_market_freshness
 from app.services.price_snapshot import load_latest_closes
 from app.services.repository import PredictionRepository, PredictionTradePlanRepository, SymbolRepository, WatchlistRepository
@@ -21,6 +25,7 @@ from app.services.symbol_details import SymbolDataService
 from app.services.symbol_catalog import infer_symbol_record, search_symbol_catalog, search_symbol_records
 from app.services.ticker_format import normalize_ticker_for_market
 from app.services.ui_lang import resolve_request_lang
+from app.api.rendering import render_daily_change_chip as _render_daily_change_chip
 from app.services.watchlist_metadata import refresh_watchlist_metadata
 from app.services.workspace_nav import WORKSPACE_COMPACT_STYLE, WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
 from app.services.workspace_snapshots import (
@@ -213,28 +218,6 @@ def _ensure_watchlist_execution_tags(items: list[dict]) -> None:
         item["execution_tags"] = _derive_watchlist_execution_tags(item)
 
 
-def _matches_execution_tag_filter(tags: list[str] | None, execution_tag_filter: str) -> bool:
-    normalized = str(execution_tag_filter or "").strip().lower()
-    if not normalized or normalized == "all":
-        return True
-    requested = [part.strip() for part in normalized.split(",") if part.strip() and part.strip() != "all"]
-    if not requested:
-        return True
-    values = [str(tag).strip().lower() for tag in (tags or []) if str(tag).strip()]
-    return any(tag in values for tag in requested)
-
-
-def _excludes_execution_tag_filter(tags: list[str] | None, exclude_execution_tag_filter: str) -> bool:
-    normalized = str(exclude_execution_tag_filter or "").strip().lower()
-    if not normalized or normalized == "all":
-        return True
-    requested = [part.strip() for part in normalized.split(",") if part.strip() and part.strip() != "all"]
-    if not requested:
-        return True
-    values = [str(tag).strip().lower() for tag in (tags or []) if str(tag).strip()]
-    return not any(tag in values for tag in requested)
-
-
 def _lightweight_watchlist_analysis(model_output: dict | None) -> dict:
     score = None if model_output is None else model_output.get("score")
     label = (model_output or {}).get("signal_label") or build_signal_label(score, lang="en") or "Hold"
@@ -247,11 +230,7 @@ def _lightweight_watchlist_analysis(model_output: dict | None) -> dict:
         decision = "WATCH"
     else:
         decision = "HOLD"
-    confidence = (
-        (model_output or {}).get("confidence")
-        or model_confidence(score)
-        or 45
-    )
+    confidence = (model_output or {}).get("confidence")
     strength = (
         (model_output or {}).get("signal_strength")
         or signal_strength(score)
@@ -260,7 +239,7 @@ def _lightweight_watchlist_analysis(model_output: dict | None) -> dict:
     return {
         "status": "lightweight",
         "decision": decision,
-        "confidence": int(confidence),
+        "confidence": int(confidence) if confidence is not None else None,
         "score": int(round(float(score or 0) * 10)),
         "signal_strength": int(strength),
     }
@@ -373,26 +352,6 @@ def _format_watchlist_close(value: float | None) -> str:
     return f"{numeric:.4f}"
 
 
-def _render_daily_change_chip(value: float | None) -> str:
-    if value is None:
-        return "<span class='muted'>-</span>"
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return "<span class='muted'>-</span>"
-    bg = "rgba(148,163,184,0.12)"
-    fg = "#cbd5e1"
-    if numeric > 0:
-        bg = "rgba(22,163,74,0.16)"
-        fg = "#4ade80"
-    elif numeric < 0:
-        bg = "rgba(220,38,38,0.16)"
-        fg = "#f87171"
-    return (
-        "<span style='display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;"
-        f"background:{bg};color:{fg};font-weight:800;font-size:12px;white-space:nowrap;'>{numeric:+.2f}%</span>"
-    )
-
 
 def _watchlist_sort_value(item: dict, sort_by: str) -> tuple[float, str]:
     normalized = str(sort_by or "daily_change").strip().lower()
@@ -452,26 +411,6 @@ def _watchlist_sort_link(
     return f"<a href='/watchlist?{query}' style='color:inherit;text-decoration:none;'>{label}{arrow}</a>"
 
 
-def _load_watchlist_daily_change_pct(*, market: str | None, ticker: str) -> float | None:
-    market_value = str(market or "").strip().upper()
-    normalized_ticker = normalize_ticker_for_market(ticker, market_value)
-    if market_value not in {"CN", "US"} or not normalized_ticker:
-        return None
-    rows = load_lake_price_history(market=market_value, ticker=normalized_ticker, limit=2)
-    if len(rows) < 2:
-        return None
-    latest = rows[-1]
-    previous = rows[-2]
-    latest_close = latest.get("close") or latest.get("adj_close")
-    previous_close = previous.get("close") or previous.get("adj_close")
-    try:
-        latest_value = float(latest_close)
-        previous_value = float(previous_close)
-    except (TypeError, ValueError):
-        return None
-    if previous_value == 0:
-        return None
-    return ((latest_value / previous_value) - 1.0) * 100.0
 
 
 def _attach_watchlist_price_fields(items: list[dict]) -> None:
@@ -850,7 +789,7 @@ def _render_watchlist_analysis_fragment(
             f"<div class='muted' style='margin-top:4px;'>{html.escape(str(item.get('name') or item.get('ticker') or '-'))} · {html.escape(str(item.get('market') or '-'))}</div>"
             f"<div class='muted' style='margin-top:4px;'>{html.escape(str(item.get('action_reason') or item.get('ai_brief') or '-'))}</div></div>"
             f"<div style='text-align:right;'><span class='signal {tone}'>{html.escape(str(item.get('action_hint') or label))}</span>"
-            f"<div class='muted' style='margin-top:6px;'>{int((item.get('combined_analysis') or {}).get('confidence') or 0)}%</div></div>"
+            f"<div class='muted' style='margin-top:6px;'>{str(int(item['combined_analysis']['confidence'])) + '%' if (item.get('combined_analysis') or {}).get('confidence') is not None else '-'}</div></div>"
             "</article>"
             for item in entries[:5]
         ) or f"<div class='muted'>{'暂无项目' if lang == 'zh' else 'No names'}</div>"

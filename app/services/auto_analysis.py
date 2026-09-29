@@ -1,6 +1,5 @@
 import json
 import threading
-import time
 from datetime import datetime, timedelta
 
 from app.core.db import SessionLocal
@@ -8,11 +7,14 @@ from app.services.ai_daily_report import build_ai_daily_report, render_ai_daily_
 from app.services.backtester import BacktestRunner
 from app.services.cn_concepts import sync_cn_concepts
 from app.services.cn_fundamentals import sync_cn_fundamentals
-from app.services.dataset_build import build_dataset
 from app.services.market_lake import load_lake_price_history
 from app.services.market_risk import save_risk_guardrail_snapshots
 from app.services.market_sync import sync_market_data
 from app.services.push_notifications import PushNotificationService
+from app.services.stock_selection.decision_ledger import dispatch_publication_message
+from app.services.stock_selection.publication_guard import (
+    load_trusted_model_qualifications, load_trusted_regime_snapshots, prepare_report_for_publication,
+)
 from app.services.repository import AppSettingRepository, DataJobRepository, WatchlistRepository
 from app.services.time_utils import app_now, app_now_iso
 from app.services.trainer import SignalTrainer
@@ -170,23 +172,16 @@ class AutoAnalysisService:
                         "ticker": ticker,
                         "status": "skipped",
                         "provider": "parquet_lake",
-                        "message": "Using pre-refreshed Parquet market lake; no per-symbol CSV sync needed.",
+                        "message": "Using pre-refreshed Parquet market lake; no per-symbol sync needed.",
                     }
                     for ticker in tickers
                 ]
-                build_result = {
-                    "normalized_files": [],
-                    "qlib_built": False,
-                    "source": "parquet_lake",
-                    "message": "Skipped CSV normalization; trainer and backtester read from Parquet lake.",
-                }
             else:
                 sync_results = sync_market_data(
                     tickers=tickers,
                     start_date=config["start_date"],
                     provider=config["provider"],
                 )
-                build_result = build_dataset(normalize_only=True)
             cn_fundamental_result = None
             cn_concept_result = None
             cn_tickers = [ticker for ticker in tickers if ticker.upper().endswith((".SS", ".SZ", ".BJ"))]
@@ -246,27 +241,38 @@ class AutoAnalysisService:
                     tickers=tickers,
                     markets=sorted(normalized_markets) if normalized_markets else None,
                 )
-                save_ai_daily_report(ai_daily_report)
+                ai_daily_report.setdefault("decision_cutoff_at", app_now_iso())
+                ai_daily_report.update(prepare_report_for_publication(
+                    ai_daily_report, approved_qualifications=load_trusted_model_qualifications(),
+                    trusted_regime_snapshots=load_trusted_regime_snapshots(),
+                ))
                 notifier = PushNotificationService()
-                if notifier.available_channels():
-                    push_messages = render_ai_daily_report_push_messages(ai_daily_report)
+                channels = notifier.available_channels()
+                push_messages = render_ai_daily_report_push_messages(ai_daily_report) if channels else []
+                decision_receipt = save_ai_daily_report(
+                    ai_daily_report, publication_messages=push_messages,
+                    publication_channels=channels,
+                )
+                if channels:
                     push_results = []
                     sent: list[str] = []
                     failed: list[dict] = []
-                    for message_item in push_messages:
-                        result = notifier.send_event(
-                            event_type="stock_recommendation",
-                            title=message_item["title"],
-                            body=message_item["body"],
-                        )
-                        push_results.append({"title": message_item["title"], **result})
-                        sent.extend(item for item in (result.get("sent") or []) if item not in sent)
-                        failed.extend(result.get("failed") or [])
+                    with SessionLocal() as delivery_db:
+                        for ordinal, message_item in enumerate(push_messages, start=1):
+                            result = dispatch_publication_message(
+                                db=delivery_db, notifier=notifier, receipt=decision_receipt,
+                                ordinal=ordinal, message=message_item,
+                                event_type="stock_recommendation", channels=channels,
+                            )
+                            push_results.append({"title": message_item["title"], **result})
+                            sent.extend(item for item in (result.get("sent") or []) if item not in sent)
+                            failed.extend(result.get("failed") or [])
                     push_result = {
                         "status": "success" if sent and not failed else "partial" if sent else "failed",
                         "sent": sent,
                         "failed": failed,
                         "messages": push_results,
+                        "final_decision_receipt": decision_receipt,
                     }
             message = (
                 f"Auto analysis finished for {len(tickers)} watchlist stock(s): "
@@ -315,7 +321,6 @@ class AutoAnalysisService:
                 "cn_fundamental_result": cn_fundamental_result,
                 "cn_concept_result": cn_concept_result,
                 "risk_guardrail_result": risk_guardrail_result,
-                "build_result": build_result,
                 "predictions_written": predictions_written,
                 "daily_rows_written": daily_rows_written,
                 "ai_daily_report": ai_daily_report,

@@ -36,11 +36,11 @@ class QlibPredictor:
             issues.append("Qlib is not installed. Install it with `.venv/bin/pip install -r requirements-qlib.txt`.")
         if artifact_predictions_csv is None and not qlib_dir.exists():
             issues.append(
-                f"Qlib dataset directory does not exist: {qlib_dir}. Build it with `scripts/build_dataset.py`."
+                f"Qlib dataset directory does not exist: {qlib_dir}. Provide a prebuilt Qlib provider directory or a model artifact with predictions."
             )
         elif artifact_predictions_csv is None and not any(qlib_dir.iterdir()):
             issues.append(
-                f"Qlib dataset directory is empty: {qlib_dir}. Build it with `scripts/build_dataset.py`."
+                f"Qlib dataset directory is empty: {qlib_dir}. Provide a prebuilt Qlib provider directory or a model artifact with predictions."
             )
         if artifact_path:
             artifact = Path(artifact_path)

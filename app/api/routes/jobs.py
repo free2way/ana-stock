@@ -13,7 +13,6 @@ from app.services.backtester import BacktestRunner
 from app.services.ai_daily_report import (
     build_ai_daily_report,
     load_ai_daily_report,
-    render_ai_daily_report_message,
     render_ai_daily_report_push_messages,
     save_ai_daily_report,
 )
@@ -27,15 +26,18 @@ from app.services.cn_market_universe import (
 from app.services.data_quality import format_data_gate_failure, market_data_gate
 from app.services.cn_concepts import sync_cn_concepts
 from app.services.cn_fundamentals import sync_cn_fundamentals
-from app.services.dataset_build import build_dataset
 from app.services.global_fundamentals import sync_global_fundamentals
 from app.services.job_response import build_job_payload, complete_job_and_build_payload, fail_job_and_build_payload
 from app.services.kronos_validation import KRONOS_VALIDATION_JOB_TYPE, save_kronos_validation_snapshot
+from app.services.hithink_market_data import import_hithink_market_dump
 from app.services.market_sync import sync_market_data
 from app.services.market_lake import get_latest_lake_trade_date, list_lake_symbols, query_us_daily_summary
 from app.services.market_risk import save_risk_guardrail_snapshots
-from app.services.market_csv_cleanup import cleanup_market_csv_files
-from app.services.model_evaluation import evaluate_model_runs, list_latest_model_evaluations
+from app.services.model_evaluation import (
+    SCHEDULED_EVALUATION_TRADE_DATES,
+    evaluate_model_runs,
+    list_latest_model_evaluations,
+)
 from app.services.model_challenger import challenger_race_readiness
 from app.services.nlp_snapshots import NEWS_ENRICHMENT_JOB_TYPE, refresh_nlp_snapshots
 from app.services.model_selection_guidance import save_model_selection_guidance_snapshots
@@ -58,6 +60,11 @@ from app.services.us_market_universe import refresh_us_grouped_daily_range
 from app.services.us_trade_universe import build_us_trade_universe
 from app.services.workspace_snapshots import refresh_workspace_snapshots
 from app.services.storage_retention import clean_model_history
+from app.services.stock_selection.history_backfill import (
+    CNHistoryBackfillConfig,
+    backfill_cn_stock_selection_history,
+    summarize_cn_history_backfill_result,
+)
 
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -69,6 +76,7 @@ PROVIDER_OPTIONS = {
         {"value": "alpaca", "label": "Alpaca", "description": "Preferred for U.S. daily bars when Alpaca credentials are configured."},
         {"value": "polygon_grouped_daily", "label": "Polygon Grouped Daily", "description": "Batch U.S. EOD refresh for the full market through Polygon grouped daily."},
         {"value": "tushare", "label": "TuShare", "description": "Preferred for A-share historical sync and close-review flows."},
+        {"value": "hithink_finance", "label": "同花顺 Financial API", "description": "Official A-share daily bars; use Market Dumps for full-market refreshes."},
         {"value": "a_stock_data_tencent", "label": "a-stock-data / Tencent (supplemental)", "description": "Opt-in, small-scope A-share price repair or independent validation; it never replaces the TuShare full-market lake."},
         {"value": "yfinance", "label": "yfinance", "description": "Default for global price sync outside A-shares."},
         {"value": "openbb", "label": "OpenBB", "description": "OpenBB wrapper with fallback behavior when available."},
@@ -76,6 +84,7 @@ PROVIDER_OPTIONS = {
     "fundamental": [
         {"value": "auto", "label": "Auto", "description": "CN uses TuShare; US/HK uses OpenBB/yfinance fundamentals."},
         {"value": "tushare", "label": "TuShare", "description": "Preferred for A-share fundamental snapshots."},
+        {"value": "hithink_finance", "label": "同花顺 Financial API", "description": "Official A-share statements, financial indicators and current valuation with point-in-time timestamps."},
         {"value": "openbb", "label": "OpenBB", "description": "Preferred for US/HK fundamental snapshots."},
         {"value": "global_stock_data_sec", "label": "global-stock-data / SEC EDGAR", "description": "Official U.S. filing fundamentals for a bounded watchlist; requires PQW_SEC_USER_AGENT and does not provide prices."},
     ],
@@ -160,7 +169,14 @@ def _result_status(result: dict, *, partial_default: bool = True) -> str:
     return "partial" if partial_default else "success"
 
 
-def _run_background_job(*, job_id: int, label: str, runner, post_success=None) -> None:
+def _run_background_job(
+    *,
+    job_id: int,
+    label: str,
+    runner,
+    post_success=None,
+    record_market_refresh_batch: bool = True,
+) -> None:
     """Keep long-running operational jobs off the single web-worker request thread."""
 
     def _work() -> None:
@@ -172,7 +188,8 @@ def _run_background_job(*, job_id: int, label: str, runner, post_success=None) -
                     progress={"step": "market_refresh"},
                 )
             result = runner()
-            _record_market_refresh_batch(job_id=job_id, result=result)
+            if record_market_refresh_batch:
+                _record_market_refresh_batch(job_id=job_id, result=result)
             status = _result_status(result)
             message = str(result.get("message") or f"{label} finished.")
             with SessionLocal() as worker_db:
@@ -216,6 +233,45 @@ def _record_market_refresh_batch(*, job_id: int, result: dict) -> None:
     record_market_refresh_result(source_job_id=job_id, result=result)
 
 
+def _run_cn_history_backfill_result(
+    *,
+    job_id: int,
+    execute: bool,
+    target_history_sessions: int,
+    minimum_partition_coverage: float,
+    max_dates: int,
+    inter_date_delay_seconds: float,
+) -> dict:
+    def progress_callback(progress: dict) -> None:
+        with SessionLocal() as progress_db:
+            DataJobRepository(progress_db).update_job(
+                job_id,
+                message=(
+                    f"CN history backfill processed {progress.get('processed_dates', 0)}/"
+                    f"{progress.get('scheduled_dates', 0)} scheduled partition(s)."
+                ),
+                progress=progress,
+            )
+
+    result = backfill_cn_stock_selection_history(
+        config=CNHistoryBackfillConfig(
+            target_history_sessions=target_history_sessions,
+            minimum_partition_coverage=minimum_partition_coverage,
+            max_dates_per_run=max_dates,
+            inter_date_delay_seconds=inter_date_delay_seconds,
+            dry_run=not execute,
+        ),
+        progress_callback=progress_callback,
+    )
+    return summarize_cn_history_backfill_result(result)
+
+
+# P0 closeout: scheduled evaluation must price next-open entries at the same
+# realistic round-trip cost as the CN close scheduler (commission + stamp tax
+# + opening slippage), not the optimistic 20bps used before the rollout.
+SCHEDULED_EVALUATION_ROUND_TRIP_COST_BPS = 50.0
+
+
 def _run_post_training_evaluation(*, source_job_id: int, market: str) -> None:
     """Create a separate, traceable evaluation Job after a successful signal run."""
     market_code = str(market or "").upper()
@@ -232,10 +288,10 @@ def _run_post_training_evaluation(*, source_job_id: int, market: str) -> None:
                 "source_job_id": source_job_id,
                 "markets": [market_code],
                 "recent_runs": 1,
-                "recent_trade_dates": 12,
+                "recent_trade_dates": SCHEDULED_EVALUATION_TRADE_DATES,
                 "top_n": 20,
                 "horizons": [1, 3, 5, 10, 20],
-                "round_trip_cost_bps": 20.0,
+                "round_trip_cost_bps": SCHEDULED_EVALUATION_ROUND_TRIP_COST_BPS,
                 "trigger": "post_signal_training",
             },
             message="Persisting scheduled structured evaluation after signal training.",
@@ -244,10 +300,11 @@ def _run_post_training_evaluation(*, source_job_id: int, market: str) -> None:
             result = evaluate_model_runs(
                 db,
                 markets=[market_code],
+                require_execution_reconciliation=True,
                 recent_runs=1,
-                recent_trade_dates=12,
+                recent_trade_dates=SCHEDULED_EVALUATION_TRADE_DATES,
                 top_n=20,
-                round_trip_cost_bps=20.0,
+                round_trip_cost_bps=SCHEDULED_EVALUATION_ROUND_TRIP_COST_BPS,
                 source_job_id=job.id,
             )
             job_repo.complete_job(
@@ -398,34 +455,15 @@ def _train_us_signals_result(
     }
 
 
-def _storage_retention_result(*, keep_runs: int, keep_snapshots: int, apply: bool) -> dict:
+def _storage_retention_result(*, keep_runs: int, keep_snapshots: int) -> dict:
     with SessionLocal() as db:
         return clean_model_history(
             db,
             keep_model_runs_per_market=keep_runs,
             keep_workspace_snapshots_per_type=keep_snapshots,
-            apply=apply,
+            apply=False,
         )
 
-
-def _combine_screener_precompute_batches(*batch_results: dict) -> dict:
-    valid_batches = [batch for batch in batch_results if batch]
-    total_created = sum(int(batch.get("count", 0) or 0) for batch in valid_batches)
-    total_failed = sum(int(batch.get("failed_count", 0) or 0) for batch in valid_batches)
-    snapshots_created: list[dict] = []
-    failed_items: list[dict] = []
-    for batch in valid_batches:
-        snapshots_created.extend(list(batch.get("snapshots_created") or []))
-        failed_items.extend(list(batch.get("failed_templates") or []))
-        failed_items.extend(list(batch.get("failed_presets") or []))
-    return {
-        "status": "success" if total_created > 0 and total_failed == 0 else "partial" if total_created > 0 else "failed",
-        "count": total_created,
-        "failed_count": total_failed,
-        "snapshots_created": snapshots_created,
-        "failed_templates": failed_items,
-        "batches": valid_batches,
-    }
 
 
 def _run_cn_precompute_tail_jobs(*, source_job_id: int, parent_job_id: int | None = None) -> None:
@@ -536,7 +574,9 @@ def job_templates(request: Request):
         {"job_type": "init_cn_market_data", "description": "Initialize A-share market price history for full-market scans."},
         {"job_type": "refresh_cn_market_data", "description": "Refresh recent A-share market prices for daily full-market scans."},
         {"job_type": "refresh_cn_market_data_daily", "description": "Incrementally refresh A-share market prices from each symbol's last synced date."},
-        {"job_type": "refresh_cn_market_data_lake_only", "description": "Refresh A-share market prices directly into Parquet lake without generating CSV files."},
+        {"job_type": "refresh_cn_market_data_lake_only", "description": "Refresh A-share market prices directly into the Parquet market lake."},
+        {"job_type": "import_hithink_market_dump", "description": "Download and merge the official HiThink full-market A-share Parquet dump into the CN lake."},
+        {"job_type": "backfill_cn_stock_selection_history", "description": "Repair undercovered A-share daily lake partitions in resumable batches for the stock-selection research gate."},
         {"job_type": "train_cn_signals", "description": "Train the LightGBM A-share multifactor signal model from the local CN Parquet market lake and write predictions."},
         {"job_type": "screener_precompute", "description": "Finish core and secondary A-share snapshots first, then compute dependent multi-model combinations in background child jobs."},
         {"job_type": "screener_precompute_core", "description": "Precompute the core A-share screener templates used by the dashboard and model screens first."},
@@ -554,15 +594,13 @@ def job_templates(request: Request):
         {"job_type": "social_us_price_sync", "description": "Automatically sync Alpaca-backed U.S. prices for tickers mentioned in imported X posts."},
         {"job_type": "precompute_us_screeners", "description": "Precompute U.S. screener snapshots after U.S. close using the locally synced U.S. symbol pool."},
         {"job_type": "refresh_us_grouped_daily", "description": "Refresh U.S. grouped daily EOD bars from Polygon for full-market U.S. scans."},
-        {"job_type": "refresh_us_grouped_daily_range", "description": "Refresh a U.S. grouped daily date range directly into Parquet lake without per-symbol CSV files."},
+        {"job_type": "refresh_us_grouped_daily_range", "description": "Refresh a U.S. grouped daily date range directly into the Parquet market lake."},
         {"job_type": "us_signal_train", "description": "Train the LightGBM U.S. multifactor signal model from the local U.S. Parquet market lake and write predictions."},
-        {"job_type": "cleanup_market_csv", "description": "Dry-run or delete market CSV files that are already covered by Parquet market lake."},
         {"job_type": "rebuild_technical_snapshots", "description": "Cache technical pattern snapshots for faster full-market scans."},
         {"job_type": "sync_cn_fundamentals", "description": "Fetch and persist A-share fundamentals through the unified fundamental provider layer."},
         {"job_type": "sync_cn_concepts", "description": "Fetch and persist A-share concept memberships through the unified concept provider layer."},
         {"job_type": "sync_global_fundamentals", "description": "Fetch and persist US/HK fundamentals through the unified fundamental provider layer."},
         {"job_type": "sync_us_sec_fundamentals", "description": "Sync official SEC EDGAR company facts for the U.S. watchlist as a supplementary fundamental source."},
-        {"job_type": "build_dataset", "description": "Normalize price files and build a Qlib dataset."},
         {"job_type": "train_model", "description": "Train a signal model with Qlib."},
         {"job_type": "import_model_output", "description": "Import external model predictions into predictions and model details."},
         {"job_type": "run_backtest", "description": "Run a backtest from stored predictions."},
@@ -669,13 +707,21 @@ async def send_ai_daily_report(request: Request, db: Session = Depends(get_db_se
         report = load_ai_daily_report()
         report_date = str((report or {}).get("report_date") or "").strip()
         rebuilt_report = False
-        if report is None or (target_report_date and (not report_date or report_date < target_report_date)):
+        if report is None or not isinstance(report.get("market_recommendations"), list) or (target_report_date and (not report_date or report_date < target_report_date)):
             report = build_ai_daily_report(limit=8)
-            save_ai_daily_report(report)
             rebuilt_report = True
+        from app.services.stock_selection.publication_guard import (
+            load_trusted_model_qualifications, prepare_report_for_publication,
+        )
+        from app.services.stock_selection.decision_ledger import dispatch_publication_message
+
+        report.update(prepare_report_for_publication(
+            report, approved_qualifications=load_trusted_model_qualifications(db=db),
+        ))
         market_meta = report.get("market_recommendations_meta") or {}
         market_status = str(market_meta.get("status") or "").strip().lower()
         if market_status in {"fallback", "not_ready"} and not force_send:
+            decision_receipt = save_ai_daily_report(report)
             note = str(market_meta.get("note") or "").strip() or "今日 A股全市场候选尚未就绪。"
             payload = complete_job_and_build_payload(
                 job_repo,
@@ -687,19 +733,23 @@ async def send_ai_daily_report(request: Request, db: Session = Depends(get_db_se
                 risk_guardrail_result=risk_guardrail_result,
                 rebuilt_report=rebuilt_report,
                 target_report_date=target_report_date,
+                final_decision_receipt=decision_receipt,
             )
             return _maybe_redirect(redirect_to, payload)
+        # Freeze this exact publication, including resends of cached reports.
         notifier = PushNotificationService()
         push_messages = render_ai_daily_report_push_messages(report)
+        channels = selected_channels or notifier.available_channels()
+        decision_receipt = save_ai_daily_report(
+            report, publication_messages=push_messages, publication_channels=channels,
+        )
         sent: list[str] = []
         failed: list[dict] = []
         results: list[dict] = []
-        for message_item in push_messages:
-            result = notifier.send_event(
-                event_type="stock_recommendation",
-                title=message_item["title"],
-                body=message_item["body"],
-                channels=selected_channels or None,
+        for ordinal, message_item in enumerate(push_messages, start=1):
+            result = dispatch_publication_message(
+                db=db, notifier=notifier, receipt=decision_receipt, ordinal=ordinal,
+                message=message_item, event_type="stock_recommendation", channels=channels,
             )
             results.append({"title": message_item["title"], **result})
             sent.extend(item for item in (result.get("sent") or []) if item not in sent)
@@ -712,6 +762,7 @@ async def send_ai_daily_report(request: Request, db: Session = Depends(get_db_se
             "forced": force_send,
             "rebuilt_report": rebuilt_report,
             "target_report_date": target_report_date,
+            "final_decision_receipt": decision_receipt,
         }
         message = (
             f"Sent A-share AI daily report as {len(push_messages)} message(s) to {', '.join(result['sent'])}"
@@ -795,6 +846,66 @@ async def run_sync_market_data(request: Request, db: Session = Depends(get_db_se
             status=status,
             message=message,
             results=results,
+        )
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
+        return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/import-hithink-market-dump")
+async def run_import_hithink_market_dump(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    kind = str(await _request_value(request, "kind", "daily-k-10d") or "daily-k-10d").strip().lower()
+    write_lake = _as_bool(await _request_value(request, "write_lake", True), default=True)
+    max_rows = _as_optional_int(await _request_value(request, "max_rows", None))
+    background = _as_bool(await _request_value(request, "background", True), default=True)
+    job_repo = DataJobRepository(db)
+    existing = job_repo.get_running_job("import_hithink_market_dump")
+    if existing:
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="running",
+                job_id=existing.get("id"),
+                message="A HiThink market dump import is already running.",
+            ),
+        )
+    job = job_repo.create_job(
+        job_type="import_hithink_market_dump",
+        status="running",
+        params={"kind": kind, "write_lake": write_lake, "max_rows": max_rows},
+    )
+
+    def _runner() -> dict:
+        return import_hithink_market_dump(kind=kind, write_lake=write_lake, max_rows=max_rows)
+
+    if background:
+        _run_background_job(
+            job_id=job.id,
+            label="HiThink A-share market dump import",
+            runner=_runner,
+        )
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="running",
+                job_id=job.id,
+                message="HiThink A-share market dump import started in the background.",
+            ),
+        )
+    try:
+        result = _runner()
+        status = _result_status(result)
+        result_details = {key: value for key, value in result.items() if key not in {"status", "message"}}
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status=status,
+            message=result.get("message") or "HiThink market dump import finished.",
+            **result_details,
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -1158,7 +1269,16 @@ async def run_model_performance_evaluation(request: Request, db: Session = Depen
     markets = [item for item in requested_markets if item in {"CN", "US"}] or ["CN", "US"]
     model_run_id = _as_optional_int(await _request_value(request, "model_run_id"))
     recent_runs = max(1, min(20, _as_int(await _request_value(request, "recent_runs", 4), 4)))
-    recent_trade_dates = max(1, min(20, _as_int(await _request_value(request, "recent_trade_dates", 12), 12)))
+    recent_trade_dates = max(
+        1,
+        min(
+            120,
+            _as_int(
+                await _request_value(request, "recent_trade_dates", SCHEDULED_EVALUATION_TRADE_DATES),
+                SCHEDULED_EVALUATION_TRADE_DATES,
+            ),
+        ),
+    )
     top_n = max(1, min(100, _as_int(await _request_value(request, "top_n", 20), 20)))
     cost_bps = max(0.0, min(500.0, _as_float(await _request_value(request, "round_trip_cost_bps", 20.0), 20.0)))
     horizons_raw = str(await _request_value(request, "horizons", "1,3,5,10,20") or "1,3,5,10,20")
@@ -1190,6 +1310,7 @@ async def run_model_performance_evaluation(request: Request, db: Session = Depen
             markets=markets,
             model_run_id=model_run_id,
             recent_runs=recent_runs,
+            require_execution_reconciliation=True,
             recent_trade_dates=recent_trade_dates,
             top_n=top_n,
             horizons=horizons,
@@ -1501,10 +1622,7 @@ async def run_refresh_us_grouped_daily(request: Request, db: Session = Depends(g
     redirect_to = await _request_value(request, "redirect_to")
     trade_date = str(await _request_value(request, "trade_date", "") or "").strip() or None
     adjusted = _as_bool(await _request_value(request, "adjusted", True), default=True)
-    normalize = _as_bool(await _request_value(request, "normalize", False), default=False)
-    persist_per_symbol = _as_bool(await _request_value(request, "persist_per_symbol", False), default=False)
     write_lake = _as_bool(await _request_value(request, "write_lake", True), default=True)
-    write_snapshot = _as_bool(await _request_value(request, "write_snapshot", False), default=False)
     background = _as_bool(await _request_value(request, "background", False), default=False)
     limit = _as_optional_int(await _request_value(request, "limit", None))
     job_repo = DataJobRepository(db)
@@ -1525,10 +1643,7 @@ async def run_refresh_us_grouped_daily(request: Request, db: Session = Depends(g
             "trade_date": trade_date,
             "adjusted": adjusted,
             "limit": limit,
-            "normalize": normalize,
-            "persist_per_symbol": persist_per_symbol,
             "write_lake": write_lake,
-            "write_snapshot": write_snapshot,
         },
     )
     if background:
@@ -1539,10 +1654,7 @@ async def run_refresh_us_grouped_daily(request: Request, db: Session = Depends(g
                 trade_date=trade_date,
                 adjusted=adjusted,
                 limit=limit,
-                normalize=normalize,
-                persist_per_symbol=persist_per_symbol,
                 write_lake=write_lake,
-                write_snapshot=write_snapshot,
             ),
         )
         return _maybe_redirect(
@@ -1558,10 +1670,7 @@ async def run_refresh_us_grouped_daily(request: Request, db: Session = Depends(g
             trade_date=trade_date,
             adjusted=adjusted,
             limit=limit,
-            normalize=normalize,
-            persist_per_symbol=persist_per_symbol,
             write_lake=write_lake,
-            write_snapshot=write_snapshot,
         )
         _record_market_refresh_batch(job_id=job.id, result=result)
         status = _result_status(result)
@@ -1642,36 +1751,82 @@ async def run_refresh_cn_market_data_lake_only(request: Request, db: Session = D
         return _maybe_redirect(redirect_to, payload)
 
 
-@router.post("/cleanup-market-csv")
-async def run_cleanup_market_csv(request: Request, db: Session = Depends(get_db_session)):
+@router.post("/backfill-cn-stock-selection-history")
+async def run_backfill_cn_stock_selection_history(
+    request: Request,
+    db: Session = Depends(get_db_session),
+):
     if not is_authenticated(request):
         return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
-    dry_run = _as_bool(await _request_value(request, "dry_run", True), default=True)
-    confirm = str(await _request_value(request, "confirm", "") or "").strip() or None
-    markets_raw = str(await _request_value(request, "markets", "CN,US") or "CN,US")
-    markets = [item.strip().upper() for item in markets_raw.split(",") if item.strip()]
-    job_repo = DataJobRepository(db)
-    job = job_repo.create_job(
-        job_type="cleanup_market_csv",
-        status="running",
-        params={"dry_run": dry_run, "markets": markets, "confirm": bool(confirm)},
+    execute = _as_bool(await _request_value(request, "execute", False), default=False)
+    target_history_sessions = max(
+        60,
+        min(500, _as_int(await _request_value(request, "target_history_sessions", 252), 252)),
     )
-    try:
-        result = cleanup_market_csv_files(dry_run=dry_run, confirm=confirm, markets=markets)
-        status = _result_status(result)
-        extra = {key: value for key, value in result.items() if key not in {"status", "message"}}
-        payload = complete_job_and_build_payload(
-            job_repo,
-            job_id=job.id,
-            status=status,
-            message=result.get("message") or "CSV cleanup finished.",
-            **extra,
+    minimum_partition_coverage = max(
+        0.10,
+        min(
+            1.0,
+            _as_float(await _request_value(request, "minimum_partition_coverage", 0.60), 0.60),
+        ),
+    )
+    max_dates = max(1, min(20, _as_int(await _request_value(request, "max_dates", 5), 5)))
+    inter_date_delay_seconds = max(
+        0.0,
+        min(
+            30.0,
+            _as_float(await _request_value(request, "inter_date_delay_seconds", 4.0), 4.0),
+        ),
+    )
+    job_repo = DataJobRepository(db)
+    existing = _existing_running_job(job_repo, {"backfill_cn_stock_selection_history"})
+    if existing:
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="running",
+                job_id=existing.get("id"),
+                message="CN stock-selection history backfill is already running.",
+            ),
         )
-        return _maybe_redirect(redirect_to, payload)
-    except Exception as exc:
-        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
-        return _maybe_redirect(redirect_to, payload)
+    job = job_repo.create_job(
+        job_type="backfill_cn_stock_selection_history",
+        status="running",
+        params={
+            "market": "CN",
+            "execute": execute,
+            "target_history_sessions": target_history_sessions,
+            "minimum_partition_coverage": minimum_partition_coverage,
+            "max_dates": max_dates,
+            "inter_date_delay_seconds": inter_date_delay_seconds,
+        },
+        message="Planning CN stock-selection history backfill.",
+    )
+    _run_background_job(
+        job_id=job.id,
+        label="CN stock-selection history backfill",
+        runner=lambda: _run_cn_history_backfill_result(
+            job_id=job.id,
+            execute=execute,
+            target_history_sessions=target_history_sessions,
+            minimum_partition_coverage=minimum_partition_coverage,
+            max_dates=max_dates,
+            inter_date_delay_seconds=inter_date_delay_seconds,
+        ),
+    )
+    return _maybe_redirect(
+        redirect_to,
+        build_job_payload(
+            status="running",
+            job_id=job.id,
+            message=(
+                "CN history backfill started in the background."
+                if execute
+                else "CN history backfill dry-run started in the background."
+            ),
+        ),
+    )
 
 
 @router.get("/market-lake/us-daily-summary")
@@ -1932,24 +2087,34 @@ async def run_cleanup_storage_retention(request: Request, db: Session = Depends(
     keep_runs = _as_int(await _request_value(request, "keep_model_runs_per_market", 20), 20)
     keep_snapshots = _as_int(await _request_value(request, "keep_workspace_snapshots_per_type", 10), 10)
     confirm = str(await _request_value(request, "confirm", "") or "").strip().upper()
-    apply = confirm == "PURGE"
+    if confirm == "PURGE":
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="blocked",
+                message=(
+                    "Production deletion is CLI-only and requires frozen post-cutover "
+                    "evidence plus the explicit destructive token. No cleanup job was started."
+                ),
+            ),
+        )
     job_repo = DataJobRepository(db)
     job = job_repo.create_job(
         job_type="cleanup_storage_retention",
         status="running",
-        params={"keep_model_runs_per_market": keep_runs, "keep_workspace_snapshots_per_type": keep_snapshots, "apply": apply},
+        params={"keep_model_runs_per_market": keep_runs, "keep_workspace_snapshots_per_type": keep_snapshots, "apply": False},
     )
     _run_background_job(
         job_id=job.id,
-        label="Storage retention cleanup" if apply else "Storage retention preview",
-        runner=lambda: _storage_retention_result(keep_runs=keep_runs, keep_snapshots=keep_snapshots, apply=apply),
+        label="Storage retention preview",
+        runner=lambda: _storage_retention_result(keep_runs=keep_runs, keep_snapshots=keep_snapshots),
     )
     return _maybe_redirect(
         redirect_to,
         build_job_payload(
             status="running",
             job_id=job.id,
-            message=("Storage cleanup started in the background." if apply else "Storage-retention preview started in the background."),
+            message="Storage-retention preview started in the background.",
         ),
     )
 
@@ -1985,75 +2150,97 @@ async def run_rebuild_technical_snapshots(request: Request, db: Session = Depend
         return _maybe_redirect(redirect_to, payload)
 
 
-@router.post("/build-dataset")
-async def run_build_dataset(request: Request, db: Session = Depends(get_db_session)):
-    if not is_authenticated(request):
-        return login_redirect("/dashboard")
-    normalize_only_raw = await _request_value(request, "normalize_only", False)
-    normalize_only = str(normalize_only_raw).lower() in {"1", "true", "yes", "on"}
-    redirect_to = await _request_value(request, "redirect_to")
-    job_repo = DataJobRepository(db)
-    job = job_repo.create_job(
-        job_type="build_dataset",
-        status="running",
-        params={"normalize_only": normalize_only},
-    )
-    try:
-        result = build_dataset(normalize_only=normalize_only)
-        if result.get("qlib_built"):
-            message = f"Built dataset with {len(result['normalized_files'])} normalized files"
-            payload = complete_job_and_build_payload(
-                job_repo,
-                job_id=job.id,
-                status="success",
-                message=message,
-                **result,
-            )
-        elif result.get("message"):
-            payload = complete_job_and_build_payload(
-                job_repo,
-                job_id=job.id,
-                status="partial",
-                message=result["message"],
-                **result,
-            )
-        else:
-            message = f"Normalized {len(result['normalized_files'])} files"
-            payload = complete_job_and_build_payload(
-                job_repo,
-                job_id=job.id,
-                status="success",
-                message=message,
-                **result,
-            )
-    except RuntimeError as exc:
-        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
-        return _maybe_redirect(redirect_to, payload)
-    return _maybe_redirect(redirect_to, payload)
-
-
 @router.post("/sync-cn-fundamentals")
 async def run_sync_cn_fundamentals(request: Request, db: Session = Depends(get_db_session)):
     if not is_authenticated(request):
         return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
     tickers_raw = await _request_value(request, "tickers", "")
+    provider = str(await _request_value(request, "provider", "community") or "community").strip().lower()
     tickers = [item.strip().upper() for item in str(tickers_raw).split(",") if item.strip()] or None
+    offset = max(0, _as_int(await _request_value(request, "offset", 0), 0))
+    default_batch_size = 20 if provider in {"hithink", "hithink_finance", "tonghuashun", "ths"} else 240
+    batch_size = max(1, _as_int(await _request_value(request, "batch_size", default_batch_size), default_batch_size))
+    default_max_batches = 1 if provider in {"hithink", "hithink_finance", "tonghuashun", "ths"} else None
+    max_batches = _as_optional_int(await _request_value(request, "max_batches", default_max_batches))
+    background = _as_bool(
+        await _request_value(request, "background", None),
+        default=tickers is None,
+    )
     job_repo = DataJobRepository(db)
+    existing = job_repo.get_running_job("sync_cn_fundamentals")
+    if existing:
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="running",
+                job_id=existing.get("id"),
+                message="An A-share point-in-time fundamental backfill is already running.",
+            ),
+        )
     job = job_repo.create_job(
         job_type="sync_cn_fundamentals",
         status="running",
-        params={"tickers": tickers},
+        params={
+            "tickers": tickers,
+            "provider": provider,
+            "offset": offset,
+            "batch_size": batch_size,
+            "max_batches": max_batches,
+            "scope": "explicit" if tickers else "full_market",
+        },
     )
+
+    def _progress(progress: dict) -> None:
+        with SessionLocal() as progress_db:
+            DataJobRepository(progress_db).update_job(
+                job.id,
+                message=(
+                    f"A-share point-in-time fundamentals processed "
+                    f"{progress.get('next_offset', 0)}/{progress.get('total_tickers', 0)} ticker(s)."
+                ),
+                progress=progress,
+            )
+
+    def _runner() -> dict:
+        return sync_cn_fundamentals(
+            tickers=tickers,
+            provider_name=provider,
+            offset=offset,
+            batch_size=batch_size,
+            max_batches=max_batches,
+            progress_callback=_progress,
+        )
+
+    if background:
+        _run_background_job(
+            job_id=job.id,
+            label="A-share point-in-time fundamental backfill",
+            runner=_runner,
+            record_market_refresh_batch=False,
+        )
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="running",
+                job_id=job.id,
+                message="A-share point-in-time fundamental backfill started in the background.",
+            ),
+        )
     try:
-        result = sync_cn_fundamentals(tickers=tickers)
+        result = _runner()
         status = _result_status(result)
+        result_extra = {
+            key: value
+            for key, value in result.items()
+            if key not in {"status", "message"}
+        }
         payload = complete_job_and_build_payload(
             job_repo,
             job_id=job.id,
             status=status,
             message=result["message"],
-            **result,
+            **result_extra,
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -2199,13 +2386,17 @@ async def run_backtest(request: Request, db: Session = Depends(get_db_session)):
     holding_days = _as_int(await _request_value(request, "holding_days", 3), 3)
     commission_bps = _as_float(await _request_value(request, "commission_bps", 8.0), 8.0)
     slippage_bps = _as_float(await _request_value(request, "slippage_bps", 12.0), 12.0)
-    model_type = str(await _request_value(request, "model_type", "lightgbm")).strip() or "lightgbm"
     max_position_weight = _as_float(await _request_value(request, "max_position_weight", 0.2), 0.2)
     min_signal_score = _as_float(await _request_value(request, "min_signal_score", 0.05), 0.05)
     max_sector_weight = _as_float(await _request_value(request, "max_sector_weight", 0.35), 0.35)
     min_adv = _as_float(await _request_value(request, "min_adv", 50000000.0), 50000000.0)
     max_gap_pct = _as_float(await _request_value(request, "max_gap_pct", 0.08), 0.08)
     rebalance_threshold = _as_float(await _request_value(request, "rebalance_threshold", 0.02), 0.02)
+    engine_version = str(
+        await _request_value(request, "engine_version", "event_driven_daily_v2")
+    ).strip().lower()
+    if engine_version not in {"legacy_forward_return_v1", "event_driven_daily_v2"}:
+        engine_version = "event_driven_daily_v2"
     benchmark_symbol_raw = await _request_value(request, "benchmark_symbol")
     benchmark_symbol = str(benchmark_symbol_raw).strip().upper() if benchmark_symbol_raw not in (None, "") else None
     model_run_raw = await _request_value(request, "model_run_id")
@@ -2228,6 +2419,7 @@ async def run_backtest(request: Request, db: Session = Depends(get_db_session)):
             "min_adv": min_adv,
             "max_gap_pct": max_gap_pct,
             "rebalance_threshold": rebalance_threshold,
+            "engine_version": engine_version,
         },
     )
     runner = BacktestRunner()
@@ -2245,10 +2437,14 @@ async def run_backtest(request: Request, db: Session = Depends(get_db_session)):
             min_adv=min_adv,
             max_gap_pct=max_gap_pct,
             rebalance_threshold=rebalance_threshold,
+            engine_version=engine_version,
         )
         run_label = f"model_run_id={model_run_id}" if model_run_id is not None else "latest_model"
         benchmark_label = benchmark_symbol or "universe_equal_weight"
-        message = f"Wrote {count} backtest rows ({run_label}, top_n={top_n}, benchmark={benchmark_label})"
+        message = (
+            f"Wrote {count} backtest rows ({run_label}, top_n={top_n}, "
+            f"engine={engine_version}, benchmark={benchmark_label})"
+        )
         payload = complete_job_and_build_payload(
             job_repo,
             job_id=job.id,
@@ -2267,6 +2463,7 @@ async def run_backtest(request: Request, db: Session = Depends(get_db_session)):
             min_adv=min_adv,
             max_gap_pct=max_gap_pct,
             rebalance_threshold=rebalance_threshold,
+            engine_version=engine_version,
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -2286,6 +2483,7 @@ async def run_backtest(request: Request, db: Session = Depends(get_db_session)):
             min_adv=min_adv,
             max_gap_pct=max_gap_pct,
             rebalance_threshold=rebalance_threshold,
+            engine_version=engine_version,
         )
         job_repo.complete_job(job.id, status="failed", message=str(exc))
         return _maybe_redirect(redirect_to, payload)
@@ -2301,6 +2499,7 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
     start_date = await _request_value(request, "start_date")
     end_date = await _request_value(request, "end_date")
     run_name = str(await _request_value(request, "run_name", "pipeline_run")).strip() or "pipeline_run"
+    model_type = str(await _request_value(request, "model_type", "lightgbm")).strip() or "lightgbm"
     signal_type = str(await _request_value(request, "signal_type", "momentum")).strip() or "momentum"
     lookback_raw = await _request_value(request, "lookback_days", 3)
     top_n_raw = await _request_value(request, "top_n", 1)
@@ -2357,7 +2556,6 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
             end_date=end_date,
             provider=provider,
         )
-        build_result = build_dataset(normalize_only=True)
         predictions_written = SignalTrainer().train(
             run_name=run_name,
             model_type=model_type,
@@ -2380,7 +2578,6 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
         )
         message = (
             f"Pipeline complete: synced {len(sync_results)} ticker(s), "
-            f"normalized {len(build_result['normalized_files'])} file(s), "
             f"wrote {predictions_written} predictions, backtested {daily_rows_written} day(s)"
         )
         payload = complete_job_and_build_payload(
@@ -2389,7 +2586,6 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
             status="success",
             message=message,
             sync_results=sync_results,
-            build_result=build_result,
             predictions_written=predictions_written,
             daily_rows_written=daily_rows_written,
             top_n=top_n,

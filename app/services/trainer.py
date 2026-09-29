@@ -1,28 +1,80 @@
 from __future__ import annotations
 
-import csv
 import json
 import math
+import resource
 import statistics
+import sys
+import time
+import tracemalloc
 import warnings
+from dataclasses import asdict
 from collections import defaultdict
 from datetime import date, datetime
-from pathlib import Path
 
 from app.core.config import get_settings
 from app.core.db import SessionLocal
 from app.services.market_lake import get_latest_lake_trade_date, load_lake_rows
+from app.services.market_hot_predictions import MarketHotPredictionRepository
+from app.services.market_storage_routing import legacy_mirror_write_enabled
 from app.services.model_signal_summary import enrich_model_output, summarize_model_output
+from app.services.model_score_contract import SCORE_CONTRACT_VERSION
+from app.services.execution_costs import FillCostModel
+from app.services.execution_reconciliation import (
+    VERSION as RECONCILED_VERSION, execution_contract, replay_candidate,
+)
+from app.services.prediction_artifacts import (
+    PredictionArtifactWriter,
+    PredictionPublicationLimitError,
+    select_hot_explanation_rows,
+    select_hot_prediction_rows,
+)
+from app.services.portfolio_book import load_portfolio_positions
 from app.services.repository import (
     ConceptSnapshotRepository,
     FundamentalSnapshotRepository,
+    LivePredictionRepository,
     ModelRunRepository,
+    PredictionArtifactRepository,
     PredictionDetailRepository,
     PredictionExplanationRepository,
     PredictionWriteRepository,
     SymbolRepository,
     WorkspaceSnapshotRepository,
 )
+from app.services.stock_selection.walk_forward import PointInTimeTrainingPool
+from app.services.stock_selection.training_weights import (
+    TRAINING_WEIGHT_POLICY, date_balanced_training_weights,
+)
+from app.services.stock_selection.executable_outcomes import (
+    confirmed_outcome,
+    limit_up_at_open,
+    ExecutionEligibility,
+)
+from app.services.stock_selection.labels import PriceBar
+from app.services.stock_selection.training_window import TrainingWindowPolicy, TrainingWindowBlocked, select_training_window
+
+EXECUTABLE_LABEL_PROFILE = "executable_net_return_v1"
+LEGACY_LABEL_PROFILE = "legacy_short_horizon_composite_v1"
+
+
+def resolve_label_profile_contract(label_profile_setting: str | None) -> tuple[str, str]:
+    """Map the configured CN label profile to (target_profile, score_semantics).
+
+    The run contract recorded at create time must describe the label family the
+    samples actually carry. Shipping the executable switch while the run
+    metadata still claims the legacy composite breaks every downstream audit
+    that separates the two label regimes.
+    """
+    normalized = str(label_profile_setting or "").strip().lower()
+    if normalized == RECONCILED_VERSION:
+        return RECONCILED_VERSION, "executable_next_open_net_return"
+    if normalized == EXECUTABLE_LABEL_PROFILE:
+        return "confirmed_next_open_fixed_exit_fill_cost_v2", "executable_next_open_net_return"
+    if normalized == LEGACY_LABEL_PROFILE:
+        return "short_horizon_composite_v1", "legacy_composite_margin"
+    raise RuntimeError(f"Unsupported trainer label profile `{label_profile_setting}`.")
+
 
 try:
     import lightgbm as lgb  # type: ignore
@@ -41,12 +93,397 @@ except ImportError:  # pragma: no cover - optional challenger
 
 
 class SignalTrainer:
-    """Train the production LightGBM multifactor signal model over the local market lake."""
+    """Train production signals and expose versioned challenger label adapters."""
+
+    @staticmethod
+    def executable_training_target(
+        bars: list[PriceBar], *, signal_date: date, trading_dates: list[date],
+        horizon_days: int, market: str, cost_bps: float | None = None,
+        eligibility: ExecutionEligibility, target_mode: str = "net_return",
+        industry_return: float | None = None,
+        cost_model: FillCostModel | None = None,
+    ) -> dict:
+        """Challenger entry point; never mixes legacy composite and net labels."""
+        if target_mode not in {"net_return", "industry_excess_return"}:
+            raise ValueError("unsupported executable target mode")
+        if target_mode == "industry_excess_return" and industry_return is None:
+            raise ValueError("industry return required for industry-neutral target")
+        label = confirmed_outcome(
+            bars, signal_date=signal_date, trading_dates=trading_dates,
+            horizon_days=horizon_days, market=market, cost_bps=cost_bps,
+            eligibility=eligibility, industry_return=industry_return if industry_return is not None else 0.0,
+            cost_model=cost_model,
+        )
+        return {
+            "target": getattr(label, target_mode) if label else None,
+            "target_mode": target_mode,
+            "label_version": label.label_version if label else None,
+            "label_available_date": label.label_available_date.isoformat() if label else None,
+            "exclusion_reason": label.exclusion_reason if label else "label_not_mature",
+            "cost_model_version": label.cost_model_version if label else None,
+            "cost_model_hash": label.cost_model_hash if label else None,
+        }
+
+    @staticmethod
+    def _complete_date_training_window(samples: list[dict], *, max_rows: int) -> list[dict]:
+        """Choose whole newest market-date groups, independent of maturity arrival order."""
+        if max_rows <= 0:
+            raise ValueError("max_rows must be positive")
+        by_date: dict[str, list[dict]] = defaultdict(list)
+        for sample in samples:
+            by_date[str(sample["trade_date"])].append(sample)
+        selected: list[dict] = []
+        for trade_date in sorted(by_date, reverse=True):
+            group = by_date[trade_date]
+            if selected and len(selected) + len(group) > max_rows:
+                break
+            selected.extend(group)
+        return sorted(selected, key=lambda row: (str(row["trade_date"]), str(row.get("ticker") or row.get("symbol") or "")))
 
     MODEL_CALIBRATION_SNAPSHOT_TYPE = "model_calibration_snapshot"
 
+    @staticmethod
+    def _process_peak_rss_bytes() -> int:
+        peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss or 0)
+        # macOS reports bytes; Linux and most other Unix platforms report KiB.
+        return peak if sys.platform == "darwin" else peak * 1024
+
     def __init__(self) -> None:
         self.settings = get_settings()
+
+    def _training_window_policy(self, market: str | None) -> TrainingWindowPolicy:
+        prefix = "trainer_cn_window" if str(market or "").upper() == "CN" else "trainer_us_window"
+        return TrainingWindowPolicy(mode=getattr(self.settings, f"{prefix}_mode"),
+            date_count=getattr(self.settings, f"{prefix}_dates"),
+            max_rows=getattr(self.settings, f"{prefix}_max_rows"),
+            max_estimated_fit_bytes=getattr(self.settings, f"{prefix}_max_estimated_fit_bytes"))
+
+    @staticmethod
+    def _holding_symbol_ids(db, *, market: str | None) -> set[int]:
+        market_code = str(market or "").strip().upper()
+        try:
+            positions = load_portfolio_positions()
+        except Exception:
+            return set()
+        tickers = {
+            str(item.get("ticker") or "").strip().upper()
+            for item in positions
+            if str(item.get("ticker") or "").strip()
+            and (
+                not market_code
+                or str(item.get("market") or "").strip().upper() == market_code
+            )
+        }
+        symbol_repo = SymbolRepository(db)
+        symbol_ids: set[int] = set()
+        for ticker in sorted(tickers):
+            symbol = symbol_repo.get_by_ticker(ticker)
+            if symbol is not None and (
+                not market_code
+                or str(symbol.market or "").strip().upper() == market_code
+            ):
+                symbol_ids.add(int(symbol.id))
+        return symbol_ids
+
+    def _persist_model_outputs(
+        self,
+        *,
+        db,
+        model_repo: ModelRunRepository,
+        prediction_repo: PredictionWriteRepository,
+        detail_repo: PredictionDetailRepository,
+        explanation_repo: PredictionExplanationRepository,
+        run_id: int,
+        market: str | None,
+        signal_rows: list[dict],
+        detail_rows: list[dict],
+        explanation_rows: list[dict],
+        model_metadata: dict,
+    ) -> int:
+        artifact_manifest: dict | None = None
+        artifact_path: str | None = None
+        publication_started = time.perf_counter()
+        publication_timings_ms: dict[str, float] = {}
+        owns_memory_trace = not tracemalloc.is_tracing()
+        if owns_memory_trace:
+            tracemalloc.start()
+        trace_start_current_bytes, trace_start_peak_bytes = (
+            int(value) for value in tracemalloc.get_traced_memory()
+        )
+        try:
+            hot_mode = str(self.settings.prediction_hot_write_mode or "compact").strip().lower()
+            if hot_mode not in {"compact", "legacy_full"}:
+                raise RuntimeError(f"Unsupported prediction hot write mode: {hot_mode}")
+            artifact_writer = PredictionArtifactWriter()
+            try:
+                publication_plan = artifact_writer.plan(
+                    prediction_rows=signal_rows,
+                    detail_rows=detail_rows,
+                    explanation_rows=explanation_rows,
+                )
+            except PredictionPublicationLimitError as exc:
+                model_repo.merge_config(
+                    run_id,
+                    {"prediction_publication_plan": exc.plan},
+                )
+                raise
+            model_repo.merge_config(
+                run_id,
+                {"prediction_publication_plan": publication_plan},
+            )
+            holding_symbol_ids = self._holding_symbol_ids(db, market=market)
+            normalized_market = str(market or "").strip().upper()
+            legacy_hot_dual_write = legacy_mirror_write_enabled(
+                db,
+                market=normalized_market,
+                configured=bool(
+                    getattr(
+                        self.settings,
+                        "market_physical_hot_dual_write_legacy",
+                        True,
+                    )
+                ),
+            )
+            published_metadata = {
+                **model_metadata,
+                "prediction_publication_plan": publication_plan,
+                "prediction_storage_contract": {
+                    "contract_version": "prediction-storage-v1",
+                    "hot_write_mode": hot_mode,
+                    "hot_full_trade_days": int(self.settings.prediction_hot_full_trade_days),
+                    "hot_top_k": int(self.settings.prediction_hot_top_k),
+                    "hot_explanation_limit": int(
+                        getattr(self.settings, "prediction_hot_explanation_limit", 50)
+                    ),
+                    "hot_explanation_boundary_radius": int(
+                        getattr(
+                            self.settings,
+                            "prediction_hot_explanation_boundary_radius",
+                            5,
+                        )
+                    ),
+                    "hot_explanation_holding_count": len(holding_symbol_ids),
+                    "hot_explanation_holding_symbol_ids": sorted(holding_symbol_ids),
+                    "legacy_hot_dual_write": legacy_hot_dual_write,
+                    "cold_explanation_scope": "latest_full_cross_section",
+                    "cold_payload": "full",
+                },
+            }
+            if self.settings.prediction_artifacts_enabled:
+                phase_started = time.perf_counter()
+                artifact_manifest = artifact_writer.write(
+                    model_run_id=run_id,
+                    market=market,
+                    prediction_rows=signal_rows,
+                    detail_rows=detail_rows,
+                    explanation_rows=explanation_rows,
+                    model_metadata=published_metadata,
+                    publication_plan=publication_plan,
+                )
+                publication_timings_ms["artifact_publish_ms"] = round(
+                    (time.perf_counter() - phase_started) * 1000.0,
+                    3,
+                )
+                artifact_path = str(artifact_manifest["artifact_path"])
+                PredictionArtifactRepository(db).upsert_manifest(artifact_manifest, status="verified")
+            else:
+                artifact_file = self.settings.artifacts_dir / f"model_run_{run_id}.json"
+                artifact_file.write_text(
+                    json.dumps(published_metadata, ensure_ascii=False, default=str),
+                    encoding="utf-8",
+                )
+                artifact_path = str(artifact_file.resolve())
+
+            hot_signal_rows = signal_rows
+            if hot_mode == "compact":
+                hot_signal_rows = select_hot_prediction_rows(
+                    signal_rows,
+                    full_trade_days=self.settings.prediction_hot_full_trade_days,
+                    top_k=self.settings.prediction_hot_top_k,
+                )
+            hot_keys = {
+                (int(row["symbol_id"]), str(row["trade_date"]))
+                for row in hot_signal_rows
+            }
+            hot_detail_rows = [
+                row for row in detail_rows
+                if (int(row["symbol_id"]), str(row["trade_date"])) in hot_keys
+            ]
+            selected_explanation_rows = select_hot_explanation_rows(
+                explanation_rows,
+                prediction_rows=signal_rows,
+                top_k=int(
+                    getattr(self.settings, "prediction_hot_explanation_limit", 50)
+                ),
+                holding_symbol_ids=holding_symbol_ids,
+                boundary_radius=int(
+                    getattr(
+                        self.settings,
+                        "prediction_hot_explanation_boundary_radius",
+                        5,
+                    )
+                ),
+            )
+            hot_explanation_rows = [
+                row for row in selected_explanation_rows
+                if (int(row["symbol_id"]), str(row["trade_date"])) in hot_keys
+            ]
+            postgresql_started = time.perf_counter()
+            if legacy_hot_dual_write:
+                phase_started = time.perf_counter()
+                count = prediction_repo.replace_for_model_run(
+                    run_id,
+                    hot_signal_rows,
+                    commit=False,
+                )
+                publication_timings_ms["legacy_predictions_ms"] = round(
+                    (time.perf_counter() - phase_started) * 1000.0,
+                    3,
+                )
+                phase_started = time.perf_counter()
+                detail_repo.replace_for_model_run(
+                    run_id,
+                    hot_detail_rows,
+                    commit=False,
+                )
+                publication_timings_ms["legacy_details_ms"] = round(
+                    (time.perf_counter() - phase_started) * 1000.0,
+                    3,
+                )
+                phase_started = time.perf_counter()
+                explanation_repo.replace_for_model_run(
+                    run_id,
+                    hot_explanation_rows,
+                    commit=False,
+                )
+                publication_timings_ms["legacy_explanations_ms"] = round(
+                    (time.perf_counter() - phase_started) * 1000.0,
+                    3,
+                )
+            else:
+                count = len(hot_signal_rows)
+                publication_timings_ms.update(
+                    {
+                        "legacy_predictions_ms": 0.0,
+                        "legacy_details_ms": 0.0,
+                        "legacy_explanations_ms": 0.0,
+                    }
+                )
+            phase_started = time.perf_counter()
+            physical_hot_repo = MarketHotPredictionRepository(db)
+            if legacy_hot_dual_write:
+                physical_hot_repo.publish_from_legacy_mirror(
+                    model_run_id=run_id,
+                    market=str(market or ""),
+                    commit=False,
+                )
+            else:
+                physical_hot_repo.publish_for_model_run(
+                    model_run_id=run_id,
+                    market=str(market or ""),
+                    prediction_rows=hot_signal_rows,
+                    detail_rows=hot_detail_rows,
+                    explanation_rows=hot_explanation_rows,
+                    commit=False,
+                    verify_after_write=False,
+                )
+            publication_timings_ms["physical_hot_ms"] = round(
+                (time.perf_counter() - phase_started) * 1000.0,
+                3,
+            )
+            phase_started = time.perf_counter()
+            LivePredictionRepository(db).publish_from_physical_hot(
+                model_run_id=run_id,
+                market=str(market or ""),
+                commit=False,
+            )
+            publication_timings_ms["live_predictions_ms"] = round(
+                (time.perf_counter() - phase_started) * 1000.0,
+                3,
+            )
+            model_repo.complete_run(
+                run_id,
+                status="success",
+                artifact_path=artifact_path,
+                commit=False,
+            )
+            commit_started = time.perf_counter()
+            db.commit()
+            publication_timings_ms["postgresql_commit_ms"] = round(
+                (time.perf_counter() - commit_started) * 1000.0,
+                3,
+            )
+            publication_timings_ms["postgresql_write_phase_ms"] = round(
+                (time.perf_counter() - postgresql_started) * 1000.0,
+                3,
+            )
+            publication_timings_ms["publication_total_ms"] = round(
+                (time.perf_counter() - publication_started) * 1000.0,
+                3,
+            )
+            traced_current_bytes, traced_peak_bytes = tracemalloc.get_traced_memory()
+            model_repo.merge_config(
+                run_id,
+                {
+                    "prediction_publication_timing": {
+                        "timing_version": "prediction-publication-timing-v2",
+                        **publication_timings_ms,
+                        "process_peak_rss_bytes": self._process_peak_rss_bytes(),
+                        "python_tracemalloc_current_bytes": int(traced_current_bytes),
+                        "python_tracemalloc_peak_bytes": int(traced_peak_bytes),
+                        "python_publication_incremental_peak_bytes": max(
+                            0,
+                            int(traced_peak_bytes)
+                            - max(
+                                trace_start_current_bytes,
+                                trace_start_peak_bytes,
+                            ),
+                        ),
+                        "cold_rows": len(signal_rows),
+                        "hot_prediction_rows": len(hot_signal_rows),
+                        "hot_detail_rows": len(hot_detail_rows),
+                        "hot_explanation_rows": len(hot_explanation_rows),
+                        "legacy_hot_dual_write": legacy_hot_dual_write,
+                        "postgresql_atomic_publish": True,
+                        "postgresql_transaction_version": "prediction-publication-transaction-v1",
+                    }
+                },
+            )
+            try:
+                LivePredictionRepository(db).prune_market_snapshots(
+                    market=str(market or ""),
+                    keep_runs=2,
+                )
+            except Exception:
+                db.rollback()
+            return count
+        except Exception:
+            db.rollback()
+            try:
+                prediction_repo.replace_for_model_run(run_id, [])
+            except Exception:
+                db.rollback()
+            try:
+                LivePredictionRepository(db).remove_for_model_run(run_id)
+            except Exception:
+                db.rollback()
+            try:
+                MarketHotPredictionRepository(db).remove_for_model_run(
+                    market=str(market or ""),
+                    model_run_id=run_id,
+                )
+            except Exception:
+                db.rollback()
+            if artifact_manifest is not None:
+                try:
+                    PredictionArtifactRepository(db).set_status(run_id, "failed_run")
+                except Exception:
+                    db.rollback()
+            model_repo.complete_run(run_id, status="failed", artifact_path=artifact_path)
+            raise
+        finally:
+            if owns_memory_trace and tracemalloc.is_tracing():
+                tracemalloc.stop()
 
     def _normalize_market_code(self, market: str | None) -> str | None:
         normalized = str(market or "").strip().upper()
@@ -77,24 +514,7 @@ class SignalTrainer:
         return filtered or rows
 
     def _load_rows(self, *, tickers: set[str] | None = None, market: str | None = None) -> list[dict]:
-        rows: list[dict] = []
-        csv_paths = sorted(self.settings.normalized_data_dir.glob("*.csv"))
-        selected_paths = csv_paths
-        if tickers:
-            matched_paths = [csv_path for csv_path in csv_paths if csv_path.stem.upper() in tickers]
-            if matched_paths:
-                selected_paths = matched_paths
-        for csv_path in selected_paths:
-            with csv_path.open("r", newline="", encoding="utf-8") as input_file:
-                reader = csv.DictReader(input_file)
-                if tickers:
-                    rows.extend(
-                        row for row in reader if str(row.get("symbol") or "").strip().upper() in tickers
-                    )
-                else:
-                    rows.extend(reader)
-        if not rows:
-            rows = load_lake_rows(tickers=tickers)
+        rows = load_lake_rows(tickers=tickers)
         rows = self._filter_rows_by_market(rows, market=market)
         rows.sort(key=lambda row: (row.get("symbol") or "", row.get("date") or ""))
         return rows
@@ -126,9 +546,6 @@ class SignalTrainer:
         if future_price <= 0 or anchor_price <= 0:
             return None
         return (future_price / anchor_price) - 1.0
-
-    def _safe_price_series(self, symbol_rows: list[dict], *, field: str) -> list[float]:
-        return [self._safe_float(row.get(field)) for row in symbol_rows]
 
     def _parse_iso_date(self, value: object) -> date | None:
         text = str(value or "").strip()
@@ -374,28 +791,125 @@ class SignalTrainer:
         }
         return composite_target, target_profile
 
-    def _baseline_explanations(
+    def _bar_date_value(self, row: dict) -> date | None:
+        raw = str(row.get("date") or row.get("trade_date") or "").strip()
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    def _build_executable_net_return_target(
         self,
         *,
-        symbol_id: int,
-        trade_date: str,
-        components: list[dict],
-    ) -> list[dict]:
-        rows: list[dict] = []
-        for index, component in enumerate(components, start=1):
-            contribution = component.get("contribution") or 0.0
-            rows.append(
-                {
-                    "symbol_id": symbol_id,
-                    "trade_date": trade_date,
-                    "feature_name": component["feature_name"],
-                    "feature_value": round((component.get("feature_value") or 0.0) * 100, 4),
-                    "contribution": round(contribution * 100, 4),
-                    "direction": "positive" if contribution >= 0 else "negative",
-                    "display_order": index,
-                }
+        symbol_rows: list[dict],
+        index: int,
+        horizon_days: int,
+        market: str,
+        limit_band_pct: float | None,
+    ) -> tuple[float | None, dict, str]:
+        """P0 production label: confirmed next-open entry, fixed-horizon exit.
+
+        Replaces the momentum-chasing legacy composite with the net return a
+        trader could actually capture: T+1 entry eligibility (signal-day
+        limit-up opens are excluded as unbuyable), an executable exit bar,
+        and explicit per-fill commission plus slippage costs.
+        """
+        version = "confirmed_next_open_fixed_exit_fill_cost_v2"
+        policy = str(
+            getattr(self.settings, "trainer_cn_entry_not_executable_policy", "") or "exclude"
+        ).strip().lower()
+        if policy not in {"exclude", "keep"}:
+            raise RuntimeError("trainer_cn_entry_not_executable_policy must be 'exclude' or 'keep'")
+        commission_bps = float(getattr(self.settings, "trainer_cn_execution_commission_bps", 2.5) or 0.0)
+        slippage_bps = float(getattr(self.settings, "trainer_cn_execution_slippage_bps", 15.0) or 0.0)
+        cost_model = FillCostModel(commission_bps, slippage_bps)
+
+        window_rows = symbol_rows[index : index + horizon_days + 1]
+        bars: list[PriceBar] = []
+        for row in window_rows:
+            bar_date = self._bar_date_value(row)
+            if bar_date is None:
+                return None, {"label_profile": version, "exclusion_reason": "unparseable_bar_date"}, version
+            try:
+                bars.append(
+                    PriceBar(
+                        bar_date,
+                        self._safe_float(row.get("open")) or 0.0,
+                        self._safe_float(row.get("high")) or 0.0,
+                        self._safe_float(row.get("low")) or 0.0,
+                        self._safe_float(row.get("close")) or 0.0,
+                        max(self._safe_float(row.get("volume")) or 0.0, 0.0),
+                    )
+                )
+            except ValueError:
+                # A provider glitch (zero/negative/non-finite quote) must not
+                # kill the whole training run: the sample simply stays
+                # unlabeled and the dirty bar is surfaced through the same
+                # auditable exclusion channel as unparseable dates.
+                return None, {"label_profile": version, "exclusion_reason": "invalid_bar_prices"}, version
+        profile = {
+            "label_profile": version,
+            "commission_bps_one_way": commission_bps,
+            "slippage_bps_one_way": slippage_bps,
+            "cost_model_hash": cost_model.model_hash,
+        }
+        previous_close = bars[0].close
+        next_open = bars[1].open
+        if previous_close <= 0 or next_open <= 0:
+            profile["exclusion_reason"] = "invalid_entry_prices"
+            return None, profile, version
+        limit_ratio = (limit_band_pct / 100.0) if limit_band_pct and limit_band_pct > 0 else None
+        # Mirror the legacy 0.2pp band tolerance below the nominal limit.
+        entry_threshold = (limit_ratio - 0.002) if limit_ratio is not None else None
+        entry_allowed = not limit_up_at_open(next_open, previous_close, entry_threshold)
+        eligibility = ExecutionEligibility(
+            entry_allowed,
+            True,
+            reason=None if entry_allowed else "entry_not_executable_signal_day_limit_up",
+        )
+        try:
+            outcome = confirmed_outcome(
+                bars,
+                signal_date=bars[0].trade_date,
+                trading_dates=[bar.trade_date for bar in bars],
+                horizon_days=horizon_days,
+                market=market,
+                eligibility=eligibility,
+                cost_model=cost_model,
             )
-        return rows
+        except (ValueError, TypeError):
+            profile["exclusion_reason"] = "executable_label_input_error"
+            return None, profile, version
+        if outcome is None:
+            profile["exclusion_reason"] = "label_window_immature"
+            return None, profile, version
+        reason = getattr(outcome, "exclusion_reason", None)
+        gross = getattr(outcome, "gross_return", None)
+        net = getattr(outcome, "net_return", None)
+        if reason:
+            profile["exclusion_reason"] = str(reason)
+        if gross is not None:
+            profile["gross_return"] = float(gross)
+        if net is not None:
+            profile["net_return"] = float(net)
+        if not getattr(outcome, "tradable", True) and str(reason or "").startswith("entry"):
+            profile["entry_not_executable"] = True
+            if policy == "exclude":
+                return None, profile, version
+        if net is None:
+            return None, profile, version
+        return float(net), profile, version
+
+    def reconciled_training_target(self, *, symbol_rows, index, horizon_days, market, ticker):
+        cost = FillCostModel(
+            float(getattr(self.settings, 'trainer_cn_execution_commission_bps', 2.5)),
+            float(getattr(self.settings, 'trainer_cn_execution_slippage_bps', 15.0)))
+        result = replay_candidate(ticker=ticker, market=market,
+            signal_date=str(symbol_rows[index]['date']), horizon_days=horizon_days,
+            rows=symbol_rows[index:], contract=execution_contract(market, cost))
+        result['exclusion_reason'] = result['reason']
+        result['label_profile'] = RECONCILED_VERSION
+        return result['net_return'], result, RECONCILED_VERSION
 
     def _feature_names(self, *, lookback_days: int) -> list[str]:
         return [
@@ -427,6 +941,9 @@ class SignalTrainer:
             "concept_strength_norm",
             "listing_days_log",
             "board_tier",
+            "limit_up_count_20d_norm",
+            "days_since_limit_up_norm",
+            "limit_up_next_day_open_to_close_avg",
         ]
 
     def _feature_direction(self, feature_name: str) -> float:
@@ -446,6 +963,7 @@ class SignalTrainer:
         lookback_days: int,
         horizon_days: int,
         symbol_feature_context: dict[str, dict] | None = None,
+        market: str = "CN",
     ) -> list[dict]:
         grouped: dict[str, list[dict]] = defaultdict(list)
         for row in rows:
@@ -560,6 +1078,37 @@ class SignalTrainer:
                 debt_to_assets = self._safe_float((active_fundamental or {}).get("debt_to_assets"))
                 concept_count = self._safe_float((active_concept or {}).get("concept_count"))
                 concept_strength = self._safe_float((active_concept or {}).get("max_strength"))
+                # P1 limit-up dynamics. All inputs are known at the signal
+                # close: limit-up days inside the trailing 20 sessions, the
+                # recency of the latest one, and the average next-day
+                # open-to-close follow-through after those limit-ups. Without
+                # a CN limit band (e.g. US runs) the factors stay neutral 0.0.
+                limit_band_for_factors = self._safe_float(context.get("limit_band_pct"), default=0.0) or 0.0
+                limit_up_count_20d = 0
+                days_since_limit_up = 20
+                limit_up_next_day_moves: list[float] = []
+                if limit_band_for_factors > 0:
+                    limit_threshold = (limit_band_for_factors / 100.0) - 0.002
+                    for probe in range(max(0, index - 19), index + 1):
+                        probe_close = self._safe_float(symbol_rows[probe].get("close"))
+                        prev_close = (
+                            self._safe_float(symbol_rows[probe - 1].get("close")) if probe > 0 else None
+                        )
+                        if probe_close is None or probe_close <= 0 or prev_close is None or prev_close <= 0:
+                            continue
+                        if (probe_close / prev_close) - 1.0 >= limit_threshold:
+                            limit_up_count_20d += 1
+                            days_since_limit_up = index - probe
+                            next_row = symbol_rows[probe + 1] if probe + 1 < len(symbol_rows) else None
+                            next_open = self._safe_float(next_row.get("open")) if next_row is not None else None
+                            next_close = self._safe_float(next_row.get("close")) if next_row is not None else None
+                            if next_open is not None and next_close is not None and next_open > 0:
+                                limit_up_next_day_moves.append((next_close / next_open) - 1.0)
+                limit_up_next_day_avg = (
+                    sum(limit_up_next_day_moves) / len(limit_up_next_day_moves)
+                    if limit_up_next_day_moves
+                    else 0.0
+                )
                 sample = {
                     "symbol": symbol,
                     "trade_date": trade_date,
@@ -592,19 +1141,65 @@ class SignalTrainer:
                         "concept_strength_norm": self._clamp(concept_strength / 100.0, 0.0, 1.0),
                         "listing_days_log": listing_days_log,
                         "board_tier": self._safe_float(context.get("board_tier")),
+                        "limit_up_count_20d_norm": min(limit_up_count_20d, 5) / 5.0,
+                        "days_since_limit_up_norm": days_since_limit_up / 20.0,
+                        "limit_up_next_day_open_to_close_avg": self._clamp(limit_up_next_day_avg * 5.0, -0.5, 0.5),
                     },
                     "target": None,
                     "target_profile": {},
+                    "label_start_date": None,
+                    "label_end_date": None,
+                    "label_available_date": None,
                 }
-                target_value, target_profile = self._build_short_horizon_target_profile(
-                    symbol_rows=symbol_rows,
-                    index=index,
-                    anchor_close=close,
-                    limit_band_pct=self._safe_float(context.get("limit_band_pct"), default=0.0) or None,
-                )
-                if target_value is not None:
-                    sample["target"] = target_value
+                # P0 label switch. The scheduled CN profile builds execution-
+                # aware net-return labels (next-open entry, fixed-horizon
+                # exit, per-fill commission and slippage); the legacy momentum
+                # composite remains only as an explicit research fallback. A
+                # labeled sample still requires the full declared horizon to
+                # exist, and its availability date stays strictly label-mature.
+                # Blank settings must resolve to the executable profile, never
+                # silently regress to the legacy momentum composite.
+                label_profile = str(
+                    getattr(self.settings, "trainer_cn_label_profile", "") or EXECUTABLE_LABEL_PROFILE
+                ).strip().lower()
+                target_mode: str
+                target_value: float | None = None
+                target_profile: dict = {}
+                if label_profile == RECONCILED_VERSION or index + horizon_days < len(symbol_rows):
+                    if label_profile == RECONCILED_VERSION:
+                        target_value, target_profile, target_mode = self.reconciled_training_target(
+                            symbol_rows=symbol_rows, index=index, horizon_days=horizon_days,
+                            market=market, ticker=symbol)
+                    elif label_profile == "executable_net_return_v1":
+                        target_value, target_profile, target_mode = self._build_executable_net_return_target(
+                            symbol_rows=symbol_rows,
+                            index=index,
+                            horizon_days=horizon_days,
+                            market=market,
+                            limit_band_pct=self._safe_float(context.get("limit_band_pct"), default=0.0) or None,
+                        )
+                    elif label_profile == "legacy_short_horizon_composite_v1":
+                        target_value, target_profile = self._build_short_horizon_target_profile(
+                            symbol_rows=symbol_rows,
+                            index=index,
+                            anchor_close=close,
+                            limit_band_pct=self._safe_float(context.get("limit_band_pct"), default=0.0) or None,
+                        )
+                        target_mode = "short_horizon_composite_v1"
+                    else:
+                        raise RuntimeError(
+                            "Unsupported trainer label profile "
+                            f"`{label_profile}`; expected executable_net_return_v1 "
+                            "or legacy_short_horizon_composite_v1."
+                        )
                     sample["target_profile"] = target_profile
+                    if target_value is not None:
+                        sample["target"] = target_value
+                        sample["target_profile"] = target_profile
+                        sample["label_start_date"] = str(symbol_rows[index + 1].get("date") or "").strip()
+                        sample["label_end_date"] = target_profile.get("label_available_date") or str(symbol_rows[index + horizon_days].get("date") or "").strip()
+                        sample["label_available_date"] = sample["label_end_date"]
+                    sample["label_mode"] = target_mode
                 samples.append(sample)
         samples.sort(key=lambda item: (item["trade_date"], item["symbol"]))
         return samples
@@ -622,7 +1217,7 @@ class SignalTrainer:
         return stats
 
     def _predict_scores(self, model: object, rows: list[list[float]]) -> list[float]:
-        if not rows:
+        if len(rows) == 0:
             return []
         with warnings.catch_warnings():
             warnings.filterwarnings(
@@ -678,6 +1273,8 @@ class SignalTrainer:
             "failed_after_gap_up",
             "tradable_next_day",
             "composite_target",
+            "gross_return",
+            "net_return",
         ]
         summary: dict[str, float | int] = {"sample_count": len(samples)}
         for metric_key in metric_keys:
@@ -739,11 +1336,14 @@ class SignalTrainer:
     ) -> list[dict]:
         if not train_window:
             return []
-        x_train = [
-            [self._safe_float(sample["features"].get(feature_name)) for feature_name in feature_names]
-            for sample in train_window
-        ]
-        predicted_scores = self._predict_scores(model, x_train)
+        predicted_scores = []
+        for start in range(0, len(train_window), 4096):
+            chunk = train_window[start:start + 4096]
+            matrix = [[self._safe_float(sample["features"].get(name)) for name in feature_names] for sample in chunk]
+            scores = self._predict_scores(model, matrix)
+            if len(scores) != len(chunk):
+                raise RuntimeError("Calibration prediction count does not match training window")
+            predicted_scores.extend(scores)
         ranked_pairs = sorted(
             zip(predicted_scores, train_window, strict=False),
             key=lambda pair: float(pair[0]),
@@ -834,12 +1434,11 @@ class SignalTrainer:
     ) -> dict:
         metrics = calibrated_metrics or {}
         expected_return_5d = metrics.get("next_5d_close_return_avg")
-        expected_return_20d = metrics.get("next_5d_max_return_avg")
-        expected_drawdown_20d = None
-        if metrics.get("next_5d_max_drawdown_avg") is not None:
-            expected_drawdown_20d = abs(float(metrics.get("next_5d_max_drawdown_avg") or 0.0))
-        elif metrics.get("next_3d_max_drawdown_avg") is not None:
-            expected_drawdown_20d = abs(float(metrics.get("next_3d_max_drawdown_avg") or 0.0))
+        # Five-day path extrema must not masquerade as twenty-day estimates.
+        expected_return_20d = metrics.get("next_20d_close_return_avg")
+        expected_drawdown_20d = metrics.get("next_20d_max_drawdown_avg")
+        if expected_drawdown_20d is not None:
+            expected_drawdown_20d = abs(float(expected_drawdown_20d))
         reward_risk_ratio = None
         if expected_return_20d not in (None, 0) and expected_drawdown_20d not in (None, 0):
             reward_risk_ratio = round(abs(float(expected_return_20d)) / float(expected_drawdown_20d), 2)
@@ -894,213 +1493,6 @@ class SignalTrainer:
             "summary_text": enriched.get("summary_text") or summarize_model_output(enriched, lang="en"),
         }
 
-    def _train_baseline(
-        self,
-        *,
-        run_name: str,
-        signal_type: str,
-        lookback_days: int,
-        normalized_tickers: set[str] | None,
-        market: str | None,
-        universe: str | None,
-        rows: list[dict],
-    ) -> int:
-        signal_rows: list[dict] = []
-        detail_rows: list[dict] = []
-        explanation_rows: list[dict] = []
-        by_date: dict[str, list[dict]] = defaultdict(list)
-        close_history_by_symbol: dict[str, list[float]] = defaultdict(list)
-        volume_history_by_symbol: dict[str, list[float]] = defaultdict(list)
-        explanation_row_limit = 2000
-        if str(market or "").upper() == "US" and len(normalized_tickers or []) >= 5000:
-            explanation_row_limit = 0
-
-        with SessionLocal() as db:
-            symbol_repo = SymbolRepository(db)
-            model_repo = ModelRunRepository(db)
-            prediction_repo = PredictionWriteRepository(db)
-            detail_repo = PredictionDetailRepository(db)
-            explanation_repo = PredictionExplanationRepository(db)
-            model_repo.complete_stale_running_runs(
-                stale_after_hours=6,
-                message_prefix="Trainer cleanup closed a stale running model run.",
-            )
-
-            dates = sorted({row["date"] for row in rows if row.get("date")})
-            latest_prediction_date = dates[-1] if dates else None
-            run = model_repo.create_run(
-                name=run_name,
-                model_type="local_baseline",
-                market=market or "US",
-                universe=universe or ("local_watchlist" if normalized_tickers else "full_dataset"),
-                train_start=dates[0] if dates else None,
-                train_end=dates[-1] if dates else None,
-                test_start=dates[0] if dates else None,
-                test_end=dates[-1] if dates else None,
-                config={
-                    "model_type": "baseline",
-                    "signal_type": signal_type,
-                    "lookback_days": lookback_days,
-                    "ticker_count": len(normalized_tickers or []),
-                    "tickers": sorted(normalized_tickers) if normalized_tickers else None,
-                },
-                artifact_path=None,
-                status="running",
-            )
-            run_id = int(run.id)
-            # `refresh()` starts a transaction; close it before CPU-heavy feature work.
-            db.commit()
-
-            for row in rows:
-                symbol = row.get("symbol")
-                date = row.get("date")
-                close_value = row.get("close")
-                if not symbol or not date or not close_value:
-                    continue
-
-                symbol_record = symbol_repo.get_by_ticker(symbol)
-                if symbol_record is None:
-                    continue
-
-                closes = close_history_by_symbol[symbol]
-                volumes = volume_history_by_symbol[symbol]
-                close = float(close_value)
-                volume = float(row.get("volume") or 0.0)
-                score = None
-                components: list[dict] = []
-                if closes:
-                    daily_return = (close / closes[-1]) - 1.0
-                    trailing = closes[-lookback_days:]
-                    if trailing:
-                        trailing_returns = []
-                        previous = None
-                        for trailing_close in trailing:
-                            if previous is not None:
-                                trailing_returns.append((trailing_close / previous) - 1.0)
-                            previous = trailing_close
-                        trailing_returns.append(daily_return)
-                        momentum_component = sum(trailing_returns) / len(trailing_returns)
-
-                        projected_closes = closes + [close]
-                        ma5 = self._moving_average(projected_closes, 5)
-                        ma20 = self._moving_average(projected_closes, 20)
-                        ma60 = self._moving_average(projected_closes, 60)
-                        price_vs_ma20 = ((close / ma20) - 1.0) if ma20 else 0.0
-                        ma_alignment = ((ma5 / ma20) - 1.0) if ma5 and ma20 else 0.0
-                        ma_stack = ((ma20 / ma60) - 1.0) if ma20 and ma60 else 0.0
-                        projected_volumes = volumes + ([volume] if volume else [])
-                        avg_volume_20 = self._moving_average(projected_volumes, 20)
-                        volume_ratio = (volume / avg_volume_20) if avg_volume_20 and volume else 1.0
-
-                        structure_component = self._clamp(price_vs_ma20, -0.08, 0.08) * 0.35
-                        alignment_component = self._clamp(ma_alignment + ma_stack, -0.08, 0.08) * 0.25
-                        volume_component = self._clamp(volume_ratio - 1.0, -0.75, 1.25) * 0.03
-
-                        score = momentum_component + structure_component + alignment_component + volume_component
-                        if signal_type == "reversal":
-                            score = -score
-
-                        polarity = -1.0 if signal_type == "reversal" else 1.0
-                        components = [
-                            {
-                                "feature_name": "recent_daily_return",
-                                "feature_value": daily_return,
-                                "contribution": (daily_return / len(trailing_returns)) * polarity,
-                            },
-                            {
-                                "feature_name": f"lookback_momentum_{lookback_days}d",
-                                "feature_value": momentum_component,
-                                "contribution": momentum_component * polarity,
-                            },
-                            {
-                                "feature_name": "price_vs_ma20",
-                                "feature_value": price_vs_ma20,
-                                "contribution": structure_component * polarity,
-                            },
-                            {
-                                "feature_name": "ma_alignment",
-                                "feature_value": ma_alignment + ma_stack,
-                                "contribution": alignment_component * polarity,
-                            },
-                            {
-                                "feature_name": "volume_ratio_20d",
-                                "feature_value": volume_ratio - 1.0,
-                                "contribution": volume_component * polarity,
-                            },
-                        ]
-
-                closes.append(close)
-                if volume:
-                    volumes.append(volume)
-
-                if score is None:
-                    continue
-
-                record = {
-                    "symbol_id": symbol_record.id,
-                    "trade_date": date,
-                    "score": score,
-                    "rank_value": None,
-                    "_explanations": self._baseline_explanations(
-                        symbol_id=symbol_record.id,
-                        trade_date=date,
-                        components=components,
-                    ),
-                }
-                by_date[date].append(record)
-
-            for date, date_rows in by_date.items():
-                ranked = sorted(date_rows, key=lambda item: item["score"], reverse=True)
-                for idx, record in enumerate(ranked, start=1):
-                    record["rank_value"] = float(idx)
-                    if latest_prediction_date and record["trade_date"] == latest_prediction_date:
-                        detail_rows.append(
-                            self._build_detail_row(
-                                symbol_id=record["symbol_id"],
-                                trade_date=record["trade_date"],
-                                score=float(record["score"]),
-                                rank_value=float(record["rank_value"]),
-                                universe_size=len(ranked),
-                                horizon_days=lookback_days * 5,
-                                run_name=run_name,
-                            )
-                        )
-                    if (
-                        explanation_row_limit != 0
-                        and latest_prediction_date
-                        and record["trade_date"] == latest_prediction_date
-                        and idx <= explanation_row_limit
-                    ):
-                        explanation_rows.extend(record.pop("_explanations", []))
-                    else:
-                        record.pop("_explanations", None)
-                    signal_rows.append(record)
-
-            if not signal_rows:
-                model_repo.complete_run(run_id, status="failed", artifact_path=None)
-                raise RuntimeError(
-                    "The baseline trainer produced no predictions. You likely need at least 2-3 trading days per symbol."
-                )
-
-            count = prediction_repo.replace_for_model_run(run_id, signal_rows)
-            detail_repo.replace_for_model_run(run_id, detail_rows)
-            explanation_repo.replace_for_model_run(run_id, explanation_rows)
-            artifact_path = str((self.settings.artifacts_dir / f"model_run_{run_id}.json").resolve())
-            Path(artifact_path).write_text(
-                json.dumps(
-                    {
-                        "model": run_name,
-                        "model_type": "baseline",
-                        "signal_type": signal_type,
-                        "lookback_days": lookback_days,
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            model_repo.complete_run(run_id, status="success", artifact_path=artifact_path)
-            return count
-
     def _train_lightgbm(
         self,
         *,
@@ -1123,7 +1515,25 @@ class SignalTrainer:
             raise RuntimeError("The LightGBM trainer currently supports `momentum` signal_type only.")
 
         horizon_days = max(5, min(10, lookback_days * 2))
+        # Blank settings must resolve to the executable profile, never
+        # silently regress to the legacy momentum composite.
+        label_profile_setting = str(
+            getattr(self.settings, "trainer_cn_label_profile", "") or EXECUTABLE_LABEL_PROFILE
+        ).strip().lower()
+        entry_not_executable_policy_setting = str(
+            getattr(self.settings, "trainer_cn_entry_not_executable_policy", "") or "exclude"
+        ).strip().lower()
+        target_profile_version, score_semantics_version = resolve_label_profile_contract(label_profile_setting)
+        execution_cost_setting = {
+            "commission_bps_one_way": float(
+                getattr(self.settings, "trainer_cn_execution_commission_bps", 2.5) or 0.0
+            ),
+            "slippage_bps_one_way": float(
+                getattr(self.settings, "trainer_cn_execution_slippage_bps", 15.0) or 0.0
+            ),
+        }
         feature_names = self._feature_names(lookback_days=lookback_days)
+        window_policy = self._training_window_policy(market)
         symbol_feature_context = self._load_symbol_feature_context(
             rows=rows,
             market=market,
@@ -1134,19 +1544,20 @@ class SignalTrainer:
             lookback_days=lookback_days,
             horizon_days=horizon_days,
             symbol_feature_context=symbol_feature_context,
+            market=market,
         )
         if not samples:
             raise RuntimeError("LightGBM trainer found no usable feature rows. The market lake may still be too short.")
 
         samples_by_date: dict[str, list[dict]] = defaultdict(list)
-        labeled_by_date: dict[str, list[dict]] = defaultdict(list)
+        labeled_samples: list[dict] = []
         all_dates: list[str] = []
         seen_dates: set[str] = set()
         for sample in samples:
             trade_date = sample["trade_date"]
             samples_by_date[trade_date].append(sample)
             if sample.get("target") is not None:
-                labeled_by_date[trade_date].append(sample)
+                labeled_samples.append(sample)
             if trade_date not in seen_dates:
                 seen_dates.add(trade_date)
                 all_dates.append(trade_date)
@@ -1160,19 +1571,42 @@ class SignalTrainer:
             raise RuntimeError("LightGBM trainer found no prediction dates.")
 
         first_prediction_date = prediction_dates[0]
-        train_pool = [
-            sample
-            for sample in samples
-            if sample.get("target") is not None and sample["trade_date"] < first_prediction_date
-        ]
+        trading_dates = [value for value in (self._parse_iso_date(item) for item in all_dates) if value is not None]
+
+        def _required_sample_date(sample: dict, key: str) -> date:
+            parsed = self._parse_iso_date(sample.get(key))
+            if parsed is None:
+                raise RuntimeError(f"Training sample is missing a valid {key}.")
+            return parsed
+
+        point_in_time_pool = PointInTimeTrainingPool(
+            labeled_samples,
+            trading_dates=trading_dates,
+            feature_date=lambda sample: _required_sample_date(sample, "trade_date"),
+            label_end_date=lambda sample: _required_sample_date(sample, "label_end_date"),
+            label_available_date=lambda sample: _required_sample_date(sample, "label_available_date"),
+            sample_id=lambda sample: f"{sample['symbol']}:{sample['trade_date']}",
+            purge_sessions=horizon_days,
+            embargo_sessions=0,
+        )
+        first_prediction_day = self._parse_iso_date(first_prediction_date)
+        if first_prediction_day is None:
+            raise RuntimeError("LightGBM trainer found an invalid first prediction date.")
+        train_pool = list(point_in_time_pool.advance(first_prediction_day))
         if len(train_pool) < 1000:
             raise RuntimeError("LightGBM trainer needs more labeled history before the first prediction date.")
 
         # A prediction's label is only visible after `horizon_days`.  Persist
         # the split protocol so downstream evaluation can distinguish genuine
         # walk-forward results from older runs that merely overlap a test date.
-        initial_train_end_index = max(0, prediction_start_index - horizon_days)
-        initial_train_end = all_dates[initial_train_end_index] if all_dates else None
+        initial_train_end = max((str(sample["trade_date"]) for sample in train_pool), default=None)
+        if window_policy.mode == "complete_dates_v1":
+            initial_dates = sorted({sample["trade_date"] for sample in train_pool})[-window_policy.date_count:]
+            initial_train_start = initial_dates[0] if initial_dates else None
+        else:
+            initial_window = self._complete_date_training_window(train_pool, max_rows=window_policy.max_rows)
+            initial_train_start = initial_window[0]["trade_date"] if initial_window else None
+            del initial_window
         universe_version = f"{str(universe or ('local_watchlist' if normalized_tickers else 'full_dataset')).lower()}:{len(normalized_tickers or []) or 'all'}"
 
         enhancement_meta = self._feature_enhancement_meta(symbol_feature_context)
@@ -1193,7 +1627,7 @@ class SignalTrainer:
                 model_type=f"{model_family}_multifactor",
                 market=market or "US",
                 universe=universe or ("local_watchlist" if normalized_tickers else "full_dataset"),
-                train_start=all_dates[0] if all_dates else None,
+                train_start=initial_train_start,
                 train_end=initial_train_end,
                 test_start=prediction_dates[0] if prediction_dates else None,
                 test_end=prediction_dates[-1] if prediction_dates else None,
@@ -1202,7 +1636,13 @@ class SignalTrainer:
                     "signal_type": signal_type,
                     "lookback_days": lookback_days,
                     "prediction_horizon_days": horizon_days,
-                    "target_profile": "short_horizon_composite_v1",
+                    "target_profile": target_profile_version,
+                    "execution_contract": (execution_contract(market, FillCostModel(**execution_cost_setting))
+                        if target_profile_version == RECONCILED_VERSION else None),
+                    "training_weight_policy": TRAINING_WEIGHT_POLICY,
+                    "training_window_policy": asdict(window_policy),
+                    "score_semantics": score_semantics_version,
+                    "score_contract_version": SCORE_CONTRACT_VERSION,
                     "target_metric_keys": [
                         "next_1d_close_return",
                         "next_1d_open_gap",
@@ -1222,6 +1662,7 @@ class SignalTrainer:
                         "liquidity_proxy",
                         "listing_maturity",
                         "board_tier",
+                        "cn_limit_up_dynamics",
                     ],
                     "feature_enhancement_mode": enhancement_meta.get("mode"),
                     "feature_enhancement_note": enhancement_meta.get("note"),
@@ -1229,10 +1670,13 @@ class SignalTrainer:
                     "ticker_count": len(normalized_tickers or []),
                     "prediction_dates": len(prediction_dates),
                     "input_market_date": input_market_date,
-                    "schema_version": 2,
-                    "evaluation_protocol": "walk_forward_purged_v1",
+                    "schema_version": 3,
+                    "evaluation_protocol": "walk_forward_purged_v2",
+                    "training_protocol": "point_in_time_purged_v2",
                     "oos_start_date": first_prediction_date,
                     "purge_gap_days": horizon_days,
+                    "embargo_sessions": 0,
+                    "label_availability_rule": "strictly_before_prediction_date",
                     "universe_version": universe_version,
                 },
                 artifact_path=None,
@@ -1246,43 +1690,53 @@ class SignalTrainer:
             detail_rows: list[dict] = []
             explanation_rows: list[dict] = []
             retrain_interval = 5
-            max_training_rows = 120000 if str(market or "").upper() == "US" else 80000
             normalized_market = str(market or "").upper()
-            full_market_run = (
-                len(normalized_tickers or []) >= 5000
-                or str(universe or "").lower() in {"full_market_cn_lake", "full_market_us_lake", "full_dataset"}
-            )
-            explanation_rank_limit = 2000
-            if full_market_run and normalized_market in {"CN", "US"}:
-                explanation_rank_limit = 0
             model = None
             feature_importance: dict[str, float] = {}
             feature_stats: dict[str, tuple[float, float]] = {}
             calibration_buckets: list[dict] = []
             latest_prediction_date = prediction_dates[-1]
+            training_window_audits: list[dict] = []
             oos_calibration_buckets, oos_calibration_meta = self._load_oos_score_calibration(market=normalized_market)
 
             for index, trade_date in enumerate(prediction_dates):
+                prediction_day = self._parse_iso_date(trade_date)
+                if prediction_day is None:
+                    raise RuntimeError(f"LightGBM trainer found invalid prediction date `{trade_date}`.")
+                train_pool = list(point_in_time_pool.advance(prediction_day))
                 if not train_pool:
-                    train_pool.extend(labeled_by_date.get(trade_date, []))
                     continue
                 if model is None or index % retrain_interval == 0:
-                    train_window = train_pool[-max_training_rows:]
-                    x_train = [
-                        [self._safe_float(sample["features"].get(feature_name)) for feature_name in feature_names]
-                        for sample in train_window
-                    ]
+                    try:
+                        train_window, selection_audit = select_training_window(train_pool,
+                            policy=window_policy, feature_count=len(feature_names))
+                    except TrainingWindowBlocked as exc:
+                        model_repo.merge_config(run_id, {"training_window_blocker": {**exc.audit, "prediction_date": trade_date},
+                                                        "training_window_audits": training_window_audits})
+                        model_repo.complete_run(run_id, status="failed", artifact_path=None)
+                        db.commit()
+                        raise
+                    # Allocate a single compact matrix instead of millions of Python lists.
+                    import numpy as np
+                    x_train = np.empty((len(train_window), len(feature_names)), dtype=np.float64)
+                    for row_index, sample in enumerate(train_window):
+                        for col_index, name in enumerate(feature_names):
+                            x_train[row_index, col_index] = self._safe_float(sample["features"].get(name))
                     y_train = [self._safe_float(sample.get("target")) for sample in train_window]
-                    sample_weights = [
-                        0.65 + (position / max(len(train_window) - 1, 1)) * 0.7
-                        for position in range(len(train_window))
-                    ]
+                    sample_weights, weight_audit = date_balanced_training_weights(train_window)
+                    training_window_audits.append({
+                        **weight_audit, "prediction_date": trade_date,
+                        "max_rows": window_policy.max_rows,
+                        "window_selection": selection_audit,
+                        "available_date_count": len({row["trade_date"] for row in train_pool}),
+                        "meets_252_session_research_window": weight_audit["date_count"] >= 252,
+                    })
                     if model_family == "lightgbm":
                         model = lgb.LGBMRegressor(
                             objective="regression", n_estimators=260, learning_rate=0.05,
                             num_leaves=63, min_child_samples=40, subsample=0.8,
                             colsample_bytree=0.8, reg_alpha=0.05, reg_lambda=0.1,
-                            random_state=42, n_jobs=-1,
+                            random_state=42, n_jobs=-1, verbosity=-1,
                         )
                     elif model_family == "xgboost":
                         model = xgb.XGBRegressor(
@@ -1298,6 +1752,7 @@ class SignalTrainer:
                             verbose=False, thread_count=-1,
                         )
                     model.fit(x_train, y_train, sample_weight=sample_weights)
+                    del x_train, y_train, sample_weights
                     raw_importance_obj = getattr(model, "feature_importances_", None)
                     if raw_importance_obj is None:
                         raw_importance = [0.0] * len(feature_names)
@@ -1320,7 +1775,6 @@ class SignalTrainer:
 
                 date_samples = samples_by_date.get(trade_date) or []
                 if not date_samples:
-                    train_pool.extend(labeled_by_date.get(trade_date, []))
                     continue
                 x_date = [
                     [self._safe_float(sample["features"].get(feature_name)) for feature_name in feature_names]
@@ -1367,37 +1821,50 @@ class SignalTrainer:
                                 calibrated_metrics=calibrated_metrics,
                             )
                         )
-                        if explanation_rank_limit and rank_index <= explanation_rank_limit:
-                            explanation_rows.extend(
-                                self._build_lightgbm_explanations(
-                                    symbol_id=symbol_id,
-                                    trade_date=trade_date,
-                                    feature_values=sample["features"],
-                                    feature_names=feature_names,
-                                    feature_importance=feature_importance,
-                                    feature_stats=feature_stats,
-                                )
+                        explanation_rows.extend(
+                            self._build_lightgbm_explanations(
+                                symbol_id=symbol_id,
+                                trade_date=trade_date,
+                                feature_values=sample["features"],
+                                feature_names=feature_names,
+                                feature_importance=feature_importance,
+                                feature_stats=feature_stats,
                             )
-                train_pool.extend(labeled_by_date.get(trade_date, []))
-
+                        )
             if not signal_rows:
                 model_repo.complete_run(run_id, status="failed", artifact_path=None)
                 raise RuntimeError("LightGBM trainer produced no predictions.")
 
-            count = prediction_repo.replace_for_model_run(run_id, signal_rows)
-            detail_repo.replace_for_model_run(run_id, detail_rows)
-            explanation_repo.replace_for_model_run(run_id, explanation_rows)
-            artifact_path = str((self.settings.artifacts_dir / f"model_run_{run_id}.json").resolve())
-            Path(artifact_path).write_text(
-                json.dumps(
-                    {
+            model_repo.merge_config(run_id, {
+                "training_window_audits": training_window_audits,
+                "training_weight_policy": TRAINING_WEIGHT_POLICY,
+            })
+            return self._persist_model_outputs(
+                db=db,
+                model_repo=model_repo,
+                prediction_repo=prediction_repo,
+                detail_repo=detail_repo,
+                explanation_repo=explanation_repo,
+                run_id=run_id,
+                market=market,
+                signal_rows=signal_rows,
+                detail_rows=detail_rows,
+                explanation_rows=explanation_rows,
+                model_metadata={
                         "model": run_name,
                         "model_type": model_family,
                         "signal_type": signal_type,
                         "lookback_days": lookback_days,
                         "prediction_horizon_days": horizon_days,
-                        "target_profile": "short_horizon_composite_v1",
-                        "train_window_target_profile": self._summarize_target_profile(train_pool[-max_training_rows:]),
+                        "target_profile": label_profile_setting,
+                        "training_weight_policy": TRAINING_WEIGHT_POLICY,
+                        "training_window_audits": training_window_audits,
+                        "training_window_policy": asdict(window_policy),
+                        "score_semantics": score_semantics_version,
+                        "score_contract_version": SCORE_CONTRACT_VERSION,
+                        "train_window_target_profile": self._summarize_target_profile(
+                            train_window
+                        ),
                         "calibration_buckets": oos_calibration_buckets,
                         "train_window_calibration_buckets": calibration_buckets,
                         "calibration_source": "model_calibration_snapshot" if oos_calibration_buckets else "disabled_without_oos",
@@ -1412,22 +1879,24 @@ class SignalTrainer:
                             "liquidity_proxy",
                             "listing_maturity",
                             "board_tier",
+                            "cn_limit_up_dynamics",
                         ],
                         "feature_enhancement_mode": enhancement_meta.get("mode"),
                         "feature_enhancement_note": enhancement_meta.get("note"),
                         "symbol_context_summary": enhancement_meta.get("coverage"),
                         "prediction_dates": prediction_dates,
-                        "evaluation_protocol": "walk_forward_purged_v1",
+                        "label_profile": label_profile_setting,
+                        "entry_not_executable_policy": entry_not_executable_policy_setting,
+                        "execution_cost_bps": execution_cost_setting,
+                        "evaluation_protocol": "walk_forward_purged_v2",
+                        "training_protocol": "point_in_time_purged_v2",
                         "oos_start_date": first_prediction_date,
                         "purge_gap_days": horizon_days,
+                        "embargo_sessions": 0,
+                        "label_availability_rule": "strictly_before_prediction_date",
                         "universe_version": universe_version,
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
+                },
             )
-            model_repo.complete_run(run_id, status="success", artifact_path=artifact_path)
-            return count
 
     def train(
         self,
@@ -1444,7 +1913,7 @@ class SignalTrainer:
         } or None
         rows = self._load_rows(tickers=normalized_tickers, market=market)
         if not rows:
-            raise RuntimeError("No local market data found. Refresh the Parquet market lake or rebuild normalized CSVs first.")
+            raise RuntimeError("No local market data found. Refresh the Parquet market lake first.")
         if lookback_days < 1:
             raise RuntimeError("lookback_days must be at least 1.")
         normalized_model_type = str(model_type or "lightgbm").strip().lower()

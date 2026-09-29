@@ -3,15 +3,18 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from datetime import timedelta
-
+from app.core.config import get_settings
 from app.core.db import SessionLocal
+from app.services.ai_daily_report_delivery import deliver_cn_ai_daily_report_to_feishu
+from app.services.cn_fundamentals import sync_cn_fundamentals
 from app.services.cn_market_universe import refresh_cn_market_data_lake_only
+from app.services.hithink_market_data import import_hithink_market_dump
 from app.services.market_calendar import is_market_open_date, next_market_open_date
 from app.services.market_lake import get_latest_lake_trade_date, list_lake_symbols
 from app.services.market_refresh_audit import record_market_refresh_result
 from app.services.market_risk import save_risk_guardrail_snapshots
-from app.services.model_evaluation import evaluate_model_runs
+from app.services.model_evaluation import SCHEDULED_EVALUATION_TRADE_DATES, evaluate_model_runs
+from app.services.prediction_dual_write_audit import audit_recent_compact_dual_writes
 from app.services.repository import AppSettingRepository, DataJobRepository
 from app.services.screener_snapshots import (
     CORE_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
@@ -19,6 +22,10 @@ from app.services.screener_snapshots import (
     WATCHLIST_PRECOMPUTE_TEMPLATES,
     refresh_precomputed_multi_screener_snapshots,
     refresh_precomputed_screener_snapshots,
+)
+from app.services.stock_selection.forward_shadow import create_cn_forward_shadow_snapshot
+from app.services.stock_selection.forward_shadow_evaluation import (
+    create_cn_forward_shadow_evaluation_snapshot,
 )
 from app.services.time_utils import app_now
 from app.services.trainer import SignalTrainer
@@ -28,9 +35,12 @@ from app.services.workspace_snapshots import refresh_workspace_snapshots
 CN_MARKET_SCHEDULER_CONFIG_KEY = "cn_market_scheduler_config"
 CN_MARKET_REFRESH_JOB_TYPE = "refresh_cn_market_data_lake_only"
 CN_POST_CLOSE_PIPELINE_JOB_TYPE = "cn_post_close_pipeline"
+CN_POINT_IN_TIME_FUNDAMENTAL_JOB_TYPE = "sync_cn_fundamentals"
+CN_FORWARD_SHADOW_JOB_TYPE = "cn_stock_selection_forward_shadow"
 CN_SCREENER_CORE_JOB_TYPE = "screener_precompute_core"
 CN_SCREENER_COMBOS_JOB_TYPE = "screener_precompute_combos"
 CN_SCREENER_REST_JOB_TYPE = "screener_precompute_rest"
+CN_AI_DAILY_REPORT_FEISHU_JOB_TYPE = "send_cn_ai_daily_report_feishu"
 logger = logging.getLogger(__name__)
 
 DEFAULT_CN_MARKET_SCHEDULER_CONFIG = {
@@ -59,6 +69,49 @@ def _post_refresh_ready(result: dict, *, target_trade_date: str, latest_lake_tra
     """
     status = str((result or {}).get("status") or "").lower()
     return status in {"success", "partial"} and str(latest_lake_trade_date or "")[:10] >= str(target_trade_date or "")[:10]
+
+
+def _refresh_cn_price_lake(target_date: str) -> dict:
+    """Prefer one official full-market dump and fall back to the existing path.
+
+    A newly published dump must actually contain the requested session before
+    it is allowed to trigger training. An unavailable or stale dump therefore
+    cannot strand the post-close pipeline.
+    """
+
+    settings = get_settings()
+    hithink_result: dict | None = None
+    hithink_error: str | None = None
+    if settings.hithink_finance_daily_dump_enabled and settings.hithink_finance_api_key:
+        try:
+            hithink_result = import_hithink_market_dump(kind="daily-k-10d", write_lake=True)
+            if (
+                str(hithink_result.get("status") or "").lower() == "success"
+                and str(hithink_result.get("last_trade_date") or "")[:10] >= str(target_date)[:10]
+            ):
+                return {
+                    **hithink_result,
+                    "market": "CN",
+                    "provider_used": "hithink_finance_dump",
+                    "providers_attempted": ["hithink_finance_dump"],
+                    "required_as_of_date": target_date,
+                    "actual_as_of_date": hithink_result.get("last_trade_date"),
+                    "success_count": int(hithink_result.get("latest_symbol_count") or 0),
+                    "failure_count": 0,
+                }
+        except Exception as exc:
+            hithink_error = str(exc)
+
+    fallback = refresh_cn_market_data_lake_only(start_date=target_date, end_date=target_date)
+    return {
+        **fallback,
+        "providers_attempted": [
+            *(["hithink_finance_dump"] if settings.hithink_finance_daily_dump_enabled and settings.hithink_finance_api_key else []),
+            *list(fallback.get("providers_attempted") or []),
+        ],
+        "hithink_shadow_result": hithink_result,
+        "hithink_shadow_error": hithink_error,
+    }
 
 
 class CNMarketSchedulerService:
@@ -199,6 +252,10 @@ class CNMarketSchedulerService:
             self._persist_last_run(trade_date=trade_date, skipped=True)
             raise
         self._start_risk_guardrail_async(source_job_id=recovery_job_id)
+        self._start_point_in_time_fundamental_collection_async(
+            source_job_id=recovery_job_id,
+            trade_date=latest_lake_trade_date,
+        )
         return {
             "job_id": recovery_job_id,
             "status": "recovered",
@@ -239,7 +296,7 @@ class CNMarketSchedulerService:
             )
             refresh_job_id = job.id
         try:
-            result = refresh_cn_market_data_lake_only(start_date=target_date, end_date=target_date)
+            result = _refresh_cn_price_lake(target_date)
             record_market_refresh_result(source_job_id=refresh_job_id, result=result)
             with SessionLocal() as db:
                 DataJobRepository(db).complete_job(
@@ -261,6 +318,10 @@ class CNMarketSchedulerService:
                     trade_date=str(latest_lake_trade_date or target_date),
                 )
                 self._start_risk_guardrail_async(source_job_id=refresh_job_id)
+                self._start_point_in_time_fundamental_collection_async(
+                    source_job_id=refresh_job_id,
+                    trade_date=str(latest_lake_trade_date or target_date),
+                )
             return {"job_id": refresh_job_id, **result}
         except Exception as exc:
             with SessionLocal() as db:
@@ -297,6 +358,166 @@ class CNMarketSchedulerService:
             daemon=True,
         ).start()
 
+    def _start_point_in_time_fundamental_collection_async(
+        self,
+        *,
+        source_job_id: int,
+        trade_date: str,
+    ) -> None:
+        """Collect the full-market shadow feature cross-section without gating production models."""
+
+        with SessionLocal() as db:
+            job_repo = DataJobRepository(db)
+            job_repo.complete_stale_running_jobs(
+                job_types=[CN_POINT_IN_TIME_FUNDAMENTAL_JOB_TYPE],
+                stale_after_hours=8,
+                message_prefix="CN point-in-time fundamental cleanup closed a stale job.",
+            )
+            if job_repo.has_running_job(CN_POINT_IN_TIME_FUNDAMENTAL_JOB_TYPE):
+                return
+            job = job_repo.create_job(
+                job_type=CN_POINT_IN_TIME_FUNDAMENTAL_JOB_TYPE,
+                status="running",
+                params={
+                    "source_job_id": source_job_id,
+                    "market": "CN",
+                    "trade_date": trade_date,
+                    "provider": "community",
+                    "scope": "full_market_shadow",
+                    "batch_size": 240,
+                },
+                message="Collecting full-market point-in-time fundamentals for the shadow dataset.",
+            )
+            job_id = job.id
+        threading.Thread(
+            target=self._run_point_in_time_fundamental_collection,
+            kwargs={"job_id": job_id, "trade_date": trade_date},
+            name=f"cn-point-in-time-fundamentals-{job_id}",
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _run_point_in_time_fundamental_collection(*, job_id: int, trade_date: str) -> None:
+        def progress_callback(progress: dict) -> None:
+            with SessionLocal() as db:
+                DataJobRepository(db).update_job(
+                    job_id,
+                    message=(
+                        f"CN point-in-time fundamentals {progress.get('next_offset', 0)}/"
+                        f"{progress.get('total_tickers', 0)} for {trade_date}."
+                    ),
+                    progress=progress,
+                )
+
+        try:
+            result = sync_cn_fundamentals(
+                provider_name="community",
+                offset=0,
+                batch_size=240,
+                max_batches=None,
+                progress_callback=progress_callback,
+            )
+            status = str(result.get("status") or "partial").lower()
+            if status not in {"success", "partial", "empty", "not_configured", "failed"}:
+                status = "partial"
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(
+                    job_id,
+                    status=status,
+                    message=str(result.get("message") or "CN point-in-time fundamental collection finished."),
+                    result={"trade_date": trade_date, **result},
+                )
+            CNMarketSchedulerService._run_stock_selection_forward_shadow(
+                source_job_id=job_id,
+                feature_date=trade_date,
+            )
+        except Exception as exc:
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(
+                    job_id,
+                    status="failed",
+                    message=f"CN point-in-time fundamental collection failed: {exc}",
+                    result={"trade_date": trade_date, "error": str(exc)},
+                )
+            CNMarketSchedulerService._run_stock_selection_forward_shadow(
+                source_job_id=job_id,
+                feature_date=trade_date,
+            )
+
+    @staticmethod
+    def _run_stock_selection_forward_shadow(*, source_job_id: int, feature_date: str) -> dict:
+        """Freeze one next-session shadow decision after the point-in-time collection attempt."""
+
+        with SessionLocal() as db:
+            job_repo = DataJobRepository(db)
+            job_repo.complete_stale_running_jobs(
+                job_types=[CN_FORWARD_SHADOW_JOB_TYPE],
+                stale_after_hours=2,
+                message_prefix="CN forward-shadow cleanup closed a stale job.",
+            )
+            if job_repo.has_running_job(CN_FORWARD_SHADOW_JOB_TYPE):
+                return {
+                    "status": "skipped",
+                    "message": "A CN forward-shadow snapshot job is already running.",
+                }
+            job = job_repo.create_job(
+                job_type=CN_FORWARD_SHADOW_JOB_TYPE,
+                status="running",
+                params={
+                    "source_job_id": source_job_id,
+                    "market": "CN",
+                    "feature_date": feature_date,
+                    "scope": "forward_shadow_only",
+                },
+                message="Freezing the next-session A-share point-in-time shadow snapshot.",
+            )
+            shadow_job_id = job.id
+        try:
+            with SessionLocal() as db:
+                result = create_cn_forward_shadow_snapshot(
+                    db,
+                    feature_date=feature_date,
+                    source_job_id=shadow_job_id,
+                )
+                payload = result.get("payload") or {}
+                status = "success" if str(result.get("status")) == "success" else "partial"
+                try:
+                    evaluation = create_cn_forward_shadow_evaluation_snapshot(
+                        db,
+                        source_job_id=shadow_job_id,
+                    )
+                except Exception as evaluation_error:
+                    evaluation = {
+                        "status": "failed",
+                        "message": str(evaluation_error),
+                    }
+                    status = "partial"
+                result = {**result, "evaluation": evaluation}
+                evaluation_payload = evaluation.get("payload") or {}
+                message = (
+                    f"CN forward shadow frozen for {result.get('snapshot_date')}: "
+                    f"{int(payload.get('confirmation_date_count') or 0)}/"
+                    f"{int(payload.get('minimum_confirmation_dates') or 60)} untouched dates; "
+                    f"{int(evaluation_payload.get('evaluated_date_count') or 0)} matured; "
+                    f"decision {payload.get('shadow_decision') or 'ABSTAIN'}."
+                )
+                DataJobRepository(db).complete_job(
+                    shadow_job_id,
+                    status=status,
+                    message=message,
+                    result=result,
+                )
+            return {"job_id": shadow_job_id, "status": status, **result}
+        except Exception as exc:
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(
+                    shadow_job_id,
+                    status="failed",
+                    message=f"CN forward-shadow snapshot failed: {exc}",
+                    result={"feature_date": feature_date, "error": str(exc)},
+                )
+            return {"job_id": shadow_job_id, "status": "failed", "message": str(exc)}
+
     def _run_post_close_pipeline(self, *, pipeline_job_id: int, source_job_id: int, trade_date: str) -> None:
         """Keep each stage visible in Task Center and isolate failures by stage."""
         stages: list[dict] = []
@@ -311,6 +532,7 @@ class CNMarketSchedulerService:
             # those prerequisites before evaluating combinations.
             stages.append(self._run_screener_precompute_rest(source_job_id=source_job_id, trade_date=trade_date))
             stages.append(self._run_screener_precompute_combos(source_job_id=source_job_id, trade_date=trade_date))
+            stages.append(self._run_ai_daily_report_delivery(source_job_id=source_job_id, trade_date=trade_date))
             failed = [stage for stage in stages if str(stage.get("status")) not in {"success", "partial"}]
             status = "success" if not failed else "partial"
             message = f"A-share post-close pipeline completed: {len(stages) - len(failed)}/{len(stages)} stages usable."
@@ -329,6 +551,61 @@ class CNMarketSchedulerService:
                     message=f"A-share post-close pipeline failed: {exc}",
                     result={"market": "CN", "trade_date": trade_date, "stages": stages, "error": str(exc)},
                 )
+
+    def _run_ai_daily_report_delivery(self, *, source_job_id: int, trade_date: str) -> dict:
+        with SessionLocal() as db:
+            job_repo = DataJobRepository(db)
+            latest = job_repo.get_latest_job(CN_AI_DAILY_REPORT_FEISHU_JOB_TYPE)
+            latest_params = (latest or {}).get("params") or {}
+            latest_result = (latest or {}).get("result") or {}
+            if (
+                str(latest_params.get("trade_date") or "") == trade_date
+                and str((latest or {}).get("status") or "") in {"success", "partial"}
+                and "feishu" in (latest_result.get("sent") or [])
+            ):
+                return {
+                    "stage": "ai_daily_report_feishu",
+                    "status": "success",
+                    "trade_date": trade_date,
+                    "skipped": True,
+                    "message": "A-share daily report was already delivered to Feishu for this trade date.",
+                }
+        job_id = self._create_stage_job(
+            job_type=CN_AI_DAILY_REPORT_FEISHU_JOB_TYPE,
+            source_job_id=source_job_id,
+            trade_date=trade_date,
+            message="Building and delivering the A-share daily report to Feishu.",
+        )
+        if job_id is None:
+            return {
+                "stage": "ai_daily_report_feishu",
+                "status": "failed",
+                "message": "An A-share Feishu daily-report delivery job is already running.",
+            }
+        try:
+            result = deliver_cn_ai_daily_report_to_feishu(limit=8)
+            status = str(result.get("status") or "failed")
+            if result.get("delivery_kind") == "readiness_notice" and status == "success":
+                status = "partial"
+            message = (
+                f"Delivered A-share daily report for {result.get('report_date') or trade_date} to Feishu."
+                if result.get("delivery_kind") == "daily_report" and result.get("sent")
+                else f"Sent A-share daily-report readiness notice for {result.get('report_date') or trade_date}."
+                if result.get("sent")
+                else "A-share daily report could not be delivered to Feishu."
+            )
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(job_id, status=status, message=message, result=result)
+            return {"stage": "ai_daily_report_feishu", "status": status, "message": message, **result}
+        except Exception as exc:
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(
+                    job_id,
+                    status="failed",
+                    message=f"A-share Feishu daily-report delivery failed: {exc}",
+                    result={"trade_date": trade_date, "error": str(exc)},
+                )
+            return {"stage": "ai_daily_report_feishu", "status": "failed", "message": str(exc)}
 
     def _create_stage_job(self, *, job_type: str, source_job_id: int, trade_date: str, message: str):
         with SessionLocal() as db:
@@ -408,16 +685,36 @@ class CNMarketSchedulerService:
                 result = evaluate_model_runs(
                     db,
                     markets=["CN"],
+                    require_execution_reconciliation=True,
                     recent_runs=1,
-                    recent_trade_dates=12,
+                    recent_trade_dates=SCHEDULED_EVALUATION_TRADE_DATES,
                     top_n=20,
-                    round_trip_cost_bps=20.0,
+                    # P0-3: scheduled evaluation uses the realistic round-trip
+                    # band (commission ~5 + stamp 5 + open-auction slippage).
+                    # The old 20 bps flattered edge and hid real losses.  The
+                    # ladder is operator-tunable without a code change.
+                    round_trip_cost_bps=float(getattr(get_settings(), "trainer_round_trip_cost_bps", 50.0)),
                     source_job_id=job_id,
                 )
+                storage_acceptance = audit_recent_compact_dual_writes(
+                    db,
+                    market="CN",
+                    required_runs=5,
+                    scan_limit=50,
+                )
+                result["prediction_storage_acceptance"] = storage_acceptance
+                evaluation_status = str(result.get("status") or "partial")
+                if storage_acceptance["status"] == "fail":
+                    evaluation_status = "partial"
                 DataJobRepository(db).complete_job(
                     job_id,
-                    status=str(result.get("status") or "partial"),
-                    message=result.get("message") or "Structured A-share model evaluation finished.",
+                    status=evaluation_status,
+                    message=(
+                        (result.get("message") or "Structured A-share model evaluation finished.")
+                        + " Production storage acceptance: "
+                        + f"{len(storage_acceptance['passed_runs'])}/"
+                        + f"{storage_acceptance['required_runs']} consecutive trading days."
+                    ),
                     result=result,
                 )
         except Exception as exc:
@@ -544,13 +841,20 @@ class CNMarketSchedulerService:
             job = job_repo.create_job(
                 job_type="risk_guardrail_snapshot",
                 status="running",
-                params={"source_job_id": source_job_id, "markets": ["CN", "US"], "trigger": "cn_market_refresh"},
+                params={"source_job_id": source_job_id, "markets": ["CN"], "trigger": "cn_market_refresh"},
                 message="Computing risk guardrail snapshots after CN market refresh.",
             )
             risk_job_id = job.id
         try:
             with SessionLocal() as db:
-                result = save_risk_guardrail_snapshots(db, source_job_id=risk_job_id, markets=["CN", "US"])
+                # A CN-triggered pipeline must not process US as a side effect.
+                # US refresh and signoff remain independently controlled while
+                # that market is on hold.
+                result = save_risk_guardrail_snapshots(
+                    db,
+                    source_job_id=risk_job_id,
+                    markets=["CN"],
+                )
                 DataJobRepository(db).complete_job(
                     risk_job_id,
                     status=str(result.get("status") or "success"),

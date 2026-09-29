@@ -12,21 +12,67 @@ import json
 import math
 import statistics
 from collections import defaultdict
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models.tables import ModelEvaluation, ModelEvaluationMetric, ModelRun, Prediction, Symbol, WorkspaceSnapshot
+from app.core.config import get_settings
+from app.models.tables import (
+    ModelEvaluation,
+    ModelEvaluationMetric,
+    ModelRun,
+    Prediction,
+    PredictionArtifact,
+    Symbol,
+    WorkspaceSnapshot,
+)
 from app.services.market_lake import load_lake_price_history
 from app.services.market_risk import market_risk_snapshot_type
+from app.services.prediction_artifacts import read_prediction_artifact_rows
 from app.services.time_utils import app_now_iso
+from app.services.stock_selection.labels import ExecutableLabel
+from app.services.stock_selection.executable_outcomes import OUTCOME_VERSION, FILL_COST_OUTCOME_VERSION
+from app.services.execution_costs import FillCostModel
+from app.services.execution_reconciliation import (
+    VERSION as RECONCILED_VERSION, replay_candidate, outcome_counts, validate_contract, implementation_identity,
+)
 
 
 DEFAULT_HORIZONS = (1, 3, 5, 10, 20)
 CORPORATE_ACTION_JUMP_PCT = 80.0
 STRICT_OOS_MIN_COVERAGE_DAYS = 20
 STRICT_OOS_MIN_SAMPLES = 100
+# Keep enough prediction dates for the longest forward-return horizon to mature
+# while still leaving the challenger gate's required number of OOS dates. A
+# 12-date scheduled window could never satisfy the 20-date gate.
+SCHEDULED_EVALUATION_TRADE_DATES = STRICT_OOS_MIN_COVERAGE_DAYS + max(DEFAULT_HORIZONS)
+
+
+def _tail_drawdown_1pct(drawdowns: list[float]) -> float:
+    """Gate statistic: CVaR-style mean of the worst tail of path drawdowns.
+
+    The legacy gate consumed the single worst sample, an extreme-value
+    statistic that destabilizes as the OOS sample grows and structurally
+    favored the old clamped composite labels (-0.35 floor made a breach
+    nearly impossible there, while unclamped executable net labels breach
+    almost by construction). The 1% tail mean converges with sample size
+    and stays comparable across label protocols. v2 hardens the floor:
+    from five samples on, the tail consumes at least the worst five
+    draws (CVaR@95% at the 100-row scheduled metrics base of five
+    scheduled days x top-20 picks), so one catastrophic sample can no
+    longer decide the gate on its own; below five samples it remains
+    the single worst sample, preserving legacy semantics for small
+    diagnostic fixtures.
+    """
+    if not drawdowns:
+        return 0.0
+    ordered = sorted(drawdowns)
+    if len(ordered) < 5:
+        return ordered[0]
+    tail_size = max(5, -(-len(ordered) // 100))
+    return sum(ordered[:tail_size]) / tail_size
 
 
 def _number(value: Any) -> float | None:
@@ -38,13 +84,30 @@ def _number(value: Any) -> float | None:
 
 
 def _history_outcome(history: list[dict], *, trade_date: str, horizon_days: int) -> dict | None:
-    """Return forward gross return and path drawdown in percent for one pick."""
+    """Return forward gross return and path drawdown in percent for one pick.
+
+    P0 closeout: the entry basis is the next bar's open -- the price a T+1
+    trader could actually pay -- gap-carried onto the stored (possibly
+    adjusted) close series.  Entering at the signal-day close overstated
+    returns for momentum-ranked picks that systematically gap up.
+    """
     target_index = next((index for index, row in enumerate(history) if str(row.get("date") or "") == trade_date), None)
     if target_index is None or target_index + horizon_days >= len(history):
         return None
-    entry = _number(history[target_index].get("adj_close")) or _number(history[target_index].get("close"))
-    exit_price = _number(history[target_index + horizon_days].get("adj_close")) or _number(history[target_index + horizon_days].get("close"))
-    if not entry or exit_price is None:
+    signal_row = history[target_index]
+    next_row = history[target_index + 1]
+    signal_close = _number(signal_row.get("adj_close")) or _number(signal_row.get("close"))
+    next_open = _number(next_row.get("open"))
+    next_close = _number(next_row.get("adj_close")) or _number(next_row.get("close"))
+    signal_raw_close = _number(signal_row.get("close"))
+    entry = next_close or signal_close
+    if signal_close and next_open and signal_raw_close:
+        gap_ratio = next_open / signal_raw_close
+        if 0.0 < gap_ratio < 3.0:
+            entry = signal_close * gap_ratio
+    exit_row = history[target_index + horizon_days]
+    exit_price = _number(exit_row.get("adj_close")) or _number(exit_row.get("close"))
+    if not entry or entry <= 0 or exit_price is None:
         return None
     path = history[target_index : target_index + horizon_days + 1]
     path_closes = [(_number(row.get("adj_close")) or _number(row.get("close"))) for row in path]
@@ -70,10 +133,80 @@ def _history_outcome(history: list[dict], *, trade_date: str, horizon_days: int)
 
 def summarize_evaluation_samples(samples: list[dict], *, horizon_days: int, round_trip_cost_bps: float) -> dict:
     """Calculate net-of-cost performance; intentionally pure for regression tests."""
-    cost_pct = max(0.0, float(round_trip_cost_bps)) / 100.0
-    gross_returns = [float(item["gross_return_pct"]) for item in samples if item.get("gross_return_pct") is not None]
+    cost_bps = float(round_trip_cost_bps)
+    if not math.isfinite(cost_bps) or cost_bps < 0:
+        raise ValueError("round_trip_cost_bps must be finite and non-negative")
+    cost_pct = cost_bps / 100.0
+    valid_samples = [item for item in samples if not item.get("excluded_reason")
+                     and item.get("tradable") is not False and _number(item.get("gross_return_pct")) is not None]
+    gross_returns = [float(item["gross_return_pct"]) for item in valid_samples]
     net_returns = [value - cost_pct for value in gross_returns]
-    drawdowns = [float(item["drawdown_pct"]) for item in samples if item.get("drawdown_pct") is not None]
+    drawdowns = [float(item["drawdown_pct"]) for item in valid_samples if _number(item.get("drawdown_pct")) is not None]
+    return _summarize_return_vectors(gross_returns, net_returns, drawdowns,
+        horizon_days=horizon_days, round_trip_cost_bps=cost_bps, selected_count=len(samples))
+
+
+DEFAULT_COST_SENSITIVITY_LADDER_BPS = (20.0, 50.0, 80.0)
+
+
+def cost_sensitivity_ladder(
+    samples: list[dict],
+    *,
+    horizon_days: int,
+    round_trip_cost_bps: float,
+    ladder_bps: tuple[float, ...] = DEFAULT_COST_SENSITIVITY_LADDER_BPS,
+) -> list[dict]:
+    """Reprice one measured sample set at escalating round-trip cost levels.
+
+    P0 acceptance requires the scheduled CN evaluation to prove its edge is not
+    an artifact of one favorable cost choice: the same measured paths are
+    evaluated at an optimistic (20bps), the scheduled nominal (50bps) and a
+    punitive (80bps) round trip. Gross returns are never modified; net returns
+    and hit rates may only decay as costs rise.
+    """
+    base_bps = float(round_trip_cost_bps)
+    if not math.isfinite(base_bps) or base_bps < 0:
+        raise ValueError("round_trip_cost_bps must be finite and non-negative")
+    levels: list[float] = []
+    for value in ladder_bps:
+        number = float(value)
+        if not math.isfinite(number) or number < 0:
+            raise ValueError("ladder_bps entries must be finite and non-negative")
+        if number not in levels:
+            levels.append(number)
+    if base_bps not in levels:
+        levels.append(base_bps)
+        levels.sort()
+    rows: list[dict] = []
+    for level_bps in levels:
+        summary = summarize_evaluation_samples(
+            samples, horizon_days=horizon_days, round_trip_cost_bps=level_bps
+        )
+        rows.append(
+            {
+                "round_trip_cost_bps": level_bps,
+                "sample_count": summary["sample_count"],
+                "hit_rate": summary["hit_rate"],
+                "net_avg_return": summary["avg_return"],
+                "gross_avg_return": summary["gross_avg_return"],
+            }
+        )
+    base_net = next(
+        (row["net_avg_return"] for row in rows if row["round_trip_cost_bps"] == base_bps),
+        None,
+    )
+    for row in rows:
+        row["net_avg_return_delta_vs_base"] = (
+            row["net_avg_return"] - base_net
+            if base_net is not None and row["net_avg_return"] is not None
+            else None
+        )
+    return rows
+
+
+def _summarize_return_vectors(gross_returns: list[float], net_returns: list[float], drawdowns: list[float],
+                              *, horizon_days: int, round_trip_cost_bps: float, selected_count: int) -> dict:
+    """Aggregate measured vectors without interpreting or reapplying costs."""
     count = len(net_returns)
     positive = [value for value in net_returns if value > 0]
     negative = [value for value in net_returns if value < 0]
@@ -94,12 +227,59 @@ def summarize_evaluation_samples(samples: list[dict], *, horizon_days: int, roun
         "median_return": statistics.median(net_returns) if net_returns else None,
         "gross_avg_return": statistics.fmean(gross_returns) if gross_returns else None,
         "avg_drawdown": statistics.fmean(drawdowns) if drawdowns else None,
-        "max_drawdown": min(drawdowns) if drawdowns else None,
+        "max_drawdown": round(_tail_drawdown_1pct(drawdowns), 4),
+        "worst_sample_drawdown": min(drawdowns) if drawdowns else None,
+        "activation_gate_version": "tail_drawdown_1pct_v2",
         "profit_loss_ratio": (statistics.fmean(positive) / abs(statistics.fmean(negative))) if positive and negative else None,
         "turnover": (1.0 / max(1, int(horizon_days))) if count else None,
         "confidence_low": confidence_low,
         "confidence_high": confidence_high,
+        "confidence_method": "iid_normal_diagnostic_not_promotion_evidence",
+        "drawdown_semantics": "cvar95_tail_gated_v2 (mean of worst >=5 samples; worst sample kept as record)",
+        "selected_sample_count": selected_count,
+        "unmeasured_sample_count": selected_count - count,
     }
+
+
+def summarize_executable_labels(labels: list[ExecutableLabel], *, horizon_days: int,
+                                cost_bps: float | None = None, cost_model: FillCostModel | None = None) -> dict:
+    """Versioned flat-cost or already-net per-fill labels; never double charge."""
+    if (cost_model is None) == (cost_bps is None):
+        raise ValueError("choose exactly one cost model: flat bps or per-fill")
+    version = OUTCOME_VERSION if cost_model is None else FILL_COST_OUTCOME_VERSION
+    expected_bps = cost_bps if cost_model is None else cost_model.nominal_round_trip_bps
+    for label in labels:
+        if (label.label_version != version or label.horizon_days != horizon_days
+            or label.round_trip_cost_bps != expected_bps
+            or label.cost_model_version != (cost_model.version if cost_model else "flat_round_trip_bps_v1")
+            or label.cost_model_hash != (cost_model.model_hash if cost_model else None)):
+            raise ValueError("mixed executable label protocol, horizon or costs")
+    if cost_model is None:
+        result = summarize_evaluation_samples([
+            {"gross_return_pct": label.gross_return * 100 if label.gross_return is not None else None,
+             "drawdown_pct": label.path_drawdown * 100 if label.path_drawdown is not None else None,
+             "tradable": label.tradable, "excluded_reason": label.exclusion_reason}
+            for label in labels
+        ], horizon_days=horizon_days, round_trip_cost_bps=cost_bps)
+    else:
+        measured = [label for label in labels if label.tradable and not label.exclusion_reason]
+        if any(_number(label.net_return) is None or _number(label.gross_return) is None for label in measured):
+            raise ValueError("measurable fill-cost labels require finite gross and net returns")
+        result = _summarize_return_vectors(
+            [label.gross_return * 100 for label in measured],
+            [label.net_return * 100 for label in measured],
+            [label.path_drawdown * 100 for label in measured if _number(label.path_drawdown) is not None],
+            horizon_days=horizon_days, round_trip_cost_bps=expected_bps, selected_count=len(labels))
+    result["outcome_protocol"] = version
+    result["cost_model_version"] = cost_model.version if cost_model else "flat_round_trip_bps_v1"
+    result["cost_model_hash"] = cost_model.model_hash if cost_model else None
+    result["cost_bps_semantics"] = "nominal_approximation_not_deduction" if cost_model else "flat_return_deduction"
+    result["return_denominator"] = "entry_notional_plus_entry_fee" if cost_model else "raw_entry_reference"
+    result["excluded_reasons"] = {
+        reason: sum(label.exclusion_reason == reason for label in labels)
+        for reason in sorted({label.exclusion_reason for label in labels if label.exclusion_reason})
+    }
+    return result
 
 
 def _snapshot_states(db: Session, *, market: str, trade_dates: set[str]) -> dict[str, dict[str, str]]:
@@ -163,8 +343,8 @@ def _strict_oos_status(run: ModelRun, *, trade_date: str) -> tuple[bool, str, in
         purge_gap_days = None
     protocol = str(config.get("evaluation_protocol") or "").strip().lower()
     oos_start = str(config.get("oos_start_date") or run.test_start or "").strip()
-    if protocol == "walk_forward_purged_v1":
-        return bool(oos_start and trade_date >= oos_start), "walk_forward_purged_v1", purge_gap_days
+    if protocol in {"walk_forward_purged_v1", "walk_forward_purged_v2"}:
+        return bool(oos_start and trade_date >= oos_start), protocol, purge_gap_days
     if oos_start:
         return bool(trade_date >= oos_start and (not run.train_end or trade_date > str(run.train_end))), "date_split_v1", purge_gap_days
     return bool(run.train_end and trade_date > str(run.train_end)), "legacy_train_end", purge_gap_days
@@ -196,6 +376,7 @@ def _selected_prediction_rows(
     market: str,
     recent_trade_dates: int,
     top_n: int,
+    cold_reads_enabled: bool | None = None,
 ) -> list[tuple[Prediction, Symbol]]:
     date_rows = db.execute(
         select(Prediction.trade_date)
@@ -207,7 +388,54 @@ def _selected_prediction_rows(
     ).all()
     trade_dates = [str(row[0]) for row in date_rows]
     if not trade_dates:
-        return []
+        if cold_reads_enabled is None:
+            cold_reads_enabled = bool(get_settings().prediction_cold_reads_enabled)
+        if not cold_reads_enabled:
+            return []
+        artifact = db.scalar(
+            select(PredictionArtifact).where(
+                PredictionArtifact.model_run_id == int(run.id),
+                PredictionArtifact.status == "verified",
+            )
+        )
+        if artifact is None:
+            return []
+        cold_rows = read_prediction_artifact_rows(artifact.artifact_path, include_details=False)
+        symbol_ids = sorted({int(row["symbol_id"]) for row in cold_rows})
+        symbols = {
+            int(symbol.id): symbol
+            for symbol in db.scalars(select(Symbol).where(Symbol.id.in_(symbol_ids), Symbol.market == market)).all()
+        }
+        eligible_rows = [row for row in cold_rows if int(row["symbol_id"]) in symbols]
+        cold_dates = sorted({str(row["trade_date"]) for row in eligible_rows}, reverse=True)[
+            : max(1, int(recent_trade_dates))
+        ]
+        selected: list[tuple[Prediction, Symbol]] = []
+        per_date: dict[str, int] = defaultdict(int)
+        for row in sorted(
+            (row for row in eligible_rows if str(row["trade_date"]) in cold_dates),
+            key=lambda row: (
+                str(row["trade_date"]),
+                -float(row.get("rank_value") or 0.0),
+                float(row.get("score") or 0.0),
+                -int(row["symbol_id"]),
+            ),
+            reverse=True,
+        ):
+            trade_date = str(row["trade_date"])
+            if per_date[trade_date] >= max(1, int(top_n)):
+                continue
+            per_date[trade_date] += 1
+            prediction = SimpleNamespace(
+                id=None,
+                model_run_id=int(run.id),
+                symbol_id=int(row["symbol_id"]),
+                trade_date=trade_date,
+                score=row.get("score"),
+                rank_value=row.get("rank_value"),
+            )
+            selected.append((prediction, symbols[int(row["symbol_id"])]))
+        return selected
     rows = db.execute(
         select(Prediction, Symbol)
         .join(Symbol, Symbol.id == Prediction.symbol_id)
@@ -270,6 +498,7 @@ def evaluate_model_runs(
     horizons: tuple[int, ...] | list[int] = DEFAULT_HORIZONS,
     round_trip_cost_bps: float = 20.0,
     source_job_id: int | None = None,
+    require_execution_reconciliation: bool = False,
 ) -> dict:
     """Evaluate stored predictions without re-training or using current risk labels for old dates."""
     target_markets = [str(item).upper() for item in (markets or ["CN", "US"]) if str(item).upper() in {"CN", "US"}]
@@ -293,6 +522,82 @@ def evaluate_model_runs(
             selected = _selected_prediction_rows(
                 db, run=run, market=market, recent_trade_dates=recent_trade_dates, top_n=top_n
             )
+            if require_execution_reconciliation:
+                contract = _run_config(run).get("execution_contract")
+                candidate_outcomes = []
+                try:
+                    frozen_cost = validate_contract(contract, market)
+                except ValueError:
+                    frozen_cost = None
+                for prediction, symbol in selected:
+                    key = (market, symbol.ticker)
+                    if key not in history_cache:
+                        history_cache[key] = (load_lake_price_history(
+                            market=market, ticker=symbol.ticker, limit=320) if frozen_cost else [])
+                    strict, _, _ = _strict_oos_status(run, trade_date=str(prediction.trade_date))
+                    for horizon in normalized_horizons:
+                        outcome = replay_candidate(
+                            ticker=symbol.ticker, market=market,
+                            signal_date=str(prediction.trade_date), horizon_days=horizon,
+                            rows=history_cache[key], contract=contract)
+                        outcome.update(model_run_id=run.id, is_out_of_sample=strict)
+                        candidate_outcomes.append(outcome)
+                counts = outcome_counts(candidate_outcomes)
+                closed = [row for row in candidate_outcomes
+                          if row['status'] == 'CLOSED' and row['is_out_of_sample']]
+                verified = bool(candidate_outcomes) and not counts.get('UNVERIFIED')
+                complete = verified and not counts.get('PENDING') and not counts.get('EXIT_DEFERRED')
+                evaluated_status = 'success' if complete else 'partial'
+                dates = {row['trade_date'] for row in closed}
+                measured = {(row['ticker'], row['trade_date']) for row in closed}
+                summary = {
+                    "outcome_protocol": RECONCILED_VERSION,
+                    "implementation": implementation_identity(),
+                    "execution_verified": verified,
+                    "activation_status": "observation_reconciliation_only" if verified else "observation_execution_unverified",
+                    "candidate_outcomes": candidate_outcomes,
+                    "selected_prediction_count": len(selected),
+                    "candidate_horizon_count": len(candidate_outcomes),
+                    "outcome_counts": counts,
+                    "horizons": list(normalized_horizons),
+                    "block_reason": None if complete else "unresolved_candidate_outcomes",
+                    "legacy_fallback_used": False,
+                    "cost_contract": contract,
+                    "note": "Per-candidate normalized-share replay, not portfolio NAV or broker fills.",
+                }
+                evaluation = ModelEvaluation(
+                    model_run_id=run.id, source_job_id=source_job_id, market=market,
+                    evaluation_type="prediction_forward_return",
+                    input_as_of_date=_model_input_as_of_date(run),
+                    is_out_of_sample=int(bool(closed)), oos_sample_count=len(measured), oos_coverage_days=len(dates),
+                    activation_status=summary['activation_status'],
+                    includes_costs=int(frozen_cost is not None),
+                    round_trip_cost_bps=frozen_cost.nominal_round_trip_bps if frozen_cost else float(round_trip_cost_bps),
+                    sample_count=len(measured), status=evaluated_status,
+                    config_json=json.dumps({"require_execution_reconciliation": True,
+                                            "top_n": int(top_n),
+                                            "recent_trade_dates": int(recent_trade_dates)}),
+                    summary_json=json.dumps(summary, ensure_ascii=False),
+                    created_at=app_now_iso(), finished_at=app_now_iso(),
+                )
+                db.add(evaluation)
+                db.flush()
+                for horizon in normalized_horizons:
+                    subset = [row for row in closed if row['horizon_days'] == horizon]
+                    metrics = _summarize_return_vectors(
+                        [row['gross_return'] * 100 for row in subset],
+                        [row['net_return'] * 100 for row in subset], [],
+                        horizon_days=horizon,
+                        round_trip_cost_bps=evaluation.round_trip_cost_bps,
+                        selected_count=len(selected))
+                    fields = {key: metrics[key] for key in (
+                        'sample_count', 'hit_rate', 'avg_return', 'median_return',
+                        'gross_avg_return', 'profit_loss_ratio', 'confidence_low', 'confidence_high')}
+                    db.add(ModelEvaluationMetric(model_evaluation_id=evaluation.id,
+                        horizon_days=horizon, metric_scope='overall', created_at=app_now_iso(), **fields))
+                evaluations.append({"id": evaluation.id, "model_run_id": run.id,
+                                    "market": market, "status": evaluated_status, **summary})
+                continue
             state_by_date = _snapshot_states(db, market=market, trade_dates={str(row[0].trade_date) for row in selected})
             samples_by_horizon: dict[int, list[dict]] = {horizon: [] for horizon in normalized_horizons}
             for prediction, symbol in selected:
@@ -352,7 +657,12 @@ def evaluate_model_runs(
                 strict_coverage_days=oos_coverage_days,
                 strict_metrics=strict_metrics,
             )
+            if activation_status == 'eligible_for_champion_review':
+                activation_status = 'observation_execution_unverified'
             summary = {
+                "outcome_protocol": "legacy_close_to_close_diagnostic_v1",
+                "execution_verified": False,
+                "drawdown_semantics": "cvar95_tail_gated_v2 (mean of worst >=5 samples; worst sample kept as record)",
                 "model_name": run.name,
                 "model_type": run.model_type,
                 "selected_prediction_count": len(selected),
@@ -369,6 +679,14 @@ def evaluate_model_runs(
                 "excluded_corporate_action_paths": excluded_discontinuity_count,
                 "corporate_action_jump_threshold_pct": CORPORATE_ACTION_JUMP_PCT,
                 "horizons": list(normalized_horizons),
+                "cost_sensitivity_ladder_bps": [float(value) for value in DEFAULT_COST_SENSITIVITY_LADDER_BPS],
+                "cost_sensitivity": {
+                    horizon: cost_sensitivity_ladder(
+                        samples, horizon_days=horizon, round_trip_cost_bps=round_trip_cost_bps
+                    )
+                    for horizon, samples in strict_samples_by_horizon.items()
+                    if samples
+                },
             }
             evaluation = ModelEvaluation(
                 model_run_id=run.id,

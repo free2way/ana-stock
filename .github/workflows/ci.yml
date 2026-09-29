@@ -10,6 +10,25 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: cleanup_ci
+          POSTGRES_PASSWORD: cleanup_ci_fixture
+          POSTGRES_DB: cleanup_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cleanup_ci -d cleanup_ci_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      # Disposable service credentials, never a production connection.
+      PQW_TEST_DATABASE_URL: postgresql+psycopg://cleanup_ci:cleanup_ci_fixture@127.0.0.1:5432/cleanup_ci_test
+      PQW_DATABASE_URL: postgresql+psycopg://cleanup_ci:cleanup_ci_fixture@127.0.0.1:5432/cleanup_ci_test
+      PQW_STORAGE_CAPACITY_MONITOR_ENABLED: "false"
 
     steps:
       - name: Check out repository
@@ -19,6 +38,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Verify Python runtime
+        run: python scripts/verify_python_runtime.py --expected-python 3.12 --output data/artifacts/ci-python-runtime.json
 
       - name: Install core dependencies
         run: |
@@ -30,3 +52,17 @@ jobs:
 
       - name: Run regression tests
         run: python -m unittest discover -s tests -v
+
+      - name: Verify offline cleanup contracts
+        if: always()
+        run: python scripts/verify_regime_p1_p2_contracts.py --include-cleanup-contracts --output data/artifacts/ci-cleanup-contracts.json
+
+      - name: Upload cleanup contract evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cleanup-contracts
+          path: |
+            data/artifacts/ci-cleanup-contracts.json
+            data/artifacts/ci-python-runtime.json
+          if-no-files-found: warn

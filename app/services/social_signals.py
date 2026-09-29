@@ -1068,44 +1068,6 @@ def _is_us_symbol_stopword(raw: str) -> bool:
     return token in _US_SYMBOL_STOPWORDS or not re.fullmatch(r"[A-Z][A-Z0-9]{0,5}(?:\.[A-Z])?", token)
 
 
-def _looks_like_standalone_us_ticker(raw: str, text: str) -> bool:
-    token = _normalize_us_symbol_token(raw)
-    if _is_us_symbol_stopword(token):
-        return False
-    if len(token.replace(".", "")) >= 3:
-        return True
-    window = _mention_window(text, {"raw_match": raw}, radius=90).lower()
-    stock_context = [
-        "stock",
-        "stocks",
-        "share",
-        "shares",
-        "ticker",
-        "calls",
-        "puts",
-        "earnings",
-        "breakout",
-        "upside",
-        "downside",
-        "long",
-        "short",
-        "buy",
-        "sell",
-        "trim",
-        "position",
-        "watchlist",
-        "股票",
-        "美股",
-        "买入",
-        "卖出",
-        "看多",
-        "看空",
-        "突破",
-        "持仓",
-        "自选",
-    ]
-    return any(keyword in window for keyword in stock_context)
-
 
 def _should_keep_social_mention(mention: dict) -> bool:
     ticker = _normalize_us_symbol_token(str(mention.get("ticker") or ""))

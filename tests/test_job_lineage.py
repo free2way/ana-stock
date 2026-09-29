@@ -1,34 +1,16 @@
-import os
-from unittest import TestCase
+from tests.postgres_safety import ApplicationPostgresTestCase
 from unittest.mock import patch
 
-from sqlalchemy import text
 from starlette.requests import Request
 
 from app.api.routes.dashboard import dashboard_ops_job_detail
-from app.core.config import get_settings
-from app.core.db import SessionLocal, configure_database, init_db
-from app.models.base import Base
+from app.core.db import SessionLocal
 from app.services.market_refresh_audit import record_market_refresh_result
 from app.services.repository import DataJobRepository
 
 
-TEST_DATABASE_URL = "postgresql+psycopg://quant:quant!123@127.0.0.1:5432/quant_test"
+class JobLineageRepositoryTests(ApplicationPostgresTestCase):
 
-
-class JobLineageRepositoryTests(TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        os.environ["PQW_DATABASE_URL"] = os.getenv("PQW_TEST_DATABASE_URL", TEST_DATABASE_URL)
-        get_settings.cache_clear()
-        configure_database()
-        init_db()
-
-    def setUp(self) -> None:
-        with SessionLocal() as db:
-            for table in reversed(Base.metadata.sorted_tables):
-                db.execute(text(f'TRUNCATE TABLE "{table.name}" RESTART IDENTITY CASCADE'))
-            db.commit()
 
     def test_job_run_records_definition_attempt_and_source_dependency(self) -> None:
         with SessionLocal() as db:

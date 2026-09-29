@@ -7,10 +7,11 @@ from datetime import datetime, timedelta
 from app.core.db import SessionLocal
 from app.services.backtester import BacktestRunner
 from app.services.market_calendar import previous_market_open_date
+from app.services.data_quality import format_data_gate_failure, market_data_gate
 from app.services.market_lake import count_lake_symbols_for_trade_date, get_latest_lake_trade_date, list_lake_symbols
 from app.services.market_refresh_audit import record_market_refresh_result
 from app.services.market_risk import save_risk_guardrail_snapshots
-from app.services.model_evaluation import evaluate_model_runs
+from app.services.model_evaluation import SCHEDULED_EVALUATION_TRADE_DATES, evaluate_model_runs
 from app.services.market_sync import sync_market_data
 from app.services.portfolio_book import load_portfolio_positions
 from app.services.repository import AppSettingRepository, DataJobRepository, WatchlistRepository
@@ -157,10 +158,7 @@ class USMarketSchedulerService:
         try:
             result = refresh_us_grouped_daily(
                 adjusted=bool(config.get("adjusted", True)),
-                normalize=False,
-                persist_per_symbol=False,
                 write_lake=True,
-                write_snapshot=False,
             )
             priority_sync_result = (
                 self._sync_priority_us_prices(
@@ -270,9 +268,6 @@ class USMarketSchedulerService:
                 break
         return gaps
 
-    def _stale_priority_us_tickers(self, *, target_trade_date: str, limit: int) -> list[str]:
-        return [row["ticker"] for row in self._priority_us_price_gaps(target_trade_date=target_trade_date, limit=limit)]
-
     def _sync_priority_us_prices(self, *, target_trade_date: str, limit: int) -> dict:
         price_gaps = self._priority_us_price_gaps(target_trade_date=target_trade_date, limit=limit)
         stale_tickers = [row["ticker"] for row in price_gaps]
@@ -345,7 +340,11 @@ class USMarketSchedulerService:
 
     def _run_signal_training(self, *, source_job_id: int, trade_date: str) -> None:
         raw_us_tickers = sorted(list_lake_symbols(market="US"))
-        us_tickers, universe_summary = build_us_trade_universe(tickers=raw_us_tickers, include_summary=True)
+        us_tickers, universe_summary = build_us_trade_universe(
+            tickers=raw_us_tickers,
+            expected_as_of_date=trade_date,
+            include_summary=True,
+        )
         if not us_tickers:
             return
         with SessionLocal() as db:
@@ -375,6 +374,10 @@ class USMarketSchedulerService:
         trainer = SignalTrainer()
         runner = BacktestRunner()
         try:
+            with SessionLocal() as db:
+                data_gate = market_data_gate(db, market="US", tickers=us_tickers)
+            if data_gate.get("status") == "blocked":
+                raise RuntimeError(format_data_gate_failure(data_gate))
             predictions_written = trainer.train(
                 run_name=f"us_close_{trade_date or app_now().date().isoformat()}",
                 model_type="lightgbm",
@@ -384,7 +387,21 @@ class USMarketSchedulerService:
                 market="US",
                 universe="full_market_us_lake",
             )
-            daily_rows_written = runner.run(top_n=5)
+            daily_rows_written = 0
+            legacy_backtest_status = "success"
+            legacy_backtest_message = None
+            try:
+                daily_rows_written = runner.run(top_n=5)
+            except RuntimeError as exc:
+                # The legacy strategy backtest is a secondary compatibility
+                # output.  It can legitimately have no tradable forward rows
+                # near the end of the available U.S. history; that must not
+                # suppress the point-in-time structured evaluation required by
+                # the prediction-storage acceptance contract.
+                if "Backtest produced no daily metrics" not in str(exc):
+                    raise
+                legacy_backtest_status = "empty"
+                legacy_backtest_message = str(exc)
             with SessionLocal() as db:
                 DataJobRepository(db).complete_job(
                     train_job_id,
@@ -400,8 +417,11 @@ class USMarketSchedulerService:
                         "ticker_count": len(us_tickers),
                         "raw_ticker_count": len(raw_us_tickers),
                         "universe_summary": universe_summary,
+                        "data_quality": data_gate,
                         "predictions_written": predictions_written,
                         "daily_rows_written": daily_rows_written,
+                        "legacy_backtest_status": legacy_backtest_status,
+                        "legacy_backtest_message": legacy_backtest_message,
                     },
                 )
             try:
@@ -428,7 +448,7 @@ class USMarketSchedulerService:
                     "source_job_id": source_job_id,
                     "markets": ["US"],
                     "recent_runs": 1,
-                    "recent_trade_dates": 12,
+                    "recent_trade_dates": SCHEDULED_EVALUATION_TRADE_DATES,
                     "top_n": 20,
                     "horizons": [1, 3, 5, 10, 20],
                     "round_trip_cost_bps": 20.0,
@@ -440,8 +460,9 @@ class USMarketSchedulerService:
                 result = evaluate_model_runs(
                     db,
                     markets=["US"],
+                    require_execution_reconciliation=True,
                     recent_runs=1,
-                    recent_trade_dates=12,
+                    recent_trade_dates=SCHEDULED_EVALUATION_TRADE_DATES,
                     top_n=20,
                     round_trip_cost_bps=20.0,
                     source_job_id=job.id,

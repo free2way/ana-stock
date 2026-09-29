@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections import defaultdict
 from statistics import mean
 
-from app.core.db import SessionLocal
 from app.services.market_lake import load_lake_price_history
 from app.services.repository import WorkspaceSnapshotRepository
 from app.services.runtime_cache import get_or_set

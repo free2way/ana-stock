@@ -9,6 +9,11 @@ from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy.orm import Session
 
+from app.api.rendering import mini_trend_bars as _mini_trend_bars
+
+from app.api.rendering import compact_text as _compact_text
+
+from app.core.config import get_settings
 from app.core.db import SessionLocal, get_db_session
 from app.services.auth import is_authenticated, login_redirect
 from app.services.market_intelligence import build_market_sentiment_snapshot
@@ -18,7 +23,7 @@ from app.services.market_sync import sync_market_data
 from app.services.market_freshness import is_snapshot_as_of_current
 from app.services.repository import AppSettingRepository, SymbolRepository, WatchlistRepository, WorkspaceSnapshotRepository
 from app.services.runtime_cache import get_or_set
-from app.services.ai_daily_report import build_trade_explain_text, format_trade_gate_reason, format_trade_status
+from app.services.ai_daily_report import build_trade_explain_text, format_trade_gate_reason, format_trade_status, load_ai_daily_report
 from app.services.model_selection_guidance import load_model_selection_guidance_snapshot, summarize_model_selection_guidance
 from app.services.recommendation_regression import (
     load_or_build_recommendation_regression,
@@ -30,10 +35,12 @@ from app.services.selection_quality import (
 )
 from app.services.screener import MODEL_TEMPLATES, ScreenerService
 from app.services.screener_snapshots import (
+    _action_semantic_buckets,  # noqa: F401 - re-export identity asserted by tests/test_cleanup_shared_helpers.py
+    _normalize_multi_model_templates,
+    _template_action_semantic_buckets,
     build_base_precompute_params,
     exact_screener_snapshot_exists,
     load_exact_screener_snapshot,
-    load_exact_screener_snapshot_rows,
     screener_snapshot_key,
     screener_snapshot_type,
 )
@@ -43,7 +50,6 @@ from app.services.template_evaluation import (
     build_next_tesla_evaluation,
     build_pattern_template_evaluation,
     build_technical_momentum_evaluation,
-    lightgbm_bias,
     lightgbm_maturity,
     normalize_lightgbm_action,
     normalize_lightgbm_prediction_action,
@@ -76,12 +82,48 @@ from app.services.workspace_snapshots import (
 )
 from app.services.workspace_snapshots import refresh_workspace_snapshots
 from app.services.time_utils import app_now_iso
+from app.services.stock_selection.p0_diagnostics import (
+    build_p0_pipeline_diagnostics,
+    load_latest_research_regime_coverage,
+)
 
 
 router = APIRouter(prefix="/screeners", tags=["screeners"])
 
 
 SCREENER_SNAPSHOT_TTL = timedelta(days=7)
+
+
+@router.get("/p0-diagnostics")
+def p0_pipeline_diagnostics(
+    request: Request,
+    market: str = Query("CN"),
+    model_template: str = Query("technical_momentum"),
+    universe: str = Query("full_market"),
+    db: Session = Depends(get_db_session),
+):
+    if not is_authenticated(request):
+        return login_redirect("/screeners/p0-diagnostics")
+    market_code = str(market or "").strip().upper()
+    if market_code not in {"CN", "US"}:
+        market_code = "CN"
+    params = build_base_precompute_params(
+        model_template=model_template,
+        universe=universe,
+        market=market_code,
+    )
+    snapshot = load_exact_screener_snapshot(params, db=db) or {}
+    research_coverage = load_latest_research_regime_coverage(
+        artifact_root=get_settings().artifacts_dir / "stock_selection_research" / "evidence",
+        market=market_code,
+        horizon_days=5,
+    )
+    return build_p0_pipeline_diagnostics(
+        market=market_code,
+        screener_payload=snapshot.get("payload") if isinstance(snapshot, dict) else None,
+        research_coverage=research_coverage,
+        publication_report=load_ai_daily_report(db=db),
+    )
 
 
 ACTION_OPTIONS = [
@@ -397,15 +439,6 @@ def _lang_text(lang: str, key: str) -> str:
 
 def _template_label(template_key: str, fallback: str, lang: str) -> str:
     return TEMPLATE_LABELS.get(template_key, {}).get(lang, fallback)
-
-
-def _compact_text(value: str | None, limit: int = 28) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    if len(text) <= limit:
-        return text
-    return f"{text[: limit - 1]}…"
 
 
 def _market_section_label(market: str | None, lang: str) -> str:
@@ -829,7 +862,7 @@ def _next_tesla_evaluation_card(*, market: str, lang: str) -> str:
             f"<div class='muted'>• {html.escape(str(item.get('trade_date') or '-'))} · {html.escape(str(item.get('ticker') or '-'))} · {html.escape(str(item.get('sector') or '-'))} · "
             f"{_fmt_number(item.get('return_5d'), suffix='%', digits=2)} / {_fmt_number(item.get('return_10d'), suffix='%', digits=2)}</div>"
             for item in (evaluation.get("samples") or {}).get(action_key, [])[:4]
-        ) or f"<div class='muted'>-</div>"
+        ) or "<div class='muted'>-</div>"
 
     def _sector_rows(action_key: str) -> str:
         groups = sector_windows.get(action_key) or {}
@@ -852,7 +885,7 @@ def _next_tesla_evaluation_card(*, market: str, lang: str) -> str:
             )
             + "</div>"
             for sector in ranked
-        ) or f"<div class='muted'>-</div>"
+        ) or "<div class='muted'>-</div>"
 
     def _market_split_html() -> str:
         market_codes = [code for code in ("CN", "US") if code in per_market]
@@ -1187,13 +1220,10 @@ def _template_overview_brief_html(*, model_template: str, market: str, lang: str
 
 def _technical_momentum_evaluation_card(*, market: str, lang: str) -> str:
     evaluation = build_technical_momentum_evaluation(market=market, lookback_snapshots=15, top_n=40)
-    maturity = technical_momentum_maturity(evaluation, lang=lang)
     per_market = evaluation.get("per_market") or {}
     windows = evaluation.get("windows") or {}
     sector_windows = evaluation.get("sector_windows") or {}
     sector_counts = evaluation.get("sector_counts") or {}
-    labeled_snapshot_total = int(evaluation.get("labeled_snapshot_total") or 0)
-    snapshot_total = int(evaluation.get("snapshot_total") or 0)
 
     def _metric_row(action_key: str, label: str) -> str:
         payload = windows.get(action_key) or {}
@@ -1258,14 +1288,21 @@ def _technical_momentum_evaluation_card(*, market: str, lang: str) -> str:
             )
         return "".join(rows)
 
-    maturity_style = (
-        "background:#dcfce7;color:#166534;"
-        if str(maturity.get("tone")) == "good"
-        else "background:#fef3c7;color:#92400e;"
-        if str(maturity.get("tone")) == "mid"
-        else "background:#e5eef7;color:#37516b;"
-    )
 
+
+def _evaluation_metric_row(windows: dict, action_key: str, label: str) -> str:
+    payload = windows.get(action_key) or {}
+    return (
+        "<tr>"
+        f"<td>{label}</td>"
+        f"<td>{int((payload.get(1) or {}).get('count') or 0)}</td>"
+        f"<td>{_fmt_number((payload.get(1) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_number((payload.get(1) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+        f"<td>{int((payload.get(3) or {}).get('count') or 0)}</td>"
+        f"<td>{_fmt_number((payload.get(3) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_number((payload.get(3) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+        f"<td>{int((payload.get(5) or {}).get('count') or 0)}</td>"
+        f"<td>{_fmt_number((payload.get(5) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_number((payload.get(5) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
+        "</tr>"
+    )
 
 def _technical_pattern_evaluation_card(*, model_template: str, market: str, lang: str) -> str:
     evaluation = build_pattern_template_evaluation(
@@ -1284,18 +1321,7 @@ def _technical_pattern_evaluation_card(*, model_template: str, market: str, lang
     template_name = _template_label(model_template, MODEL_TEMPLATES[model_template]["label"], lang)
 
     def _metric_row(action_key: str, label: str) -> str:
-        payload = windows.get(action_key) or {}
-        return (
-            "<tr>"
-            f"<td>{label}</td>"
-            f"<td>{int((payload.get(1) or {}).get('count') or 0)}</td>"
-            f"<td>{_fmt_number((payload.get(1) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_number((payload.get(1) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
-            f"<td>{int((payload.get(3) or {}).get('count') or 0)}</td>"
-            f"<td>{_fmt_number((payload.get(3) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_number((payload.get(3) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
-            f"<td>{int((payload.get(5) or {}).get('count') or 0)}</td>"
-            f"<td>{_fmt_number((payload.get(5) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_number((payload.get(5) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
-            "</tr>"
-        )
+        return _evaluation_metric_row(windows, action_key, label)
 
     def _sector_summary(action_key: str) -> str:
         groups = sector_windows.get(action_key) or {}
@@ -1391,66 +1417,6 @@ def _technical_pattern_evaluation_card(*, model_template: str, market: str, lang
         + "<div style='border:1px solid #d9e5df;border-radius:18px;padding:14px;background:rgba(255,255,255,0.68);'>"
         + f"<div class='eyebrow'>{'观察等待主导板块' if lang == 'zh' else 'Watch sectors'}</div>"
         + _sector_summary("hold_and_watch")
-        + "</div>"
-        + "</div>"
-        + f"<div class='muted' style='margin-top:12px;'>{html.escape(tactical_note)}</div>"
-        + f"<div class='muted' style='margin-top:12px;font-weight:700;'>{'结论' if lang == 'zh' else 'Takeaway'}: {html.escape(takeaway)}</div>"
-        + "</article>"
-    )
-    note = (
-        f"最近回看 {snapshot_total} 个快照，其中 {labeled_snapshot_total} 个带 BUY / WATCH / HOLD 标签。"
-        if lang == "zh"
-        else f"Reviewing the latest {snapshot_total} snapshots, with {labeled_snapshot_total} carrying BUY / WATCH / HOLD labels."
-    )
-    takeaway = technical_momentum_bias(evaluation, lang=lang)
-    if int(((windows.get("buy") or {}).get(5) or {}).get("count") or 0) <= 0 and int(((windows.get("watch") or {}).get(5) or {}).get("count") or 0) <= 0:
-        tactical_note = (
-            "当前还没有成熟 5 日窗口，因此更适合把这块当作观察看板，而不是直接下结论。"
-            if lang == "zh"
-            else "There are no mature 5-day windows yet, so treat this as an observation panel rather than a verdict."
-        )
-    else:
-        buy_hit = float((((windows.get("buy") or {}).get(5) or {}).get("hit_rate") or 0.0))
-        watch_hit = float((((windows.get("watch") or {}).get(5) or {}).get("hit_rate") or 0.0))
-        if buy_hit >= watch_hit + 5:
-            tactical_note = (
-                "近期直接 BUY 的后续命中率更高，说明动量确认后的直接跟随更顺。"
-                if lang == "zh"
-                else "Direct BUY currently carries the higher 5-day hit rate, suggesting cleaner momentum follow-through."
-            )
-        elif watch_hit >= buy_hit + 5:
-            tactical_note = (
-                "近期先 WATCH 再等确认更稳，说明动量信号更适合二次确认。"
-                if lang == "zh"
-                else "WATCH-first names currently carry the higher 5-day hit rate, suggesting a cleaner confirmation-first approach."
-            )
-        else:
-            tactical_note = (
-                "BUY 和 WATCH 目前差距不大，更适合把它们当成两套执行节奏。"
-                if lang == "zh"
-                else "BUY and WATCH are currently close enough to be treated as two execution tempos rather than one dominant edge."
-            )
-    return (
-        "<article class='card' style='background:#f7faf8;border-color:#dce8e1;'>"
-        f"<div class='eyebrow'>{'模型评测' if lang == 'zh' else 'Template Evaluation'}</div>"
-        f"<div class='muted' style='margin-bottom:10px;'>{'先用最简单的执行问题来评：动量模板里，直接 BUY 和先 WATCH 哪类后续更稳。' if lang == 'zh' else 'Start with the simplest execution question: inside the momentum template, is direct BUY follow-through steadier than WATCH-first candidates?'}</div>"
-        f"<div style='display:inline-flex;align-items:center;padding:8px 12px;border-radius:999px;margin-bottom:12px;{maturity_style}font-weight:800;font-size:12px;'>{html.escape(str(maturity.get('level') or '-'))}</div>"
-        + _market_split_html()
-        + "<div style='overflow-x:auto;border:1px solid #e2e8f0;border-radius:12px;background:white;'>"
-        + "<table style='width:100%;min-width:760px;border-collapse:collapse;font-size:13px;'>"
-        + f"<thead><tr><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>{'动作' if lang == 'zh' else 'Action'}</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>3D {'样本' if lang == 'zh' else 'Samples'}</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>3D</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>5D {'样本' if lang == 'zh' else 'Samples'}</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>5D</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>10D {'样本' if lang == 'zh' else 'Samples'}</th><th style='text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;'>10D</th></tr></thead>"
-        + f"<tbody>{_metric_row('buy', 'BUY')}{_metric_row('watch', 'WATCH')}</tbody>"
-        + "</table></div>"
-        + f"<div class='muted' style='margin-top:10px;'>{note}</div>"
-        + f"<div class='muted' style='margin-top:8px;'>{html.escape(str(maturity.get('summary') or ''))}</div>"
-        + "<div style='display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));margin-top:12px;'>"
-        + "<div style='border:1px solid #d9e5df;border-radius:18px;padding:14px;background:rgba(255,255,255,0.68);'>"
-        + f"<div class='eyebrow'>BUY {'主导板块' if lang == 'zh' else 'Dominant sectors'}</div>"
-        + _sector_summary("buy")
-        + "</div>"
-        + "<div style='border:1px solid #d9e5df;border-radius:18px;padding:14px;background:rgba(255,255,255,0.68);'>"
-        + f"<div class='eyebrow'>WATCH {'主导板块' if lang == 'zh' else 'Dominant sectors'}</div>"
-        + _sector_summary("watch")
         + "</div>"
         + "</div>"
         + f"<div class='muted' style='margin-top:12px;'>{html.escape(tactical_note)}</div>"
@@ -1719,18 +1685,7 @@ def _lightgbm_evaluation_card(*, market: str, lang: str) -> str:
     latest_trade_date = str(history_eval.get("latest_trade_date") or "")
 
     def _metric_row(action_key: str, label: str) -> str:
-        payload = windows.get(action_key) or {}
-        return (
-            "<tr>"
-            f"<td>{label}</td>"
-            f"<td>{int((payload.get(1) or {}).get('count') or 0)}</td>"
-            f"<td>{_fmt_number((payload.get(1) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_number((payload.get(1) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
-            f"<td>{int((payload.get(3) or {}).get('count') or 0)}</td>"
-            f"<td>{_fmt_number((payload.get(3) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_number((payload.get(3) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
-            f"<td>{int((payload.get(5) or {}).get('count') or 0)}</td>"
-            f"<td>{_fmt_number((payload.get(5) or {}).get('avg_return'), suffix='%', digits=2)}<div class='muted'>{_fmt_number((payload.get(5) or {}).get('hit_rate'), suffix='%', digits=1)}</div></td>"
-            "</tr>"
-        )
+        return _evaluation_metric_row(windows, action_key, label)
 
     def _market_split_html() -> str:
         market_codes = [code for code in ("CN", "US") if code in per_market]
@@ -1939,19 +1894,6 @@ def _market_snapshot_history(
     }
 
 
-def _mini_trend_bars(values: list[int], *, lang: str) -> str:
-    normalized = [max(0, int(value)) for value in values]
-    if not normalized:
-        label = "暂无趋势" if lang == "zh" else "No trend"
-        return f"<div class='mini-trend empty'><span>{label}</span></div>"
-    top = max(normalized) or 1
-    bars = "".join(
-        f"<span style='height:{max(16, int((value / top) * 100))}%;'></span>"
-        for value in normalized
-    )
-    return f"<div class='mini-trend'>{bars}</div>"
-
-
 def _market_snapshot_table(rows: list[dict], watchlist_map: dict[str, dict], lang: str, current_params: dict | None = None) -> str:
     if not rows:
         return f"<div class='muted'>{_lang_text(lang, 'snapshot_empty')}</div>"
@@ -2016,7 +1958,6 @@ def _detail_panel(item: dict, watchlist_map: dict[str, dict], current_params: di
     collapse_label = "Collapse" if lang == "en" else "收起"
     model_highlights = item.get("model_highlights") or []
     model_execution_tags = list(item.get("model_execution_tags") or [])
-    model_activation_status = str(item.get("model_activation_status") or "unverified")
     lightgbm_tactical_note = str(item.get("lightgbm_tactical_note") or "").strip()
     action_badge = _action_badge(item.get("action_label"), lang)
     trend_badge = _trend_badge(item.get("trend_score"))
@@ -2030,7 +1971,7 @@ def _detail_panel(item: dict, watchlist_map: dict[str, dict], current_params: di
         )
         + "</div>"
         if model_highlights
-        else f"<div style='margin-top:8px;color:#6b7280;'>-</div>"
+        else "<div style='margin-top:8px;color:#6b7280;'>-</div>"
     )
     execution_tags_html = (
         "<div class='detail-chip-row' style='margin-top:10px;'>"
@@ -2125,7 +2066,6 @@ def _model_cell(item: dict, lang: str) -> str:
     model_expected_drawdown_20d = item.get("model_expected_drawdown_20d")
     readiness_score = item.get("trade_readiness_score")
     readiness_bucket = str(item.get("readiness_bucket") or "").upper()
-    readiness_reason = item.get("readiness_reason")
     block_reason = item.get("block_reason")
     tradability_status = item.get("tradability_status")
     model_conviction_bucket = item.get("model_conviction_bucket")
@@ -2604,20 +2544,6 @@ def _current_params(
     return params
 
 
-def _normalize_multi_model_templates(values: object) -> list[str]:
-    if values is None:
-        return []
-    if isinstance(values, str):
-        raw_values = [item.strip() for item in values.split(",")]
-    else:
-        raw_values = [str(item or "").strip() for item in list(values)]
-    normalized: list[str] = []
-    for item in raw_values:
-        if not item or item not in MODEL_TEMPLATES or item in normalized:
-            continue
-        normalized.append(item)
-    return normalized
-
 
 def _template_default_min_trend_score(template_key: str, fallback: int = 60) -> int:
     defaults = (MODEL_TEMPLATES.get(str(template_key) or "") or {}).get("defaults") or {}
@@ -2875,48 +2801,6 @@ def _normalize_action_filter(value: str | None) -> str:
     return str(value or "").strip().lower().replace(" ", "_")
 
 
-def _action_semantic_buckets(value: str | None) -> list[str]:
-    normalized = _normalize_action_filter(value)
-    if not normalized:
-        return []
-    if normalized == "buy_the_dip":
-        return ["buy_the_dip", "bullish_entry"]
-    if normalized == "wait_for_breakout":
-        return ["breakout_confirmation"]
-    if normalized == "pullback":
-        return ["buy_the_dip", "bullish_entry"]
-    if normalized == "breakout":
-        return ["breakout_confirmation", "bullish_entry"]
-    if normalized in {"buy", "strong_buy", "technical_pattern", "fundamental_pass"}:
-        return ["bullish_entry"]
-    if normalized in {"watch", "hold", "hold_and_watch", "wait", "avoid", "avoid_or_wait", "continue_to_watch"}:
-        return ["watchlist"]
-    return []
-
-
-def _template_action_semantic_buckets(template_key: str, action_label: str | None) -> list[str]:
-    buckets = list(_action_semantic_buckets(action_label))
-    if template_key in {"cn_hammer_reversal", "cn_bullish_engulfing_reversal", "cn_macd_underwater_cross"}:
-        for bucket in ("buy_the_dip", "bullish_entry"):
-            if bucket not in buckets:
-                buckets.append(bucket)
-    elif template_key in {"cn_volume_breakout", "cn_bullish_ma_stack", "cn_three_white_soldiers", "tv_multi_timeframe_bullish"}:
-        for bucket in ("breakout_confirmation", "bullish_entry"):
-            if bucket not in buckets:
-                buckets.append(bucket)
-    elif template_key in {"cn_ma_cluster_breakout_watch", "cn_bollinger_squeeze_watch"}:
-        if "breakout_confirmation" not in buckets:
-            buckets.append("breakout_confirmation")
-    elif template_key in {
-        "global_growth_value",
-        "global_income_quality",
-        "cn_growth_value",
-        "cn_high_roe_steady_growth",
-        "cn_low_valuation_high_dividend",
-    }:
-        if "bullish_entry" not in buckets:
-            buckets.append("bullish_entry")
-    return buckets
 
 
 def _load_precomputed_screener_rows(service: ScreenerService, params: dict) -> list[dict] | None:
@@ -3071,19 +2955,6 @@ def _load_screener_snapshot_record(params: dict) -> dict | None:
     return snapshot
 
 
-def _persist_screener_snapshot(params: dict, rows: list[dict]) -> None:
-    payload = {
-        "key": screener_snapshot_key(params),
-        "rows": rows,
-        "updated_at": app_now_iso(),
-    }
-    with SessionLocal() as db:
-        WorkspaceSnapshotRepository(db).create_snapshot(
-            snapshot_type=screener_snapshot_type(params),
-            snapshot_date=app_now_iso(),
-            payload=payload,
-        )
-
 
 def _screen_run_receipt_html(
     *,
@@ -3154,6 +3025,22 @@ def _screen_run_receipt_html(
             else f"Returned {returned_count} / persisted {persisted_count} / limit {source_limit}"
         )
         lineage_rows.append(("候选口径" if lang == "zh" else "Candidate Scope", stats_text))
+    regime_diagnostics = payload.get("regime_diagnostics") if isinstance(payload.get("regime_diagnostics"), dict) else {}
+    if regime_diagnostics:
+        policy = regime_diagnostics.get("regime_policy") if isinstance(regime_diagnostics.get("regime_policy"), dict) else {}
+        gate = str(policy.get("buy_gate") or regime_diagnostics.get("status") or "-")
+        regime = str(policy.get("risk_regime") or "-")
+        counts = (
+            f"观察 {regime_diagnostics.get('observation_count', 0)} / 体制短名单 {regime_diagnostics.get('regime_shortlist_count', 0)} / 正式候选 0"
+            if lang == "zh"
+            else f"Observe {regime_diagnostics.get('observation_count', 0)} / regime shortlist {regime_diagnostics.get('regime_shortlist_count', 0)} / formal candidates 0"
+        )
+        lineage_rows.append(("体制门" if lang == "zh" else "Regime Gate", f"{regime} / {gate}"))
+        lineage_rows.append(("候选分层" if lang == "zh" else "Candidate Layers", counts))
+        lineage_rows.append((
+            "结果语义" if lang == "zh" else "Result Semantics",
+            "研究观察，不构成买入授权" if lang == "zh" else "Research observation, not buy authorization",
+        ))
     if len(multi_templates_active) >= 2:
         lineage_rows.append(("参与模型" if lang == "zh" else "Available Models", " / ".join(available_labels) or "-"))
         lineage_rows.append(("缺失模型" if lang == "zh" else "Missing Models", " / ".join(missing_labels) or ("无" if lang == "zh" else "None")))
@@ -4342,12 +4229,6 @@ def screener_page(
         ("synced", "Synced Stocks"),
         ("full_market", "Full Market"),
     ]
-    market_options = [
-        ("ALL", "All Markets"),
-        ("US", "US"),
-        ("CN", "A-Shares"),
-        ("HK", "Hong Kong"),
-    ]
     template_option_html = "".join(
         f"<option value='{value}' {'selected' if model_template == value else ''}>{_template_label(value, config['label'], lang)}</option>"
         for value, config in MODEL_TEMPLATES.items()
@@ -4364,10 +4245,6 @@ def screener_page(
     universe_option_html = "".join(
         f"<option value='{value}' {'selected' if universe == value else ''}>{label}</option>"
         for value, label in universe_options
-    )
-    market_option_html = "".join(
-        f"<option value='{value}' {'selected' if market == value else ''}>{label}</option>"
-        for value, label in market_options
     )
     template_groups = _template_groups_for_display(market, lang)
     sort_by_option_html = "".join(
@@ -7119,7 +6996,7 @@ def today_focus_pool_page(request: Request, lang: str = Query("en"), db: Session
             <div class="brand">
               <span class="brand-tag">PQW</span>
               <h1>{_lang_text(lang, 'today_focus_pool')}</h1>
-              <p>{'把今天最值得先看的股票先放进一个临时研究池。' if lang == 'zh' else 'Collect the names you want to review first into a temporary focus pool.'}</p>
+              <p>{'把今天最值得先看的股票先放进一个临时研究池；该列表不构成买入授权。' if lang == 'zh' else 'Collect the names you want to review first into a temporary focus pool; this list is not buy authorization.'}</p>
             </div>
             <nav class="side-nav">{render_workspace_nav_html(lang=lang, active_key='screeners')}</nav>
             <div class="sidebar-foot">{'这页更像盘前/盘后优先级列表，决定谁先看，而不是最终持有清单。' if lang == 'zh' else 'This page acts like a premarket/postmarket priority list rather than a final holdings list.'}</div>

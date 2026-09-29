@@ -138,7 +138,122 @@ def _run_migrations() -> None:
                 connection.execute(text("ALTER TABLE prediction_trade_plans ADD COLUMN invalidation_reason TEXT"))
             if "execution_tags_json" not in columns:
                 connection.execute(text("ALTER TABLE prediction_trade_plans ADD COLUMN execution_tags_json TEXT"))
+    _run_market_snapshot_type_migrations()
+    _run_market_fact_constraint_migrations()
+    _run_storage_maintenance_migrations()
     _run_index_migrations(inspector)
+
+
+def _run_market_snapshot_type_migrations() -> None:
+    targets = {
+        "cn_fundamental_snapshots": {
+            "report_date": "DATE",
+            "listing_date": "DATE",
+            "created_at": "TIMESTAMP WITH TIME ZONE",
+            "updated_at": "TIMESTAMP WITH TIME ZONE",
+        },
+        "us_fundamental_snapshots": {
+            "report_date": "DATE",
+            "listing_date": "DATE",
+            "created_at": "TIMESTAMP WITH TIME ZONE",
+            "updated_at": "TIMESTAMP WITH TIME ZONE",
+        },
+        "hk_fundamental_snapshots": {
+            "report_date": "DATE",
+            "listing_date": "DATE",
+            "created_at": "TIMESTAMP WITH TIME ZONE",
+            "updated_at": "TIMESTAMP WITH TIME ZONE",
+        },
+        "cn_point_in_time_features": {
+            "event_time": "TIMESTAMP WITH TIME ZONE",
+            "available_time": "TIMESTAMP WITH TIME ZONE",
+            "ingested_time": "TIMESTAMP WITH TIME ZONE",
+            "created_at": "TIMESTAMP WITH TIME ZONE",
+        },
+        "us_point_in_time_features": {
+            "event_time": "TIMESTAMP WITH TIME ZONE",
+            "available_time": "TIMESTAMP WITH TIME ZONE",
+            "ingested_time": "TIMESTAMP WITH TIME ZONE",
+            "created_at": "TIMESTAMP WITH TIME ZONE",
+        },
+        "hk_point_in_time_features": {
+            "event_time": "TIMESTAMP WITH TIME ZONE",
+            "available_time": "TIMESTAMP WITH TIME ZONE",
+            "ingested_time": "TIMESTAMP WITH TIME ZONE",
+            "created_at": "TIMESTAMP WITH TIME ZONE",
+        },
+        "cn_technical_snapshots": {
+            "as_of_date": "DATE",
+            "created_at": "TIMESTAMP WITH TIME ZONE",
+            "updated_at": "TIMESTAMP WITH TIME ZONE",
+        },
+        "us_technical_snapshots": {
+            "as_of_date": "DATE",
+            "created_at": "TIMESTAMP WITH TIME ZONE",
+            "updated_at": "TIMESTAMP WITH TIME ZONE",
+        },
+        "hk_technical_snapshots": {
+            "as_of_date": "DATE",
+            "created_at": "TIMESTAMP WITH TIME ZONE",
+            "updated_at": "TIMESTAMP WITH TIME ZONE",
+        },
+    }
+    current_inspector = inspect(engine)
+    table_names = set(current_inspector.get_table_names())
+    statements: list[str] = []
+    for table_name, columns in targets.items():
+        if table_name not in table_names:
+            continue
+        current_types = {
+            str(column["name"]): column["type"]
+            for column in current_inspector.get_columns(table_name)
+        }
+        for column_name, sql_type in columns.items():
+            current_type = current_types.get(column_name)
+            current_type_name = str(current_type or "").upper()
+            desired_matches = (
+                current_type_name == "DATE"
+                if sql_type == "DATE"
+                else "TIMESTAMP" in current_type_name
+                and bool(getattr(current_type, "timezone", False))
+            )
+            if desired_matches:
+                continue
+            statements.append(
+                f"ALTER TABLE {table_name} ALTER COLUMN {column_name} "
+                f"TYPE {sql_type} USING NULLIF({column_name}::text, '')::{sql_type}"
+            )
+    if not statements:
+        return
+    with engine.begin() as connection:
+        connection.execute(text("SET LOCAL lock_timeout = '10s'"))
+        for statement in statements:
+            connection.execute(text(statement))
+
+
+def _run_storage_maintenance_migrations() -> None:
+    """Keep table-level autovacuum policy present on upgrades and fresh installs."""
+
+    from app.services.storage_maintenance import apply_storage_maintenance
+
+    with engine.begin() as connection:
+        result = apply_storage_maintenance(connection)
+    if result["status"] != "pass":
+        raise RuntimeError(
+            "PostgreSQL storage maintenance migration failed: "
+            f"missing_tables={result['missing_tables']}"
+        )
+
+
+def _run_market_fact_constraint_migrations() -> None:
+    """Enforce symbol/market identity in every physical market fact table."""
+
+    from app.services.market_fact_constraints import apply_market_fact_constraints
+
+    with engine.begin() as connection:
+        result = apply_market_fact_constraints(connection)
+    if result["status"] != "pass":
+        raise RuntimeError("PostgreSQL market fact composite-FK migration failed.")
 
 
 def _run_index_migrations(inspector) -> None:
@@ -203,6 +318,40 @@ def _run_index_migrations(inspector) -> None:
                     "ON workspace_snapshots (snapshot_type, snapshot_date DESC)"
                 ),
             ]
+        )
+    if "point_in_time_feature_snapshots" in table_names:
+        statements.extend(
+            [
+                (
+                    "CREATE INDEX IF NOT EXISTS ix_pit_features_symbol_name_available "
+                    "ON point_in_time_feature_snapshots "
+                    "(symbol_id, feature_name, available_time)"
+                ),
+                (
+                    "CREATE INDEX IF NOT EXISTS ix_pit_features_source_record_revision "
+                    "ON point_in_time_feature_snapshots "
+                    "(source, source_record_id, revision_id)"
+                ),
+            ]
+        )
+    if "strategy_orders" in table_names:
+        statements.extend(
+            [
+                "CREATE INDEX IF NOT EXISTS ix_strategy_orders_run_date ON strategy_orders (strategy_run_id, effective_date, id)",
+                "CREATE INDEX IF NOT EXISTS ix_strategy_orders_run_ticker ON strategy_orders (strategy_run_id, ticker, id)",
+            ]
+        )
+    if "strategy_fills" in table_names:
+        statements.append(
+            "CREATE INDEX IF NOT EXISTS ix_strategy_fills_run_date ON strategy_fills (strategy_run_id, fill_date, id)"
+        )
+    if "strategy_rejects" in table_names:
+        statements.append(
+            "CREATE INDEX IF NOT EXISTS ix_strategy_rejects_run_reason ON strategy_rejects (strategy_run_id, reject_reason, id)"
+        )
+    if "strategy_portfolio_states" in table_names:
+        statements.append(
+            "CREATE INDEX IF NOT EXISTS ix_strategy_portfolio_states_run_date ON strategy_portfolio_states (strategy_run_id, trade_date)"
         )
     if not statements:
         return

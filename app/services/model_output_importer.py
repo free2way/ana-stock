@@ -2,9 +2,16 @@ import csv
 from collections import defaultdict
 from pathlib import Path
 
+from sqlalchemy import select
+
+from app.core.config import get_settings
 from app.core.db import SessionLocal
+from app.models.tables import ModelRun, Symbol
 from app.models.schema import SymbolCreate
+from app.services.market_hot_predictions import MarketHotPredictionRepository
+from app.services.market_storage_routing import legacy_mirror_write_enabled
 from app.services.model_signal_summary import enrich_model_output, summarize_model_output
+from app.services.prediction_artifacts import select_hot_prediction_rows
 from app.services.repository import (
     ModelChartSignalRepository,
     ModelRunRepository,
@@ -75,6 +82,28 @@ class ExternalModelOutputImporter:
         for row in rows:
             grouped[str(row["trade_date"])].append(row)
 
+        inferred_markets = {
+            _infer_market_exchange(str(row.get("ticker") or ""))[0]
+            for row in rows
+            if str(row.get("ticker") or "").strip()
+        }
+        requested_market = str(market or "").strip().upper()
+        if requested_market in {"ALL", "MIXED"}:
+            raise RuntimeError(
+                "External model imports must target exactly one market."
+            )
+        if requested_market and inferred_markets != {requested_market}:
+            raise RuntimeError(
+                "External model import ticker markets do not match the requested "
+                f"market {requested_market}: {sorted(inferred_markets)}"
+            )
+        if not requested_market:
+            if len(inferred_markets) != 1:
+                raise RuntimeError(
+                    "External model imports must contain exactly one inferred market."
+                )
+            requested_market = next(iter(inferred_markets))
+
         prepared_predictions: list[dict] = []
         prepared_details: list[dict] = []
 
@@ -89,7 +118,7 @@ class ExternalModelOutputImporter:
             run = model_repo.create_run(
                 name=run_name,
                 model_type=model_type,
-                market=market,
+                market=requested_market,
                 universe=universe,
                 train_start=all_dates[0] if all_dates else None,
                 train_end=all_dates[-1] if all_dates else None,
@@ -182,17 +211,119 @@ class ExternalModelOutputImporter:
                 model_repo.complete_run(run.id, status="failed", artifact_path=artifact_path)
                 raise RuntimeError("External model CSV produced no importable predictions.")
 
-            prediction_repo.replace_for_model_run(run.id, prepared_predictions)
-            detail_repo.replace_for_model_run(run.id, prepared_details)
-            explanation_repo.replace_for_model_run(run.id, [])
-            model_repo.complete_run(run.id, status="success", artifact_path=artifact_path)
+            physical_market = requested_market in {"CN", "US"}
+            symbol_markets = {
+                str(value or "").strip().upper()
+                for value in db.scalars(
+                    select(Symbol.market).where(
+                        Symbol.id.in_(
+                            {
+                                int(row["symbol_id"])
+                                for row in prepared_predictions
+                            }
+                        )
+                    )
+                )
+            }
+            if symbol_markets != {requested_market}:
+                model_repo.complete_run(
+                    run.id,
+                    status="failed",
+                    artifact_path=artifact_path,
+                )
+                raise RuntimeError("External model run market identity changed during import.")
+
+            settings = get_settings()
+            hot_predictions = prepared_predictions
+            if physical_market:
+                hot_predictions = select_hot_prediction_rows(
+                    prepared_predictions,
+                    full_trade_days=int(settings.prediction_hot_full_trade_days),
+                    top_k=int(settings.prediction_hot_top_k),
+                )
+            hot_keys = {
+                (int(row["symbol_id"]), str(row["trade_date"]))
+                for row in hot_predictions
+            }
+            hot_details = [
+                row
+                for row in prepared_details
+                if (int(row["symbol_id"]), str(row["trade_date"])) in hot_keys
+            ]
+            write_legacy = not physical_market or legacy_mirror_write_enabled(
+                db,
+                market=requested_market,
+                configured=bool(settings.market_physical_hot_dual_write_legacy),
+            )
+            try:
+                if write_legacy:
+                    prediction_repo.replace_for_model_run(
+                        run.id,
+                        hot_predictions,
+                        commit=False,
+                    )
+                    detail_repo.replace_for_model_run(
+                        run.id,
+                        hot_details,
+                        commit=False,
+                    )
+                    explanation_repo.replace_for_model_run(
+                        run.id,
+                        [],
+                        commit=False,
+                    )
+                if physical_market:
+                    MarketHotPredictionRepository(db).publish_for_model_run(
+                        model_run_id=run.id,
+                        market=requested_market,
+                        prediction_rows=hot_predictions,
+                        detail_rows=hot_details,
+                        explanation_rows=[],
+                        commit=False,
+                    )
+                model_repo.merge_config(
+                    run.id,
+                    {
+                        "prediction_storage_contract": {
+                            "contract_version": "prediction-storage-v1",
+                            "hot_write_mode": "compact",
+                            "hot_full_trade_days": int(
+                                settings.prediction_hot_full_trade_days
+                            ),
+                            "hot_top_k": int(settings.prediction_hot_top_k),
+                            "legacy_hot_dual_write": bool(write_legacy),
+                            "primary_market_table": bool(physical_market),
+                            "live_publication": False,
+                            "source_payload": "external_model_artifact",
+                        }
+                    },
+                    commit=False,
+                )
+                model_repo.complete_run(
+                    run.id,
+                    status="success",
+                    artifact_path=artifact_path or str(csv_path.resolve()),
+                    commit=False,
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                model_repo.complete_run(
+                    run.id,
+                    status="failed",
+                    artifact_path=artifact_path or str(csv_path.resolve()),
+                )
+                raise
 
             return {
                 "model_run_id": run.id,
                 "run_name": run.name,
-                "predictions_written": len(prepared_predictions),
-                "details_written": len(prepared_details),
+                "market": requested_market,
+                "predictions_written": len(hot_predictions),
+                "details_written": len(hot_details),
                 "trade_dates": all_dates,
+                "physical_market_table": physical_market,
+                "legacy_hot_dual_write": bool(write_legacy),
             }
 
     def import_explanations_csv(self, csv_path: Path, *, model_run_id: int) -> int:
@@ -218,6 +349,12 @@ class ExternalModelOutputImporter:
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
             explanation_repo = PredictionExplanationRepository(db)
+            model_run = db.scalar(
+                select(ModelRun).where(ModelRun.id == int(model_run_id))
+            )
+            if model_run is None:
+                raise RuntimeError(f"Model run {int(model_run_id)} was not found.")
+            market = str(model_run.market or "").strip().upper()
             for row in rows:
                 if not isinstance(row, dict):
                     continue
@@ -240,7 +377,49 @@ class ExternalModelOutputImporter:
                         "display_order": _optional_int(row.get("display_order")),
                     }
                 )
-            return explanation_repo.replace_for_model_run(model_run_id, prepared_rows)
+            physical_market = market in {"CN", "US"}
+            settings = get_settings()
+            write_legacy = not physical_market or legacy_mirror_write_enabled(
+                db,
+                market=market,
+                configured=bool(settings.market_physical_hot_dual_write_legacy),
+            )
+            try:
+                if write_legacy:
+                    explanation_repo.replace_for_model_run(
+                        model_run_id,
+                        prepared_rows,
+                        commit=False,
+                    )
+                if physical_market:
+                    physical_repo = MarketHotPredictionRepository(db)
+                    prediction_rows, detail_rows, _ = physical_repo._load_rows(
+                        market=market,
+                        model_run_id=int(model_run_id),
+                    )
+                    hot_keys = {
+                        (int(row["symbol_id"]), str(row["trade_date"]))
+                        for row in prediction_rows
+                    }
+                    physical_explanations = [
+                        row
+                        for row in prepared_rows
+                        if (int(row["symbol_id"]), str(row["trade_date"]))
+                        in hot_keys
+                    ]
+                    physical_repo.publish_for_model_run(
+                        model_run_id=int(model_run_id),
+                        market=market,
+                        prediction_rows=prediction_rows,
+                        detail_rows=detail_rows,
+                        explanation_rows=physical_explanations,
+                        commit=False,
+                    )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            return len(prepared_rows)
 
     def import_chart_signals_csv(self, csv_path: Path, *, model_run_id: int) -> int:
         if not csv_path.exists():

@@ -1,11 +1,16 @@
+import math
+
+
+CALIBRATED_ESTIMATE_SCHEMA_V1 = "calibrated_estimates_v1"
+
+
 def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
 def model_confidence(score: float | None) -> int | None:
-    if score is None:
-        return None
-    return min(92, max(38, int(45 + abs(float(score)) * 18)))
+    # A raw regression score carries no calibrated probability or confidence.
+    return None
 
 
 def build_signal_label(score: float | None, *, lang: str) -> str | None:
@@ -105,15 +110,6 @@ def _derive_target_horizon_days(score: float | None, existing: int | None = None
     return 20
 
 
-def _derive_expected_drawdown_20d(score: float | None, risk_score: float | None) -> float | None:
-    if score is None:
-        return None
-    base_risk = float(risk_score) if risk_score is not None else _clamp(50.0 - float(score) * 55.0, 8.0, 92.0)
-    drawdown = 2.5 + (base_risk / 100.0) * 14.0
-    if float(score) < 0:
-        drawdown += min(6.0, abs(float(score)) * 12.0)
-    return round(_clamp(drawdown, 2.5, 22.0), 2)
-
 
 def _derive_model_reward_risk_ratio(expected_return_20d: float | None, expected_drawdown_20d: float | None) -> float | None:
     if expected_return_20d is None or expected_drawdown_20d in (None, 0):
@@ -121,12 +117,81 @@ def _derive_model_reward_risk_ratio(expected_return_20d: float | None, expected_
     return round(abs(float(expected_return_20d)) / float(expected_drawdown_20d), 2)
 
 
+def _validate_calibrated_estimates(model_output: dict) -> None:
+    if model_output.get("estimate_schema_version") != CALIBRATED_ESTIMATE_SCHEMA_V1:
+        return
+    if model_output.get("probability_unit") != "ratio":
+        raise ValueError("calibrated_estimates_v1 requires probability_unit=ratio")
+    if model_output.get("return_unit") != "ratio":
+        raise ValueError("calibrated_estimates_v1 requires return_unit=ratio")
+    if not str(model_output.get("estimate_protocol_id") or "").strip():
+        raise ValueError("calibrated estimates require estimate_protocol_id")
+    for key in ("confidence", "bullish_prob", "bearish_prob"):
+        value = model_output.get(key)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be a finite ratio") from exc
+        if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+            raise ValueError(f"{key} must be in [0, 1]")
+    for key in ("expected_return_5d", "expected_return_20d", "expected_drawdown_20d"):
+        value = model_output.get(key)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be finite") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{key} must be finite")
+
+
+def estimate_display_percent(model_output: dict | None, key: str) -> float | None:
+    if not model_output or model_output.get(key) is None:
+        return None
+    value = float(model_output[key])
+    units = model_output.get("estimate_units") or {}
+    unit_key = "probability" if key in {"confidence", "bullish_prob", "bearish_prob"} else "return"
+    return value * 100.0 if units.get(unit_key) == "ratio" else value
+
+
 def enrich_model_output(model_output: dict | None, *, lang: str) -> dict | None:
     if model_output is None:
         return None
 
+    model_output = dict(model_output)
+    _validate_calibrated_estimates(model_output)
+
     score = model_output.get("score")
-    confidence = model_confidence(score)
+    confidence = model_output.get("confidence")
+    has_supplied_estimate = any(
+        model_output.get(key) is not None
+        for key in (
+            "confidence", "bullish_prob", "bearish_prob", "expected_return_5d",
+            "expected_return_20d", "expected_drawdown_20d",
+        )
+    )
+    calibrated = model_output.get("estimate_schema_version") == CALIBRATED_ESTIMATE_SCHEMA_V1
+    if calibrated:
+        model_output.setdefault("estimate_source", "calibrated_protocol")
+    elif has_supplied_estimate:
+        claimed_source = model_output.get("estimate_source")
+        if claimed_source and claimed_source != "supplied_unverified":
+            model_output["legacy_estimate_source"] = claimed_source
+        model_output["estimate_source"] = "supplied_unverified"
+    else:
+        model_output["estimate_source"] = "unavailable"
+    model_output["estimate_certified"] = bool(calibrated)
+    model_output["estimate_units"] = {
+        "probability": "ratio" if calibrated else "legacy_percent" if has_supplied_estimate else "unavailable",
+        "return": "ratio" if calibrated else "legacy_percent" if has_supplied_estimate else "unavailable",
+    }
+    if has_supplied_estimate and not calibrated:
+        model_output.setdefault("estimate_protocol_id", "legacy_unverified")
+    elif not calibrated:
+        model_output.setdefault("estimate_protocol_id", None)
     if score is None:
         model_output["confidence"] = confidence
         model_output["state"] = build_model_state(None, lang=lang)
@@ -151,11 +216,7 @@ def enrich_model_output(model_output: dict | None, *, lang: str) -> dict | None:
                 score,
                 existing=model_output.get("target_horizon_days"),
             )
-        if model_output.get("expected_drawdown_20d") is None:
-            model_output["expected_drawdown_20d"] = _derive_expected_drawdown_20d(
-                score,
-                model_output.get("risk_score"),
-            )
+        model_output.setdefault("expected_drawdown_20d", None)
         if model_output.get("model_reward_risk_ratio") is None:
             model_output["model_reward_risk_ratio"] = _derive_model_reward_risk_ratio(
                 model_output.get("expected_return_20d"),
@@ -186,37 +247,25 @@ def enrich_model_output(model_output: dict | None, *, lang: str) -> dict | None:
             model_output["summary_text"] = summarize_model_output(model_output, lang=lang)
         return model_output
 
-    bounded = _clamp(float(score) * 8, -1.5, 1.5)
-    bullish_prob = _clamp(0.5 + (bounded / 3.5) * 0.25, 0.05, 0.95)
-    bearish_prob = _clamp(1.0 - bullish_prob, 0.05, 0.95)
-    expected_return_5d = _clamp(float(score) * 0.35, -0.25, 0.25)
-    expected_return_20d = _clamp(float(score) * 0.8, -0.45, 0.45)
-
-    if bullish_prob >= 0.64:
+    # These labels describe the score only; they are not probability estimates.
+    if float(score) >= 0.18:
         regime_label = "bullish_trend" if lang == "en" else "偏多趋势"
-    elif bearish_prob >= 0.6:
+    elif float(score) <= -0.18:
         regime_label = "cautious_range" if lang == "en" else "谨慎震荡"
     else:
         regime_label = "balanced_range" if lang == "en" else "中性震荡"
     risk_score = _clamp(50.0 - float(score) * 55.0, 8.0, 92.0)
 
     model_output["confidence"] = confidence
-    if model_output.get("bullish_prob") is None:
-        model_output["bullish_prob"] = round(bullish_prob * 100, 1)
-    if model_output.get("bearish_prob") is None:
-        model_output["bearish_prob"] = round(bearish_prob * 100, 1)
-    if model_output.get("expected_return_5d") is None:
-        model_output["expected_return_5d"] = round(expected_return_5d * 100, 2)
-    if model_output.get("expected_return_20d") is None:
-        model_output["expected_return_20d"] = round(expected_return_20d * 100, 2)
+    for key in ("bullish_prob", "bearish_prob", "expected_return_5d", "expected_return_20d"):
+        model_output.setdefault(key, None)
     if model_output.get("regime_label") is None:
         model_output["regime_label"] = regime_label
     if model_output.get("risk_score") is None:
         model_output["risk_score"] = round(risk_score, 1)
     if model_output.get("target_horizon_days") is None:
         model_output["target_horizon_days"] = _derive_target_horizon_days(score)
-    if model_output.get("expected_drawdown_20d") is None:
-        model_output["expected_drawdown_20d"] = _derive_expected_drawdown_20d(score, model_output.get("risk_score"))
+    model_output.setdefault("expected_drawdown_20d", None)
     if model_output.get("model_reward_risk_ratio") is None:
         model_output["model_reward_risk_ratio"] = _derive_model_reward_risk_ratio(
             model_output.get("expected_return_20d"),
@@ -328,7 +377,7 @@ def summarize_model_output(model_output: dict | None, *, lang: str) -> str:
         return "暂无模型摘要。" if lang == "zh" else "No model summary yet."
 
     run_name = (model_output.get("model_run") or {}).get("name") or "-"
-    confidence = model_output.get("confidence")
+    confidence = estimate_display_percent(model_output, "confidence")
     if confidence is None:
         confidence = model_confidence(score)
     percentile = model_output.get("percentile")

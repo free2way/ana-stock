@@ -55,6 +55,9 @@ def add_to_today_focus_pool(rows: list[dict], *, top_n: int = 0, target_date: st
             "model_signal_label": row.get("model_signal_label"),
             "model_signal_strength": row.get("model_signal_strength"),
             "matched_patterns": row.get("matched_patterns") or [],
+            "candidate_semantics": "research_observation_not_trade_authorization",
+            "regime_buy_gate": row.get("regime_buy_gate"),
+            "regime_position_hint": row.get("regime_position_hint"),
             "added_on": target_date or date.today().isoformat(),
         }
         if ticker not in existing_map:

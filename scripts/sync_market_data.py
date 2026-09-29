@@ -12,7 +12,7 @@ from app.services.market_sync import sync_market_data
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Sync historical market data into local CSV files.")
+    parser = argparse.ArgumentParser(description="Sync historical market data into the Parquet market lake.")
     parser.add_argument("--tickers", nargs="*", help="Ticker list to sync. Defaults to all symbols in the database.")
     parser.add_argument("--start-date", help="Optional start date in YYYY-MM-DD.")
     parser.add_argument("--end-date", help="Optional end date in YYYY-MM-DD.")
@@ -30,7 +30,7 @@ def main() -> None:
     )
     for result in results:
         if result["status"] == "success":
-            print(f"{result['ticker']}: wrote {result['rows']} rows to {result['raw_path']}")
+            print(f"{result['ticker']}: wrote {result['rows']} rows to {len(result.get('lake_paths') or [])} lake partition(s)")
         else:
             print(f"{result['ticker']}: sync failed: {result.get('message', 'unknown error')}")
 

@@ -1,69 +1,13 @@
-import csv
-from pathlib import Path
-
 from app.core.config import get_settings
 from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
 from app.services.market_lake import load_lake_price_history, write_ohlcv_rows_to_lake
 from app.services.market_freshness import is_as_of_current
-from app.services.normalizer import MarketDataNormalizer
 from app.services.openbb_client import HistoricalPriceRequest
 from app.services.providers import resolve_price_provider
 from app.services.repository import PriceSyncStateRepository, SymbolRepository
 from app.services.tushare_client import TushareClient
 from app.services.ticker_format import infer_market_from_ticker, normalize_ticker_for_market, provider_ticker_candidates
-
-
-RAW_FIELDS = [
-    "date",
-    "symbol",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-    "adj_close",
-    "dividend",
-    "split_ratio",
-]
-
-
-def write_raw_csv(path, rows: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as output_file:
-        writer = csv.DictWriter(output_file, fieldnames=RAW_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def read_raw_csv(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    with path.open("r", newline="", encoding="utf-8") as input_file:
-        return list(csv.DictReader(input_file))
-
-
-def merge_market_data_rows(existing_rows: list[dict], new_rows: list[dict]) -> list[dict]:
-    merged: dict[tuple[str, str], dict] = {}
-    for row in existing_rows + new_rows:
-        symbol = str(row.get("symbol") or "").strip().upper()
-        trade_date = str(row.get("date") or "").strip()
-        if not symbol or not trade_date:
-            continue
-        normalized = {
-            "date": trade_date,
-            "symbol": symbol,
-            "open": row.get("open"),
-            "high": row.get("high"),
-            "low": row.get("low"),
-            "close": row.get("close"),
-            "volume": row.get("volume"),
-            "adj_close": row.get("adj_close"),
-            "dividend": row.get("dividend"),
-            "split_ratio": row.get("split_ratio"),
-        }
-        merged[(symbol, trade_date)] = normalized
-    return [merged[key] for key in sorted(merged.keys(), key=lambda item: (item[0], item[1]))]
 
 
 def sync_market_data(
@@ -73,11 +17,9 @@ def sync_market_data(
     end_date: str | None = None,
     provider: str = "auto",
     start_dates_by_ticker: dict[str, str] | None = None,
-    persist_csv: bool = False,
     required_as_of_date: str | None = None,
 ) -> list[dict]:
     settings = get_settings()
-    normalizer = MarketDataNormalizer()
     results: list[dict] = []
 
     with SessionLocal() as db:
@@ -239,9 +181,6 @@ def sync_market_data(
                                 "no_trade": no_trade,
                                 "no_trade_reason": "suspended" if no_trade else None,
                                 "lake_paths": [],
-                                "raw_path": None,
-                                "normalized_path": None,
-                                "persist_csv": persist_csv,
                                 "message": message,
                             }
                         )
@@ -250,21 +189,11 @@ def sync_market_data(
                 lake_paths = []
                 if market_code in {"CN", "US"} and not bulk_rows_by_ticker:
                     lake_paths = write_ohlcv_rows_to_lake(market=market_code, rows=rows, merge_existing=True)
-                raw_path = settings.raw_data_dir / f"{symbol.ticker}.csv"
-                normalized_path = settings.normalized_data_dir / f"{symbol.ticker}.csv"
-                merged_rows = rows
-                if persist_csv:
-                    merged_rows = merge_market_data_rows(read_raw_csv(raw_path), rows)
-                    write_raw_csv(raw_path, merged_rows)
-                    normalizer.normalize_symbol_file(raw_path, normalized_path)
                 sorted_rows = sorted(rows, key=lambda row: str(row.get("date") or ""))
                 last_synced_date = sorted_rows[-1]["date"] if sorted_rows else None
                 is_current = is_as_of_current(last_synced_date, required_as_of_date)
                 status = "success" if is_current else "partial"
-                message = (
-                    f"Wrote {len(rows)} fetched row(s) to Parquet lake via {selected_provider_ticker}"
-                    + (f" and {len(merged_rows)} stored CSV row(s) to {raw_path.name}" if persist_csv else "")
-                )
+                message = f"Wrote {len(rows)} fetched row(s) to Parquet lake via {selected_provider_ticker}"
                 if not is_current:
                     message += f" Required as-of date is {required_as_of_date}; fetched data is stale."
                 sync_repo.upsert_state(
@@ -279,13 +208,10 @@ def sync_market_data(
                         "ticker": symbol.ticker,
                         "status": status,
                         "rows": len(rows),
-                        "stored_rows": len(merged_rows),
+                        "stored_rows": len(rows),
                         "provider_ticker": selected_provider_ticker,
                         "last_synced_date": last_synced_date,
                         "lake_paths": [str(path) for path in lake_paths],
-                        "raw_path": str(raw_path) if persist_csv else None,
-                        "normalized_path": str(normalized_path) if persist_csv else None,
-                        "persist_csv": persist_csv,
                         "message": message,
                     }
                 )

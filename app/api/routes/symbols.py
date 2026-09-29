@@ -11,7 +11,7 @@ from app.services.ai_analysis import AIAnalysisService
 from app.services.auth import is_authenticated, login_redirect
 from app.services.market_intelligence import build_symbol_decision_brief, build_symbol_news_sentiment_brief
 from app.services.market_news import MarketNewsService
-from app.services.model_signal_summary import build_signal_label, model_confidence
+from app.services.model_signal_summary import build_signal_label
 from app.services.repository import PredictionRepository, PriceSyncStateRepository, SymbolRepository
 from app.services.runtime_cache import get_or_set
 from app.services.symbol_details import SymbolDataService
@@ -44,7 +44,7 @@ def _lightweight_symbol_summary(overview: dict, latest_signal: dict | None) -> d
     score = None if latest_signal is None else latest_signal.get("score")
     label = (latest_signal or {}).get("signal_label") or build_signal_label(score, lang="en") or "Hold"
     decision = str(label).strip().upper()
-    confidence = (latest_signal or {}).get("confidence") or model_confidence(score) or 45
+    confidence = (latest_signal or {}).get("confidence")
     if decision not in {"BUY", "SELL", "WATCH", "HOLD"}:
         decision = "HOLD"
     if score is None:
@@ -59,7 +59,7 @@ def _lightweight_symbol_summary(overview: dict, latest_signal: dict | None) -> d
         reason = "Current setup is mixed and still needs more evidence."
     return {
         "decision": decision,
-        "confidence": int(confidence),
+        "confidence": int(confidence) if confidence is not None else None,
         "score": int(round(float(score or 0) * 10)),
         "reason": reason,
         "headline": f"{overview['ticker']} is loading detailed analysis",
@@ -585,7 +585,7 @@ def symbol_page(ticker: str, request: Request, db: Session = Depends(get_db_sess
             <article class="card">
               <div class="eyebrow">{'综合分析' if lang == 'zh' else 'Combined Analysis'}</div>
               <div class="metric">{decision_chip}</div>
-              <div class="muted" id="combined-meta">Confidence: {lightweight['confidence']} | Score: {lightweight['score']}</div>
+              <div class="muted" id="combined-meta">Confidence: {lightweight['confidence'] if lightweight['confidence'] is not None else '-'} | Score: {lightweight['score']}</div>
               <div class="chip-row" id="combined-chips"></div>
               <div class="muted" style="margin-top:10px;" id="combined-reasons">{lightweight['reason']}</div>
             </article>

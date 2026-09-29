@@ -5,6 +5,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from app.core.config import get_settings
+from app.services.hithink_finance_client import HithinkFinanceClient
 from app.services.openbb_client import HistoricalPriceRequest, OpenBBClient
 from app.services.providers.base import BasePriceProvider
 from app.services.tushare_client import TushareClient
@@ -60,7 +61,7 @@ class AlpacaPriceProvider(BasePriceProvider):
     def fetch_historical_prices(self, request: HistoricalPriceRequest) -> list[dict]:
         if not self.settings.alpaca_api_key or not self.settings.alpaca_api_secret:
             rows = self.fallback.fetch_historical_prices(request)
-            self.last_source_used = f"yfinance_fallback_missing_alpaca"
+            self.last_source_used = "yfinance_fallback_missing_alpaca"
             return rows
         try:
             rows = self._fetch_with_alpaca(request)
@@ -70,7 +71,7 @@ class AlpacaPriceProvider(BasePriceProvider):
             self.last_source_used = "alpaca"
             return rows
         fallback_rows = self.fallback.fetch_historical_prices(request)
-        self.last_source_used = f"yfinance_fallback_after_alpaca"
+        self.last_source_used = "yfinance_fallback_after_alpaca"
         return fallback_rows
 
     def _fetch_with_alpaca(self, request: HistoricalPriceRequest) -> list[dict]:
@@ -133,6 +134,29 @@ class TusharePriceProvider(BasePriceProvider):
             end_date=request.end_date,
         )
         self.last_source_used = self.name if rows else "tushare_unavailable"
+        return rows
+
+
+class HithinkFinancePriceProvider(BasePriceProvider):
+    name = "hithink_finance"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.client = HithinkFinanceClient()
+
+    def fetch_historical_prices(self, request: HistoricalPriceRequest) -> list[dict]:
+        if not self.client.is_configured():
+            self.last_source_used = "hithink_finance_unavailable"
+            return []
+        rows = self.client.fetch_historical_prices(
+            request.ticker,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            # The canonical lake stores raw OHLC and treats adj_close as close.
+            # Adjustment events can be imported independently when required.
+            adjust="none",
+        )
+        self.last_source_used = self.name if rows else "hithink_finance_empty"
         return rows
 
 
@@ -223,6 +247,8 @@ def resolve_price_provider(name: str | None, *, market: str | None = None) -> Ba
         return OpenBBPriceProvider()
     if normalized == "tushare":
         return TusharePriceProvider()
+    if normalized in {"hithink", "hithink_finance", "tonghuashun", "ths"} and market_code == "CN":
+        return HithinkFinancePriceProvider()
     if normalized in {"a_stock_data", "a_stock_data_tencent", "tencent"} and market_code == "CN":
         return AStockDataTencentPriceProvider()
     if normalized == "yfinance":

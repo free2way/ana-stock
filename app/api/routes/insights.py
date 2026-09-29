@@ -9,7 +9,12 @@ from app.core.db import get_db_session
 from app.services.ai_daily_report import format_risk_flags, format_trade_status
 from app.services.auth import is_authenticated, login_redirect
 from app.services.insight_engine import InsightEngine
-from app.services.model_signal_summary import build_signal_label, enrich_model_output, model_confidence, summarize_model_output
+from app.services.model_signal_summary import (
+    build_signal_label,
+    enrich_model_output,
+    estimate_display_percent,
+    summarize_model_output,
+)
 from app.services.repository import (
     FundamentalSnapshotRepository,
     ModelChartSignalRepository,
@@ -86,8 +91,9 @@ TEXT = {
         "expected_return_20d": "Expected 20D Return",
         "expected_drawdown_20d": "Expected 20D Drawdown",
         "model_reward_risk_ratio": "Model Reward / Risk",
-        "probability_help": "A score-derived probability proxy until full Qlib probability outputs are wired in.",
-        "expected_return_help": "A score-derived return estimate for this MVP view. Later this can be replaced by direct model forecasts.",
+        "probability_help": "Shown only when stored as a separate estimate; the raw score is never converted into a probability.",
+        "expected_return_help": "Shown only when stored as a separate estimate; the raw score is never converted into an expected return.",
+        "estimate_source": "Estimate source",
         "expected_drawdown_help": "A model-side estimate of how much pullback this setup may tolerate over the same horizon.",
         "model_reward_risk_help": "Expected 20D return divided by model-side drawdown estimate. Higher is more attractive.",
         "regime": "Regime",
@@ -120,6 +126,10 @@ TEXT = {
         "risk_drivers": "Risk Drivers",
         "drivers_empty": "There is not enough model context yet to explain what is driving this score.",
         "feature_contrib_empty": "No stored feature contributions are available for this model run yet.",
+        "feature_contrib_not_materialized": "This stock was not selected for online explanation materialization. No empty explanation has been inferred.",
+        "feature_contrib_cold_unavailable": "The explanation belongs to cold storage, which is currently unavailable.",
+        "feature_contrib_loaded_cold": "Loaded and verified from the cold Parquet artifact.",
+        "feature_contrib_materialized": "Loaded from the online materialized explanation layer.",
     },
     "zh": {
         "no_price_history": "暂无价格历史数据。",
@@ -180,8 +190,9 @@ TEXT = {
         "expected_return_20d": "预期 20 日收益",
         "expected_drawdown_20d": "预期 20 日回撤",
         "model_reward_risk_ratio": "模型盈亏比",
-        "probability_help": "当前是基于分数推导的概率近似值，后续可以替换成完整 Qlib 概率输出。",
-        "expected_return_help": "当前是基于分数推导的预期收益占位结果，后续可替换成模型直接预测值。",
+        "probability_help": "仅展示单独存储的估计值；不会把原始模型分数换算成概率。",
+        "expected_return_help": "仅展示单独存储的估计值；不会把原始模型分数换算成预期收益。",
+        "estimate_source": "估计来源",
         "expected_drawdown_help": "这是模型侧推导的同周期潜在回撤估计，用来帮助判断承受空间。",
         "model_reward_risk_help": "预期 20 日收益与模型侧回撤估计的比值，越高通常越有吸引力。",
         "regime": "市场状态",
@@ -214,6 +225,10 @@ TEXT = {
         "risk_drivers": "风险拖累",
         "drivers_empty": "当前模型上下文还不够完整，暂时无法给出更细的驱动解释。",
         "feature_contrib_empty": "当前这次模型运行还没有保存下来的特征贡献记录。",
+        "feature_contrib_not_materialized": "该股票未进入在线解释物化范围；系统不会把未物化误报为空解释。",
+        "feature_contrib_cold_unavailable": "该解释位于冷存储，但冷存储当前不可用。",
+        "feature_contrib_loaded_cold": "解释已从冷层 Parquet 工件加载并校验。",
+        "feature_contrib_materialized": "解释已从在线物化层加载。",
     },
 }
 
@@ -221,128 +236,6 @@ TEXT = {
 def tr(lang: str, key: str) -> str:
     return TEXT["zh" if lang == "zh" else "en"][key]
 
-
-def _candles_svg(history: list[dict], insight: dict) -> str:
-    lang = insight.get("lang", "en")
-    if not history:
-        return f"<p class='muted'>{tr(lang, 'no_price_history')}</p>"
-
-    candles = history[-50:]
-    width = 980
-    height = 420
-    left_pad = 48
-    top_pad = 24
-    bottom_pad = 44
-    volume_height = 80
-    plot_height = height - top_pad - bottom_pad - volume_height - 16
-    lows = [row["low"] for row in candles if row.get("low") is not None]
-    highs = [row["high"] for row in candles if row.get("high") is not None]
-    volumes = [row["volume"] for row in candles if row.get("volume") is not None]
-    if not lows or not highs:
-        return f"<p class='muted'>{tr(lang, 'not_enough_data')}</p>"
-
-    min_price = min(min(lows), insight["risk_level"], insight["entry_zone"]["low"])
-    max_price = max(max(highs), insight["take_profit_zone"]["high"], insight["breakout_level"])
-    price_span = max(max_price - min_price, 0.01)
-
-    step = (width - left_pad * 2) / max(len(candles), 1)
-    candle_width = max(6, step * 0.55)
-
-    def y_of(price: float) -> float:
-        return top_pad + plot_height * (1 - ((price - min_price) / price_span))
-
-    volume_top = top_pad + plot_height + 16
-    max_volume = max(volumes) if volumes else 1.0
-
-    candle_parts: list[str] = []
-    label_parts: list[str] = []
-    volume_parts: list[str] = []
-    for index, row in enumerate(candles):
-        open_price = row.get("open")
-        high_price = row.get("high")
-        low_price = row.get("low")
-        close_price = row.get("close")
-        if None in (open_price, high_price, low_price, close_price):
-            continue
-        x = left_pad + index * step + step / 2
-        wick_top = y_of(high_price)
-        wick_bottom = y_of(low_price)
-        body_top = y_of(max(open_price, close_price))
-        body_bottom = y_of(min(open_price, close_price))
-        body_height = max(2, body_bottom - body_top)
-        color = "#0f766e" if close_price >= open_price else "#b91c1c"
-        candle_parts.append(
-            f"<line x1='{x:.2f}' y1='{wick_top:.2f}' x2='{x:.2f}' y2='{wick_bottom:.2f}' stroke='{color}' stroke-width='2' />"
-        )
-        candle_parts.append(
-            f"<rect x='{x - candle_width / 2:.2f}' y='{body_top:.2f}' width='{candle_width:.2f}' "
-            f"height='{body_height:.2f}' rx='2' fill='{color}' opacity='0.85' />"
-        )
-        volume_value = row.get("volume") or 0
-        volume_bar_height = (volume_value / max_volume) * volume_height if max_volume else 0
-        volume_parts.append(
-            f"<rect x='{x - candle_width / 2:.2f}' y='{volume_top + volume_height - volume_bar_height:.2f}' "
-            f"width='{candle_width:.2f}' height='{max(2, volume_bar_height):.2f}' rx='1.5' fill='{color}' opacity='0.4' />"
-        )
-        if index % max(1, len(candles) // 6) == 0:
-            label_parts.append(
-                f"<text x='{x:.2f}' y='{height - 10}' font-size='10' fill='#6b7280' text-anchor='middle'>{row['date'][5:]}</text>"
-            )
-
-    ma20_points: list[str] = []
-    window: list[float] = []
-    for index, row in enumerate(candles):
-        close_price = row.get("close")
-        if close_price is None:
-            continue
-        window.append(close_price)
-        sample = window[-20:] if len(window) >= 20 else window
-        ma20 = sum(sample) / len(sample)
-        x = left_pad + index * step + step / 2
-        ma20_points.append(f"{x:.2f},{y_of(ma20):.2f}")
-
-    bands = [
-        ("Entry zone", insight["entry_zone"]["low"], insight["entry_zone"]["high"], "#dff5ef"),
-        ("Take profit", insight["take_profit_zone"]["low"], insight["take_profit_zone"]["high"], "#fef3c7"),
-    ]
-    band_parts = []
-    for _, low_price, high_price, color in bands:
-        y_top = y_of(high_price)
-        y_bottom = y_of(low_price)
-        band_parts.append(
-            f"<rect x='{left_pad}' y='{y_top:.2f}' width='{width - left_pad * 2:.2f}' height='{max(4, y_bottom - y_top):.2f}' "
-            f"fill='{color}' opacity='0.45' />"
-        )
-
-    lines = [
-        (tr(lang, "breakout"), insight["breakout_level"], "#1d4ed8"),
-        (tr(lang, "risk"), insight["risk_level"], "#b91c1c"),
-    ]
-    line_parts = []
-    for label, price, color in lines:
-        y = y_of(price)
-        line_parts.append(
-            f"<line x1='{left_pad}' y1='{y:.2f}' x2='{width-left_pad}' y2='{y:.2f}' stroke='{color}' stroke-dasharray='7 5' />"
-        )
-        line_parts.append(
-            f"<text x='{width-left_pad+4}' y='{y + 4:.2f}' font-size='11' fill='{color}'>{label} {price:.2f}</text>"
-        )
-
-    return f"""
-    <svg viewBox="0 0 {width} {height}" width="100%" height="420" role="img" aria-label="Candlestick chart">
-      <rect x="0" y="0" width="{width}" height="{height}" rx="18" fill="#fffdf7"></rect>
-      {' '.join(band_parts)}
-      <line x1="{left_pad}" y1="{top_pad + plot_height}" x2="{width-left_pad}" y2="{top_pad + plot_height}" stroke="#d6cfc2" />
-      <line x1="{left_pad}" y1="{top_pad}" x2="{left_pad}" y2="{top_pad + plot_height}" stroke="#d6cfc2" />
-      {' '.join(candle_parts)}
-      <polyline fill="none" stroke="#0f766e" stroke-width="3" points="{' '.join(ma20_points)}"></polyline>
-      {' '.join(line_parts)}
-      <rect x="{left_pad}" y="{volume_top}" width="{width - left_pad * 2}" height="{volume_height}" rx="10" fill="#f7f2e8"></rect>
-      {' '.join(volume_parts)}
-      <text x="{left_pad}" y="{volume_top - 4}" font-size="11" fill="#6b7280">{tr(lang, "volume")}</text>
-      {' '.join(label_parts)}
-    </svg>
-    """
 
 
 def _build_chart_payload(*, insight: dict, prediction_history: list[dict], chart_signal_history: list[dict], lang: str) -> dict:
@@ -897,7 +790,20 @@ def _build_model_context(*, ticker: str, lang: str, db: Session) -> dict:
                 downside = max(0.01, latest_close - insight["risk_level"])
                 insight["reward_risk_ratio"] = round(upside / downside, 2) if downside else None
         fundamentals = fundamentals_repo.get_latest_for_ticker(ticker)
-        feature_contributions = _serialize_feature_contributions(explanation_repo.get_latest_for_ticker(ticker), lang=lang)
+        explanation_state = explanation_repo.get_latest_state_for_ticker(ticker)
+        feature_contributions = _serialize_feature_contributions(
+            explanation_state["rows"],
+            lang=lang,
+        )
+        feature_contributions.update(
+            {
+                "availability_status": explanation_state["status"],
+                "source_layer": explanation_state["source_layer"],
+                "model_run_id": explanation_state["model_run_id"],
+                "trade_date": explanation_state["trade_date"],
+                "reason": explanation_state["reason"],
+            }
+        )
         drivers = _build_model_drivers(
             insight=insight or {},
             model_output=model_output,
@@ -1116,7 +1022,6 @@ def insight_page(
     sync_repo = PriceSyncStateRepository(db)
     overview = symbol_repo.get_overview(ticker) or {"ticker": insight["ticker"], "name": insight["ticker"], "market": "US"}
     sync_state = sync_repo.get_state_for_ticker(ticker)
-    fundamentals = context["fundamentals"]
     model_output = context["model_output"]
     feature_contributions = context["feature_contributions"]
     trade_plan = context["trade_plan"] or {}
@@ -1135,7 +1040,17 @@ def insight_page(
     )
     chart = _interactive_chart_html(chart_id=f"chart-{escape(insight['ticker']).replace('.', '-')}", payload=chart_payload, lang=lang)
     model_summary = _model_output_summary(model_output, lang=lang)
-    model_confidence = model_output.get("confidence") if model_output else None
+    model_confidence = estimate_display_percent(model_output, "confidence")
+    bullish_probability = estimate_display_percent(model_output, "bullish_prob")
+    bearish_probability = estimate_display_percent(model_output, "bearish_prob")
+    expected_return_5d = estimate_display_percent(model_output, "expected_return_5d")
+    expected_return_20d = estimate_display_percent(model_output, "expected_return_20d")
+    expected_drawdown_20d = estimate_display_percent(model_output, "expected_drawdown_20d")
+    estimate_source = (model_output or {}).get("estimate_source") or "unavailable"
+    estimate_protocol_id = (model_output or {}).get("estimate_protocol_id") or "-"
+    estimate_source_note = (
+        f"{tr(lang, 'estimate_source')}: {escape(str(estimate_source))} · protocol: {escape(str(estimate_protocol_id))}"
+    )
     model_state = (model_output or {}).get("state")
     model_run_name = "-"
     if model_output:
@@ -1186,6 +1101,20 @@ def insight_page(
             f"<div style='width:{item['strength']}%; height:100%; background:#b91c1c;'></div></div></li>"
         )
         for item in feature_contributions["negative"]
+    )
+    explanation_status = str(
+        feature_contributions.get("availability_status") or "not_materialized"
+    )
+    explanation_notice = (
+        tr(lang, "feature_contrib_materialized")
+        if explanation_status == "materialized_hot"
+        else tr(lang, "feature_contrib_loaded_cold")
+        if explanation_status == "loaded_cold"
+        else tr(lang, "feature_contrib_cold_unavailable")
+        if explanation_status == "cold_unavailable"
+        else tr(lang, "feature_contrib_not_materialized")
+        if explanation_status == "not_materialized"
+        else tr(lang, "feature_contrib_empty")
     )
     lang_switch = (
         f"<a href='/insights/{insight['ticker']}?lang=en'>{tr(lang, 'lang_en')}</a> | "
@@ -1451,6 +1380,7 @@ def insight_page(
               <div class="eyebrow">{tr(lang, 'confidence')}</div>
               <div class="metric">{f"{model_confidence}%" if model_confidence is not None else '-'}</div>
               <div class="muted">{tr(lang, 'model_score_help')}</div>
+              <div class="muted">{estimate_source_note}</div>
             </article>
             <article class="card">
               <div class="eyebrow">{tr(lang, 'model_run')}</div>
@@ -1462,28 +1392,33 @@ def insight_page(
           <section class="grid">
             <article class="card">
               <div class="eyebrow">{tr(lang, 'bullish_probability')}</div>
-              <div class="metric">{f"{model_output['bullish_prob']:.1f}%" if model_output and model_output.get('bullish_prob') is not None else '-'}</div>
+              <div class="metric">{f"{bullish_probability:.1f}%" if bullish_probability is not None else '-'}</div>
               <div class="muted">{tr(lang, 'probability_help')}</div>
+              <div class="muted">{estimate_source_note}</div>
             </article>
             <article class="card">
               <div class="eyebrow">{tr(lang, 'bearish_probability')}</div>
-              <div class="metric">{f"{model_output['bearish_prob']:.1f}%" if model_output and model_output.get('bearish_prob') is not None else '-'}</div>
+              <div class="metric">{f"{bearish_probability:.1f}%" if bearish_probability is not None else '-'}</div>
               <div class="muted">{tr(lang, 'probability_help')}</div>
+              <div class="muted">{estimate_source_note}</div>
             </article>
             <article class="card">
               <div class="eyebrow">{tr(lang, 'expected_return_5d')}</div>
-              <div class="metric">{f"{model_output['expected_return_5d']:.2f}%" if model_output and model_output.get('expected_return_5d') is not None else '-'}</div>
+              <div class="metric">{f"{expected_return_5d:.2f}%" if expected_return_5d is not None else '-'}</div>
               <div class="muted">{tr(lang, 'expected_return_help')}</div>
+              <div class="muted">{estimate_source_note}</div>
             </article>
             <article class="card">
               <div class="eyebrow">{tr(lang, 'expected_return_20d')}</div>
-              <div class="metric">{f"{model_output['expected_return_20d']:.2f}%" if model_output and model_output.get('expected_return_20d') is not None else '-'}</div>
+              <div class="metric">{f"{expected_return_20d:.2f}%" if expected_return_20d is not None else '-'}</div>
               <div class="muted">{tr(lang, 'expected_return_help')}</div>
+              <div class="muted">{estimate_source_note}</div>
             </article>
             <article class="card">
               <div class="eyebrow">{tr(lang, 'expected_drawdown_20d')}</div>
-              <div class="metric">{f"{model_output['expected_drawdown_20d']:.2f}%" if model_output and model_output.get('expected_drawdown_20d') is not None else '-'}</div>
+              <div class="metric">{f"{expected_drawdown_20d:.2f}%" if expected_drawdown_20d is not None else '-'}</div>
               <div class="muted">{tr(lang, 'expected_drawdown_help')}</div>
+              <div class="muted">{estimate_source_note}</div>
             </article>
             <article class="card">
               <div class="eyebrow">{tr(lang, 'model_reward_risk_ratio')}</div>
@@ -1621,6 +1556,7 @@ def insight_page(
             </article>
             <article class="card">
               <div class="eyebrow">{tr(lang, 'feature_contributions')}</div>
+              <div class="muted" style="margin-bottom:10px;">{escape(explanation_notice)}</div>
               <div class="label" style="margin-bottom:8px;">{tr(lang, 'model_positive_factors')}</div>
               {"<ul>" + positive_feature_items + "</ul>" if positive_feature_items else f"<div class='muted'>{tr(lang, 'feature_contrib_empty')}</div>"}
               <div class="label" style="margin:14px 0 8px;">{tr(lang, 'model_negative_factors')}</div>

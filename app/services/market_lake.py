@@ -201,7 +201,7 @@ def load_lake_price_history(*, market: str, ticker: str, limit: int = 120) -> li
     parquet_files = _recent_parquet_files(market_code, limit=max(20, int(limit) * 2))
     if market_code not in {"CN", "US"} or not symbol or not parquet_files:
         return []
-    sql = f"""
+    sql = """
         SELECT
             CAST(date AS VARCHAR) AS date,
             symbol,
@@ -231,6 +231,67 @@ def load_lake_price_history(*, market: str, ticker: str, limit: int = 120) -> li
     history = history[: max(1, int(limit))]
     history.sort(key=lambda item: item.get("date") or "")
     return history
+
+
+def load_lake_latest_open_gaps(*, market: str, tickers: list[str]) -> dict[str, float | None]:
+    """Signal-day open gap per symbol: latest session open vs prior close.
+
+    Feeds the gap-chase entry rule.  A symbol with fewer than two sessions in
+    the window maps to None so callers treat it as "unknown", never zero gap.
+    """
+    market_code = str(market or "").strip().upper()
+    parquet_files = _recent_parquet_files(market_code, limit=180)
+    normalized = []
+    for ticker in tickers:
+        symbol = str(ticker or "").strip().upper()
+        if symbol and symbol not in normalized:
+            normalized.append(symbol)
+    if market_code not in {"CN", "US"} or not normalized or not parquet_files:
+        return {}
+
+    payload: dict[str, float | None] = {}
+    for start in range(0, len(normalized), 500):
+        ticker_chunk = normalized[start : start + 500]
+        placeholders = ", ".join("?" for _ in ticker_chunk)
+        sql = f"""
+            WITH ranked AS (
+                SELECT
+                    symbol,
+                    open,
+                    close,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol
+                        ORDER BY CAST(date AS DATE) DESC
+                    ) AS row_num
+                FROM read_parquet(?, hive_partitioning = true)
+                WHERE symbol IN ({placeholders})
+                  AND CAST(date AS DATE) <= CAST(? AS DATE)
+            )
+            SELECT latest.symbol, latest.open, previous.close
+            FROM (SELECT symbol, open FROM ranked WHERE row_num = 1) AS latest
+            LEFT JOIN (SELECT symbol, close FROM ranked WHERE row_num = 2) AS previous
+              ON previous.symbol = latest.symbol
+        """
+        rows, _columns = _duckdb_fetchall(
+            sql,
+            [parquet_files, *ticker_chunk, latest_completed_market_date(market_code)],
+            label="lake_latest_open_gaps",
+        )
+        for symbol, open_value, previous_close_value in rows:
+            normalized_symbol = str(symbol or "").strip().upper()
+            try:
+                open_price = None if open_value in (None, "") else float(open_value)
+                previous_close = (
+                    None if previous_close_value in (None, "") else float(previous_close_value)
+                )
+            except (TypeError, ValueError):
+                payload[normalized_symbol] = None
+                continue
+            if not open_price or not previous_close or previous_close <= 0:
+                payload[normalized_symbol] = None
+                continue
+            payload[normalized_symbol] = round((open_price / previous_close) - 1.0, 6)
+    return payload
 
 
 def load_lake_latest_closes(*, market: str, tickers: list[str]) -> dict[str, float | None]:
@@ -441,6 +502,52 @@ def count_lake_symbols_for_trade_date(*, market: str, trade_date: str) -> int:
         return 0
 
 
+def list_lake_symbols_for_trade_date(*, market: str, trade_date: str) -> set[str]:
+    """Return the exact symbol set materialized in one market/date partition."""
+
+    market_code = str(market or "").strip().upper()
+    normalized_trade_date = str(trade_date or "").strip()[:10]
+    if market_code not in {"CN", "US"} or not normalized_trade_date:
+        return set()
+    path = (
+        market_lake_root()
+        / f"{market_code.lower()}_daily"
+        / f"date={normalized_trade_date}"
+        / "part.parquet"
+    )
+    if not path.exists():
+        return set()
+    rows, _columns = _duckdb_fetchall(
+        """
+        SELECT DISTINCT symbol
+        FROM read_parquet(?, hive_partitioning = true)
+        WHERE symbol IS NOT NULL
+        """,
+        [[str(path)]],
+        label="lake_trade_date_symbols",
+    )
+    return {
+        str(row[0] or "").strip().upper()
+        for row in rows
+        if row and str(row[0] or "").strip()
+    }
+
+
+def list_lake_trade_dates(*, market: str) -> list[str]:
+    market_code = str(market or "").strip().lower()
+    if market_code not in {"cn", "us"}:
+        return []
+    market_dir = market_lake_root() / f"{market_code}_daily"
+    return sorted(
+        {
+            path.parent.name.removeprefix("date=")
+            for path in market_dir.glob("date=*/*.parquet")
+            if path.is_file() and path.stat().st_size >= LAKE_MIN_PARQUET_BYTES
+        },
+        reverse=True,
+    )
+
+
 def _recent_parquet_files(market: str, *, limit: int) -> list[str]:
     return _all_parquet_files(market)[: max(1, int(limit))]
 
@@ -448,11 +555,15 @@ def _recent_parquet_files(market: str, *, limit: int) -> list[str]:
 def _all_parquet_files(market: str) -> list[str]:
     market_code = str(market or "").strip().lower()
     now = time.monotonic()
+    market_dir = market_lake_root() / f"{market_code}_daily"
     with _LAKE_FILE_LIST_CACHE_LOCK:
         cached = _LAKE_FILE_LIST_CACHE.get(market_code)
-        if cached and (now - float(cached.get("fetched_at") or 0.0)) < LAKE_FILE_LIST_CACHE_TTL_SECONDS:
+        if (
+            cached
+            and cached.get("market_dir") == str(market_dir)
+            and (now - float(cached.get("fetched_at") or 0.0)) < LAKE_FILE_LIST_CACHE_TTL_SECONDS
+        ):
             return list(cached.get("files") or [])
-    market_dir = market_lake_root() / f"{market_code}_daily"
     files = sorted(
         (
             path
@@ -466,6 +577,7 @@ def _all_parquet_files(market: str) -> list[str]:
     with _LAKE_FILE_LIST_CACHE_LOCK:
         _LAKE_FILE_LIST_CACHE[market_code] = {
             "files": normalized_files,
+            "market_dir": str(market_dir),
             "fetched_at": now,
         }
     return normalized_files
@@ -661,7 +773,14 @@ def _duckdb_fetchall(sql: str, params: list | tuple, *, label: str = "duckdb_que
     return [], []
 
 
-def load_lake_rows(*, markets: list[str] | None = None, tickers: set[str] | None = None, limit_per_symbol: int | None = None) -> list[dict]:
+def load_lake_rows(
+    *,
+    markets: list[str] | None = None,
+    tickers: set[str] | None = None,
+    limit_per_symbol: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[dict]:
     market_codes = [
         str(market or "").strip().upper()
         for market in (markets or ["CN", "US"])
@@ -670,10 +789,35 @@ def load_lake_rows(*, markets: list[str] | None = None, tickers: set[str] | None
     normalized_tickers = {str(ticker or "").strip().upper() for ticker in (tickers or set()) if str(ticker or "").strip()}
     all_rows: list[dict] = []
     for market_code in market_codes:
-        parquet_files = _all_parquet_files(market_code)
+        parquet_files = (
+            _recent_parquet_files(market_code, limit=int(limit_per_symbol))
+            if limit_per_symbol is not None and int(limit_per_symbol) > 0
+            else _all_parquet_files(market_code)
+        )
+        requested_start = str(start_date or "")[:10]
+        requested_end = str(end_date or "")[:10]
+        if requested_start or requested_end:
+            bounded_files: list[str] = []
+            for path in parquet_files:
+                match = re.search(r"date=(\d{4}-\d{2}-\d{2})", str(path))
+                partition_date = match.group(1) if match else ""
+                if requested_start and partition_date and partition_date < requested_start:
+                    continue
+                if requested_end and partition_date and partition_date > requested_end:
+                    continue
+                bounded_files.append(path)
+            parquet_files = bounded_files
         if not parquet_files:
             continue
         where_parts = ["CAST(date AS DATE) <= CAST(? AS DATE)"]
+        effective_end_date = min(
+            str(end_date or latest_completed_market_date(market_code))[:10],
+            latest_completed_market_date(market_code),
+        )
+        params_tail: list[object] = [effective_end_date]
+        if start_date:
+            where_parts.append("CAST(date AS DATE) >= CAST(? AS DATE)")
+            params_tail.append(str(start_date)[:10])
         if normalized_tickers:
             where_parts.append("symbol = ANY(?)")
         ticker_filter = "WHERE " + " AND ".join(where_parts)
@@ -693,7 +837,7 @@ def load_lake_rows(*, markets: list[str] | None = None, tickers: set[str] | None
         """
         columns: list[str] = []
         for file_chunk in _chunked_paths(parquet_files):
-            params = [file_chunk, latest_completed_market_date(market_code)]
+            params = [file_chunk, *params_tail]
             if normalized_tickers:
                 params.append(sorted(normalized_tickers))
             rows, chunk_columns = _duckdb_fetchall(sql, params, label="lake_load_rows")

@@ -1,0 +1,133 @@
+from types import SimpleNamespace
+import unittest
+from unittest.mock import MagicMock, patch
+
+from app.services.us_market_scheduler import USMarketSchedulerService
+
+
+class USMarketSchedulerTests(unittest.TestCase):
+    def test_priority_price_sync_keeps_per_symbol_resume_dates(self):
+        service = USMarketSchedulerService()
+        gaps = [{"ticker": "AAPL", "start_date": "2026-09-21"},
+                {"ticker": "MSFT", "start_date": "2025-01-01"}]
+        with patch.object(service, "_priority_us_price_gaps", return_value=gaps) as find, \
+             patch("app.services.us_market_scheduler.sync_market_data", return_value=[
+                 {"ticker": "AAPL", "status": "success", "rows": 3},
+                 {"ticker": "MSFT", "status": "failed", "rows": 0}]) as sync:
+            result = service._sync_priority_us_prices(target_trade_date="2026-09-23", limit=20)
+        find.assert_called_once_with(target_trade_date="2026-09-23", limit=20)
+        sync.assert_called_once_with(tickers=["AAPL", "MSFT"], start_date="2025-01-01",
+            start_dates_by_ticker={"AAPL": "2026-09-21", "MSFT": "2025-01-01"},
+            end_date="2026-09-23", provider="auto")
+        self.assertEqual("partial", result["status"])
+        self.assertEqual((2, 1, 1), (result["ticker_count"], result["success_count"], result["failure_count"]))
+
+    def test_priority_price_sync_skips_current_symbols(self):
+        service = USMarketSchedulerService()
+        with patch.object(service, "_priority_us_price_gaps", return_value=[]), \
+             patch("app.services.us_market_scheduler.sync_market_data") as sync:
+            result = service._sync_priority_us_prices(target_trade_date="2026-09-23", limit=20)
+        self.assertEqual("skipped", result["status"])
+        sync.assert_not_called()
+
+    def test_priority_price_sync_exposes_provider_failure(self):
+        service = USMarketSchedulerService()
+        with patch.object(service, "_priority_us_price_gaps", return_value=[
+                 {"ticker": "AAPL", "start_date": "2026-09-21"}]), \
+             patch("app.services.us_market_scheduler.sync_market_data", side_effect=RuntimeError("fixture failure")):
+            result = service._sync_priority_us_prices(target_trade_date="2026-09-23", limit=20)
+        self.assertEqual("failed", result["status"])
+        self.assertEqual(1, result["failure_count"])
+        self.assertIn("fixture failure", result["message"])
+
+    def test_empty_legacy_backtest_does_not_suppress_structured_evaluation(self):
+        service = USMarketSchedulerService()
+        fake_db = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = fake_db
+        context.__exit__.return_value = False
+        job_repo = MagicMock()
+        job_repo.has_running_job.return_value = False
+        job_repo.create_job.return_value = SimpleNamespace(id=309)
+
+        with patch(
+            "app.services.us_market_scheduler.list_lake_symbols",
+            return_value=["AAPL"],
+        ), patch(
+            "app.services.us_market_scheduler.build_us_trade_universe",
+            return_value=(["AAPL"], {"eligible_count": 1}),
+        ) as build_universe, patch(
+            "app.services.us_market_scheduler.market_data_gate",
+            return_value={"status": "ready"},
+        ), patch(
+            "app.services.us_market_scheduler.SessionLocal",
+            return_value=context,
+        ), patch(
+            "app.services.us_market_scheduler.DataJobRepository",
+            return_value=job_repo,
+        ), patch(
+            "app.services.us_market_scheduler.SignalTrainer.train",
+            return_value=120,
+        ), patch(
+            "app.services.us_market_scheduler.BacktestRunner.run",
+            side_effect=RuntimeError(
+                "Backtest produced no daily metrics. The dataset may be too short "
+                "or filtered out by tradeability gates."
+            ),
+        ), patch(
+            "app.services.us_market_scheduler.refresh_workspace_snapshots",
+        ), patch.object(
+            service,
+            "_run_structured_evaluation",
+        ) as structured_evaluation:
+            service._run_signal_training(source_job_id=100, trade_date="2026-09-02")
+
+        completion = job_repo.complete_job.call_args.kwargs
+        self.assertEqual("success", completion["status"])
+        self.assertEqual("empty", completion["result"]["legacy_backtest_status"])
+        self.assertEqual(0, completion["result"]["daily_rows_written"])
+        structured_evaluation.assert_called_once_with(source_job_id=309)
+        build_universe.assert_called_once_with(
+            tickers=["AAPL"],
+            expected_as_of_date="2026-09-02",
+            include_summary=True,
+        )
+
+    def test_blocked_data_gate_prevents_us_training(self):
+        service = USMarketSchedulerService()
+        fake_db = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = fake_db
+        context.__exit__.return_value = False
+        job_repo = MagicMock()
+        job_repo.has_running_job.return_value = False
+        job_repo.create_job.return_value = SimpleNamespace(id=318)
+
+        with patch(
+            "app.services.us_market_scheduler.list_lake_symbols",
+            return_value=["AAPL"],
+        ), patch(
+            "app.services.us_market_scheduler.build_us_trade_universe",
+            return_value=(["AAPL"], {"eligible_count": 1}),
+        ), patch(
+            "app.services.us_market_scheduler.SessionLocal",
+            return_value=context,
+        ), patch(
+            "app.services.us_market_scheduler.DataJobRepository",
+            return_value=job_repo,
+        ), patch(
+            "app.services.us_market_scheduler.market_data_gate",
+            return_value={"status": "blocked", "message": "US input blocked"},
+        ), patch(
+            "app.services.us_market_scheduler.SignalTrainer.train",
+        ) as train:
+            service._run_signal_training(source_job_id=101, trade_date="2026-09-08")
+
+        train.assert_not_called()
+        completion = job_repo.complete_job.call_args.kwargs
+        self.assertEqual("failed", completion["status"])
+        self.assertEqual("US input blocked", completion["message"])
+
+
+if __name__ == "__main__":
+    unittest.main()

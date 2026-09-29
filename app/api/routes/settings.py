@@ -27,16 +27,16 @@ def _provider_strategy_view(lang: str) -> dict:
         return {
             "title": "数据策略",
             "copy": "先看系统如何自动选 provider，再看当前自动任务实际会用什么默认策略。",
-            "price": "价格 `auto`：A 股优先 TuShare，其他市场优先 yfinance。",
-            "fundamental": "基本面 `auto`：A 股走 TuShare，美股/港股走 OpenBB 或 yfinance fundamentals。",
+            "price": "价格 `auto`：A 股仍以 TuShare 为主；同花顺已作为官方影子源和全市场 Parquet 增量入口。",
+            "fundamental": "基本面 `auto`：A 股默认免费点时源；同花顺可选用于官方财报、指标和最新估值。",
             "concept": "概念 `auto`：当前 A 股概念映射统一走 TuShare。",
             "execution": "执行与实时：后续会收敛到 `execution / realtime` 层，不混进研究数据层。",
         }
     return {
         "title": "Data Strategy",
         "copy": "Review how the app chooses providers automatically first, then what the automation layer currently defaults to.",
-        "price": "Price `auto`: CN prefers TuShare, while other markets default to yfinance.",
-        "fundamental": "Fundamentals `auto`: CN uses TuShare, while US/HK uses OpenBB or yfinance fundamentals.",
+        "price": "Price `auto`: CN still prefers TuShare; HiThink is available as an official shadow source and full-market Parquet increment.",
+        "fundamental": "Fundamentals `auto`: CN defaults to the free point-in-time source; HiThink is opt-in for official statements, indicators, and current valuation.",
         "concept": "Concept `auto`: current CN concept mapping is standardized on TuShare.",
         "execution": "Execution and realtime are reserved for the future `execution / realtime` layer instead of the research data layer.",
     }
@@ -219,9 +219,10 @@ def settings_home_page(request: Request) -> str:
         ai_chat_config = load_ai_chat_config(db)
     configured = {
         "wechat": bool(settings.wechat_webhook_url),
-        "feishu": bool(settings.feishu_webhook_url),
+        "feishu": "feishu" in channels,
         "telegram": bool(settings.telegram_bot_token and settings.telegram_chat_id),
         "ai_chat": ai_chat_config.is_configured,
+        "hithink": bool(settings.hithink_finance_api_key),
     }
     total_configured = sum(1 for value in configured.values() if value)
     auto_provider = str(auto_status.get("provider") or "auto")
@@ -300,8 +301,9 @@ def settings_home_page(request: Request) -> str:
             <div class="list-stack">
               <div class="list-row"><div><div class="ticker">Telegram</div><div class="subtle">PQW_TELEGRAM_BOT_TOKEN / PQW_TELEGRAM_CHAT_ID</div></div><div class="ticker">{'已配置' if configured['telegram'] and lang == 'zh' else ('未配置' if lang == 'zh' else ('Configured' if configured['telegram'] else 'Missing'))}</div></div>
               <div class="list-row"><div><div class="ticker">{'企业微信' if lang == 'zh' else 'WeCom'}</div><div class="subtle">PQW_WECHAT_WEBHOOK_URL</div></div><div class="ticker">{'已配置' if configured['wechat'] and lang == 'zh' else ('未配置' if lang == 'zh' else ('Configured' if configured['wechat'] else 'Missing'))}</div></div>
-              <div class="list-row"><div><div class="ticker">{'飞书' if lang == 'zh' else 'Feishu'}</div><div class="subtle">PQW_FEISHU_WEBHOOK_URL</div></div><div class="ticker">{'已配置' if configured['feishu'] and lang == 'zh' else ('未配置' if lang == 'zh' else ('Configured' if configured['feishu'] else 'Missing'))}</div></div>
+              <div class="list-row"><div><div class="ticker">{'飞书' if lang == 'zh' else 'Feishu'}</div><div class="subtle">Webhook 或 App ID / App Secret / Chat ID</div></div><div class="ticker">{'已配置' if configured['feishu'] and lang == 'zh' else ('未配置' if lang == 'zh' else ('Configured' if configured['feishu'] else 'Missing'))}</div></div>
               <div class="list-row"><div><div class="ticker">{'AI 问答' if lang == 'zh' else 'AI Q&A'}</div><div class="subtle">{html.escape(ai_chat_config.provider_name)} · {html.escape(ai_chat_config.model or '-')} · {html.escape(masked_api_key(ai_chat_config) or '-')}</div></div><div class="ticker">{'已配置' if configured['ai_chat'] and lang == 'zh' else ('未配置' if lang == 'zh' else ('Configured' if configured['ai_chat'] else 'Missing'))}</div></div>
+              <div class="list-row"><div><div class="ticker">{'同花顺金融数据' if lang == 'zh' else 'HiThink Financial Data'}</div><div class="subtle">PQW_HITHINK_FINANCE_API_KEY · {'官方 A 股行情/财报/估值' if lang == 'zh' else 'Official CN prices/statements/valuation'}</div></div><div class="ticker">{'已配置' if configured['hithink'] and lang == 'zh' else ('未配置' if lang == 'zh' else ('Configured' if configured['hithink'] else 'Missing'))}</div></div>
               <div class="list-row"><div><div class="ticker">{'Kronos 二次验证' if lang == 'zh' else 'Kronos Validation'}</div><div class="subtle">{html.escape(kronos['model'])} · {html.escape(kronos['device'])} · {html.escape(kronos['hint'])}</div></div><div><span class="status-pill {'success' if kronos['status'] == 'ready' else ('warning' if kronos['status'] == 'not_configured' else 'idle')}">{html.escape(kronos['label'])}</span></div></div>
             </div>
           </article>
@@ -310,7 +312,7 @@ def settings_home_page(request: Request) -> str:
             <div class="list-stack">
               <div class="list-row"><div><div class="ticker">{'自动分析' if lang == 'zh' else 'Auto analysis'}</div><div class="subtle">{'默认 provider / 下次运行' if lang == 'zh' else 'Default provider / next run'}</div></div><div class="ticker">{auto_provider} · {_display_time(auto_status.get('next_run_at'))}</div></div>
               <div class="list-row"><div><div class="ticker">{'最近全市场轻刷新结果' if lang == 'zh' else 'Latest light refresh result'}</div><div class="subtle">{latest_cn_refresh['label']}</div></div><div class="ticker">{latest_cn_refresh['summary']}</div></div>
-              <div class="list-row"><div><div class="ticker">{'当前建议' if lang == 'zh' else 'Current guidance'}</div><div class="subtle">{'如果主要覆盖 A 股，优先用 TuShare 或 auto。' if lang == 'zh' else 'If CN coverage matters most, prefer TuShare or auto.'}</div></div></div>
+              <div class="list-row"><div><div class="ticker">{'当前建议' if lang == 'zh' else 'Current guidance'}</div><div class="subtle">{'日常全市场行情优先使用同花顺近 10 日 Parquet；保留 TuShare/免费源作为回退和交叉校验。' if lang == 'zh' else 'Prefer the HiThink 10-session Parquet for daily full-market CN data, retaining TuShare/free sources for fallback and cross-checking.'}</div></div></div>
             </div>
           </article>
           <article class="card">
@@ -481,7 +483,7 @@ def notification_settings_page(request: Request) -> str:
     channels = notifier.available_channels()
     configured = {
         "wechat": bool(settings.wechat_webhook_url),
-        "feishu": bool(settings.feishu_webhook_url),
+        "feishu": "feishu" in channels,
         "telegram": bool(settings.telegram_bot_token and settings.telegram_chat_id),
     }
     total_configured = sum(1 for value in configured.values() if value)
@@ -494,7 +496,7 @@ def notification_settings_page(request: Request) -> str:
         {
             "label": "飞书" if lang == "zh" else "Feishu",
             "status": "已配置" if configured["feishu"] and lang == "zh" else ("未配置" if lang == "zh" else ("Configured" if configured["feishu"] else "Not configured")),
-            "hint": "PQW_FEISHU_WEBHOOK_URL",
+            "hint": "PQW_FEISHU_WEBHOOK_URL，或 PQW_FEISHU_APP_ID / APP_SECRET / CHAT_ID",
         },
         {
             "label": "Telegram",
@@ -581,6 +583,9 @@ def notification_settings_page(request: Request) -> str:
             <div class="list-stack">
               <div class="ticker">PQW_WECHAT_WEBHOOK_URL</div>
               <div class="ticker">PQW_FEISHU_WEBHOOK_URL</div>
+              <div class="ticker">PQW_FEISHU_APP_ID</div>
+              <div class="ticker">PQW_FEISHU_APP_SECRET</div>
+              <div class="ticker">PQW_FEISHU_CHAT_ID</div>
               <div class="ticker">PQW_TELEGRAM_BOT_TOKEN</div>
               <div class="ticker">PQW_TELEGRAM_CHAT_ID</div>
             </div>

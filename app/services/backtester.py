@@ -1,4 +1,3 @@
-import csv
 from collections import defaultdict
 from math import sqrt
 
@@ -37,14 +36,8 @@ class BacktestRunner:
             if str(market or "").strip().upper() in {"CN", "US"}
         ]
 
-        for csv_path in sorted(self.settings.normalized_data_dir.glob("*.csv")):
-            with csv_path.open("r", newline="", encoding="utf-8") as input_file:
-                reader = csv.DictReader(input_file)
-                for row in reader:
-                    self._append_market_row(rows_by_symbol, row)
-        if not rows_by_symbol:
-            for row in load_lake_rows(markets=normalized_markets or None, tickers=normalized_tickers or None):
-                self._append_market_row(rows_by_symbol, row)
+        for row in load_lake_rows(markets=normalized_markets or None, tickers=normalized_tickers or None):
+            self._append_market_row(rows_by_symbol, row)
 
         for symbol, items in rows_by_symbol.items():
             items.sort(key=lambda item: item["date"])
@@ -355,6 +348,12 @@ class BacktestRunner:
         rebalance_threshold: float,
     ) -> dict:
         return {
+            "engine_version": "legacy_forward_return_v1",
+            "legacy": True,
+            "reality_model_version": "forward_return_proxy_v1",
+            "signal_cutoff": "close",
+            "entry_price_mode": "same_close_forward_return_proxy",
+            "holding_period_basis": "forward_label",
             "top_n": top_n,
             "model_run_id": model_run_id,
             "holding_days": holding_days,
@@ -386,6 +385,7 @@ class BacktestRunner:
         min_adv: float | None = None,
         max_gap_pct: float | None = None,
         rebalance_threshold: float | None = None,
+        engine_version: str = "legacy_forward_return_v1",
     ) -> int:
         holding_days = max(1, int(holding_days or self.settings.backtest_default_holding_days))
         commission_bps = float(commission_bps if commission_bps is not None else self.settings.backtest_commission_bps)
@@ -398,6 +398,25 @@ class BacktestRunner:
         min_adv = float(min_adv if min_adv is not None else self.settings.backtest_min_adv)
         max_gap_pct = float(max_gap_pct if max_gap_pct is not None else self.settings.backtest_max_gap_pct)
         rebalance_threshold = float(rebalance_threshold if rebalance_threshold is not None else self.settings.backtest_rebalance_threshold)
+        engine_version = str(engine_version or "legacy_forward_return_v1").strip().lower()
+        if engine_version == "event_driven_daily_v2":
+            from app.services.backtesting.runner import EventDrivenBacktestRunner
+
+            return EventDrivenBacktestRunner().run(
+                top_n=max(1, int(top_n)),
+                model_run_id=model_run_id,
+                holding_days=holding_days,
+                commission_bps=commission_bps,
+                slippage_bps=slippage_bps,
+                max_position_weight=max_position_weight,
+                min_signal_score=min_signal_score,
+                min_adv=min_adv,
+                max_gap_pct=max_gap_pct,
+            )
+        if engine_version != "legacy_forward_return_v1":
+            raise ValueError(
+                "engine_version must be legacy_forward_return_v1 or event_driven_daily_v2"
+            )
 
         with SessionLocal() as db:
             model_repo = ModelRunRepository(db)
@@ -428,7 +447,7 @@ class BacktestRunner:
                 markets=market_filters,
             )
             if not forward_returns:
-                raise RuntimeError("No local market data available for backtest. Refresh the Parquet market lake or rebuild normalized CSVs first.")
+                raise RuntimeError("No local market data available for backtest. Refresh the Parquet market lake first.")
             benchmark_returns, benchmark_label = self._build_benchmark_returns(forward_returns, benchmark_symbol=benchmark_symbol)
             grouped: dict[str, list] = defaultdict(list)
             for prediction in predictions:

@@ -4,6 +4,7 @@ __pycache__/
 
 .DS_Store
 .env
+.env.local
 
 storage/*.db
 storage/*.sqlite
@@ -17,3 +18,23 @@ data/artifacts/
 
 *.log
 storage/
+
+# CatBoost's generated training logs are not application source.
+/catboost_info/
+
+# Internal documents and host-specific deployment material stay local.
+/docs/
+/deploy/
+/tmp/
+/.codex/
+/.agents/
+/.ruff_cache/
+/.uv-cache/
+/.venv-*/
+/.p0_smoke_check.py
+.env.*
+*.md
+!/README.md
+!/README.zh-CN.md
+*.docx
+*.pdf

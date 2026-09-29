@@ -63,26 +63,27 @@ class SocialSignalSchedulerService:
                 params={"source": "scheduler", "interval_minutes": self.interval_minutes},
                 message="Polling tracked X accounts for social ticker mentions.",
             )
+            job_id = int(job.id)
         self._last_started_at = app_now()
         try:
             with SessionLocal() as db:
                 result = poll_tracked_social_accounts(db)
                 DataJobRepository(db).complete_job(
-                    job.id,
+                    job_id,
                     status=_job_status_from_result(result),
                     message=result.get("message"),
                     result=result,
                 )
-                return {"job_id": job.id, **result}
+                return {"job_id": job_id, **result}
         except Exception as exc:
             with SessionLocal() as db:
                 DataJobRepository(db).complete_job(
-                    job.id,
+                    job_id,
                     status="failed",
                     message=f"Social signal poll failed: {exc}",
                     result={"error": str(exc)},
                 )
-            return {"job_id": job.id, "status": "failed", "message": str(exc)}
+            return {"job_id": job_id, "status": "failed", "message": str(exc)}
 
     def run_now_async(self) -> dict:
         with SessionLocal() as db:
@@ -100,9 +101,10 @@ class SocialSignalSchedulerService:
                 params={"source": "manual"},
                 message="Manual social signal poll queued.",
             )
-        thread = threading.Thread(target=self._run_existing_job, args=(job.id,), name=f"social-poll-{job.id}", daemon=True)
+            job_id = int(job.id)
+        thread = threading.Thread(target=self._run_existing_job, args=(job_id,), name=f"social-poll-{job_id}", daemon=True)
         thread.start()
-        return {"job_id": job.id, "status": "queued"}
+        return {"job_id": job_id, "status": "queued"}
 
     def _run_existing_job(self, job_id: int) -> None:
         self._last_started_at = app_now()

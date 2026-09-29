@@ -10,10 +10,13 @@ from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy.orm import Session
 
+from app.api.rendering import compact_text as _compact_text
+
+from app.api.rendering import render_daily_change_chip as _render_daily_change_chip
 from app.core.db import SessionLocal, get_db_session
 from app.models.schema import SymbolCreate
 from app.services.auth import is_authenticated, login_redirect
-from app.services.market_lake import load_lake_price_history
+from app.services.price_snapshot import load_daily_change_pct as _load_portfolio_daily_change_pct
 from app.services.portfolio_intelligence import (
     build_position_management_fields,
     build_portfolio_ai_summary,
@@ -59,55 +62,6 @@ MARKET_OPTIONS = [
 ]
 
 
-def _render_daily_change_chip(value: float | None) -> str:
-    if value is None:
-        return "<span class='muted'>-</span>"
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return "<span class='muted'>-</span>"
-    bg = "rgba(148,163,184,0.12)"
-    fg = "#cbd5e1"
-    if numeric > 0:
-        bg = "rgba(22,163,74,0.16)"
-        fg = "#4ade80"
-    elif numeric < 0:
-        bg = "rgba(220,38,38,0.16)"
-        fg = "#f87171"
-    return (
-        "<span style='display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;"
-        f"background:{bg};color:{fg};font-weight:800;font-size:12px;white-space:nowrap;'>{numeric:+.2f}%</span>"
-    )
-
-
-def _load_portfolio_daily_change_pct(*, market: str | None, ticker: str) -> float | None:
-    market_value = str(market or "").strip().upper()
-    normalized_ticker = normalize_ticker_for_market(ticker, market_value)
-    if market_value not in {"CN", "US"} or not normalized_ticker:
-        return None
-    rows = load_lake_price_history(market=market_value, ticker=normalized_ticker, limit=2)
-    if len(rows) < 2:
-        return None
-    latest = rows[-1]
-    previous = rows[-2]
-    latest_close = latest.get("close") or latest.get("adj_close")
-    previous_close = previous.get("close") or previous.get("adj_close")
-    try:
-        latest_value = float(latest_close)
-        previous_value = float(previous_close)
-    except (TypeError, ValueError):
-        return None
-    if previous_value == 0:
-        return None
-    return ((latest_value / previous_value) - 1.0) * 100.0
-
-def _compact_text(value: str | None, limit: int = 28) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    if len(text) <= limit:
-        return text
-    return f"{text[: limit - 1]}…"
 
 
 def _portfolio_action_chip(value: str | None) -> str:
@@ -233,6 +187,17 @@ def _format_portfolio_money(value: float | None, *, market: str | None, digits: 
     except (TypeError, ValueError):
         numeric = 0.0
     return f"{_portfolio_currency_symbol(market)}{numeric:,.{digits}f}"
+
+
+def _render_private_portfolio_value(value: object) -> str:
+    """Render a portfolio value masked by default and revealable by the page toggle."""
+    safe_value = html.escape(str(value))
+    return (
+        "<span class='portfolio-private-value'>"
+        "<span class='portfolio-private-mask' aria-hidden='true'>*****</span>"
+        f"<span class='portfolio-private-actual'>{safe_value}</span>"
+        "</span>"
+    )
 
 
 def _redirect(message: str | None = None) -> RedirectResponse:
@@ -523,8 +488,6 @@ def portfolio_page(
     for row in watch_items:
         news_row = nlp_map.get(str(row.get("ticker") or "").strip().upper()) or {}
         row["news_text"] = news_row.get("summary_text") or ("暂无相关新闻摘要" if lang == "zh" else "No relevant news summary yet")
-    total_pnl = total_market_value - total_cost
-    total_pnl_pct = ((total_market_value / total_cost) - 1.0) * 100 if total_cost else 0.0
     option_html = "".join(
         f"<option value='{market}'>{label}</option>"
         for market, label, _ in MARKET_OPTIONS
@@ -622,9 +585,9 @@ def portfolio_page(
         f"<td>{html.escape(row.get('ticker') or '-')}</td>"
         f"<td title='{html.escape(row.get('name') or '-', quote=True)}'>{_compact_text(row.get('name') or row.get('ticker'), 18)}</td>"
         f"<td>{float(row.get('quantity') or 0.0):.0f}</td>"
-        f"<td>{float(row.get('price') or 0.0):.2f}</td>"
-        f"<td>{float(row.get('cost_basis') or 0.0):.2f}</td>"
-        f"<td>{float(row.get('realized_pnl') or 0.0):.2f} ({float(row.get('realized_pnl_pct') or 0.0):.1f}%)</td>"
+        f"<td>{_render_private_portfolio_value(format(float(row.get('price') or 0.0), '.2f'))}</td>"
+        f"<td>{_render_private_portfolio_value(format(float(row.get('cost_basis') or 0.0), '.2f'))}</td>"
+        f"<td>{_render_private_portfolio_value(format(float(row.get('realized_pnl') or 0.0), '.2f') + ' (' + format(float(row.get('realized_pnl_pct') or 0.0), '.1f') + '%)')}</td>"
         f"<td>{float(row.get('remaining_quantity') or 0.0):.0f}</td>"
         f"<td>{_render_trade_reason_cell(row)}</td>"
         "</tr>"
@@ -637,7 +600,7 @@ def portfolio_page(
     market_rankings_html = "".join(
         "<article style='display:flex;justify-content:space-between;gap:12px;padding:12px 0;border-top:1px solid var(--line);'>"
         f"<div><div style='font-weight:800'>{row['market']}</div><div class='muted'>{'市场暴露' if lang == 'zh' else 'Market exposure'}</div></div>"
-        f"<div style='text-align:right;'><div style='font-weight:700'>{row['weight_pct']:.1f}%</div><div class='muted'>{_format_portfolio_money(row.get('market_value'), market=row.get('market'))}</div></div>"
+        f"<div style='text-align:right;'><div style='font-weight:700'>{row['weight_pct']:.1f}%</div><div class='muted'>{_render_private_portfolio_value(_format_portfolio_money(row.get('market_value'), market=row.get('market')))}</div></div>"
         "</article>"
         for row in intelligence.get("market_rankings", [])
     ) or f"<div class='muted'>{'暂无市场暴露数据' if lang == 'zh' else 'No market exposure data yet'}</div>"
@@ -705,7 +668,7 @@ def portfolio_page(
     sector_rankings_html = "".join(
         "<article style='display:flex;justify-content:space-between;gap:12px;padding:12px 0;border-top:1px solid var(--line);'>"
         f"<div><div style='font-weight:800'>{row['sector']}</div><div class='muted'>{'市值暴露' if lang == 'zh' else 'Exposure'}</div></div>"
-        f"<div style='text-align:right;'><div style='font-weight:700'>{row['weight_pct']:.1f}%</div><div class='muted'>{row['market_value']:.2f}</div></div>"
+        f"<div style='text-align:right;'><div style='font-weight:700'>{row['weight_pct']:.1f}%</div><div class='muted'>{_render_private_portfolio_value(format(row['market_value'], '.2f'))}</div></div>"
         "</article>"
         for row in intelligence["sector_rankings"]
     ) or f"<div class='muted'>{'暂无行业暴露数据' if lang == 'zh' else 'No sector exposure data yet'}</div>"
@@ -745,8 +708,8 @@ def portfolio_page(
         (
             "<article style='border:1px solid var(--line);border-radius:16px;padding:12px 14px;background:rgba(15,24,35,0.58);'>"
             f"<div class='eyebrow'>{html.escape(_portfolio_market_label(market, lang=lang))}</div>"
-            f"<div style='font-size:22px;font-weight:900;margin-top:4px;'>{_format_portfolio_money(market_value_totals.get(market, 0.0), market=market)}</div>"
-            f"<div class='muted'>{'浮盈亏' if lang == 'zh' else 'PnL'} { _format_portfolio_money(market_pnl_totals.get(market, 0.0), market=market)}"
+            f"<div style='font-size:22px;font-weight:900;margin-top:4px;'>{_render_private_portfolio_value(_format_portfolio_money(market_value_totals.get(market, 0.0), market=market))}</div>"
+            f"<div class='muted'>{'浮盈亏' if lang == 'zh' else 'PnL'} {_render_private_portfolio_value(_format_portfolio_money(market_pnl_totals.get(market, 0.0), market=market))}"
             f" · { _portfolio_currency_label(market, lang=lang)}</div>"
             "</article>"
         )
@@ -828,7 +791,7 @@ def portfolio_page(
         f"<td>{row['sector']}</td>"
         f"<td>{row['signal_label']}</td>"
         f"<td>{_portfolio_risk_chip(row['risk_tag'])}</td>"
-        f"<td>{row['pnl_pct']:.1f}%</td>"
+        f"<td>{_render_private_portfolio_value(format(row['pnl_pct'], '.1f') + '%')}</td>"
         f"<td>{row['weight_pct']:.1f}%</td>"
         f"<td>{(format(row['target_weight_pct'], '.1f') + '%' if row.get('target_weight_pct') is not None else '-')}</td>"
         f"<td>{(format(row['rebalance_gap_pct'], '.1f') + '%' if row.get('rebalance_gap_pct') is not None else '-')}</td>"
@@ -845,7 +808,7 @@ def portfolio_page(
         f"<div class='mobile-position-grid'>"
         f"<div><span class='muted'>{'信号' if lang == 'zh' else 'Signal'}</span><div>{row['signal_label']}</div></div>"
         f"<div><span class='muted'>{'风险' if lang == 'zh' else 'Risk'}</span><div>{_portfolio_risk_chip(row['risk_tag'])}</div></div>"
-        f"<div><span class='muted'>PnL</span><div>{row['pnl_pct']:.1f}%</div></div>"
+        f"<div><span class='muted'>PnL</span><div>{_render_private_portfolio_value(format(row['pnl_pct'], '.1f') + '%')}</div></div>"
         f"<div><span class='muted'>{'仓位' if lang == 'zh' else 'Weight'}</span><div>{row['weight_pct']:.1f}%</div></div>"
         f"<div><span class='muted'>{'目标' if lang == 'zh' else 'Target'}</span><div>{(format(row['target_weight_pct'], '.1f') + '%' if row.get('target_weight_pct') is not None else '-')}</div></div>"
         f"<div><span class='muted'>{'偏离' if lang == 'zh' else 'Gap'}</span><div>{(format(row['rebalance_gap_pct'], '.1f') + '%' if row.get('rebalance_gap_pct') is not None else '-')}</div></div>"
@@ -868,11 +831,11 @@ def portfolio_page(
             f"<td title='{row['name']}'>{_compact_text(row['name'], 24)}</td>"
             f"<td>{row['market']}</td>"
             f"<td>{row['quantity']:.0f}</td>"
-            f"<td>{row['cost_basis']:.2f}</td>"
+            f"<td>{_render_private_portfolio_value(format(row['cost_basis'], '.2f'))}</td>"
             f"<td>{latest_price_text}</td>"
             f"<td>{_render_daily_change_chip(row.get('daily_change_pct'))}</td>"
-            f"<td>{_format_portfolio_money(row['market_value'], market=row.get('market'))}</td>"
-            f"<td>{pnl_text}</td>"
+            f"<td>{_render_private_portfolio_value(_format_portfolio_money(row['market_value'], market=row.get('market')))}</td>"
+            f"<td>{_render_private_portfolio_value(pnl_text)}</td>"
             f"<td>{row['ai_verdict']}</td>"
             f"<td title='{row['ai_headline']}'>{_compact_text(row['ai_headline'], 30)}</td>"
             f"<td title='{row['ai_strategy']}'>{_compact_text(row['ai_strategy'], 24)}</td>"
@@ -898,13 +861,13 @@ def portfolio_page(
         sell_price_text = "" if price_missing else f"{float(row.get('latest_price') or 0.0):.2f}"
         return (
             "<article class='mobile-position-card'>"
-            f"<div class='mobile-position-head'><div><div class='mobile-position-ticker'>{row['ticker']}</div><div class='muted'>{_compact_text(row['name'], 24)} · {row['market']}</div></div><div style='text-align:right;'><div style='font-weight:800;'>{pnl_value_text}</div><div class='muted'>{pnl_pct_text}</div></div></div>"
+            f"<div class='mobile-position-head'><div><div class='mobile-position-ticker'>{row['ticker']}</div><div class='muted'>{_compact_text(row['name'], 24)} · {row['market']}</div></div><div style='text-align:right;'><div style='font-weight:800;'>{_render_private_portfolio_value(pnl_value_text)}</div><div class='muted'>{_render_private_portfolio_value(pnl_pct_text)}</div></div></div>"
             f"<div class='mobile-position-grid'>"
             f"<div><span class='muted'>{'数量' if lang == 'zh' else 'Qty'}</span><div>{row['quantity']:.0f}</div></div>"
-            f"<div><span class='muted'>{'成本' if lang == 'zh' else 'Cost'}</span><div>{row['cost_basis']:.2f}</div></div>"
+            f"<div><span class='muted'>{'成本' if lang == 'zh' else 'Cost'}</span><div>{_render_private_portfolio_value(format(row['cost_basis'], '.2f'))}</div></div>"
             f"<div><span class='muted'>{'收盘价' if lang == 'zh' else 'Close'}</span><div>{latest_price_text}</div></div>"
             f"<div><span class='muted'>{'涨幅' if lang == 'zh' else 'Day %'}</span><div>{_render_daily_change_chip(row.get('daily_change_pct'))}</div></div>"
-            f"<div><span class='muted'>{'市值' if lang == 'zh' else 'Value'}</span><div>{_format_portfolio_money(row['market_value'], market=row.get('market'))}</div></div>"
+            f"<div><span class='muted'>{'市值' if lang == 'zh' else 'Value'}</span><div>{_render_private_portfolio_value(_format_portfolio_money(row['market_value'], market=row.get('market')))}</div></div>"
             f"<div><span class='muted'>AI</span><div>{row['ai_verdict']}</div></div>"
             f"<div><span class='muted'>{'动作桶' if lang == 'zh' else 'Bucket'}</span><div>{row['action_bucket']}</div></div>"
             "</div>"
@@ -936,7 +899,7 @@ def portfolio_page(
                 f"<div class='market-position-head'>"
                 f"<div><div class='eyebrow'>{_portfolio_market_label(market, lang=lang)}</div>"
                 f"<div class='muted'>{len(grouped_rows.get(market, []))} {'只持仓' if lang == 'zh' else 'positions'} · "
-                f"{_format_portfolio_money(sum(float(item.get('market_value') or 0.0) for item in grouped_rows.get(market, [])), market=market)} "
+                f"{_render_private_portfolio_value(_format_portfolio_money(sum(float(item.get('market_value') or 0.0) for item in grouped_rows.get(market, [])), market=market))} "
                 f"{'市值' if lang == 'zh' else 'value'} · {_portfolio_currency_label(market, lang=lang)}</div></div>"
                 f"</div>"
                 f"<div class='table-wrap positions-table-wrap'>"
@@ -1216,6 +1179,31 @@ def portfolio_page(
           .quote-value {{ font-size:14px; font-weight:800; }}
           .quote-value.positive {{ color:#4ade80; }}
           .quote-value.negative {{ color:#f87171; }}
+          .portfolio-private-value {{ display:inline-flex; align-items:center; min-height:1em; }}
+          .portfolio-private-mask {{ letter-spacing:0.08em; font-variant-numeric:tabular-nums; }}
+          .portfolio-private-actual {{ display:none; }}
+          #portfolio-private-values.portfolio-values-visible .portfolio-private-mask {{ display:none; }}
+          #portfolio-private-values.portfolio-values-visible .portfolio-private-actual {{ display:inline; }}
+          .portfolio-privacy-toggle {{
+            width:auto;
+            display:inline-flex;
+            align-items:center;
+            gap:7px;
+            margin-top:12px;
+            padding:8px 11px;
+            border:1px solid var(--line);
+            border-radius:999px;
+            background:#0f1823;
+            color:var(--ink);
+            font-size:12px;
+            line-height:1;
+          }}
+          .portfolio-privacy-toggle:hover {{ border-color:rgba(61,217,182,0.52); color:var(--accent); }}
+          .portfolio-privacy-toggle:focus-visible {{ outline:2px solid var(--accent); outline-offset:2px; }}
+          .portfolio-privacy-toggle svg {{ width:17px; height:17px; flex:0 0 auto; }}
+          .portfolio-privacy-toggle .privacy-eye-open {{ display:none; }}
+          .portfolio-privacy-toggle[aria-pressed="true"] .privacy-eye-open {{ display:block; }}
+          .portfolio-privacy-toggle[aria-pressed="true"] .privacy-eye-closed {{ display:none; }}
           .mobile-action-bucket {{ margin-top:10px; padding:10px 12px; border-radius:12px; background:rgba(61,217,182,0.10); border:1px solid rgba(61,217,182,0.18); color:var(--ink); font-weight:800; }}
           input, select, textarea {{ width:100%; padding:10px 12px; border-radius:12px; border:1px solid var(--line); background:#0f1823; color:var(--ink); }}
           button {{ padding:10px 14px; border:none; border-radius:12px; background:var(--accent); color:#fff; font-weight:700; cursor:pointer; }}
@@ -1256,8 +1244,8 @@ def portfolio_page(
               valueEl.textContent = "--";
               pnlEl.textContent = "--";
               pnlPctEl.textContent = "--";
-              pnlEl.className = "quote-value";
-              pnlPctEl.className = "quote-value";
+              pnlEl.className = "quote-value portfolio-private-actual";
+              pnlPctEl.className = "quote-value portfolio-private-actual";
               return;
             }}
 
@@ -1268,10 +1256,25 @@ def portfolio_page(
             pnlEl.textContent = formatPreviewNumber(pnl);
             pnlPctEl.textContent = pnlPct === null ? "--" : `${{formatPreviewNumber(pnlPct)}}%`;
 
-            const toneClass = pnl > 0 ? "quote-value positive" : (pnl < 0 ? "quote-value negative" : "quote-value");
-            const tonePctClass = pnlPct !== null && pnlPct > 0 ? "quote-value positive" : (pnlPct !== null && pnlPct < 0 ? "quote-value negative" : "quote-value");
+            const toneClass = pnl > 0 ? "quote-value positive portfolio-private-actual" : (pnl < 0 ? "quote-value negative portfolio-private-actual" : "quote-value portfolio-private-actual");
+            const tonePctClass = pnlPct !== null && pnlPct > 0 ? "quote-value positive portfolio-private-actual" : (pnlPct !== null && pnlPct < 0 ? "quote-value negative portfolio-private-actual" : "quote-value portfolio-private-actual");
             pnlEl.className = toneClass;
             pnlPctEl.className = tonePctClass;
+          }}
+
+          function initializePortfolioPrivacy() {{
+            const root = document.getElementById("portfolio-private-values");
+            const toggle = document.querySelector("[data-portfolio-privacy-toggle]");
+            if (!root || !toggle) return;
+            const label = toggle.querySelector("[data-portfolio-privacy-label]");
+            toggle.addEventListener("click", () => {{
+              const isVisible = root.classList.toggle("portfolio-values-visible");
+              const nextLabel = isVisible ? toggle.dataset.hideLabel : toggle.dataset.showLabel;
+              toggle.setAttribute("aria-pressed", String(isVisible));
+              toggle.setAttribute("aria-label", nextLabel);
+              toggle.setAttribute("title", nextLabel);
+              if (label) label.textContent = nextLabel;
+            }});
           }}
 
           function openSellModal(ticker, name, quantity, price) {{
@@ -1356,6 +1359,7 @@ def portfolio_page(
           }}
 
           window.addEventListener("DOMContentLoaded", () => {{
+            initializePortfolioPrivacy();
             const tickerInput = document.getElementById("portfolio-ticker");
             const marketSelect = document.getElementById("portfolio-market");
             const quantityInput = document.getElementById("portfolio-quantity");
@@ -1408,7 +1412,7 @@ def portfolio_page(
             <nav class="side-nav">{render_workspace_nav_html(lang=lang, active_key='portfolio')}</nav>
           </aside>
           <main class="content">
-        <div class="wrap">
+        <div id="portfolio-private-values" class="wrap">
           <div id="sell-modal" class="sell-modal" onclick="if (event.target === this) closeSellModal();">
             <div class="sell-modal-card">
               <div class="sell-modal-head">
@@ -1449,6 +1453,25 @@ def portfolio_page(
                 <div style="font-size:28px;font-weight:900;letter-spacing:-0.03em;">{'分市场统计' if lang == 'zh' else 'Market-separated totals'}</div>
                 <div class="muted">{'人民币和美元分别统计，不再混合成一个总市值。' if lang == 'zh' else 'CNY and USD values are shown separately instead of as one blended total.'}</div>
                 <div class="muted" style="margin-top:8px;">{'持仓' if lang == 'zh' else 'Positions'} {intelligence['total_positions']}</div>
+                <button
+                  type="button"
+                  class="portfolio-privacy-toggle"
+                  data-portfolio-privacy-toggle
+                  data-show-label="{'显示金额和盈亏' if lang == 'zh' else 'Show values and PnL'}"
+                  data-hide-label="{'隐藏金额和盈亏' if lang == 'zh' else 'Hide values and PnL'}"
+                  aria-controls="portfolio-private-values"
+                  aria-pressed="false"
+                  aria-label="{'显示金额和盈亏' if lang == 'zh' else 'Show values and PnL'}"
+                  title="{'显示金额和盈亏' if lang == 'zh' else 'Show values and PnL'}"
+                >
+                  <svg class="privacy-eye-closed" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M3 3l18 18"></path><path d="M10.6 10.7a2 2 0 0 0 2.7 2.7"></path><path d="M9.9 4.3A10.8 10.8 0 0 1 12 4c5 0 8.6 4.4 9.5 6.1a3.9 3.9 0 0 1 0 3.8 13.5 13.5 0 0 1-2.1 2.8"></path><path d="M6.6 6.6A13.1 13.1 0 0 0 2.5 10a3.9 3.9 0 0 0 0 3.8C3.4 15.6 7 20 12 20a10.6 10.6 0 0 0 4.3-.9"></path>
+                  </svg>
+                  <svg class="privacy-eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2.5 10.1a3.9 3.9 0 0 0 0 3.8C3.4 15.6 7 20 12 20s8.6-4.4 9.5-6.1a3.9 3.9 0 0 0 0-3.8C20.6 8.4 17 4 12 4S3.4 8.4 2.5 10.1Z"></path><circle cx="12" cy="12" r="3"></circle>
+                  </svg>
+                  <span data-portfolio-privacy-label>{'显示金额和盈亏' if lang == 'zh' else 'Show values and PnL'}</span>
+                </button>
               </div>
               <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;flex:1;min-width:min(100%,760px);">
                 {market_value_summary_html}
@@ -1464,7 +1487,7 @@ def portfolio_page(
                   <div class="eyebrow">{'最大单票' if lang == 'zh' else 'Largest Position'}</div>
                   <div style="margin-top:6px;font-size:20px;font-weight:900;">{float(top_position.get('weight_pct') or 0.0):.1f}%</div>
                   <div class="muted">{top_position_label}</div>
-                  <div class="muted" style="margin-top:8px;">{'单票市值' if lang == 'zh' else 'Position value'} {_format_portfolio_money(float(top_position.get('market_value') or 0.0), market=top_position_market)}</div>
+                  <div class="muted" style="margin-top:8px;">{'单票市值' if lang == 'zh' else 'Position value'} {_render_private_portfolio_value(_format_portfolio_money(float(top_position.get('market_value') or 0.0), market=top_position_market))}</div>
                 </article>
                 <article style="border:1px solid var(--line);border-radius:16px;padding:14px 15px;background:rgba(15,24,35,0.58);">
                   <div class="eyebrow">{'市场暴露' if lang == 'zh' else 'Market Exposure'}</div>
@@ -1533,9 +1556,9 @@ def portfolio_page(
                 <div class="muted">{"输入代码、成本价和股数后，会根据本地最新收盘价即时试算。" if lang == "zh" else "Enter a ticker, cost basis, and quantity to preview value and unrealized PnL from the latest local close."}</div>
                 <div class="quote-grid">
                   <div class="quote-cell"><div class="quote-label">{"收盘价" if lang == "zh" else "Close"}</div><div id="portfolio-latest-close" class="quote-value">--</div></div>
-                  <div class="quote-cell"><div class="quote-label">{"预估市值" if lang == "zh" else "Estimated Value"}</div><div id="portfolio-est-value" class="quote-value">--</div></div>
-                  <div class="quote-cell"><div class="quote-label">{"浮盈亏" if lang == "zh" else "Unrealized PnL"}</div><div id="portfolio-est-pnl" class="quote-value">--</div></div>
-                  <div class="quote-cell"><div class="quote-label">{"浮盈亏%" if lang == "zh" else "Unrealized PnL %"}</div><div id="portfolio-est-pnl-pct" class="quote-value">--</div></div>
+                  <div class="quote-cell"><div class="quote-label">{"预估市值" if lang == "zh" else "Estimated Value"}</div><div class="portfolio-private-value"><span class="portfolio-private-mask" aria-hidden="true">*****</span><span id="portfolio-est-value" class="quote-value portfolio-private-actual">--</span></div></div>
+                  <div class="quote-cell"><div class="quote-label">{"浮盈亏" if lang == "zh" else "Unrealized PnL"}</div><div class="portfolio-private-value"><span class="portfolio-private-mask" aria-hidden="true">*****</span><span id="portfolio-est-pnl" class="quote-value portfolio-private-actual">--</span></div></div>
+                  <div class="quote-cell"><div class="quote-label">{"浮盈亏%" if lang == "zh" else "Unrealized PnL %"}</div><div class="portfolio-private-value"><span class="portfolio-private-mask" aria-hidden="true">*****</span><span id="portfolio-est-pnl-pct" class="quote-value portfolio-private-actual">--</span></div></div>
                 </div>
               </div>
               <div class="stack" style="margin-top:12px;">
@@ -1585,7 +1608,7 @@ def portfolio_page(
           </section>
           <section class="card">
             <div class="eyebrow">{'卖出记录' if lang == 'zh' else 'Sell Records'}</div>
-            <div class="muted">{('已实现盈亏合计: ' + f'{realized_total:.2f}') if lang == 'zh' else ('Total realized PnL: ' + f'{realized_total:.2f}')}</div>
+            <div class="muted">{'已实现盈亏合计: ' if lang == 'zh' else 'Total realized PnL: '}{_render_private_portfolio_value(format(realized_total, '.2f'))}</div>
             <div class="muted" style="margin-top:8px;">{'下方可直接修正历史卖出原因；标黄的记录仍待补录，会影响每周复盘里的建议有效性统计。' if lang == 'zh' else 'You can correct historical sell reasons below. Highlighted rows still need review and will weaken the advice-effectiveness section in weekly review.'}</div>
             {sell_reason_progress_html}
             <div class="table-wrap" style="margin-top:12px;">

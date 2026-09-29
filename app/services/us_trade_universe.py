@@ -5,7 +5,11 @@ from dataclasses import dataclass
 
 from app.core.config import get_settings
 from app.core.db import SessionLocal
-from app.services.market_lake import load_lake_latest_metrics, list_lake_symbols
+from app.services.market_lake import (
+    get_latest_lake_trade_date,
+    load_lake_latest_metrics,
+    list_lake_symbols,
+)
 from app.services.repository import SymbolRepository
 
 
@@ -108,6 +112,7 @@ def build_us_trade_universe(
     *,
     tickers: list[str] | set[str] | tuple[str, ...] | None = None,
     config: USTradeUniverseConfig | None = None,
+    expected_as_of_date: str | None = None,
     include_summary: bool = False,
 ) -> list[str] | tuple[list[str], dict]:
     cfg = config or default_us_trade_universe_config()
@@ -119,6 +124,15 @@ def build_us_trade_universe(
     with SessionLocal() as db:
         overview_map = SymbolRepository(db).list_overviews_for_tickers(source_tickers)
     metrics_map = load_lake_latest_metrics(market="US", tickers=source_tickers, lookback_days=cfg.lookback_days)
+
+    # ``list_lake_symbols`` is intentionally a historical union.  Without an
+    # explicit as-of check, delisted/renamed symbols that disappeared months
+    # ago remain in every future production training universe.  The latest
+    # materialized market partition is the authoritative cohort for this
+    # post-close run.
+    target_trade_date = str(
+        expected_as_of_date or get_latest_lake_trade_date(market="US") or ""
+    ).strip()[:10]
 
     eligible: list[str] = []
     rejected_reasons: dict[str, int] = {}
@@ -146,6 +160,7 @@ def build_us_trade_universe(
             continue
         metrics = metrics_map.get(ticker) or {}
         try:
+            latest_trade_date = str(metrics.get("latest_trade_date") or "").strip()[:10]
             latest_close = float(metrics.get("latest_close") or 0.0)
             avg_volume = float(metrics.get("avg_volume") or 0.0)
             avg_dollar_volume = float(metrics.get("avg_dollar_volume") or 0.0)
@@ -153,6 +168,9 @@ def build_us_trade_universe(
             duplicate_conflict_days = int(metrics.get("duplicate_conflict_days") or 0)
         except (TypeError, ValueError):
             reject(ticker, "invalid_lake_metrics")
+            continue
+        if target_trade_date and latest_trade_date < target_trade_date:
+            reject(ticker, "stale_lake_symbol")
             continue
         if duplicate_conflict_days > 0:
             reject(ticker, "duplicate_price_conflict")
@@ -183,6 +201,7 @@ def build_us_trade_universe(
             "min_avg_volume": cfg.min_avg_volume,
             "min_history_days": cfg.min_history_days,
             "lookback_days": cfg.lookback_days,
+            "required_latest_trade_date": target_trade_date or None,
         },
     }
     return (eligible, summary) if include_summary else eligible
