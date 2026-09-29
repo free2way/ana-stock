@@ -28,6 +28,12 @@ Built for deliberate post-close analysis—not high-frequency execution or autom
 | :--- | :--- | :--- |
 | Explore model-ranked candidates and market context. | Inspect evaluations, data quality, and research history. | Review holdings, job status, and daily summaries together. |
 
+## Interface preview
+
+![ANA screener: market selection, research overview, and strategy playbooks](assets/readme/screener-en.png)
+
+*Actual application screenshot of the initial screener view, before running a screen. No stock tickers or private holdings are displayed.*
+
 ## What you can do
 
 - **Follow two markets.** Separate A-share and U.S. refresh workflows and market-quality checks.
