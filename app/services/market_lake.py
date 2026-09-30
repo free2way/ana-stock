@@ -13,18 +13,24 @@ from app.core.config import get_settings
 from app.services.market_freshness import latest_completed_market_date
 
 
-LAKE_OHLCV_COLUMNS = [
-    "date",
-    "symbol",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-    "adj_close",
-    "dividend",
-    "split_ratio",
-]
+# Explicit per-column dtypes for lake partitions. The `date` column MUST stay
+# pl.String: partitions are written independently, so an inferred Date column in
+# one partition breaks schema-unifying readers (polars glob scans) even though
+# DuckDB's CAST(date AS DATE) tolerates both. Never let this be inferred.
+LAKE_OHLCV_SCHEMA: dict[str, pl.DataType] = {
+    "date": pl.String,
+    "symbol": pl.String,
+    "open": pl.Float64,
+    "high": pl.Float64,
+    "low": pl.Float64,
+    "close": pl.Float64,
+    "volume": pl.Float64,
+    "adj_close": pl.Float64,
+    "dividend": pl.Float64,
+    "split_ratio": pl.Float64,
+}
+
+LAKE_OHLCV_COLUMNS = list(LAKE_OHLCV_SCHEMA)
 
 LAKE_PARQUET_CHUNK_SIZE = 48
 LAKE_DUCKDB_MAX_CONCURRENT_READS = 2
@@ -72,7 +78,7 @@ def write_daily_ohlcv_parquet(*, market: str, trade_date: str, rows: list[dict],
     path = market_lake_root() / f"{market_code}_daily" / f"date={normalized_trade_date}" / "part.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
     normalized_rows = [_normalize_ohlcv_row(row, trade_date=trade_date) for row in rows]
-    incoming = pl.DataFrame(normalized_rows, schema=LAKE_OHLCV_COLUMNS, orient="row")
+    incoming = pl.DataFrame(normalized_rows, schema=LAKE_OHLCV_SCHEMA, orient="row")
     with _lake_write_lock(path):
         frame = incoming
         if merge_existing and path.exists():
@@ -81,6 +87,9 @@ def write_daily_ohlcv_parquet(*, market: str, trade_date: str, rows: list[dict],
             existing = pl.read_parquet(path)
             frame = pl.concat([existing, incoming], how="vertical_relaxed")
         frame = frame.unique(subset=["date", "symbol"], keep="last").sort(["date", "symbol"])
+        # vertical_relaxed merge with a legacy partition could still yield a
+        # non-String supertype; enforce the schema invariant before writing.
+        frame = frame.cast(LAKE_OHLCV_SCHEMA)
         temporary_path = path.with_name(f".{path.name}.tmp")
         frame.write_parquet(temporary_path, compression="zstd")
         temporary_path.replace(path)
