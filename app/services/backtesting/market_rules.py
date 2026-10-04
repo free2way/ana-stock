@@ -7,7 +7,7 @@ def cn_price_limit_pct(ticker: str, *, is_st: bool = False) -> float:
     code = str(ticker or "").split(".", 1)[0]
     if str(ticker or "").upper().endswith(".BJ"):
         return 0.30
-    if code.startswith(("300", "301", "688")):
+    if code.startswith(("300", "301", "302", "688", "689")):
         return 0.20
     if is_st:
         return 0.05

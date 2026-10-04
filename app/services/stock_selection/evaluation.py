@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Iterable, Mapping, Protocol
 
+from app.services.statistical_inference import significance_report
 from app.services.stock_selection.factor_pipeline import FactorScore, _percentile_ranks
 
 
@@ -94,6 +95,7 @@ class CrossSectionalEvaluationReport:
     overall_label_component_means: Mapping[str, float]
     label_component_coverage: Mapping[str, float]
     turnover_definition: str = "0.5 * sum(abs(equal_weight_t - equal_weight_t_minus_1))"
+    significance: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,6 +418,11 @@ def evaluate_cross_sectional_predictions(
     if ic_mean is not None and ic_std is not None:
         half_width = 1.96 * ic_std / math.sqrt(len(daily_ics))
         ic_ci = (ic_mean - half_width, ic_mean + half_width)
+    ic_significance = (
+        significance_report(daily_ics, horizon_days=next(iter(horizons)))
+        if len(daily_ics) >= 2
+        else None
+    )
     component_counts: Counter[str] = Counter(
         name for row in rows for name in row.label_components
     )
@@ -431,6 +438,7 @@ def evaluate_cross_sectional_predictions(
         rank_ic_std=ic_std,
         rank_ic_ir=(ic_mean / ic_std) if ic_mean is not None and ic_std not in {None, 0.0} else None,
         rank_ic_ci95=ic_ci,
+        significance=ic_significance,
         quantile_mean_labels=quantile_means,
         quantile_monotonicity=(sum(value >= 0 for value in adjacent) / len(adjacent)) if adjacent else None,
         top_minus_bottom_mean=_mean_or_none(daily_spreads),

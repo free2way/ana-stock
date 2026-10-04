@@ -82,6 +82,17 @@ class ExecutionReconciliationTests(TestCase):
         rows[1]['suspended'] = False; rows[1]['upper_limit'] = 100
         self.assertEqual('limit_up_at_entry', self.replay(rows=rows)['reason'])
 
+    def test_optional_suspension_and_cn_bounds_do_not_block_v2(self):
+        rows = golden_rows()
+        for row in rows:
+            row.pop('suspended')
+            row.pop('upper_limit')
+            row.pop('lower_limit')
+        result = self.replay(rows=rows)
+        self.assertEqual('CLOSED', result['status'])
+        self.assertEqual('raw_price_volume_company_action_v2', result['evidence_policy'])
+        self.assertTrue(result['optional_evidence_gaps'])
+
     def test_missing_open_never_falls_back_to_close(self):
         rows = golden_rows(); del rows[1]['open']
         for market in ('CN', 'US'):

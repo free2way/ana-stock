@@ -391,7 +391,7 @@ class USMarketSchedulerService:
             legacy_backtest_status = "success"
             legacy_backtest_message = None
             try:
-                daily_rows_written = runner.run(top_n=5)
+                daily_rows_written = runner.run(top_n=5, engine_version="event_driven_daily_v2")
             except RuntimeError as exc:
                 # The legacy strategy backtest is a secondary compatibility
                 # output.  It can legitimately have no tradable forward rows

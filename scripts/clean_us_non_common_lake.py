@@ -1,7 +1,18 @@
+"""Drop known US non-common securities from the canonical v1 US daily lake.
+
+Every rewritten v1 partition is mirrored into the provenance shadow
+(``data/lake/_lake_v2``) as ``provider=manual_repair`` / ``price_basis=raw`` so
+the manual repair cannot silently drift from the fail-closed v2 store.
+
+Operational note: after this repair completes, run
+``python scripts/verify_lake_manifest.py --check``; if it reports drift,
+rebaseline with ``python scripts/verify_lake_manifest.py --write``.
+"""
+
 from __future__ import annotations
 
 from app.core.db import SessionLocal
-from app.services.market_lake import market_lake_root
+from app.services.market_lake import market_lake_root, write_lake_v2_partition
 from app.services.repository import SymbolRepository
 from app.services.us_trade_universe import is_known_us_non_common_security
 
@@ -55,6 +66,23 @@ def main() -> None:
         rows_after += after
         if after != before:
             filtered.write_parquet(path, compression="zstd")
+            trade_date = path.parent.name.split("=", 1)[-1]
+            # Rebuild the v2 provenance shadow for the rewritten partition so the
+            # two stores stay in lockstep. Rows carry their own provenance; the
+            # manual-repair source is recorded explicitly.
+            write_lake_v2_partition(
+                market="US",
+                trade_date=trade_date,
+                rows=[
+                    {
+                        **row,
+                        "provider": "manual_repair",
+                        "source_reference": f"clean_us_non_common_lake.py:US:{trade_date}",
+                        "price_basis": "raw",
+                    }
+                    for row in filtered.to_dicts()
+                ],
+            )
             files_touched += 1
             rows_removed += before - after
     print(

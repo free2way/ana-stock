@@ -1,0 +1,192 @@
+
+    <!DOCTYPE html>
+    <html lang="{{ lang }}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{{ labels.continuous_detail }}</title>
+        <style>{{ style }}</style>
+      </head>
+      <body>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{{ labels.continuous_leaders }}</h1>
+              <p>{{ t(lang, '查看最近几次模型快照里持续入选、持续走强的股票，并快速加入自选。', 'Review names that keep recurring across recent model snapshots and move them into the watchlist quickly.') }}</p>
+            </div>
+            <nav class="side-nav">{{ nav_html }}</nav>
+            <div class="sidebar-foot">{{ t(lang, '这页聚焦连续入选和持续走强的股票，适合做盘前优先级排序。', 'This page focuses on names that keep recurring and staying strong, useful for pre-market prioritization.') }}</div>
+          </aside>
+          <main class="content">
+        <div class="wrap">
+          <div class="toolbar">
+            <a href="/dashboard?lang={{ lang }}" class="pill">← {{ labels.back_to_dashboard }}</a>
+            <a href="/watchlist?lang={{ lang }}" class="pill">{{ t(lang, '观察池', 'Watchlist') }}</a>
+            <a href="/dashboard/market?lang={{ lang }}&lookback_runs={{ lookback_runs }}" class="pill">{{ t(lang, '市场概览', 'Market Overview') }}</a>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:12px;">{% for link in language_links %}<a href="{{ link.href }}" class="compare-pill{{ ' active' if link.active else '' }}">{{ labels['lang_' + link.lang] }}</a>{% endfor %}</div>
+          </div>
+          <div class="card">
+            <div class="eyebrow">{{ labels.continuous_leaders }}</div>
+            <h1>{{ labels.continuous_detail }}</h1>
+            <div class="muted">{{ labels.continuous_subtitle }}</div>
+          </div>
+          <section class="card">
+            <div class="eyebrow">Snapshot Window</div>
+            <div class="compare-row">{{ lookback_html }}</div>
+          </section>
+          <section class="card">
+            <form action="/dashboard/continuous-leaders" method="get" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));align-items:end;">
+              <input type="hidden" name="lang" value="{{ lang }}" />
+              <input type="hidden" name="lookback_runs" value="{{ lookback_runs }}" />
+              <input type="hidden" name="continuous_sort_by" value="{{ continuous_sort_by }}" />
+              <input type="hidden" name="continuous_sort_order" value="{{ continuous_sort_order }}" />
+              <div>
+                <label class="muted" style="display:block;margin-bottom:6px;">{{ labels.market_filter }}</label>
+                <select name="continuous_market">
+                  <option value="ALL" {{ 'selected' if continuous_market == 'ALL' else '' }}>All</option>
+                  <option value="CN" {{ 'selected' if continuous_market == 'CN' else '' }}>CN</option>
+                  <option value="HK" {{ 'selected' if continuous_market == 'HK' else '' }}>HK</option>
+                  <option value="US" {{ 'selected' if continuous_market == 'US' else '' }}>US</option>
+                </select>
+              </div>
+              <div>
+                <label class="muted" style="display:block;margin-bottom:6px;">{{ labels.state_filter }}</label>
+                <select name="continuous_state">
+                  <option value="ALL" {{ 'selected' if continuous_state == 'ALL' else '' }}>All</option>
+                  <option value="READY" {{ 'selected' if continuous_state == 'READY' else '' }}>Ready</option>
+                  <option value="WAITING" {{ 'selected' if continuous_state == 'WAITING' else '' }}>Waiting</option>
+                  <option value="OFF" {{ 'selected' if continuous_state == 'OFF' else '' }}>Off</option>
+                </select>
+              </div>
+              <div>
+                <label class="muted" style="display:block;margin-bottom:6px;">{{ 'Signal' if lang == 'en' else '信号' }}</label>
+                <select name="continuous_signal">
+                  {% for value, label in (('ALL', 'All Signals' if lang == 'en' else '全部信号'), ('BUY', 'Buy' if lang == 'en' else '买点'), ('WATCH', 'Watch' if lang == 'en' else '观察'), ('SELL', 'Sell' if lang == 'en' else '卖点'), ('HOLD', 'Hold' if lang == 'en' else '持有')) %}<option value="{{ value }}" {{ 'selected' if continuous_signal == value else '' }}>{{ label }}</option>{% endfor %}
+                </select>
+              </div>
+              <div>
+                <label class="muted" style="display:block;margin-bottom:6px;">{{ 'Min Strength' if lang == 'en' else '最低强度' }}</label>
+                <input type="number" name="min_signal_strength" min="0" max="100" step="1" value="{{ min_signal_strength }}" />
+              </div>
+              <div>
+                <label class="muted" style="display:block;margin-bottom:6px;">{{ 'Execution Tag' if lang == 'en' else '执行提醒标签' }}</label>
+                <input type="text" name="execution_tag_filter" list="execution-tag-options" value="{{ execution_tag_filter if execution_tag_filter.upper() != 'ALL' else '' }}" placeholder="gap-risk, earnings-soon" />
+              </div>
+              <div>
+                <label class="muted" style="display:block;margin-bottom:6px;">{{ 'Exclude Tag' if lang == 'en' else '排除标签' }}</label>
+                <input type="text" name="exclude_execution_tag_filter" list="execution-tag-options" value="{{ exclude_execution_tag_filter if exclude_execution_tag_filter.upper() != 'ALL' else '' }}" placeholder="gap-risk, earnings-soon" />
+              </div>
+              <div style="grid-column:1 / -1;">
+                <div class="muted" style="margin-bottom:6px;">{{ 'Quick Tags' if lang == 'en' else '快捷标签' }}</div>
+                <div style="display:flex;flex-wrap:wrap;gap:8px;">
+                  <button type="button" onclick="appendExecutionTag('/dashboard/continuous-leaders', 'execution_tag_filter', 'gap-risk')">gap-risk</button>
+                  <button type="button" onclick="appendExecutionTag('/dashboard/continuous-leaders', 'execution_tag_filter', 'earnings-soon')">earnings-soon</button>
+                  <button type="button" onclick="appendExecutionTag('/dashboard/continuous-leaders', 'execution_tag_filter', 'thin-liquidity')">thin-liquidity</button>
+                  <button type="button" onclick="appendExecutionTag('/dashboard/continuous-leaders', 'exclude_execution_tag_filter', 'gap-risk')">{{ 'exclude gap-risk' if lang == 'en' else '排除 gap-risk' }}</button>
+                  <button type="button" onclick="clearExecutionTags('/dashboard/continuous-leaders')">{{ 'Clear Tags' if lang == 'en' else '清空标签' }}</button>
+                </div>
+              </div>
+              <datalist id="execution-tag-options">
+                <option value="gap-risk"></option>
+                <option value="earnings-soon"></option>
+                <option value="thin-liquidity"></option>
+              </datalist>
+              <button type="submit">{{ labels.apply_filters }}</button>
+            </form>
+          </section>
+          <section class="card">
+            <div class="eyebrow">{{ labels.risk_overview }}</div>
+            <div class="grid">
+              <article class="card" style="margin:0;background:#f9f7f0;">
+                <div class="eyebrow">{{ labels.tagged_names }}</div>
+                <div class="metric">{{ view.tagged_names }}</div>
+                <div class="muted">{{ labels.risk_examples }}</div>
+              </article>
+              <article class="card" style="margin:0;background:#f9f7f0;">
+                <div class="eyebrow">{{ labels.common_risks }}</div>
+                <div class="compare-row" style="margin-bottom:8px;">{% for tag, count in view.risk_top_tags %}<span class="compare-pill">{{ tag }} · {{ count }}</span>{% else %}<span class="muted">{{ labels.no_execution_risks }}</span>{% endfor %}</div>
+                <div class="muted">{{ labels.risk_examples }}: {% for item in view.risk_examples %}{% if not loop.first %} · {% endif %}{{ item.ticker }} ({{ ' / '.join(item.tags) }}){% else %}-{% endfor %}</div>
+              </article>
+            </div>
+          </section>
+          <section class="card">
+            <form action="/dashboard/continuous-leaders/export" method="get" style="display:flex;justify-content:flex-end;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
+              <input type="hidden" name="lang" value="{{ lang }}" />
+              <input type="hidden" name="lookback_runs" value="{{ lookback_runs }}" />
+              <input type="hidden" name="continuous_sort_by" value="{{ continuous_sort_by }}" />
+              <input type="hidden" name="continuous_sort_order" value="{{ continuous_sort_order }}" />
+              <input type="hidden" name="continuous_market" value="{{ continuous_market }}" />
+              <input type="hidden" name="continuous_state" value="{{ continuous_state }}" />
+              <input type="hidden" name="continuous_signal" value="{{ continuous_signal }}" />
+              <input type="hidden" name="min_signal_strength" value="{{ min_signal_strength }}" />
+              <input type="hidden" name="execution_tag_filter" value="{{ execution_tag_filter }}" />
+              <input type="hidden" name="exclude_execution_tag_filter" value="{{ exclude_execution_tag_filter }}" />
+              <button type="submit">Export CSV</button>
+            </form>
+            <form action="/dashboard/continuous-leaders/watchlist-top" method="post" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));align-items:end;margin-bottom:16px;">
+              <input type="hidden" name="tickers_csv" value="{{ tickers_csv }}" />
+              <input type="hidden" name="lookback_runs" value="{{ lookback_runs }}" />
+              <div>
+                <label class="muted" style="display:block;margin-bottom:6px;">Top N</label>
+                <input type="number" name="top_n" min="1" max="{{ max_top_n }}" value="{{ top_n }}" />
+              </div>
+              <label class="checkbox-row">
+                <input type="checkbox" name="auto_enable_sync" value="1" />
+                {{ labels.auto_enable_sync }}
+              </label>
+              <label class="checkbox-row">
+                <input type="checkbox" name="sync_after_add" value="1" />
+                {{ labels.sync_selected_top_n }}
+              </label>
+              <button type="submit">{{ labels.add_top_n }}</button>
+            </form>
+            <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th><a href="{{ sort_link('ticker') }}">{{ labels.ticker }}</a></th>
+                  <th>{{ labels.name }}</th>
+                  <th>{{ labels.market_filter }}</th>
+                  <th><a href="{{ sort_link('hits') }}">{{ labels.hits }}</a></th>
+                  <th><a href="{{ sort_link('score') }}">{{ labels.model_score }}</a></th>
+                  <th><a href="{{ sort_link('signal') }}">Signal</a></th>
+                  <th><a href="{{ sort_link('trend') }}">{{ labels.trend }}</a></th>
+                  <th>{{ labels.last }}</th>
+                  <th>{{ labels.watchlist }}</th>
+                  <th>{{ labels.actions }}</th>
+                </tr>
+              </thead>
+              <tbody>{% include 'dashboard/components/continuous_leader_rows.html' %}</tbody>
+            </table>
+            </div>
+          </section>
+        </div>
+          </main>
+        </div>
+        <script>
+          function appendExecutionTag(formAction, inputName, tag) {
+            const form = document.querySelector(`form[action="${formAction}"]`);
+            if (!form) return;
+            const input = form.querySelector(`input[name="${inputName}"]`);
+            if (!input) return;
+            const values = input.value.split(",").map((item) => item.trim()).filter(Boolean);
+            if (!values.includes(tag)) {
+              values.push(tag);
+            }
+            input.value = values.join(", ");
+            input.focus();
+          }
+
+          function clearExecutionTags(formAction) {
+            const form = document.querySelector(`form[action="${formAction}"]`);
+            if (!form) return;
+            const includeInput = form.querySelector('input[name="execution_tag_filter"]');
+            const excludeInput = form.querySelector('input[name="exclude_execution_tag_filter"]');
+            if (includeInput) includeInput.value = "";
+            if (excludeInput) excludeInput.value = "";
+            if (includeInput) includeInput.focus();
+          }
+        </script>
+      </body>
+    </html>

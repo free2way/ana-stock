@@ -1,0 +1,271 @@
+
+    <!DOCTYPE html>
+    <html lang="{{ (lang) }}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{{ (t(lang, '模型评测总览', 'Model Evaluation Overview')) }}</title>
+        <style>{{ (MARKET_LABEL_STYLE) }}</style>
+      </head>
+      <body>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{{ (t(lang, '模型评测总览', 'Model Evaluation Overview')) }}</h1>
+              <p>{{ (t(lang, '先看模型近期表现、动作评测和长期分层，再决定这套模型现在值不值得继续信。', 'Review recent model performance, action-level evaluation, and long-horizon slices before deciding how much trust the model deserves.')) }}</p>
+            </div>
+            <nav class="side-nav">{{ (nav_html) }}</nav>
+          </aside>
+          <main class="main">
+            <div class="wrap">
+              <div class="toolbar">
+                <a class="pill" href="/dashboard?lang={{ (lang) }}">← {{ (t(lang, '返回首页', 'Back to Dashboard')) }}</a>
+                <a class="pill" href="/dashboard/ops?lang={{ (lang) }}">{{ (t(lang, '任务中心', 'Ops')) }}</a>
+                <a class="pill" href="/dashboard/model-performance/winner-traceback?lang={{ (lang) }}&market={{ (market) }}">{{ (t(lang, '强票反向归因', 'Winner Traceback')) }}</a>
+              </div>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '模型闭环', 'Model Loop')) }}</div>
+                <h2>{{ (selected_title) }}</h2>
+                <div class="muted">{{ (selected_subtitle) }}</div>
+                <form method="get" action="/dashboard/model-performance">
+                  <input type="hidden" name="lang" value="{{ (lang) }}" />
+                  <div class="filters">
+                    <div><label>{{ (t(lang, '模型 run', 'Model run')) }}</label><select name="run_id">{{ (run_options_html) }}</select></div>
+                    <div><label>{{ (t(lang, '市场', 'Market')) }}</label><select name="market">{{ (market_options_html) }}</select></div>
+                    <div><label>{{ (t(lang, '每日取前 N 名', 'Top N per day')) }}</label><input type="number" name="top_n" min="1" max="50" value="{{ (int(top_n)) }}" /></div>
+                    <div><label>{{ (t(lang, '回看交易日数', 'Trade dates window')) }}</label><input type="number" name="max_trade_dates" min="5" max="120" value="{{ (int(max_trade_dates)) }}" /></div>
+                  </div>
+                  <div style='margin-top:14px;'><button type="submit">{{ (t(lang, '更新统计', 'Refresh Stats')) }}</button></div>
+                </form>
+                <div class="metric-grid">{{ summary_cards_html }}</div>
+                {{ (training_diagnostic_html) }}
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '总览摘要', 'Overview Brief')) }}</div>
+                <div class="muted">{{ (t(lang, '先回答三个问题：现在更值得看哪个模板、哪个市场更有参考价值、以及当前应把这块当观察面板还是比较面板。', 'Answer three questions first: which template is more worth watching, which market is more informative, and whether this should be treated as an observation panel or a comparison panel right now.')) }}</div>
+                {{ (overview_cards_html) }}
+                <div style="margin-top:14px;">
+                  <div class="muted" style="margin-bottom:8px;">{{ (t(lang, '常见阻断原因反查：直接跳回模型选股，看同类票为什么被拦。', 'Common block reasons: jump back into screeners to inspect why similar names were gated.')) }}</div>
+                  <div class="toolbar">{{ (reason_jump_html) }}</div>
+                </div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '结构化样本外评测', 'Structured OOS Evaluation')) }}</div>
+                <div class="muted">{{ (t(lang, '结果按模型版本落库，5D 指标已扣除往返成本；主表只展示严格滚动样本外结果，并按预测当日的市场状态拆分。未满 20 个交易日或样本不足的模型只能观察，不能自动升级。', 'Results are persisted per model version. The table shows strict walk-forward out-of-sample results only, split by the market state recorded on the prediction date. Models with fewer than 20 covered sessions or insufficient samples remain observation-only and cannot auto-promote.')) }}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '模型版本', 'Model version')) }}</th><th>{{ (t(lang, '市场', 'Market')) }}</th><th>{{ (t(lang, '样本日期', 'Sample dates')) }}</th><th>{{ (t(lang, '严格 OOS 样本', 'Strict OOS samples')) }}</th><th>5D {{ (t(lang, '命中率', 'Hit rate')) }}</th><th>5D {{ (t(lang, '净收益', 'Net return')) }}</th><th>5D {{ (t(lang, '最大回撤', 'Max drawdown')) }}</th><th>{{ (t(lang, '成本', 'Cost')) }}</th><th>{{ (t(lang, '启用状态', 'Activation')) }}</th></tr></thead>
+                  <tbody>{{ (structured_evaluation_rows_html) }}</tbody>
+                </table></div>
+                <div style="margin-top:12px;"><a class="pill" href="/dashboard/ops?lang={{ (lang) }}">{{ (t(lang, '到任务中心运行/查看详情', 'Run or inspect it in Ops')) }}</a></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ ('今日使用建议' if lang == 'zh' else "Today's Usage Guidance") }}</div>
+                <div class="muted">{{ (t(lang, '先按这里决定今天打开哪套模型、哪套组合、偏回踩还是突破，以及哪些模型不要单独依赖。', 'Use this first to decide which model, combo, and playbook bias to start from, plus which models should not be used alone.')) }}</div>
+                {{ (guidance_ui['decision_cards_html']) }}
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '选股指导 · 模型命中归因', 'Selection Guidance · Model Attribution')) }}</div>
+                <div class="muted">{{ (t(lang, '这块不是看模型能筛出多少股票，而是反过来看近期真正大涨的股票，前一天到底被哪些模型或模型组合提前命中。用它来决定明天优先打开哪套模型/共振模板。', 'This does not reward models for producing many names. It traces recent strong movers back to the prior session and checks which models or confluence presets caught them before the move.')) }}</div>
+                {{ (guidance_ui['cards_html']) }}
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '模型 / 动作', 'Model / Playbook')) }}</th><th>{{ (t(lang, '样本', 'Samples')) }}</th><th>1D</th><th>3D</th><th>{{ (t(lang, '强票覆盖', 'Winner Capture')) }}</th><th>{{ (t(lang, '评分', 'Score')) }}</th></tr></thead>
+                  <tbody>{{ (guidance_ui['rows_html']) }}</tbody>
+                </table></div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '建议组合', 'Suggested Combo')) }}</th><th>{{ (t(lang, '动作约束', 'Action Gate')) }}</th><th>1D</th><th>3D</th><th>5D</th><th>10D</th><th>{{ (t(lang, '强票覆盖', 'Winner Capture')) }}</th></tr></thead>
+                  <tbody>{{ (guidance_ui['combo_rows_html']) }}</tbody>
+                </table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '推荐结果历史验证', 'Recommendation Validation')) }}</div>
+                <div class="muted">{{ (t(lang, '把今天优先模型、优先组合和 AI 日报 Top 5 放到同一张表里，看它们最近 1/3/5/10 日到底准不准。这样模型使用指导就不只告诉你“今天看什么”，也会告诉你“最近这套建议有没有持续兑现”。', 'Put the priority model, priority combo, and AI Daily Report Top 5 onto one board and verify their 1/3/5/10-day follow-through. This turns guidance into an accountable recommendation loop instead of a one-day opinion.')) }}</div>
+                <div class="metric-grid">{{ (guidance_ui['validation_cards_html']) }}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '对象', 'Recommendation')) }}</th><th>{{ (t(lang, '样本 / 说明', 'Samples / Note')) }}</th><th>1D</th><th>3D</th><th>5D</th><th>10D</th></tr></thead>
+                  <tbody>{{ (guidance_ui['validation_rows_html']) }}</tbody>
+                </table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '大涨股反向归因', 'Strong-Mover Traceback')) }}</div>
+                <div class="muted">{{ (t(lang, '按近期次日涨幅较高的股票排序，展示它们前一个交易日是否被模型快照提前命中。命中数越高，说明对应组合越值得复盘。', 'Ranks recent high 1D movers and shows whether they were captured by model snapshots on the previous trading session.')) }}</div>
+                <div class="toolbar" style="margin-top:12px;margin-bottom:0;"><a class="pill" href="/dashboard/model-performance/winner-traceback?lang={{ (lang) }}&market={{ (market) }}">{{ (t(lang, '打开独立归因视图', 'Open dedicated traceback view')) }}</a></div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '股票', 'Ticker')) }}</th><th>{{ (t(lang, '市场', 'Market')) }}</th><th>{{ (t(lang, '信号日 / 上涨日', 'Signal / Move Date')) }}</th><th>{{ (t(lang, '次日涨幅', '1D Move')) }}</th><th>{{ (t(lang, '提前命中', 'Prior Hits')) }}</th></tr></thead>
+                  <tbody>{{ (guidance_ui['winner_rows_html']) }}</tbody>
+                </table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '模型历史胜率榜', 'Historical Model Win-Rate Board')) }}</div>
+                <div class="muted">{{ (t(lang, '按模型名称聚合最近成功 run。主值是平均收益，下面小字是上涨命中率；同时展示覆盖交易日数与样本数，避免只看单次 run。', 'Aggregates recent successful runs by model name. Main values are average returns, muted values are positive hit rate, and the table also shows covered trade dates plus sample counts so you are not overreacting to a single run.')) }}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '模型', 'Model')) }}</th><th>{{ (t(lang, 'Runs', 'Runs')) }}</th><th>{{ (t(lang, '覆盖交易日 / 样本', 'Trade Dates / Samples')) }}</th><th>{{ (t(lang, '最近交易日', 'Latest Trade Date')) }}</th><th>3D</th><th>5D</th><th>10D</th></tr></thead>
+                  <tbody>{{ (aggregate_rows_html) }}</tbody>
+                </table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '模型评测', 'Template Evaluation')) }}</div>
+                <div class="muted">{{ (t(lang, '先用最接近实盘执行的问题来评：同一套“强趋势二次启动”里，Buy The Dip 和 Wait For Breakout 哪一类最近更稳。主值是平均收益，小字是上涨命中率。', 'Start with the most execution-relevant question: inside the same Next Tesla Swing template, which playbook has recently been steadier — Buy The Dip or Wait For Breakout. Main values are average returns and muted values are positive hit rates.')) }}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '动作类型', 'Playbook')) }}</th><th>3D {{ (t(lang, '样本', 'Samples')) }}</th><th>3D</th><th>5D {{ (t(lang, '样本', 'Samples')) }}</th><th>5D</th><th>10D {{ (t(lang, '样本', 'Samples')) }}</th><th>10D</th></tr></thead>
+                  <tbody>{{ (evaluation_ui['next_tesla_rows_html']) }}</tbody>
+                </table></div>
+                <div style="display:inline-flex;align-items:center;padding:8px 12px;border-radius:999px;margin-top:12px;{{ (evaluation_ui['next_tesla_maturity_style']) }}font-weight:800;font-size:12px;">{{ (str(next_tesla_maturity_state.get('level') or '-')) }}</div>
+                <div class="muted" style="margin-top:12px;">{{ (evaluation_ui['next_tesla_note']) }}</div>
+                <div class="muted" style="margin-top:8px;">{{ (str(next_tesla_maturity_state.get('summary') or '')) }}</div>
+                {{ (evaluation_ui['next_tesla_market_split_html']) }}
+                <div style="display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));margin-top:12px;">
+                  <div class="metric-card">
+                    <div class="eyebrow">Buy The Dip</div>
+                    <div class="muted">{{ (t(lang, '最近更常出现在哪些板块，以及这些板块对应的 5 日表现。', 'Which sectors appear most often recently, along with their 5-day behavior.')) }}</div>
+                    <div style="margin-top:10px;">{{ (evaluation_ui['next_tesla_sector_buy_html']) }}</div>
+                  </div>
+                  <div class="metric-card">
+                    <div class="eyebrow">Wait For Breakout</div>
+                    <div class="muted">{{ (t(lang, '如果当前更偏突破确认，这里会更快暴露出主要集中在哪些板块。', 'If the tape currently leans toward breakout confirmation, this block shows which sectors are dominating.')) }}</div>
+                    <div style="margin-top:10px;">{{ (evaluation_ui['next_tesla_sector_breakout_html']) }}</div>
+                  </div>
+                </div>
+                <div class="muted" style="margin-top:8px;font-weight:700;">{{ (t(lang, '结论', 'Takeaway')) }}: {{ (evaluation_ui['next_tesla_takeaway']) }}</div>
+                <div style="margin-top:12px;"><a class="pill" href="/screeners?lang={{ (lang) }}&model_template=next_tesla_swing&market={{ (market if market in ('CN', 'US') else 'CN') }}&universe=full_market&run=1">{{ (t(lang, '打开模板页查看明细', 'Open template page for detail')) }}</a></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '模型评测 · 技术动量', 'Template Evaluation · Technical Momentum')) }}</div>
+                <div class="muted">{{ (t(lang, '这块回答更简单的执行问题：动量模板里，直接 BUY 是否比先 WATCH 更有后续胜率。', 'This asks a simpler execution question: inside the momentum template, does direct BUY follow-through beat WATCH-first names.')) }}</div>
+                <div style="display:inline-flex;align-items:center;padding:8px 12px;border-radius:999px;margin-top:12px;{{ (evaluation_ui['technical_maturity_style']) }}font-weight:800;font-size:12px;">{{ (str(technical_momentum_maturity_state.get('level') or '-')) }}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '动作', 'Action')) }}</th><th>3D {{ (t(lang, '样本', 'Samples')) }}</th><th>3D</th><th>5D {{ (t(lang, '样本', 'Samples')) }}</th><th>5D</th><th>10D {{ (t(lang, '样本', 'Samples')) }}</th><th>10D</th></tr></thead>
+                  <tbody>{{ (evaluation_ui['technical_buy_row']) }}{{ (evaluation_ui['technical_watch_row']) }}</tbody>
+                </table></div>
+                <div class="muted" style="margin-top:12px;">{{ ('最近回看 ' + str(evaluation_ui['technical_snapshot_total']) + ' 个快照，其中 ' + str(evaluation_ui['technical_labeled_total']) + ' 个带 BUY / WATCH / HOLD 标签。' if lang == 'zh' else 'Reviewing the latest ' + str(evaluation_ui['technical_snapshot_total']) + ' snapshots, with ' + str(evaluation_ui['technical_labeled_total']) + ' carrying BUY / WATCH / HOLD labels.') }}</div>
+                <div class="muted" style="margin-top:8px;">{{ (str(technical_momentum_maturity_state.get('summary') or '')) }}</div>
+                {{ (evaluation_ui['technical_market_split_html']) }}
+                <div style="display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));margin-top:12px;">
+                  <div class="metric-card">
+                    <div class="eyebrow">BUY {{ (t(lang, '主导板块', 'Dominant sectors')) }}</div>
+                    <div class="muted">{{ (t(lang, '近期直接 BUY 更常出现在哪些行业，以及这些行业对应的 5 日表现。', 'Which sectors show up most often for direct BUY, plus their 5-day behavior.')) }}</div>
+                    <div style="margin-top:10px;">{{ (evaluation_ui['technical_sector_buy_html']) }}</div>
+                  </div>
+                  <div class="metric-card">
+                    <div class="eyebrow">WATCH {{ (t(lang, '主导板块', 'Dominant sectors')) }}</div>
+                    <div class="muted">{{ (t(lang, '如果当前更偏先观察，这里会更快暴露主要集中在哪些行业。', 'If the tape currently leans toward watch-first, this shows which sectors are dominating that behavior.')) }}</div>
+                    <div style="margin-top:10px;">{{ (evaluation_ui['technical_sector_watch_html']) }}</div>
+                  </div>
+                </div>
+                <div class="muted" style="margin-top:8px;">{{ (str(evaluation_ui['technical_takeaway'])) }}</div>
+                <div class="muted" style="margin-top:8px;font-weight:700;">{{ (t(lang, '结论', 'Takeaway')) }}: {{ (technical_bias) }}</div>
+                <div style="margin-top:12px;"><a class="pill" href="/screeners?lang={{ (lang) }}&model_template=technical_momentum&market={{ (market if market in ('CN', 'US') else 'CN') }}&universe=full_market&run=1">{{ (t(lang, '打开技术动量模板页', 'Open technical momentum template')) }}</a></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '模型评测 · LightGBM', 'Template Evaluation · LightGBM')) }}</div>
+                <div class="muted">{{ (t(lang, '这块专门回答 LightGBM 当前更擅长哪类执行动作：回踩、突破，还是继续观察。主值是平均收益，小字是上涨命中率。', 'This block focuses on which execution style LightGBM is currently handling best: pullback, breakout, or watch. Main values are average returns and muted values are positive hit rates.')) }}</div>
+                <div style="display:inline-flex;align-items:center;padding:8px 12px;border-radius:999px;margin-top:12px;{{ (evaluation_ui['lightgbm_maturity_style']) }}font-weight:800;font-size:12px;">{{ (str(lightgbm_maturity_state.get('level') or '-')) }}</div>
+                <div class="metric-grid" style="margin-top:12px;">{{ (evaluation_ui['lightgbm_short_cycle_1']) }}{{ (evaluation_ui['lightgbm_short_cycle_3']) }}{{ (evaluation_ui['lightgbm_short_cycle_5']) }}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '动作', 'Action')) }}</th><th>1D {{ (t(lang, '样本', 'Samples')) }}</th><th>1D</th><th>3D {{ (t(lang, '样本', 'Samples')) }}</th><th>3D</th><th>5D {{ (t(lang, '样本', 'Samples')) }}</th><th>5D</th><th>10D {{ (t(lang, '样本', 'Samples')) }}</th><th>10D</th></tr></thead>
+                  <tbody>{{ (evaluation_ui['lightgbm_pullback_row']) }}{{ (evaluation_ui['lightgbm_breakout_row']) }}{{ (evaluation_ui['lightgbm_watch_row']) }}</tbody>
+                </table></div>
+                <div class="muted" style="margin-top:12px;">{{ ('最近回看 ' + str(evaluation_ui['lightgbm_snapshot_total']) + ' 个快照，其中 ' + str(evaluation_ui['lightgbm_labeled_total']) + ' 个带 Pullback / Breakout / Watch 动作标签。' if lang == 'zh' else 'Reviewing the latest ' + str(evaluation_ui['lightgbm_snapshot_total']) + ' snapshots, with ' + str(evaluation_ui['lightgbm_labeled_total']) + ' carrying Pullback / Breakout / Watch labels.') }}</div>
+                <div class="muted" style="margin-top:8px;">{{ (str(lightgbm_maturity_state.get('summary') or '')) }}</div>
+                {{ (evaluation_ui['lightgbm_market_split_html']) }}
+                <div style="display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));margin-top:12px;">
+                  <div class="metric-card">
+                    <div class="eyebrow">Pullback {{ (t(lang, '主导板块', 'Dominant sectors')) }}</div>
+                    <div class="muted">{{ (t(lang, '近期 LightGBM 回踩候选主要集中在哪些板块，以及这些板块对应的 5 日表现。', 'Which sectors dominate recent LightGBM pullback candidates, plus their 5-day behavior.')) }}</div>
+                    <div style="margin-top:10px;">{{ (evaluation_ui['lightgbm_sector_pullback_html']) }}</div>
+                  </div>
+                  <div class="metric-card">
+                    <div class="eyebrow">Breakout {{ (t(lang, '主导板块', 'Dominant sectors')) }}</div>
+                    <div class="muted">{{ (t(lang, '如果 LightGBM 当前更偏突破确认，这里会更快暴露主要集中在哪些行业。', 'If LightGBM currently leans toward breakout confirmation, this block shows which sectors are dominating that behavior.')) }}</div>
+                    <div style="margin-top:10px;">{{ (evaluation_ui['lightgbm_sector_breakout_html']) }}</div>
+                  </div>
+                </div>
+                <div class="muted" style="margin-top:8px;">{{ (str(evaluation_ui['lightgbm_takeaway'])) }}</div>
+                <div class="muted" style="margin-top:8px;font-weight:700;">{{ (t(lang, '结论', 'Takeaway')) }}: {{ (lightgbm_bias_text) }}</div>
+                <div style="margin-top:12px;"><a class="pill" href="/screeners?lang={{ (lang) }}&model_template=lightgbm_top_picks&market={{ (market if market in ('CN', 'US') else 'CN') }}&universe=full_market&run=1">{{ (t(lang, '打开 LightGBM 模板页', 'Open LightGBM template')) }}</a></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '历史预测验证 · LightGBM', 'Historical Prediction Check · LightGBM')) }}</div>
+                <div class="muted">{{ (t(lang, '这块直接从历史 LightGBM predictions/model_runs 回看次日、3日、5日表现，更贴近“第二天能不能用”这个问题。', 'This block reads historical LightGBM predictions/model_runs directly and evaluates next-day, 3-day, and 5-day behavior for a closer answer to whether the model is usable on the next session.')) }}</div>
+                <div class="metric-grid" style="margin-top:12px;">{{ (evaluation_ui['prediction_short_cycle_1']) }}{{ (evaluation_ui['prediction_short_cycle_3']) }}{{ (evaluation_ui['prediction_short_cycle_5']) }}</div>
+                {{ (evaluation_ui['prediction_market_split_html']) }}
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '动作', 'Action')) }}</th><th>{{ (t(lang, '样本', 'Samples')) }}</th><th>{{ (t(lang, '可交易命中率', 'Execution Hit')) }}</th><th>{{ (t(lang, '次日高开', 'Open Gap')) }}</th><th>{{ (t(lang, '开盘到最高', 'Open to High')) }}</th><th>{{ (t(lang, '盘中最大回撤', 'Low Drawdown')) }}</th><th>{{ (t(lang, '买不到/高开阻断', 'Gap Blocked')) }}</th><th>{{ (t(lang, '高开低走', 'High-open Fail')) }}</th></tr></thead>
+                  <tbody>{{ (evaluation_ui['execution_pullback_row']) }}{{ (evaluation_ui['execution_breakout_row']) }}{{ (evaluation_ui['execution_watch_row']) }}</tbody>
+                </table></div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '动作', 'Action')) }}</th><th>1D {{ (t(lang, '样本', 'Samples')) }}</th><th>1D</th><th>3D {{ (t(lang, '样本', 'Samples')) }}</th><th>3D</th><th>5D {{ (t(lang, '样本', 'Samples')) }}</th><th>5D</th></tr></thead>
+                  <tbody>{{ (evaluation_ui['prediction_pullback_row']) }}{{ (evaluation_ui['prediction_breakout_row']) }}{{ (evaluation_ui['prediction_watch_row']) }}</tbody>
+                </table></div>
+                <div class="muted" style="margin-top:12px;">{{ ('最近直接回看 ' + str(evaluation_ui['prediction_run_count']) + ' 个成功 LightGBM run，累计样本 ' + str(evaluation_ui['prediction_sample_count']) + ' 条；最新交易日 ' + (str(evaluation_ui['prediction_latest_trade_date']) or '-') if lang == 'zh' else 'Directly reviewing the latest ' + str(evaluation_ui['prediction_run_count']) + ' successful LightGBM runs with ' + str(evaluation_ui['prediction_sample_count']) + ' samples in total; latest trade date ' + (str(evaluation_ui['prediction_latest_trade_date']) or '-')) }}</div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '长期环境分层', 'Historical Regime Slice')) }}</div>
+                <div class="muted">{{ (t(lang, '把最近成功 run 的样本按环境标签汇总，观察模型在不同市场状态下的长期平均收益和上涨命中率。', 'Aggregates recent successful runs by regime label so you can inspect long-horizon average returns and positive hit rates across market states.')) }}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '环境', 'Regime')) }}</th><th>{{ (t(lang, '样本数', 'Samples')) }}</th><th>3D</th><th>5D</th><th>10D</th></tr></thead>
+                  <tbody>{{ (aggregate_regime_rows_html) }}</tbody>
+                </table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '长期行业分层', 'Historical Sector Slice')) }}</div>
+                <div class="muted">{{ (t(lang, '把最近成功 run 的样本按行业/板块汇总，看模型长期主要在哪些板块更有效，哪些板块更容易拖后腿。', 'Aggregates recent successful runs by sector/industry so you can see which groups have historically carried the model and which have lagged.')) }}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '行业/板块', 'Sector / Industry')) }}</th><th>{{ (t(lang, '样本数', 'Samples')) }}</th><th>3D</th><th>5D</th><th>10D</th></tr></thead>
+                  <tbody>{{ (aggregate_sector_rows_html) }}</tbody>
+                </table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '市场环境分层', 'Regime Slice')) }}</div>
+                <div class="muted">{{ ('按当前 run 内每条样本自带的 regime label 分层。主值是平均收益，下面小字是上涨命中率。' if lang == 'zh' else "Slices the selected run by each pick's regime label. Main values are average returns; muted values are positive hit rate.") }}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '环境', 'Regime')) }}</th><th>{{ (t(lang, '样本数', 'Samples')) }}</th><th>3D</th><th>5D</th><th>10D</th></tr></thead>
+                  <tbody>{{ (regime_rows_html) }}</tbody>
+                </table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '当前行业分层', 'Sector Slice')) }}</div>
+                <div class="muted">{{ (t(lang, '按当前 run 样本自带的行业/板块分层，适合快速判断这次表现到底集中在哪几个方向。', 'Slices the selected run by sector/industry so you can quickly see which groups are driving this run.')) }}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '行业/板块', 'Sector / Industry')) }}</th><th>{{ (t(lang, '样本数', 'Samples')) }}</th><th>3D</th><th>5D</th><th>10D</th></tr></thead>
+                  <tbody>{{ (sector_rows_html) }}</tbody>
+                </table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '自选加入后表现', 'Watchlist After Add')) }}</div>
+                <div class="muted">{{ (t(lang, '统计当前仍在自选里的股票，从加入当日开始算 3/5/10 日表现；右侧“当前”列表示从加入到最新收盘的累计收益。', 'Measures current watchlist names from their add date across 3/5/10 day windows. The Current column shows cumulative return from add date to latest close.')) }}</div>
+                <div class="metric-grid">
+                  {{ watchlist_cards_html }}
+                  <article class='metric-card'>
+                    <div class='eyebrow'>{{ (t(lang, '当前累计', 'Current Since Add')) }}</div>
+                    <div class='metric'>{{ (_fmt_optional_float(watchlist_current.get('avg_return'), suffix='%', digits=2)) }}</div>
+                    <div class='muted'>{{ (t(lang, '上涨命中率', 'Positive hit rate')) }} {{ (_fmt_optional_float(watchlist_current.get('hit_rate'), suffix='%', digits=1)) }}</div>
+                    <div class='muted'>{{ (t(lang, '样本数', 'Samples')) }} {{ (watchlist_current.get('count') or 0) }}</div>
+                  </article>
+                </div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '加入日期', 'Added Date')) }}</th><th>{{ (t(lang, '股票', 'Ticker')) }}</th><th>3D</th><th>5D</th><th>10D</th><th>{{ (t(lang, '当前', 'Current')) }}</th><th>{{ (t(lang, '同步状态', 'Sync Status')) }}</th></tr></thead>
+                  <tbody>{{ (watchlist_rows_html) }}</tbody>
+                </table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '最近模型 run', 'Recent Runs')) }}</div>
+                <div class="muted">{{ (t(lang, '主值是平均收益，下面小字是上涨命中率。', 'Main values show average returns; muted values underneath show positive hit rate.')) }}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, 'Run', 'Run')) }}</th><th>{{ (t(lang, '市场/范围', 'Market/Universe')) }}</th><th>{{ (t(lang, '最近交易日', 'Latest Trade Date')) }}</th><th>3D</th><th>5D</th><th>10D</th></tr></thead>
+                  <tbody>{{ (recent_rows_html) }}</tbody>
+                </table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ (t(lang, '样本明细', 'Sample Detail')) }}</div>
+                <div class="muted">{{ (t(lang, '默认展示最近 run 的部分 Top-N 样本，方便核对统计不是黑箱。', 'Shows a slice of recent Top-N picks so the aggregate stats remain auditable.')) }}</div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ (t(lang, '交易日', 'Trade Date')) }}</th><th>{{ (t(lang, '股票', 'Ticker')) }}</th><th>{{ (t(lang, '环境', 'Regime')) }}</th><th>{{ (t(lang, '信号', 'Signal')) }}</th><th>{{ (t(lang, '模型分', 'Score')) }}</th><th>3D</th><th>5D</th><th>10D</th></tr></thead>
+                  <tbody>{{ (detail_rows_html) }}</tbody>
+                </table></div>
+              </section>
+            </div>
+          </main>
+        </div>
+      </body>
+    </html>

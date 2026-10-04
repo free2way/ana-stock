@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.services.statistical_inference import significance_report
 from app.models.tables import (
     ModelEvaluation,
     ModelEvaluationMetric,
@@ -31,6 +32,7 @@ from app.models.tables import (
 from app.services.market_lake import load_lake_price_history
 from app.services.market_risk import market_risk_snapshot_type
 from app.services.prediction_artifacts import read_prediction_artifact_rows
+from app.services.price_basis import preferred_close
 from app.services.time_utils import app_now_iso
 from app.services.stock_selection.labels import ExecutableLabel
 from app.services.stock_selection.executable_outcomes import OUTCOME_VERSION, FILL_COST_OUTCOME_VERSION
@@ -96,9 +98,11 @@ def _history_outcome(history: list[dict], *, trade_date: str, horizon_days: int)
         return None
     signal_row = history[target_index]
     next_row = history[target_index + 1]
-    signal_close = _number(signal_row.get("adj_close")) or _number(signal_row.get("close"))
+    # R2: close-to-close legs prefer the adjusted view; the overnight gap stays
+    # a raw open / raw close ratio so its meaning is unchanged.
+    signal_close = preferred_close(signal_row)
     next_open = _number(next_row.get("open"))
-    next_close = _number(next_row.get("adj_close")) or _number(next_row.get("close"))
+    next_close = preferred_close(next_row)
     signal_raw_close = _number(signal_row.get("close"))
     entry = next_close or signal_close
     if signal_close and next_open and signal_raw_close:
@@ -106,11 +110,11 @@ def _history_outcome(history: list[dict], *, trade_date: str, horizon_days: int)
         if 0.0 < gap_ratio < 3.0:
             entry = signal_close * gap_ratio
     exit_row = history[target_index + horizon_days]
-    exit_price = _number(exit_row.get("adj_close")) or _number(exit_row.get("close"))
+    exit_price = preferred_close(exit_row)
     if not entry or entry <= 0 or exit_price is None:
         return None
     path = history[target_index : target_index + horizon_days + 1]
-    path_closes = [(_number(row.get("adj_close")) or _number(row.get("close"))) for row in path]
+    path_closes = [preferred_close(row) for row in path]
     for previous, current in zip(path_closes, path_closes[1:], strict=False):
         if previous is None or current is None or previous <= 0:
             continue
@@ -121,7 +125,7 @@ def _history_outcome(history: list[dict], *, trade_date: str, horizon_days: int)
             # Exclude the whole holding path until adjusted history is available.
             return {"excluded_reason": "suspected_corporate_action_discontinuity"}
     lows = [
-        _number(row.get("low")) or _number(row.get("adj_close")) or _number(row.get("close"))
+        _number(row.get("low")) or preferred_close(row)
         for row in history[target_index : target_index + horizon_days + 1]
     ]
     valid_lows = [value for value in lows if value is not None]
@@ -218,12 +222,17 @@ def _summarize_return_vectors(gross_returns: list[float], net_returns: list[floa
         confidence_high = min(100.0, hit_rate + margin)
     else:
         confidence_low = confidence_high = None
+    significance = significance_report(net_returns, horizon_days=horizon_days) if len(net_returns) >= 2 else None
     return {
         "horizon_days": int(horizon_days),
         "sample_count": count,
         "cost_bps": float(round_trip_cost_bps),
         "hit_rate": hit_rate,
         "avg_return": statistics.fmean(net_returns) if net_returns else None,
+        "avg_return_ci95_iid": (significance or {}).get("iid_ci95"),
+        "avg_return_ci95_newey_west": (significance or {}).get("newey_west_ci95"),
+        "avg_return_ci95_block_bootstrap": (significance or {}).get("block_bootstrap_ci95"),
+        "significance_method": (significance or {}).get("ci_method"),
         "median_return": statistics.median(net_returns) if net_returns else None,
         "gross_avg_return": statistics.fmean(gross_returns) if gross_returns else None,
         "avg_drawdown": statistics.fmean(drawdowns) if drawdowns else None,

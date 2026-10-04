@@ -3,13 +3,16 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+import hashlib
+import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 import duckdb
 import polars as pl
 
 from app.core.config import get_settings
+from app.services.market_data_quality import partition_ohlcv_rows, quarantine_rows
 from app.services.market_freshness import latest_completed_market_date
 
 
@@ -31,6 +34,31 @@ LAKE_OHLCV_SCHEMA: dict[str, pl.DataType] = {
 }
 
 LAKE_OHLCV_COLUMNS = list(LAKE_OHLCV_SCHEMA)
+
+# Shadow v2 schema: canonical OHLCV plus provenance. v1 remains the read
+# source until the adjusted view and readers are migrated.
+LAKE_V2_PROVENANCE_COLUMNS = (
+    "market",
+    "provider",
+    "provider_symbol",
+    "price_basis",
+    "volume_unit",
+    "currency",
+    "source_reference",
+    "source_batch_id",
+    "ingested_at",
+    "revision_id",
+)
+LAKE_V2_SCHEMA: dict[str, pl.DataType] = {
+    **LAKE_OHLCV_SCHEMA,
+    **{name: pl.String for name in LAKE_V2_PROVENANCE_COLUMNS},
+}
+LAKE_V2_PRICE_BASIS_VALUES = {"raw", "qfq", "hfq", "adjusted"}
+# Placeholder provenance must never be written silently. ``auto`` is a provider
+# *selector*, not a source, so it is rejected like an empty value.
+LAKE_V2_PLACEHOLDER_PROVIDERS = {"", "unknown", "auto"}
+LAKE_V2_PLACEHOLDER_REFERENCES = {"", "unspecified"}
+MARKET_CURRENCY = {"CN": "CNY", "US": "USD", "HK": "HKD"}
 
 LAKE_PARQUET_CHUNK_SIZE = 48
 LAKE_DUCKDB_MAX_CONCURRENT_READS = 2
@@ -67,7 +95,165 @@ def _lake_write_lock(path: Path) -> threading.Lock:
         return _LAKE_WRITE_LOCKS.setdefault(key, threading.Lock())
 
 
-def write_daily_ohlcv_parquet(*, market: str, trade_date: str, rows: list[dict], merge_existing: bool = True) -> Path:
+def _lake_v2_root() -> Path:
+    # Underscore-prefixed sibling namespace inside the v1 root: patched test
+    # roots stay isolated and lake tooling that skips ``_*`` directories does
+    # not mistake it for a market partition set.
+    return market_lake_root() / "_lake_v2"
+
+
+def _lake_v2_shadow_enabled() -> bool:
+    return bool(getattr(get_settings(), "lake_v2_shadow_enabled", True))
+
+
+def _revision_id(row: dict) -> str:
+    payload = "|".join(
+        str(row.get(key) if row.get(key) is not None else "")
+        for key in ("date", "symbol", "open", "high", "low", "close", "volume", "adj_close", "price_basis")
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _with_provenance(
+    row: dict,
+    *,
+    market_code: str,
+    batch_id: str | None,
+    allow_legacy_defaults: bool = False,
+) -> dict:
+    basis = str(row.get("price_basis") or "raw").strip().lower()
+    if basis not in LAKE_V2_PRICE_BASIS_VALUES:
+        raise ValueError(f"unsupported price_basis `{basis}` for {market_code} {row.get('symbol')}")
+    provider = str(row.get("provider") or "").strip()
+    source_reference = str(row.get("source_reference") or "").strip()
+    if not allow_legacy_defaults:
+        # Audit finding #3: placeholder provenance must never be written
+        # silently. Callers either pass real values or explicitly opt into the
+        # legacy backfill mode.
+        if provider.lower() in LAKE_V2_PLACEHOLDER_PROVIDERS:
+            raise ValueError(
+                f"a concrete provider is required for provenance rows ({market_code} {row.get('symbol')} "
+                f"{row.get('date')}); pass provider=... or allow_legacy_defaults=True"
+            )
+        if source_reference.lower() in LAKE_V2_PLACEHOLDER_REFERENCES:
+            raise ValueError(
+                f"source_reference is required for provenance rows ({market_code} {row.get('symbol')} "
+                f"{row.get('date')}); pass source_reference=... or allow_legacy_defaults=True"
+            )
+    return {
+        **row,
+        "market": market_code,
+        "provider": provider or "unknown",
+        "provider_symbol": str(row.get("provider_symbol") or row.get("symbol") or "").strip(),
+        "price_basis": basis,
+        "volume_unit": str(row.get("volume_unit") or "share").strip(),
+        "currency": str(row.get("currency") or MARKET_CURRENCY.get(market_code, "")).strip(),
+        "source_reference": source_reference or "unspecified",
+        "source_batch_id": str(row.get("source_batch_id") or batch_id or "unspecified").strip(),
+        "ingested_at": str(row.get("ingested_at") or datetime.now(tz=timezone.utc).isoformat()).strip(),
+        "revision_id": str(row.get("revision_id") or _revision_id(row)).strip(),
+    }
+
+
+def _assert_no_price_basis_conflict(rows: list[dict], existing: pl.DataFrame | None) -> None:
+    conflicts: list[str] = []
+    seen: dict[tuple[str, str], set[str]] = {}
+    for row in rows:
+        seen.setdefault((str(row.get("date")), str(row.get("symbol"))), set()).add(str(row.get("price_basis")))
+    conflicts.extend(f"{day}:{symbol}" for (day, symbol), bases in seen.items() if len(bases) > 1)
+    if existing is not None and "price_basis" in existing.columns:
+        existing_basis = {
+            (str(day), str(symbol)): str(basis)
+            for day, symbol, basis in zip(existing["date"], existing["symbol"], existing["price_basis"])
+        }
+        for row in rows:
+            previous = existing_basis.get((str(row.get("date")), str(row.get("symbol"))))
+            if previous and previous != str(row.get("price_basis")):
+                conflicts.append(f"{row.get('date')}:{row.get('symbol')}")
+    if conflicts:
+        sample = ", ".join(sorted(set(conflicts))[:5])
+        raise ValueError(f"price_basis conflict inside one canonical series (refusing merge): {sample}")
+
+
+def write_lake_v2_partition(
+    *,
+    market: str,
+    trade_date: str,
+    rows: list[dict],
+    merge_existing: bool = True,
+    batch_id: str | None = None,
+    allow_legacy_defaults: bool = False,
+) -> Path | None:
+    """Shadow-write the provenance schema; never changes v1 semantics.
+
+    Provenance validation is unconditional: even with the shadow write disabled
+    (kill switch) a row without a real source must not slip through, otherwise
+    the fail-closed guarantee would depend on a runtime toggle.
+    """
+
+    if not rows:
+        return None
+    market_code = str(market or "").strip().upper() or "UNKNOWN"
+    normalized_trade_date = str(trade_date or "").strip()[:10]
+    enriched = [
+        _with_provenance(
+            row, market_code=market_code, batch_id=batch_id, allow_legacy_defaults=allow_legacy_defaults
+        )
+        for row in rows
+    ]
+    if not _lake_v2_shadow_enabled():
+        return None
+    path = _lake_v2_root() / f"{market_code.lower()}_daily" / f"date={normalized_trade_date}" / "part.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _lake_write_lock(path):
+        existing = pl.read_parquet(path) if (merge_existing and path.exists()) else None
+        _assert_no_price_basis_conflict(enriched, existing)
+        incoming = pl.DataFrame(enriched, schema=LAKE_V2_SCHEMA, orient="row")
+        frame = pl.concat([existing, incoming], how="vertical_relaxed") if existing is not None else incoming
+        frame = frame.unique(subset=["date", "symbol"], keep="last").sort(["date", "symbol"])
+        frame = frame.cast(LAKE_V2_SCHEMA)
+        temporary_path = path.with_name(f".{path.name}.tmp")
+        frame.write_parquet(temporary_path, compression="zstd")
+        temporary_path.replace(path)
+    return path
+
+
+def _write_partition_file(frame: pl.DataFrame, path: Path) -> None:
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    frame.write_parquet(temporary_path, compression="zstd")
+    temporary_path.replace(path)
+
+
+def _record_lake_write_divergence(*, market: str, trade_date: str, symbols: list[str], error: str) -> None:
+    """The shadow committed but the canonical v1 write failed: record it.
+
+    The manifest checker picks the divergence up; this log explains it and
+    names the symbols so a repair can re-apply or drop the shadow rows.
+    """
+
+    record = {
+        "recorded_at": datetime.now(tz=timezone.utc).isoformat(),
+        "market": str(market or "").strip().upper(),
+        "trade_date": str(trade_date or "").strip()[:10],
+        "symbol_count": len(symbols),
+        "symbols": sorted(str(symbol) for symbol in symbols)[:50],
+        "error": str(error)[:500],
+        "note": "provenance shadow committed; canonical v1 partition was not updated",
+    }
+    path = _lake_v2_root() / "write_divergence.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def write_daily_ohlcv_parquet(
+    *,
+    market: str,
+    trade_date: str,
+    rows: list[dict],
+    merge_existing: bool = True,
+    allow_legacy_defaults: bool = False,
+) -> Path:
     market_code = str(market or "").strip().lower() or "unknown"
     normalized_trade_date = str(trade_date or "").strip()[:10]
     if market_code in {"cn", "us"} and normalized_trade_date > latest_completed_market_date(market_code.upper()):
@@ -78,8 +264,26 @@ def write_daily_ohlcv_parquet(*, market: str, trade_date: str, rows: list[dict],
     path = market_lake_root() / f"{market_code}_daily" / f"date={normalized_trade_date}" / "part.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
     normalized_rows = [_normalize_ohlcv_row(row, trade_date=trade_date) for row in rows]
-    incoming = pl.DataFrame(normalized_rows, schema=LAKE_OHLCV_SCHEMA, orient="row")
+    accepted_rows, rejected_rows = partition_ohlcv_rows(normalized_rows)
+    if rejected_rows:
+        # Fail closed on the row level: invalid rows never reach canonical
+        # storage, but every rejection is recoverable from the quarantine log.
+        quarantine_rows(root=market_lake_root(), market=market_code.upper(), rows=rejected_rows)
+        if not accepted_rows:
+            reasons: dict[str, int] = {}
+            for row in rejected_rows:
+                key = str(row.get("rejection_reason") or "unknown")
+                reasons[key] = reasons.get(key, 0) + 1
+            raise ValueError(
+                f"All {len(rejected_rows)} rows for {market_code.upper()} {normalized_trade_date} "
+                f"failed OHLCV validation and were quarantined: {reasons}"
+            )
+    v1_rows = [{key: row.get(key) for key in LAKE_OHLCV_COLUMNS} for row in accepted_rows]
+    incoming = pl.DataFrame(v1_rows, schema=LAKE_OHLCV_SCHEMA, orient="row")
     with _lake_write_lock(path):
+        # Prepare the merged v1 frame FIRST: an unreadable existing partition
+        # must fail before the shadow is touched, so a preparation error can
+        # never leave the two stores divergent.
         frame = incoming
         if merge_existing and path.exists():
             # A partial refresh must never replace the other symbols in a daily
@@ -90,9 +294,25 @@ def write_daily_ohlcv_parquet(*, market: str, trade_date: str, rows: list[dict],
         # vertical_relaxed merge with a legacy partition could still yield a
         # non-String supertype; enforce the schema invariant before writing.
         frame = frame.cast(LAKE_OHLCV_SCHEMA)
-        temporary_path = path.with_name(f".{path.name}.tmp")
-        frame.write_parquet(temporary_path, compression="zstd")
-        temporary_path.replace(path)
+        # Provenance shadow write happens before the v1 commit: a basis/provenance
+        # conflict must block the v1 write instead of leaving the two stores divergent.
+        write_lake_v2_partition(
+            market=market_code.upper(),
+            trade_date=normalized_trade_date,
+            rows=accepted_rows,
+            merge_existing=merge_existing,
+            allow_legacy_defaults=allow_legacy_defaults,
+        )
+        try:
+            _write_partition_file(frame, path)
+        except Exception as exc:
+            _record_lake_write_divergence(
+                market=market_code,
+                trade_date=normalized_trade_date,
+                symbols=[str(row.get("symbol") or "") for row in accepted_rows],
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
     _invalidate_lake_file_cache(market_code)
     return path
 
@@ -887,7 +1107,19 @@ def list_lake_symbols(*, market: str) -> set[str]:
     return symbols
 
 
-def write_ohlcv_rows_to_lake(*, market: str, rows: list[dict], merge_existing: bool = True) -> list[Path]:
+def write_ohlcv_rows_to_lake(
+    *,
+    market: str,
+    rows: list[dict],
+    merge_existing: bool = True,
+    provenance: dict | None = None,
+    allow_legacy_defaults: bool = False,
+) -> list[Path]:
+    if provenance:
+        rows = [
+            {**row, **{key: value for key, value in provenance.items() if not row.get(key)}}
+            for row in rows
+        ]
     rows_by_date: dict[str, list[dict]] = {}
     for row in rows:
         trade_date = str(row.get("date") or "").strip()
@@ -902,7 +1134,13 @@ def write_ohlcv_rows_to_lake(*, market: str, rows: list[dict], merge_existing: b
             )
         rows_by_date.setdefault(trade_date, []).append(row)
     return [
-        write_daily_ohlcv_parquet(market=market, trade_date=trade_date, rows=date_rows, merge_existing=merge_existing)
+        write_daily_ohlcv_parquet(
+            market=market,
+            trade_date=trade_date,
+            rows=date_rows,
+            merge_existing=merge_existing,
+            allow_legacy_defaults=allow_legacy_defaults,
+        )
         for trade_date, date_rows in sorted(rows_by_date.items())
     ]
 
@@ -1029,12 +1267,29 @@ def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: i
                 ),
             }
         )
+        # S-4: this is the single delivery boundary that converts the lake
+        # fraction (close/LAG-1) into the percent口径 used by insight_engine,
+        # workspace snapshots, tradability/ai-daily thresholds and the page.
+        # Derived fields above are computed from the fraction on purpose; the
+        # emitted row is percent and self-describes its unit.
+        item["momentum_5"] = _fraction_to_percent(item.get("momentum_5"))
+        item["momentum_20"] = _fraction_to_percent(item.get("momentum_20"))
+        item["momentum_units"] = "percent"
         results.append(item)
     return results
 
 
+def _fraction_to_percent(value) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return round(float(value) * 100.0, 2)
+    except (TypeError, ValueError):
+        return None
+
+
 def _normalize_ohlcv_row(row: dict, *, trade_date: str) -> dict:
-    return {
+    normalized = {
         "date": str(row.get("date") or trade_date),
         "symbol": str(row.get("symbol") or "").strip().upper(),
         "open": _as_float(row.get("open")),
@@ -1046,6 +1301,11 @@ def _normalize_ohlcv_row(row: dict, *, trade_date: str) -> dict:
         "dividend": _as_float(row.get("dividend")),
         "split_ratio": _as_float(row.get("split_ratio")),
     }
+    for key in LAKE_V2_PROVENANCE_COLUMNS:
+        value = row.get(key)
+        if value not in (None, ""):
+            normalized[key] = str(value)
+    return normalized
 
 
 def _as_float(value) -> float | None:

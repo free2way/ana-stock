@@ -187,6 +187,7 @@ def build_point_in_time_universe(
     normalized_metadata = {str(key).strip().upper(): value for key, value in metadata.items()}
     rows_by_ticker_date: dict[tuple[str, date], Mapping[str, Any]] = {}
     history_by_ticker: dict[str, list[tuple[date, float, float]]] = defaultdict(list)
+    nonpositive_history: dict[str, int] = defaultdict(int)
     known_tickers = set(normalized_metadata)
     for row in rows:
         ticker = str(row.get("symbol") or row.get("ticker") or "").strip().upper()
@@ -200,6 +201,17 @@ def build_point_in_time_universe(
         known_tickers.add(ticker)
         close = _safe_float(row.get("close")) or 0.0
         volume = _safe_float(row.get("volume")) or 0.0
+        # Negative/zero prices must never reach features or labels (C-3). A
+        # legacy row can carry a negative adj_close while close is positive, so
+        # every price column of the row is checked, not just close.
+        for column in ("close", "adj_close", "open", "high", "low"):
+            value = row.get(column)
+            if value is None:
+                continue
+            parsed = _safe_float(value)
+            if parsed is not None and parsed <= 0:
+                nonpositive_history[ticker] += 1
+                break
         if close > 0 and volume >= 0:
             history_by_ticker[ticker].append((trade_date, close, volume))
     for history in history_by_ticker.values():
@@ -228,6 +240,8 @@ def build_point_in_time_universe(
                 reasons.append("unsupported_security_type")
             if not state.active:
                 reasons.append("inactive")
+            if nonpositive_history.get(ticker):
+                reasons.append("nonpositive_price_history")
             if rules.exclude_st and state.is_st:
                 reasons.append("st_security")
             if rules.exclude_suspended and state.suspended:

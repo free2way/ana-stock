@@ -1,6 +1,8 @@
 import hashlib
 import hmac
+import threading
 import time
+from collections import deque
 from urllib.parse import urlsplit
 from urllib.parse import quote
 
@@ -75,3 +77,49 @@ def sanitize_next_path(next_path: str | None, fallback: str = "/dashboard") -> s
     if not candidate.startswith("/") or candidate.startswith("//"):
         return fallback
     return candidate
+
+
+# --- Login rate limiting -----------------------------------------------------
+# In-memory sliding window of failed logins per client host. This is a
+# single-user, single-process local application; per-worker counters are the
+# documented trade-off if uvicorn is ever run with multiple workers.
+LOGIN_FAILURE_WINDOW_SECONDS = 300
+LOGIN_FAILURE_MAX_ATTEMPTS = 8
+
+_login_failure_lock = threading.Lock()
+_login_failures: dict[str, deque[float]] = {}
+
+
+def _prune_login_failures(attempts: deque[float], now: float) -> None:
+    cutoff = now - LOGIN_FAILURE_WINDOW_SECONDS
+    while attempts and attempts[0] <= cutoff:
+        attempts.popleft()
+
+
+def is_login_rate_limited(key: str) -> bool:
+    now = time.time()
+    with _login_failure_lock:
+        attempts = _login_failures.get(key)
+        if not attempts:
+            return False
+        _prune_login_failures(attempts, now)
+        return len(attempts) >= LOGIN_FAILURE_MAX_ATTEMPTS
+
+
+def register_login_failure(key: str) -> None:
+    now = time.time()
+    with _login_failure_lock:
+        attempts = _login_failures.setdefault(key, deque())
+        _prune_login_failures(attempts, now)
+        attempts.append(now)
+
+
+def reset_login_failures(key: str) -> None:
+    with _login_failure_lock:
+        _login_failures.pop(key, None)
+
+
+def reset_login_rate_limit_state() -> None:
+    """Clear every failure record (ops hook and test isolation)."""
+    with _login_failure_lock:
+        _login_failures.clear()

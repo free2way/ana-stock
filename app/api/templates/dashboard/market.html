@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ copy.page_title }}</title>
+    <style>{{ page_style|safe }}</style>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-tag">PQW</span>
+          <h1>{{ copy.sidebar_title }}</h1>
+          <p>{{ copy.sidebar_description }}</p>
+        </div>
+        <nav class="side-nav">{{ nav_html|safe }}</nav>
+        <div class="sidebar-foot">{{ copy.sidebar_note }}</div>
+      </aside>
+      <main class="main">
+        <div class="wrap">
+          <div class="toolbar">
+            <a href="/dashboard?lang={{ lang }}" class="pill">← {{ copy.back }}</a>
+            <a href="/dashboard/ops?lang={{ lang }}&amp;lookback_runs={{ lookback_runs }}" class="pill">{{ copy.operations }}</a>
+            <a href="{{ language_hrefs.en }}" class="pill">English</a>
+            <a href="{{ language_hrefs.zh }}" class="pill">中文</a>
+          </div>
+          <div class="mode-switch">{{ mode_pills|safe }}</div>
+          <div class="compare-row">{{ market_pills|safe }}</div>
+          <section class="card market-hero">
+            <div>
+              <div class="eyebrow">{{ active_mode_meta.eyebrow }} · {{ market_scope_title }}</div>
+              <h1>{{ active_mode_meta.headline }}</h1>
+              <p class="muted">{{ active_mode_meta.help }} {{ tone_sentence }}.</p>
+              <div class="mode-steps">{{ mode_steps_html|safe }}</div>
+              <div class="market-kpis">
+                <a class="market-kpi market-kpi-link{{ active_focus_classes.focused }}" href="{{ market_kpi_links.focused }}"><b>{{ filtered_signal_count }}</b><span class="muted">{{ copy.focused_names }}</span></a>
+                <a class="market-kpi market-kpi-link{{ active_focus_classes.buy }}" href="{{ market_kpi_links.buy }}"><b>{{ signal_bucket_counts.BUY }}</b><span class="muted">{{ copy.buy_signals }}</span></a>
+                <a class="market-kpi market-kpi-link{{ active_focus_classes.risk }}" href="{{ market_kpi_links.risk }}"><b>{{ tagged_names }}</b><span class="muted">{{ copy.material_risk }}</span></a>
+                <a class="market-kpi market-kpi-link{{ active_focus_classes.boards }}" href="{{ market_kpi_links.boards }}"><b>{{ board_count }}</b><span class="muted">{{ copy.board_names }}</span></a>
+              </div>
+            </div>
+            <div class="advanced-panel">
+              <div class="eyebrow">{{ copy.data_status }}</div>
+              <div class="muted">{{ copy.latest_snapshot }}: {{ latest_snapshot }}</div>
+              <div class="compare-row" style="margin:12px 0 0;">{{ risk_top_tags_html|safe }}</div>
+              <div class="muted">{{ copy.risk_examples }}: {{ risk_examples_html }}</div>
+            </div>
+          </section>
+          {{ kpi_detail_section|safe }}
+          <section class="market-actions">
+            <article class="market-action">
+              <div>
+                <div class="eyebrow">{{ copy.step_1 }}</div>
+                <h2>{{ copy.heatmap_title }}</h2>
+                <p>{{ copy.heatmap_help }}</p>
+                <div class="market-mini-list">{{ heatmap_preview_html|safe }}</div>
+              </div>
+              <a class="go" href="{{ heatmap_href }}">{{ copy.open_heatmap }} →</a>
+            </article>
+            <article class="market-action">
+              <div>
+                <div class="eyebrow">{{ copy.step_2 }}</div>
+                <h2>{{ copy.secondary_title }}</h2>
+                <p>{{ copy.secondary_help }}</p>
+                <div class="market-mini-list">{{ secondary_preview_html|safe }}</div>
+              </div>
+              <a class="go" href="{{ secondary_href }}">{{ copy.secondary_open }} →</a>
+            </article>
+            <article class="market-action">
+              <div>
+                <div class="eyebrow">{{ copy.step_3 }}</div>
+                <h2>{{ copy.action_boards }}</h2>
+                <p>{{ copy.action_boards_help }}</p>
+                <div class="metric">{{ board_count }}</div>
+                <p>{{ copy.precomputed_candidates }}</p>
+              </div>
+              <a class="go" href="/screeners/market-snapshot?lang={{ lang }}">{{ copy.open_boards }} →</a>
+            </article>
+          </section>
+          <section class="grid">
+            <article class="card">
+              <div class="eyebrow">{{ copy.signal_distribution }}</div>
+              <div class="market-scope-grid">{{ market_scope_cards_html|safe }}</div>
+              <div class="market-scope-help">{{ market_scope_help }}</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{{ copy.candidate_preview }}</div>
+              <div class="muted">{{ copy.candidate_preview_help }}</div>
+              <div style="margin-top:12px;display:grid;gap:10px;">{{ top_signal_rows|safe }}</div>
+            </article>
+          </section>
+          <section class="card">
+            <details class="advanced-panel">
+              <summary>{{ copy.advanced }}</summary>
+              <div class="eyebrow" style="margin-top:14px;">{{ copy.snapshot_window }}</div>
+              <div class="compare-row">{{ lookback_pills|safe }}</div>
+              <div class="eyebrow" style="margin-top:12px;">{{ copy.market_scope }}</div>
+              <div class="compare-row">{{ market_pills|safe }}</div>
+              <div class="eyebrow" style="margin-top:12px;">{{ copy.signal_focus }}</div>
+              <div class="compare-row">{{ signal_pills|safe }}</div>
+              <form action="/dashboard/market" method="get" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));align-items:end;">
+                <input type="hidden" name="lang" value="{{ lang }}" />
+                <input type="hidden" name="lookback_runs" value="{{ lookback_runs }}" />
+                <input type="hidden" name="heatmap_sort" value="{{ heatmap_sort }}" />
+                <input type="hidden" name="market_filter" value="{{ market_filter }}" />
+                <input type="hidden" name="kpi_focus" value="{{ kpi_focus }}" />
+                <input type="hidden" name="mode" value="{{ market_mode }}" />
+                <input type="hidden" name="signal_filter" value="{{ signal_filter }}" />
+                <div>
+                  <label class="muted" style="display:block;margin-bottom:6px;">{{ copy.execution_tag }}</label>
+                  <input type="text" name="execution_tag_filter" list="execution-tag-options" value="{{ execution_tag_value }}" placeholder="gap-risk, earnings-soon" />
+                </div>
+                <div>
+                  <label class="muted" style="display:block;margin-bottom:6px;">{{ copy.exclude_tag }}</label>
+                  <input type="text" name="exclude_execution_tag_filter" list="execution-tag-options" value="{{ exclude_execution_tag_value }}" placeholder="gap-risk, earnings-soon" />
+                </div>
+                <div>
+                  <label class="muted" style="display:block;margin-bottom:6px;">{{ copy.min_buy_hits }}</label>
+                  <input type="number" name="min_buy_signal_count" min="0" step="1" value="{{ min_buy_signal_count }}" />
+                </div>
+                <div>
+                  <label class="muted" style="display:block;margin-bottom:6px;">{{ copy.min_strength }}</label>
+                  <input type="number" name="min_signal_strength" min="0" max="100" step="1" value="{{ min_signal_strength }}" />
+                </div>
+                <div style="grid-column:1 / -1;"><div class="muted">{{ copy.filter_help }}</div></div>
+                <datalist id="execution-tag-options">
+                  <option value="gap-risk"></option>
+                  <option value="earnings-soon"></option>
+                  <option value="thin-liquidity"></option>
+                </datalist>
+                <button type="submit">{{ copy.apply }}</button>
+              </form>
+            </details>
+          </section>
+        </div>
+      </main>
+    </div>
+    <script>
+      function appendExecutionTag(formAction, inputName, tag) {
+        const form = document.querySelector(`form[action="${formAction}"]`);
+        if (!form) return;
+        const input = form.querySelector(`input[name="${inputName}"]`);
+        if (!input) return;
+        const values = input.value.split(",").map((item) => item.trim()).filter(Boolean);
+        if (!values.includes(tag)) values.push(tag);
+        input.value = values.join(", ");
+        input.focus();
+      }
+      function clearExecutionTags(formAction) {
+        const form = document.querySelector(`form[action="${formAction}"]`);
+        if (!form) return;
+        const includeInput = form.querySelector('input[name="execution_tag_filter"]');
+        const excludeInput = form.querySelector('input[name="exclude_execution_tag_filter"]');
+        if (includeInput) includeInput.value = "";
+        if (excludeInput) excludeInput.value = "";
+        if (includeInput) includeInput.focus();
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ t(lang, 'AI 日报历史详情', 'AI Report Detail') }}</title>
+    <style>{{ style }}</style>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-tag">PQW</span>
+          <h1>{{ t(lang, '历史详情', 'History Detail') }}</h1>
+          <p>{{ t(lang, '回看当日报告原文和 Top 5，后续用于验证准确性。', 'Review the archived report and Top 5 for later accuracy checks.') }}</p>
+        </div>
+        <nav class="side-nav">{{ nav_html }}</nav>
+      </aside>
+      <main class="main">
+        <div class="wrap">
+          <div class="toolbar">
+            <a class="pill" href="/dashboard/ai-daily-report/history?lang={{ lang }}">← {{ t(lang, '返回历史记录', 'Back to History') }}</a>
+            <a class="pill" href="/dashboard/ai-daily-report?lang={{ lang }}">{{ t(lang, '当前日报', 'Current Report') }}</a>
+          </div>
+          <section class="card">
+            <div class="eyebrow">{{ t(lang, '历史日报', 'Archived Report') }}</div>
+            <h2>{{ snapshot.get('snapshot_date') or '-' }}</h2>
+            <div class="muted">{{ t(lang, '保存时间', 'Saved at') }}: {{ saved_at }}</div>
+            <div class="muted">{{ report.get('headline') or '-' }}</div>
+          </section>
+          <section class="card">
+            <div class="eyebrow">LightGBM Bias</div>
+            <div class="muted" style="font-weight:800;color:var(--ink);">{{ execution_bias.get('title') or t(lang, 'LightGBM：未记录', 'LightGBM: not recorded') }}</div>
+            <div class="muted" style="margin-top:6px;">{{ execution_bias.get('summary') or '-' }}</div>
+          </section>
+          {{ model_guidance_card_html }}
+          <section class="card">
+            <div class="eyebrow">{{ t(lang, '事后表现验证', 'Outcome Check') }}</div>
+            <div class="muted">{{ outcome_summary }}</div>
+            <div class="table-wrap"><table>
+              <thead><tr><th>{{ t(lang, '股票', 'Ticker') }}</th><th>{{ t(lang, '基准收盘', 'Baseline Close') }}</th><th>{{ t(lang, '最新收盘', 'Latest Close') }}</th><th>{{ t(lang, '区间收益', 'Return') }}</th><th>{{ t(lang, '状态', 'Status') }}</th></tr></thead>
+              <tbody>{% for item in outcome_rows %}<tr><td><div style='font-weight:800'>{{ item.name }}</div><div class='muted'>{{ item.ticker }}</div></td><td>{{ item.baseline_date }}<div class='muted'>{{ item.baseline_close }}</div></td><td>{{ item.latest_date }}<div class='muted'>{{ item.latest_close }}</div></td><td>{{ item.return_text }}</td><td>{{ item.status_label }}</td></tr>{% else %}<tr><td colspan='5'>{{ t(lang, '暂无可验证记录。', 'No measurable records yet.') }}</td></tr>{% endfor %}</tbody>
+            </table></div>
+          </section>
+          <section class="card">
+            <div class="eyebrow">{{ t(lang, '当日可执行买入池', 'Executable Buy Pool') }}</div>
+            <div class="table-wrap"><table>
+              <thead><tr><th>#</th><th>{{ t(lang, '股票', 'Ticker') }}</th><th>{{ t(lang, '结论', 'Verdict') }}</th><th>{{ t(lang, '量化/验证', 'Quant/Validation') }}</th><th>{{ t(lang, '触发/失效', 'Trigger/Invalidation') }}</th><th>Headline</th></tr></thead>
+              <tbody>{% for item in actionable_rows %}<tr><td>{{ item.index }}</td><td><a href='/insights/{{ item.ticker_path }}?lang={{ lang }}' style='font-weight:800;color:var(--ink);'>{{ item.name }}</a><div class='muted'>{{ item.ticker }}</div></td><td>{{ item.verdict }}<div class='muted'>{{ item.display_trade_status }}</div><div class='muted'>{{ item.pool_reason }}</div></td><td>{{ item.quant_rank }}<div class='muted'>验证分 {{ item.verification_score }}</div><div class='muted'>{{ item.readiness_score }} / {{ item.readiness_bucket }}</div></td><td>{{ item.entry_trigger }}<div class='muted'>失效: {{ item.invalidation }}</div><div class='muted'>{{ t(lang, '现价', 'Latest') }}: {{ item.latest_price }}</div><div class='muted'>{{ t(lang, '偏离买点上沿', 'Vs buy-zone high') }}: {{ item.buy_zone_delta }}</div><div class='muted'><a href='{{ item.reason_href }}'>{{ item.explain_text }}</a></div><div class='muted'><a href='{{ item.reason_href }}'>{{ t(lang, '查看同类筛选', 'Open screener') }}</a></div></td><td>{{ item.headline }}</td></tr>{% else %}<tr><td colspan='6'>{{ t(lang, '当日没有可执行买入池记录。', 'No executable buy-pool rows were archived for this report.') }}</td></tr>{% endfor %}</tbody>
+            </table></div>
+          </section>
+          <section class="card">
+            <div class="eyebrow">{{ t(lang, '日报原文', 'Original Message') }}</div>
+            <textarea readonly>{{ message }}</textarea>
+          </section>
+        </div>
+      </main>
+    </div>
+  </body>
+</html>

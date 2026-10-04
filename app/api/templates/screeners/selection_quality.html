@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ copy.page_title }}</title>
+    <style>{{ page_style|safe }}</style>
+  </head>
+  <body>
+    <div class="workspace-shell">
+      <nav class="side-nav">{{ nav_html|safe }}</nav>
+      <main class="workspace-main">
+        <section class="hero">
+          <div class="card">
+            <div class="eyebrow">{{ copy.eyebrow }}</div>
+            <h1>{{ copy.page_title }}</h1>
+            <p>{{ headline }}</p>
+            <div class="metric-grid">
+              <div class="metric"><span>{{ copy.samples }}</span><b>{{ sample_count }}</b></div>
+              <div class="metric"><span>1D Hit</span><b>{{ all_metrics.hit_rate_1d }}</b></div>
+              <div class="metric"><span>{{ copy.execution_hit }}</span><b>{{ all_metrics.execution_hit_rate }}</b></div>
+              <div class="metric"><span>{{ copy.avg_1d }}</span><b>{{ all_metrics.avg_return_1d }}</b></div>
+            </div>
+            <div class="toolbar">
+              <a class="button secondary" href="/screeners?lang={{ lang }}">{{ copy.back }}</a>
+              <a class="button secondary" href="/screeners/factor-lab?lang={{ lang }}">{{ copy.factor_lab }}</a>
+              <form method="post" action="/screeners/selection-quality/refresh">
+                <input type="hidden" name="lang" value="{{ lang }}" />
+                <button type="submit">{{ copy.refresh }}</button>
+              </form>
+            </div>
+          </div>
+          <div class="card">
+            <div class="eyebrow">{{ copy.playbook }}</div>
+            <h2>{{ copy.how_to_use }}</h2>
+            <ul>
+              {% for rule in rules %}<li>{{ rule }}</li>{% else %}<li>{{ copy.default_rule }}</li>{% endfor %}
+            </ul>
+            <p class="mini">{{ copy.source }}: {{ source_name }} · AI {{ ai_count }} · Factor {{ factor_count }}</p>
+          </div>
+        </section>
+        <section class="card">
+          <div class="section-head"><div><div class="eyebrow">{{ copy.by_source }}</div><h2>{{ copy.converting }}</h2></div></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>{{ copy.source }}</th><th>{{ copy.available_total }}</th><th>1D Hit</th><th>{{ copy.execution_hit }}</th><th>{{ copy.avg_1d }}</th><th>{{ copy.open_high }}</th><th>{{ copy.open_low }}</th><th>{{ copy.gap_block }}</th></tr></thead>
+              <tbody>
+                {% for row in source_rows %}
+                <tr>
+                  <td><strong>{{ row.source_name }}</strong><div class="muted mini">{{ row.source_type }}</div></td>
+                  <td>{{ row.available }} / {{ row.count }}</td><td>{{ row.hit_rate_1d }}</td><td>{{ row.execution_hit_rate }}</td><td>{{ row.avg_return_1d }}</td><td>{{ row.avg_open_to_high }}</td><td>{{ row.avg_open_to_low }}</td><td>{{ row.gap_blocked_rate }}</td>
+                </tr>
+                {% else %}<tr><td colspan="8" class="muted">{{ copy.no_samples }}</td></tr>{% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+        <section class="card" style="margin-top:14px;">
+          <div class="section-head"><div><div class="eyebrow">{{ copy.recent }}</div><h2>{{ copy.records }}</h2></div></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>{{ copy.ticker }}</th><th>{{ copy.market }}</th><th>{{ copy.signal_next }}</th><th>{{ copy.source }}</th><th>{{ copy.score }}</th><th>1D</th><th>{{ copy.high }}</th><th>{{ copy.low }}</th><th>{{ copy.risk }}</th></tr></thead>
+              <tbody>
+                {% for row in records %}
+                <tr>
+                  <td><strong><a href="{{ row.insight_href }}">{{ row.ticker }}</a></strong><div class="muted mini">{{ row.name }}</div></td>
+                  <td>{{ row.market }}</td><td>{{ row.signal_date }}<div class="muted mini">{{ row.next_date }}</div></td><td>{{ row.source_name }}<div class="muted mini">{{ row.source_type }}</div></td><td>{{ row.score }}</td><td>{{ row.return_1d }}</td><td>{{ row.open_to_high }}</td><td>{{ row.open_to_low }}</td>
+                  <td>{% for flag in row.risk_flags %}<span class="risk-chip">{{ flag }}</span>{% else %}<span class="muted">-</span>{% endfor %}</td>
+                </tr>
+                {% else %}<tr><td colspan="9" class="muted">{{ copy.no_recent }}</td></tr>{% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

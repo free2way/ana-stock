@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ labels.title }}</title>
+    <style>{{ style }}</style>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand"><span class="brand-tag">PQW</span><h1>{{ labels.status_title }}</h1><p>{{ labels.status_copy }}</p></div>
+        <nav class="side-nav">{{ nav_html }}</nav>
+        <div class="sidebar-foot">{{ labels.top_summary_copy }}</div>
+      </aside>
+      <main class="main">
+        <div class="topbar">
+          <div class="chip-row"><span class="top-pill">{{ labels.updated }}: {{ generated_at }}</span><span class="top-pill">{{ labels.primary_provider_label }}: {{ primary_provider }}</span><span class="top-pill">{{ labels.synced_symbols }}: {{ synced_count }}</span></div>
+          <div class="chip-row"><a class="top-pill" href="/dashboard/data-sources?lang=en&lookback_runs={{ lookback_runs }}">EN</a><a class="top-pill" href="/dashboard/data-sources?lang=zh&lookback_runs={{ lookback_runs }}">中文</a></div>
+        </div>
+        <section class="hero">
+          <article class="card"><span class="eyebrow">{{ labels.top_summary }}</span><h1>{{ labels.hero }}</h1><p class="lead">{{ labels.lead }}</p><div class="action-row"><a class="cta primary" href="/dashboard?lang={{ lang }}&lookback_runs={{ lookback_runs }}">{{ labels.open_workspace }}</a><a class="cta" href="/dashboard/ops?lang={{ lang }}&lookback_runs={{ lookback_runs }}">{{ labels.open_jobs }}</a></div></article>
+          <article class="card"><span class="eyebrow">{{ labels.focus }}</span><h2 class="section-title">{{ labels.status_title }}</h2><p class="section-copy">{{ labels.focus_copy }}</p><div class="list-stack"><div><div class="subtle">{{ labels.primary_provider }}</div><div class="ticker">{{ primary_provider }}</div></div><div><div class="subtle">{{ labels.concept_freshness }}</div><div class="ticker">{{ concept_freshness }}</div></div><div><div class="subtle">{{ labels.latest_as_of }}</div><div class="ticker">{{ concept_data.get('latest_as_of_date') or '-' }}</div></div><div><div class="subtle">{{ labels.tracked_providers }}</div><div class="ticker">{{ provider_count }}</div></div></div></article>
+        </section>
+        <section class="metrics-grid">{% for label, value, meta in metrics %}<article class='metric-card'><div class='metric-label'>{{ label }}</div><div class='metric-value'>{{ value }}</div><div class='metric-meta'>{{ meta }}</div></article>{% endfor %}</section>
+        <section class="workspace-grid">
+          <div class="stack">
+            <article class="card"><span class="eyebrow">{{ labels.strategy }}</span><h2 class="section-title">{{ labels.strategy_copy }}</h2><div class="workspace-grid" style="grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px;"><article class="metric-card"><div class="metric-label">{{ labels.strategy_prices }}</div><ul>{% for step in strategies.historical %}<li>{{ step }}</li>{% endfor %}</ul></article><article class="metric-card"><div class="metric-label">{{ labels.strategy_profiles }}</div><ul>{% for step in strategies.profiles %}<li>{{ step }}</li>{% endfor %}</ul></article><article class="metric-card"><div class="metric-label">{{ labels.strategy_concepts }}</div><ul>{% for step in strategies.concepts %}<li>{{ step }}</li>{% endfor %}</ul></article><article class="metric-card"><div class="metric-label">{{ labels.strategy_supplemental }}</div><ul>{% for step in strategies.supplemental %}<li>{{ step }}</li>{% endfor %}</ul></article></div></article>
+            <article class="card"><span class="eyebrow">{{ provider_strategy.title }}</span><h2 class="section-title">{{ provider_strategy['copy'] }}</h2><div class="list-stack"><article class="list-row"><div><div class="ticker">Price / Auto</div><div class="subtle">{{ provider_strategy.price_auto }}</div></div></article><article class="list-row"><div><div class="ticker">Price / OpenBB</div><div class="subtle">{{ provider_strategy.price_openbb }}</div></div></article><article class="list-row"><div><div class="ticker">Fundamental / Auto</div><div class="subtle">{{ provider_strategy.fund_auto }}</div></div></article><article class="list-row"><div><div class="ticker">Concept / Auto</div><div class="subtle">{{ provider_strategy.concept_auto }}</div></div></article><article class="list-row"><div><div class="ticker">Execution / Realtime</div><div class="subtle">{{ provider_strategy.execution }}</div></div></article></div></article>
+            <article class="card"><span class="eyebrow">{{ labels.recent_sync }}</span><h2 class="section-title">{{ labels.per_symbol_sync_source }}</h2><div class="list-stack">{% for item in sync_rows %}<article class='sync-row'><div><a class='ticker' href='/insights/{{ item.ticker_path }}?lang={{ lang }}'>{{ item.ticker }}</a><div class='subtle'>{{ item.display_name }} · {{ item.display_provider }}</div><div class='subtle'>{{ item.display_message }}</div></div><div class='row-right'><div class='mini-metric'>{{ item.display_date }}</div><span class='status-pill {{ item.status_class }}'>{{ item.display_status }}</span></div></article>{% else %}<div class='empty'>{{ labels.no_sync_history }}</div>{% endfor %}</div></article>
+          </div>
+          <div class="stack">
+            <article class="card"><span class="eyebrow">{{ labels.current_mix }}</span><h2 class="section-title">{{ labels.provider_rows }}</h2><div class="list-stack">{% for item in provider_rows %}<article class='list-row'><div><div class='ticker'>{{ item.provider }}</div><div class='subtle'>{{ labels.stocks }}</div></div><div class='row-right'><div class='mini-metric'>{{ item.count }}</div></div></article>{% else %}<div class='empty'>{{ labels.no_provider_usage }}</div>{% endfor %}</div></article>
+            <article class="card"><span class="eyebrow">{{ labels.cn_concepts }}</span><h2 class="section-title">{{ labels.concept_freshness }}</h2><p class="section-copy">{{ labels.concepts_across_symbols.format(concepts=concept_data.get('concept_count'), symbols=concept_data.get('symbol_count')) }}</p><div class="list-stack"><div><div class="subtle">{{ labels.latest_as_of }}</div><div class="ticker">{{ concept_data.get('latest_as_of_date') or '-' }}</div></div><div><div class="subtle">{{ labels.freshness }}</div><div class="ticker">{{ concept_freshness }}</div></div></div></article>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

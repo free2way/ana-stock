@@ -30,7 +30,7 @@ class ExecutableSelectionProtocol:
     data_manifest_hash: str = "unversioned"
     feature_set_version: str = "unversioned"
     label_version: str = "next_open_fixed_horizon_net_profit_v1"
-    calendar_version: str = "market_calendar_2026_v1"
+    calendar_version: str = "market_calendar_2027_v2"
     market_rules_version: str = "daily_market_rules_v2"
     adjustment_version: str = "raw_prices_with_actions_v1"
     cost_model_version: str = "one_way_commission_slippage_v1"
@@ -59,6 +59,10 @@ class ExecutableSelectionProtocol:
             raise ValueError("market must be CN, US, or HK")
         if self.horizon_days <= 0 or self.top_n <= 0:
             raise ValueError("horizon_days and top_n must be positive")
+        if market == "CN" and self.horizon_days < 2:
+            # A-share T+1: a position opened at the next session open cannot be
+            # closed at that same session close, so horizon 1 is not executable.
+            raise ValueError("CN T+1 forbids a same-session exit; horizon_days must be >= 2")
         if self.entry_price_mode != "next_session_open" or self.exit_price_mode != "holding_session_close":
             raise ValueError("v1 executable protocol requires next-session open and fixed-horizon close")
         try:

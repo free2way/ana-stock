@@ -14,6 +14,7 @@ from app.services.recommendation_regression import (
     _iter_report_candidate_rows,
 )
 from app.services.market_lake import load_lake_rows
+from app.services.price_basis import preferred_close
 from app.services.repository import WorkspaceSnapshotRepository
 from app.services.market_freshness import is_snapshot_as_of_current
 from app.services.runtime_cache import clear_namespace, get_or_set
@@ -82,30 +83,37 @@ def _next_session_metrics_from_history(*, history: list[dict[str, Any]] | None, 
         break
     if baseline is None or next_row is None:
         return None
-    base_close = _safe_float(baseline.get("close"))
+    # R2: close-to-close return prefers the adjusted view.  The raw close is
+    # retained for the overnight gap and intraday open-to-close ratios, whose
+    # other leg (raw open) is not adjusted -- mixing bases there would change
+    # their meaning, not just their scale.
+    raw_base_close = _safe_float(baseline.get("close"))
+    base_close = preferred_close(baseline) or raw_base_close
     next_open = _safe_float(next_row.get("open"))
     next_high = _safe_float(next_row.get("high"))
     next_low = _safe_float(next_row.get("low"))
-    next_close = _safe_float(next_row.get("close"))
+    raw_next_close = _safe_float(next_row.get("close"))
+    next_close = preferred_close(next_row) or raw_next_close
     if not base_close or not next_open or not next_high or not next_low or not next_close:
         return None
 
     def pct(start: float, end: float) -> float:
         return round((end / start - 1.0) * 100.0, 2)
 
+    gap_open = pct(raw_base_close or base_close, next_open)
     open_to_high = pct(next_open, next_high)
     open_to_low = pct(next_open, next_low)
     close_1d = pct(base_close, next_close)
     return {
         "next_date": str(next_row.get("date") or next_row.get("trade_date") or "")[:10],
-        "gap_open_pct": pct(base_close, next_open),
+        "gap_open_pct": gap_open,
         "open_to_high_pct": open_to_high,
         "open_to_low_pct": open_to_low,
-        "open_to_close_pct": pct(next_open, next_close),
+        "open_to_close_pct": pct(next_open, raw_next_close or next_close),
         "close_1d_pct": close_1d,
         "close_hit": close_1d > 0,
         "execution_hit": open_to_high >= 2.0 and open_to_low > -4.0,
-        "gap_blocked": pct(base_close, next_open) >= 7.0,
+        "gap_blocked": gap_open >= 7.0,
     }
 
 

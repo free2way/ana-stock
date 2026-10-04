@@ -1,6 +1,7 @@
 from datetime import date, datetime
 from dataclasses import asdict
 import json
+import logging
 
 from app.services.execution_tag_filters import (
     matches_execution_tag_filter as _matches_execution_tag_filter,
@@ -10,6 +11,7 @@ from app.core.db import SessionLocal
 from app.models.schema import SymbolCreate
 from app.services.insight_engine import InsightEngine
 from app.services.market_context import load_market_context_snapshot
+from app.services.market_freshness import latest_completed_market_date
 from app.services.market_lake import screen_us_lake_momentum
 from app.services.runtime_cache import get_or_set
 from app.services.repository import (
@@ -23,7 +25,13 @@ from app.services.repository import (
     TechnicalSnapshotRepository,
     WatchlistRepository,
 )
-from app.services.model_signal_summary import build_model_state, enrich_model_output, summarize_explanations
+from app.services.model_signal_summary import (
+    build_model_state,
+    enrich_model_output,
+    model_direction_rank,
+    model_rank_strength,
+    summarize_explanations,
+)
 from app.services.model_evaluation import latest_model_activation_statuses
 from app.services.price_snapshot import load_latest_closes, load_latest_open_gaps
 from app.services.technical_patterns import TechnicalPatternService
@@ -33,6 +41,8 @@ from app.services.tradingview_client import TradingViewClient
 from app.services.tushare_client import TushareClient
 from app.services.us_trade_universe import build_us_trade_universe
 
+
+logger = logging.getLogger(__name__)
 
 MODEL_TEMPLATES = {
     "lightgbm_top_picks": {
@@ -285,6 +295,12 @@ def _normalize_action_value(value: str | None) -> str:
 
 
 class ScreenerService:
+    # Newest successful runs inspected when picking the model-ranking champion.
+    # Mirrors PredictionRepository._SERVING_RUN_WINDOW: a run the unified
+    # promotion gate withholds is skipped so it cannot shadow an older servable
+    # run, and the window bounds the per-read gate work.
+    _SCREENING_SERVING_RUN_WINDOW = 5
+
     def __init__(self) -> None:
         self.insight_engine = InsightEngine()
         self.technical_patterns = TechnicalPatternService()
@@ -369,6 +385,8 @@ class ScreenerService:
                 market=effective_market,
                 min_trend_score=min_trend_score,
                 action_filter=action_filter,
+                model_signal_filter=model_signal_filter,
+                min_model_signal_strength=min_model_signal_strength,
             )
         elif template["mode"] == "technical_pattern":
             fixed_market = template.get("market")
@@ -512,23 +530,62 @@ class ScreenerService:
         market: str,
         min_trend_score: int,
         action_filter: str,
+        model_signal_filter: str = "ALL",
+        min_model_signal_strength: float = 0.0,
     ) -> list[dict]:
+        # ``min_trend_score`` is a technical-trend threshold and no longer gates
+        # the model signal; model rows use ``min_model_signal_strength`` instead.
+        _ = min_trend_score
         tickers = self._load_universe(universe=universe, market=market)
         if not tickers:
             return []
 
         universe_scope = ["local_watchlist"] if universe == "watchlist" else ["full_market", "full_market_us_lake", "full_dataset"]
 
+        # Lazy import mirrors PredictionRepository: the stock_selection package
+        # is heavy and imports this service's siblings.
+        from app.services.stock_selection.promotion_enforcement import (
+            annotate_rows_with_promotion,
+            assess_run_for_serving,
+        )
+
         with SessionLocal() as db:
             run_repo = ModelRunRepository(db)
             prediction_repo = PredictionRepository(db)
-            run = run_repo.get_latest_successful_run(
+            # A gate-withheld latest run must not shadow an older servable one:
+            # walk the newest successful candidates and fall through on a
+            # blocked decision (REJECT, or OBSERVE under
+            # PQW_PROMOTION_GATE_REQUIRE_COMPLETE_EVIDENCE=true).
+            run = None
+            serving_decision = None
+            for candidate_run in run_repo.list_successful_runs(
                 market=market,
                 model_types=["lightgbm_multifactor"],
                 universe_like=universe_scope,
-            )
+                limit=self._SCREENING_SERVING_RUN_WINDOW,
+            ):
+                decision = assess_run_for_serving(candidate_run, db=db)
+                if not decision.blocked:
+                    run = candidate_run
+                    serving_decision = decision
+                    break
             if run is None:
                 return []
+            if (
+                serving_decision is not None
+                and serving_decision.enforce
+                and serving_decision.marked_non_promotable
+            ):
+                # Missing/insufficient promotion evidence, but still served under
+                # the default observe-only policy: keep current behaviour, make
+                # the gap explicit.
+                logger.warning(
+                    "screener model ranking serves non-promotable model run %s "
+                    "(%s): promotion evidence is absent or incomplete; rows are "
+                    "labelled research-only",
+                    run.id,
+                    serving_decision.report.decision,
+                )
             candidates = prediction_repo.list_predictions_for_run(
                 run.id,
                 market=market,
@@ -560,9 +617,14 @@ class ScreenerService:
             decisions = [prediction_repo._build_signal_decision(candidate) for candidate in enriched_candidates]
 
         results: list[dict] = []
+        normalized_signal_filter = SIGNAL_FILTER_MAP.get((model_signal_filter or "ALL").upper(), None)
         for item in decisions:
+            signed_score = item.get("score")
             signal_strength = float(item.get("signal_strength") or item.get("percentile") or 0.0)
-            if signal_strength < float(min_trend_score or 0):
+            if signal_strength < float(min_model_signal_strength or 0.0):
+                continue
+            if normalized_signal_filter is None and signed_score is not None and float(signed_score) < 0:
+                # Direction gate: raw SELL rows never top the default model ranking.
                 continue
             entry_style = _normalize_action_value(item.get("entry_style"))
             if action_filter != "ALL" and entry_style != _normalize_action_value(action_filter):
@@ -586,12 +648,13 @@ class ScreenerService:
                     "name": item.get("name") or ticker,
                     "market": item.get("market") or self._infer_market(ticker),
                     "as_of_date": item.get("trade_date"),
-                    "trend_score": signal_strength,
+                    "trend_score": model_rank_strength(signed_score),
                     "action_label": action_label,
                     "action_summary": item.get("summary_text") or item.get("execution_note") or "Ranked by LightGBM multifactor score.",
                     "latest_close": item.get("latest_close"),
                     "momentum_5": item.get("expected_return_5d"),
                     "momentum_20": item.get("expected_return_20d"),
+                    "momentum_units": "percent",
                     "volume_ratio": None,
                     "distance_to_breakout_pct": None,
                     "snapshot_hits": 0,
@@ -622,11 +685,15 @@ class ScreenerService:
 
         results.sort(
             key=lambda item: (
-                -(item.get("model_signal_strength") or 0),
+                -model_rank_strength(first_present(item, "model_score", "score")),
                 -(item.get("model_percentile") or 0),
                 item.get("ticker", ""),
             )
         )
+        if serving_decision is not None:
+            # Non-promotable rows carry the "非晋级/研究口径" label plus the
+            # gate audit fields, matching the recommendation path.
+            results = annotate_rows_with_promotion(results, serving_decision)
         return results
 
     def _market_snapshot_score(self, board_key: str, row: dict, mode: str = "monitor") -> int:
@@ -719,7 +786,7 @@ class ScreenerService:
 
         for ticker in tickers:
             cached_snapshot = cached_snapshot_map.get(ticker)
-            snapshot = self._snapshot_from_cache(cached_snapshot) if cached_snapshot is not None else self.technical_patterns.evaluate_ticker(ticker)
+            snapshot, pattern_freshness = self._resolve_cached_pattern_snapshot(ticker, cached_snapshot, market)
             if snapshot is None:
                 continue
             if required_patterns and not self._matches_required_patterns(snapshot, required_patterns):
@@ -737,6 +804,7 @@ class ScreenerService:
             else:
                 row = self._build_result_from_fallback_pattern(snapshot, model_context)
             row["matched_patterns"] = list(snapshot.matched_patterns or [])
+            row.update(pattern_freshness)
             row["selection_reason"] = self._build_pattern_reason(template_key, row["matched_patterns"], row)
             results.append(row)
 
@@ -759,6 +827,55 @@ class ScreenerService:
         if not payload:
             return None
         return type("CachedTechnicalSnapshot", (), payload)()
+
+    # --- S-5: as_of freshness for technical-pattern labels -----------------
+    _PATTERN_FRESHNESS_MARKETS = {"CN", "US"}
+
+    def _pattern_as_of_status(self, as_of_date, market: str) -> dict:
+        """Compare a pattern snapshot's as_of date with the latest completed session."""
+        as_of = str(as_of_date or "").strip()[:10] or None
+        market_code = str(market or "").strip().upper()
+        expected = (
+            latest_completed_market_date(market_code)
+            if market_code in self._PATTERN_FRESHNESS_MARKETS
+            else None
+        )
+        if as_of and expected:
+            stale: bool | None = as_of < expected
+        else:
+            stale = None
+        return {
+            "pattern_as_of_date": as_of,
+            "pattern_expected_as_of_date": expected,
+            "pattern_as_of_stale": stale,
+        }
+
+    def _resolve_cached_pattern_snapshot(self, ticker: str, cached_snapshot: dict | None, market: str):
+        """Return ``(snapshot, freshness)`` for a pattern label.
+
+        A cached snapshot that predates the latest completed session is
+        recomputed live when possible.  If the live recompute is unavailable the
+        stale snapshot is still returned, but the freshness annotation marks it
+        ``pattern_as_of_stale=True`` so the page/API can flag it instead of
+        presenting it as today's pattern.
+        """
+        if cached_snapshot is None:
+            snapshot = self.technical_patterns.evaluate_ticker(ticker)
+            as_of = getattr(snapshot, "as_of_date", None) if snapshot is not None else None
+            status = self._pattern_as_of_status(as_of, market)
+            status["pattern_as_of_source"] = "live"
+            return snapshot, status
+        status = self._pattern_as_of_status(cached_snapshot.get("as_of_date"), market)
+        if status.get("pattern_as_of_stale"):
+            live = self.technical_patterns.evaluate_ticker(ticker)
+            if live is not None:
+                live_status = self._pattern_as_of_status(getattr(live, "as_of_date", None), market)
+                live_status["pattern_as_of_source"] = "live_recompute"
+                return live, live_status
+            status["pattern_as_of_source"] = "cached_stale"
+            return self._snapshot_from_cache(cached_snapshot), status
+        status["pattern_as_of_source"] = "current"
+        return self._snapshot_from_cache(cached_snapshot), status
 
     def _rank_cn_snapshot_candidates(
         self,
@@ -981,8 +1098,16 @@ class ScreenerService:
             if snapshot is None:
                 evaluated = self.technical_patterns.evaluate_ticker(ticker)
                 snapshot = self._snapshot_from_cache(asdict(evaluated)) if evaluated is not None else None
+                pattern_freshness = self._pattern_as_of_status(
+                    getattr(evaluated, "as_of_date", None) if evaluated is not None else None,
+                    market,
+                )
+                pattern_freshness["pattern_as_of_source"] = "live"
+            else:
+                snapshot, pattern_freshness = self._resolve_cached_pattern_snapshot(ticker, snapshot, market)
             row = self._build_result_from_insight(insight, model_context_map.get(ticker))
             row["matched_patterns"] = list(getattr(snapshot, "matched_patterns", None) or [])
+            row.update(pattern_freshness)
             row["setup_bucket"] = setup_context.get("setup_bucket")
             row["distance_to_52w_high_pct"] = setup_context.get("distance_to_52w_high_pct")
             row["pullback_depth_pct"] = setup_context.get("pullback_depth_pct")
@@ -1242,6 +1367,17 @@ class ScreenerService:
             "model_signal_strength",
             "trade_readiness_score",
         }
+        if sort_by == "model_signal_strength":
+            # Direction-aware: a large |score| on the short side must not rank top.
+            return sorted(
+                results,
+                key=lambda row: (
+                    model_direction_rank(first_present(row, "model_score", "score")),
+                    self._sortable_number(row.get("model_signal_strength")),
+                    row.get("ticker", ""),
+                ),
+                reverse=reverse,
+            )
         if sort_by in numeric_fields:
             return sorted(
                 results,
@@ -1491,6 +1627,8 @@ class ScreenerService:
             "latest_close": insight["latest_close"],
             "momentum_5": insight.get("momentum_5"),
             "momentum_20": insight.get("momentum_20"),
+            # S-4: momentum fields on a result row are percent-scaled.
+            "momentum_units": insight.get("momentum_units") or "percent",
             "volume_ratio": insight.get("volume_ratio"),
             "distance_to_breakout_pct": insight.get("distance_to_breakout_pct"),
             "snapshot_hits": 0,

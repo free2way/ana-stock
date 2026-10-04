@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ copy.page_title }}</title>
+    <style>{{ page_style|safe }}</style>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-tag">PQW</span>
+          <h1>{{ copy.sidebar_title }}</h1>
+          <p>{{ copy.sidebar_description }}</p>
+        </div>
+        <nav class="side-nav">{{ nav_html|safe }}</nav>
+      </aside>
+      <main class="content">
+        <div class="wrap">
+          <div class="toolbar">
+            <a class="pill" href="/screeners?lang={{ lang }}">← {{ copy.back }}</a>
+            <a class="pill" href="/settings/kronos?lang={{ lang }}">{{ copy.settings }}</a>
+            <a class="pill" href="/dashboard/ai-daily-report?lang={{ lang }}">{{ copy.report }}</a>
+            <form class="inline" action="/jobs/kronos-validation" method="post">
+              <input type="hidden" name="redirect_to" value="/screeners/kronos-validation?lang={{ lang }}&amp;market={{ selected_market }}&amp;status={{ selected_status }}" />
+              <input type="hidden" name="markets" value="{{ pool.refresh_markets }}" />
+              <input type="hidden" name="candidate_limit" value="80" />
+              <button type="submit">{{ copy.refresh }}</button>
+            </form>
+          </div>
+          <section class="hero">
+            <article class="card">
+              <div class="eyebrow">{{ copy.eyebrow }}</div>
+              <h1>{{ copy.page_title }}</h1>
+              <p class="lead">{{ copy.lead }}</p>
+              <div class="chip-row" style="margin-top:12px;">
+                {% for item in market_filters %}<a class="filter-chip{% if selected_market == item.value %} active{% endif %}" href="{{ item.href }}">{{ item.label }}</a>{% endfor %}
+              </div>
+              <div class="chip-row">
+                {% for item in status_filters %}<a class="filter-chip{% if selected_status == item.value %} active{% endif %}" href="{{ item.href }}">{{ item.label }}</a>{% endfor %}
+              </div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{{ copy.latest }}</div>
+              <div class="metric-grid">
+                <div class="metric"><span class="muted">{{ copy.status }}</span><strong>{{ pool.status }}</strong></div>
+                <div class="metric"><span class="muted">{{ copy.model }}</span><strong style="font-size:17px;">{{ pool.model_name }}</strong></div>
+                <div class="metric"><span class="muted">{{ copy.candidates }}</span><strong>{{ pool.candidate_count }}</strong></div>
+                <div class="metric"><span class="muted">{{ copy.validated }}</span><strong>{{ pool.validated_count }}</strong></div>
+              </div>
+              <div class="muted" style="margin-top:10px;">{{ pool.message }}</div>
+              <div class="muted" style="margin-top:6px;">{{ copy.updated }}: {{ snapshot_time }}</div>
+            </article>
+          </section>
+          <section class="card">
+            <div class="eyebrow">{{ copy.results }}</div>
+            <div class="muted">{{ copy.results_help }}</div>
+            <div class="table-wrap" style="margin-top:12px;">
+              <table>
+                <thead>
+                  <tr>
+                    <th class="sticky-col sticky-col-1">{{ copy.ticker }}</th>
+                    <th>{{ copy.market }}</th>
+                    <th>{{ copy.status }}</th>
+                    <th>{{ copy.decision }}</th>
+                    <th>{{ copy.score }}</th>
+                    <th>{{ copy.expected }}</th>
+                    <th>{{ copy.drawdown }}</th>
+                    <th>{{ copy.latest_close }}</th>
+                    <th>{{ copy.source }}</th>
+                    <th>{{ copy.signal }}</th>
+                    <th>{{ copy.bars }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in rows %}
+                  <tr>
+                    <td class="sticky-col sticky-col-1"><a class="ticker-link" href="/insights/{{ row.ticker|urlencode }}?lang={{ lang }}">{{ row.ticker }}</a><div class="muted">{{ row.name }}</div></td>
+                    <td>{{ row.market }}</td>
+                    <td><span class="status-badge {{ row.status.class }}">{{ row.status.label }}</span></td>
+                    <td><span class="decision-chip {{ row.decision_tone }}">{{ row.decision }}</span><div class="muted">{{ row.reason }}</div></td>
+                    <td>{{ row.score }}<div class="muted">{{ copy.precheck }} {{ row.precheck_score }}</div></td>
+                    <td>{{ row.expected_1d }}<div class="muted">{{ copy.three_day }} {{ row.expected_3d }}</div></td>
+                    <td>{{ row.drawdown }}</td>
+                    <td>{{ row.latest_close }}<div class="muted">{{ row.latest_date }}</div></td>
+                    <td>{{ row.source }}<div class="muted">{{ row.source_templates }}</div></td>
+                    <td>{{ row.signal_label }}<div class="muted">{{ copy.strength }} {{ row.signal_strength }}</div></td>
+                    <td>{{ row.history_count }}</td>
+                  </tr>
+                  {% else %}
+                  <tr><td colspan="11">{{ copy.empty }}</td></tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+  </body>
+</html>

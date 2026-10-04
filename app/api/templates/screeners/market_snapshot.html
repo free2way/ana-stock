@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ copy.title }}</title>
+    <style>
+      {{ page_style|safe }}
+      .value-chip,.rating-chip,.watchlist-chip{display:inline-flex;align-items:center;padding:5px 9px;border-radius:999px;font-weight:800;font-size:12px;white-space:nowrap}
+      .tone-good{background:#dcfce7;color:#166534}.tone-positive{background:#dbeafe;color:#1d4ed8}.tone-warn{background:#fef3c7;color:#92400e}.tone-bad{background:#fee2e2;color:#991b1b}.tone-neutral{background:#f3f4f6;color:#374151}
+      .chip-list{display:flex;gap:6px;flex-wrap:wrap}.history-bars{height:34px;display:flex;align-items:flex-end;gap:3px}.history-bar{width:7px;border-radius:4px 4px 1px 1px;background:#0f766e;min-height:6px}
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand"><span class="brand-tag">PQW</span><h1>{{ copy.title }}</h1><p>{{ copy.sidebar_description }}</p></div>
+        <nav class="side-nav">{{ nav_html|safe }}</nav>
+        <div class="sidebar-foot">{{ copy.sidebar_note }}</div>
+      </aside>
+      <main class="content"><div class="wrap">
+        <div class="toolbar"><a href="/screeners?lang={{ lang }}">← {{ copy.back }}</a><a href="/screeners/focus/today?lang={{ lang }}">{{ copy.focus }}</a><a href="/watchlist?lang={{ lang }}">{{ copy.watchlist }}</a></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
+          {% for item in market_filters %}<a class="filter-chip{% if selected_market == item.value %} active{% endif %}" href="{{ item.href }}">{{ item.label }}</a>{% endfor %}
+        </div>
+        <div class="market-scope-grid">
+          {% for item in summaries %}
+          <a class="market-scope-card{% if selected_market == item.market %} active{% endif %}" href="{{ item.href }}">
+            <div class="market-scope-head"><strong>{{ item.label }}</strong><span>{{ copy.boards }} {{ item.board_count }}</span></div>
+            <div class="market-scope-headline"><span class="market-scope-chip {{ item.delta_tone }}">{{ item.delta_label }}</span></div>
+            <div class="market-scope-stats"><div><b>{{ item.candidate_count }}</b><span>{{ copy.candidates }}</span></div><div><b>{{ '%.1f'|format(item.heat) }}</b><span>{{ copy.heat }}</span></div><div><b>{{ '%.0f'|format(item.highest_trend) }}</b><span>{{ copy.top_trend }}</span></div></div>
+            <div class="market-scope-trend-wrap"><span>{{ copy.history }}</span><div class="history-bars">{% for bar in item.history_bars %}<i class="history-bar" style="height:{{ bar.height }}px" title="{{ bar.value }}"></i>{% endfor %}</div></div>
+            <div class="market-scope-meta">{{ copy.mode }} {{ mode }}</div>
+          </a>
+          {% endfor %}
+        </div>
+        <div class="market-scope-help">{{ copy.methodology }}</div>
+        <div class="card">
+          <div class="eyebrow">{{ copy.title }}</div><h1 style="margin:0 0 8px;">{{ copy.title }}</h1><p style="margin:0;color:#6b7280;">{{ copy.lead }} {{ copy.scope }}: {{ market_label }}</p>
+          <div style="margin-top:14px;"><div class="muted" style="margin-bottom:8px;">{{ copy.view_mode }}</div><div style="display:flex;gap:8px;flex-wrap:wrap;">{% for item in mode_filters %}<a class="filter-chip{% if mode == item.value %} active{% endif %}" href="{{ item.href }}">{{ item.label }}</a>{% endfor %}</div></div>
+        </div>
+        <div class="card"><div class="eyebrow">{{ copy.sentiment }}</div><div class="chip-list"><span class="value-chip tone-{{ sentiment.tone }}">Market {{ sentiment.value }}</span></div><p style="margin:12px 0 0;color:#6b7280;">{{ copy.avg_score }} {{ sentiment.average }} | {{ copy.bullish_boards }} {{ sentiment.bullish_boards }} | {{ copy.total_candidates }} {{ sentiment.total_candidates }}</p></div>
+        {% if message %}<div class="card">{{ message }}</div>{% endif %}
+        {% if not view.snapshot_ready %}<div class="card"><div class="eyebrow">{{ copy.loading_title }}</div><p style="margin:0;color:#6b7280;">{{ copy.loading }}</p></div>{% elif not boards %}<div class="card"><div class="eyebrow">{{ copy.title }}</div><p style="margin:0;color:#6b7280;">{{ copy.empty }}</p></div>{% endif %}
+        {% for board in boards %}
+        <section class="card">
+          <div class="eyebrow">{{ copy.title }}</div><h2 style="margin:0 0 8px;">{{ board.title }}</h2><p style="margin:0 0 14px;color:#6b7280;">{{ board.description }}</p>
+          <div class="table-wrap"><table><thead><tr><th>{{ copy.ticker }}</th><th>{{ copy.name }}</th><th>{{ copy.snapshot_score }}</th><th>{{ copy.trend }}</th><th>5D %</th><th>Volume</th><th>{{ copy.patterns }}</th><th>{{ copy.breakdown }}</th><th>{{ copy.rating }}</th><th>{{ copy.watchlist }}</th><th>{{ copy.focus_action }}</th></tr></thead>
+            <tbody>
+              {% for row in board.rows %}
+              <tr>
+                <td><a class="main-open-link" href="/insights/{{ row.ticker|urlencode }}?lang={{ lang }}">{{ row.ticker }}</a></td><td>{{ row.name }}</td>
+                <td><span class="value-chip tone-{{ row.snapshot_tone }}">{{ row.snapshot_score }}</span></td><td><span class="value-chip tone-{{ row.trend_tone }}">{{ row.trend_score }}</span></td><td><span class="value-chip tone-{{ row.momentum_tone }}">{{ row.momentum_5 }}</span></td><td>{{ row.volume_ratio }}</td><td>{{ row.patterns }}</td>
+                <td><div class="chip-list">{% for value in row.breakdown %}<span class="value-chip tone-neutral">{{ value }}</span>{% else %}-{% endfor %}</div></td>
+                <td><div class="chip-list">{% for rating in row.ratings %}<span class="rating-chip tone-{{ rating.tone }}">{{ rating.interval }} {{ rating.value }}</span>{% endfor %}</div></td>
+                <td><div class="chip-list">{% for value in row.watchlist_chips %}<span class="watchlist-chip tone-neutral">{{ value }}</span>{% endfor %}</div></td>
+                <td><form method="post" action="/screeners/market-snapshot/add-to-focus" style="margin:0;"><input type="hidden" name="lang" value="{{ lang }}" /><input type="hidden" name="mode" value="{{ mode }}" /><input type="hidden" name="market_filter" value="{{ selected_market }}" /><input type="hidden" name="ticker" value="{{ row.ticker }}" /><input type="hidden" name="name" value="{{ row.name }}" /><input type="hidden" name="market" value="{{ row.market }}" /><input type="hidden" name="selection_reason" value="{{ row.selection_reason }}" /><input type="hidden" name="matched_patterns" value="{{ row.patterns }}" /><button type="submit">{{ copy.add }}</button></form></td>
+              </tr>
+              {% else %}<tr><td colspan="11" class="muted">{{ copy.empty }}</td></tr>{% endfor %}
+            </tbody>
+          </table></div>
+        </section>
+        {% endfor %}
+      </div></main>
+    </div>
+  </body>
+</html>

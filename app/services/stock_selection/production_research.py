@@ -28,6 +28,9 @@ from app.services.stock_selection.data_readiness import (
 )
 from app.services.stock_selection.factor_pipeline import CrossSectionalFactorPipeline
 from app.services.stock_selection.factor_sets import ResearchFactorSet, get_research_factor_set
+from app.services.stock_selection.historical_universe_contract import (
+    load_historical_universe_contract_for_market,
+)
 from app.services.stock_selection.factor_diagnostics import (
     FactorDiagnosticConfig,
     FactorDiagnosticReport,
@@ -286,10 +289,18 @@ def audit_market_research_readiness(
     market: str,
     artifact_root: Path | None = None,
     required_history_sessions: int = 252,
+    historical_universe_contract_path: Path | None = None,
 ) -> MarketReadinessAuditResult:
     market_code = str(market or "").strip().upper()
     if market_code not in {"CN", "US"}:
         raise ValueError("market must be CN or US")
+    settings = get_settings()
+    historical_contract = load_historical_universe_contract_for_market(
+        market=market_code,
+        artifacts_dir=settings.artifacts_dir,
+        explicit_path=historical_universe_contract_path,
+        settings_path=settings.historical_universe_contract_path,
+    )
     symbols = sorted(list_lake_symbols(market=market_code))
     if not symbols:
         raise ValueError(f"no {market_code} market lake symbols found")
@@ -321,9 +332,10 @@ def audit_market_research_readiness(
             required_history_sessions=required_history_sessions,
             require_historical_universe_contract=True,
         ),
+        historical_universe_contract=historical_contract,
     )
     source_version = market_lake_source_version(market_code)
-    root = artifact_root or (get_settings().artifacts_dir / "stock_selection_research")
+    root = artifact_root or (settings.artifacts_dir / "stock_selection_research")
     evidence = persist_data_readiness_report(
         report,
         source_version=source_version,
@@ -434,6 +446,7 @@ def run_production_research_challenger(
     regime_snapshots_by_date: Mapping[date, Mapping[str, object]] | None = None,
     regime_decision_cutoffs_by_date: Mapping[date, str] | None = None,
     historical_training_regime_by_date: Mapping[date, str] | None = None,
+    historical_universe_contract_path: Path | None = None,
 ) -> ProductionResearchRunResult:
     market_code = config.market.strip().upper()
     if bool(config.fill_cost_model) != (execution_evidence is not None):
@@ -448,6 +461,7 @@ def run_production_research_challenger(
             market=market_code,
             artifact_root=root,
             required_history_sessions=config.minimum_required_history_sessions,
+            historical_universe_contract_path=historical_universe_contract_path,
         )
         if not readiness_audit.report.passed:
             blockers = ", ".join(readiness_audit.report.blockers)
@@ -567,6 +581,7 @@ def run_production_factor_diagnostics(
     config: ProductionFactorDiagnosticConfig,
     artifact_root: Path | None = None,
     tickers: Iterable[str] | None = None,
+    historical_universe_contract_path: Path | None = None,
 ) -> ProductionFactorDiagnosticResult:
     market_code = config.market.strip().upper()
     explicit_tickers = tuple(
@@ -577,6 +592,7 @@ def run_production_factor_diagnostics(
         readiness = audit_market_research_readiness(
             market=market_code,
             artifact_root=root,
+            historical_universe_contract_path=historical_universe_contract_path,
         )
         if not readiness.report.passed:
             raise RuntimeError(

@@ -32,7 +32,7 @@ class DashboardWorkflowHomeTests(unittest.TestCase):
             "close_review_action_feed": {"summary": "复盘已生成", "actionable": [], "blocked": [], "risk_reduction": []},
         }
         with patch(
-            "app.api.routes.dashboard.build_lightgbm_prediction_evaluation",
+            "app.api.routes.dashboard.home.build_lightgbm_prediction_evaluation",
             return_value={"sample_count": 0, "windows": {}},
         ):
             rendered = _render_dashboard_workspace(

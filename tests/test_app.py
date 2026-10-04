@@ -119,6 +119,18 @@ class AppFlowTests(unittest.TestCase):
         os.environ["PQW_AUTH_PASSWORD"] = "admin1234"
         os.environ["PQW_AUTH_SECRET"] = "test-secret"
         os.environ["PQW_STORAGE_CAPACITY_MONITOR_ENABLED"] = "false"
+        # These end-to-end flow tests train on temp-lake fixtures with no
+        # rebuilt adjusted view. The fail-closed gate (absent view => refuse)
+        # is covered directly in tests/test_trainer_label_price_coverage.py, so
+        # the app fixture explicitly opts in to raw labels rather than silently
+        # depending on the old "no view => allow" behaviour.
+        os.environ["PQW_TRAINER_ALLOW_RAW_FALLBACK"] = "true"
+        # An enabled opt-in now requires an auditable reason (fail closed).
+        # The end-to-end fixture records one so raw-label runs still exercise
+        # the full path; the missing-reason refusal is covered in
+        # tests/test_trainer_label_price_coverage.py.
+        os.environ.setdefault("PQW_OPTIN_REASON", "test_app end-to-end raw label fixture")
+        os.environ.setdefault("PQW_OPTIN_OPERATOR", "test_app_fixture")
 
     def _login(self) -> None:
         response = self.client.post(
@@ -143,7 +155,11 @@ class AppFlowTests(unittest.TestCase):
 
         market = infer_market_from_ticker(ticker)
         symbol = normalize_ticker_for_market(ticker, market)
-        write_ohlcv_rows_to_lake(market=market, rows=[{**row, "symbol": symbol} for row in rows])
+        write_ohlcv_rows_to_lake(
+            market=market,
+            rows=[{**row, "symbol": symbol} for row in rows],
+            provenance={"provider": "fixture", "source_reference": f"fixture:{ticker}"},
+        )
 
     def _build_bullish_cn_history(self) -> list[dict]:
         rows: list[dict] = []
@@ -334,9 +350,9 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seeded = seed_sample_data()
+        seeded = seed_sample_data(days=600)
         predictions_written = SignalTrainer().train(run_name="sample_flow", signal_type="momentum", lookback_days=3)
-        daily_rows_written = BacktestRunner().run(top_n=1)
+        daily_rows_written = BacktestRunner().run(top_n=1, engine_version="event_driven_daily_v2")
 
         self.assertGreaterEqual(len(seeded), 3)
         self.assertTrue(all(item["lake_paths"] for item in seeded))
@@ -410,10 +426,10 @@ class AppFlowTests(unittest.TestCase):
         ):
             clear_namespace(namespace)
         with patch(
-            "app.api.routes.dashboard.load_lake_rows",
+            "app.api.routes.dashboard._common.load_lake_rows",
             side_effect=AssertionError("model performance page must not scan the lake inline"),
         ), patch(
-            "app.api.routes.dashboard.load_lake_price_history",
+            "app.api.routes.dashboard.performance.load_lake_price_history",
             side_effect=AssertionError("model performance page must not load price history inline"),
         ):
             response = self.client.get("/dashboard/model-performance?lang=zh&market=CN")
@@ -532,7 +548,7 @@ class AppFlowTests(unittest.TestCase):
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="dashboard_context_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol = SymbolRepository(db).get_by_ticker("AAPL")
@@ -577,7 +593,7 @@ class AppFlowTests(unittest.TestCase):
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="dashboard_lookback_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol = SymbolRepository(db).get_by_ticker("AAPL")
@@ -599,7 +615,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="dashboard_zh_demo", signal_type="momentum", lookback_days=3)
 
         with patch(
@@ -631,7 +647,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="dashboard_fragment_demo", signal_type="momentum", lookback_days=3)
 
         with patch(
@@ -650,7 +666,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="dashboard_top_fragment_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/top-fragment?lang=zh&lookback_runs=3")
@@ -664,7 +680,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="dashboard_cache_demo", signal_type="momentum", lookback_days=3)
 
         with patch(
@@ -686,11 +702,11 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="dashboard_summary_cache_demo", signal_type="momentum", lookback_days=3)
 
         with patch(
-            "app.api.routes.dashboard._build_market_context",
+            "app.api.routes.dashboard._common._build_market_context",
             return_value={"concept_board": [], "continuous_leaders": [], "risk_overview": {}},
         ) as market_context_mock:
             first = self.client.get("/dashboard/summary?lookback_runs=3")
@@ -704,14 +720,14 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="dashboard_watchlist_cache_demo", signal_type="momentum", lookback_days=3)
 
         with patch(
             "app.api.routes.dashboard.WatchlistRepository.list_ticker_map",
             return_value={},
         ) as map_mock, patch(
-            "app.api.routes.dashboard.load_today_focus_pool",
+            "app.api.routes.dashboard.home.load_today_focus_pool",
             return_value=[],
         ) as focus_mock:
             first = self.client.get("/dashboard?lang=zh&lookback_runs=3&mode=monitor")
@@ -1259,7 +1275,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="dashboard_market_zh_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/market?lang=zh&lookback_runs=3")
@@ -1278,7 +1294,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="dashboard_market_heatmap_zh_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/market/heatmap?lang=zh&lookback_runs=3")
@@ -1298,7 +1314,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="dashboard_market_concepts_zh_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/market/concepts?lang=zh&lookback_runs=3")
@@ -1318,7 +1334,7 @@ class AppFlowTests(unittest.TestCase):
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="market_concepts_signal_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -1342,7 +1358,7 @@ class AppFlowTests(unittest.TestCase):
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="market_concepts_buy_count_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -1367,7 +1383,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="market_execution_tag_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -1425,7 +1441,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="market_execution_tag_exclude_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -1464,7 +1480,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="multi_execution_tag_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -1526,7 +1542,7 @@ class AppFlowTests(unittest.TestCase):
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="market_concepts_sort_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -1548,7 +1564,7 @@ class AppFlowTests(unittest.TestCase):
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="market_concepts_export_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -1572,7 +1588,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="dashboard_ops_zh_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/ops?lang=zh&lookback_runs=3")
@@ -2047,7 +2063,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="dashboard_ops_models_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/ops/models?lang=zh&lookback_runs=3")
@@ -2087,7 +2103,7 @@ class AppFlowTests(unittest.TestCase):
         from app.core.db import SessionLocal
         from app.services.repository import WatchlistRepository
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="continuous_leader_action_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.post(
@@ -2111,7 +2127,7 @@ class AppFlowTests(unittest.TestCase):
         from app.core.db import SessionLocal
         from app.services.repository import WatchlistRepository
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="continuous_leader_bulk_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.post(
@@ -2139,7 +2155,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="continuous_leaders_page_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/continuous-leaders?lang=zh&lookback_runs=3")
@@ -2155,7 +2171,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="continuous_leaders_signal_filter_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get(
@@ -2170,7 +2186,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="continuous_leaders_export_demo", signal_type="momentum", lookback_days=3)
 
         response = self.client.get("/dashboard/continuous-leaders/export?lookback_runs=3")
@@ -2198,7 +2214,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="screener_execution_tag_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -2237,7 +2253,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="continuous_execution_tag_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -2276,7 +2292,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.openbb_client import OpenBBClient
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository, WatchlistRepository
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="concept_watchlist_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol = SymbolRepository(db).get_by_ticker("AAPL")
@@ -2339,7 +2355,7 @@ class AppFlowTests(unittest.TestCase):
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository, WatchlistRepository
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="concept_single_action_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol = SymbolRepository(db).get_by_ticker("AAPL")
@@ -2373,7 +2389,7 @@ class AppFlowTests(unittest.TestCase):
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="concept_sort_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol = SymbolRepository(db).get_by_ticker("AAPL")
@@ -2401,7 +2417,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.openbb_client import OpenBBClient
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository, WatchlistRepository
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="concept_topn_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -2464,7 +2480,7 @@ class AppFlowTests(unittest.TestCase):
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="concept_compare_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -2498,7 +2514,7 @@ class AppFlowTests(unittest.TestCase):
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="concept_zh_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol = SymbolRepository(db).get_by_ticker("AAPL")
@@ -2532,7 +2548,7 @@ class AppFlowTests(unittest.TestCase):
         from app.core.db import SessionLocal
         from app.services.repository import ConceptSnapshotRepository, SymbolRepository
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="concept_signal_strength_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -3391,7 +3407,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="watchlist_execution_tag_demo", signal_type="momentum", lookback_days=3)
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -3493,7 +3509,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="screener_model_context", signal_type="momentum", lookback_days=3)
         self.client.post(
             "/watchlist/add",
@@ -3921,7 +3937,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="screener_model_context_zh", signal_type="momentum", lookback_days=3)
 
         response = self.client.get(
@@ -3949,7 +3965,7 @@ class AppFlowTests(unittest.TestCase):
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
 
-        seed_sample_data()
+        seed_sample_data(days=600)
         SignalTrainer().train(run_name="snapshot_filter_one", signal_type="momentum", lookback_days=3)
         SignalTrainer().train(run_name="snapshot_filter_two", signal_type="momentum", lookback_days=4)
 
@@ -5395,9 +5411,14 @@ class AppFlowTests(unittest.TestCase):
         with patch.object(OpenBBClient, "fetch_historical_prices", new=fake_fetch):
             results = sync_market_data(tickers=["0100.HK"], start_date="2026-04-01", provider="yfinance")
 
-        self.assertEqual("success", results[0]["status"])
+        # S-13: the five-digit alias lookup is still exercised, but HK is not a
+        # lake-supported market, so the result must not claim a Parquet write.
+        self.assertEqual("unsupported_market", results[0]["status"])
         self.assertEqual(3, results[0]["rows"])
         self.assertEqual("00100.HK", results[0]["provider_ticker"])
+        self.assertEqual([], results[0]["lake_paths"])
+        self.assertNotIn("Parquet lake via", results[0]["message"])
+        self.assertIn("not supported by the Parquet lake", results[0]["message"])
 
     def test_openbb_permission_error_falls_back_to_yfinance_history(self) -> None:
         from app.services.openbb_client import HistoricalPriceRequest, OpenBBClient

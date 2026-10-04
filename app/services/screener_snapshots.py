@@ -13,19 +13,33 @@ from app.services.repository import (
     WorkspaceSnapshotRepository,
 )
 from app.services.market_lake import get_latest_lake_trade_date, screen_cn_lake_momentum, screen_us_lake_momentum
+from app.services.job_control import JobCancelled
 from app.services.market_freshness import is_snapshot_as_of_current
 from app.services.market_freshness import latest_completed_market_date
 from app.services.screener import MODEL_TEMPLATES, ScreenerService
 from app.services.stock_selection.screener_regime import build_screener_regime_diagnostics
+from app.services.stock_selection.multi_model_confluence import (
+    action_semantic_buckets as _action_semantic_buckets,  # noqa: F401 - compatibility export
+    aggregate_multi_model_rows,
+    normalize_multi_model_templates as _normalize_multi_model_templates,
+    template_action_semantic_buckets as _template_action_semantic_buckets,  # noqa: F401 - compatibility export
+)
 from app.services.time_utils import app_now_iso
 
 
 SCREENER_SNAPSHOT_TYPE_PREFIX = "screener_result:"
 
+# Query time applies the user's thresholds on top of the snapshot, so precompute
+# must use the widest possible bounds. Otherwise relaxing a threshold can never
+# surface rows that precompute already dropped (S-6).
+PRECOMPUTE_WIDEST_LOWER_BOUND = -1.0e12
+PRECOMPUTE_WIDEST_UPPER_BOUND = 1.0e12
+
 WATCHLIST_PRECOMPUTE_TEMPLATES = [
     "lightgbm_top_picks",
     "next_tesla_swing",
     "technical_momentum",
+    "tv_multi_timeframe_bullish",
     "cn_limit_up_watch",
     "cn_volume_breakout",
     "cn_bullish_ma_stack",
@@ -46,6 +60,7 @@ FULL_MARKET_CN_PRECOMPUTE_TEMPLATES = [
     "lightgbm_top_picks",
     "next_tesla_swing",
     "technical_momentum",
+    "tv_multi_timeframe_bullish",
     "cn_limit_up_watch",
     "cn_volume_breakout",
     "cn_bullish_ma_stack",
@@ -64,6 +79,7 @@ FULL_MARKET_US_PRECOMPUTE_TEMPLATES = [
     "lightgbm_top_picks",
     "next_tesla_swing",
     "technical_momentum",
+    "tv_multi_timeframe_bullish",
     "global_growth_value",
     "global_income_quality",
 ]
@@ -71,6 +87,7 @@ FULL_MARKET_US_PRECOMPUTE_TEMPLATES = [
 FULL_MARKET_ALL_PRECOMPUTE_TEMPLATES = [
     "next_tesla_swing",
     "technical_momentum",
+    "tv_multi_timeframe_bullish",
     "global_growth_value",
     "global_income_quality",
 ]
@@ -155,10 +172,12 @@ SNAPSHOT_ROW_FIELDS = {
     "matched_patterns",
     "matched_model_templates",
     "matched_model_labels",
+    "matched_action_labels",
     "matched_action_buckets",
     "matched_action_bucket_hits",
     "model_hit_count",
     "confluence_alignment_count",
+    "confluence_score_mean",
     "selection_reason",
     "model_score",
     "model_summary",
@@ -273,38 +292,30 @@ def load_exact_screener_snapshot_rows(params: dict, *, db: Session | None = None
 
 def _build_default_params(template_key: str, *, universe: str, market: str | None = None) -> dict:
     template = MODEL_TEMPLATES.get(template_key, {})
-    defaults = template.get("defaults") or {}
     template_market = str(market or template.get("market") or "ALL").upper()
-    min_trend_score = int(defaults.get("min_trend_score", 60))
     limit = 300 if universe == "watchlist" else 5000
+    if universe == "full_market" and template_key == "lightgbm_top_picks":
+        # Multi-model confluence needs a much broader LightGBM source pool.
+        limit = 6000
 
-    if universe == "full_market":
-        if template_key == "lightgbm_top_picks":
-            # Multi-model confluence needs a much broader LightGBM source pool than
-            # the user-facing single-template default threshold.
-            min_trend_score = 10
-            limit = 6000
-        elif template_key == "technical_momentum":
-            limit = 5000
-        elif template_key == "next_tesla_swing":
-            limit = 5000
-
+    # Widest-threshold precompute (S-6): query-time filtering narrows this set,
+    # and a broadened user threshold can only re-include rows that exist here.
     return {
         "model_template": template_key,
         "universe": universe,
         "market": template_market,
-        "min_trend_score": min_trend_score,
+        "min_trend_score": 0,
         "action_filter": "ALL",
-        "min_volume_ratio": float(defaults.get("min_volume_ratio", 0.0)),
-        "min_listing_days": int(defaults.get("min_listing_days", 365)),
-        "pe_min": float(defaults.get("pe_min", 0.0)),
-        "pe_max": float(defaults.get("pe_max", 30.0)),
-        "min_roe_avg_3y": float(defaults.get("min_roe_avg_3y", 12.0)),
-        "min_net_profit_yoy": float(defaults.get("min_net_profit_yoy", 20.0)),
-        "min_revenue_yoy": float(defaults.get("min_revenue_yoy", 0.0)),
-        "max_debt_to_assets": float(defaults.get("max_debt_to_assets", 100.0)),
-        "min_dividend_yield": float(defaults.get("min_dividend_yield", 0.0)),
-        "exclude_bottom_market_cap_pct": float(defaults.get("exclude_bottom_market_cap_pct", 10.0)),
+        "min_volume_ratio": 0.0,
+        "min_listing_days": 0,
+        "pe_min": PRECOMPUTE_WIDEST_LOWER_BOUND,
+        "pe_max": PRECOMPUTE_WIDEST_UPPER_BOUND,
+        "min_roe_avg_3y": PRECOMPUTE_WIDEST_LOWER_BOUND,
+        "min_net_profit_yoy": PRECOMPUTE_WIDEST_LOWER_BOUND,
+        "min_revenue_yoy": PRECOMPUTE_WIDEST_LOWER_BOUND,
+        "max_debt_to_assets": PRECOMPUTE_WIDEST_UPPER_BOUND,
+        "min_dividend_yield": PRECOMPUTE_WIDEST_LOWER_BOUND,
+        "exclude_bottom_market_cap_pct": 0.0,
         "recent_snapshot_runs": 0,
         "min_snapshot_hits": 0,
         "model_signal_filter": "ALL",
@@ -420,76 +431,9 @@ def _compact_snapshot_rows(rows: list[dict], *, limit: int) -> list[dict]:
     return compacted
 
 
-def _normalize_multi_model_templates(values: object) -> list[str]:
-    if values is None:
-        return []
-    if isinstance(values, str):
-        raw_values = [item.strip() for item in values.split(",")]
-    else:
-        raw_values = [str(item or "").strip() for item in list(values)]
-    normalized: list[str] = []
-    for item in raw_values:
-        if not item or item not in MODEL_TEMPLATES or item in normalized:
-            continue
-        normalized.append(item)
-    return normalized
-
-
-def _normalize_action_filter(value: str | None) -> str:
-    return str(value or "ALL").strip().lower()
-
-
-def _action_semantic_buckets(action_label: str | None) -> list[str]:
-    normalized = str(action_label or "").strip().lower().replace(" ", "_")
-    if not normalized:
-        return []
-    if normalized == "buy_the_dip":
-        return ["buy_the_dip", "bullish_entry"]
-    if normalized == "wait_for_breakout":
-        return ["breakout_confirmation"]
-    if normalized == "pullback":
-        return ["buy_the_dip", "bullish_entry"]
-    if normalized == "breakout":
-        return ["breakout_confirmation", "bullish_entry"]
-    if normalized in {"buy", "strong_buy", "technical_pattern", "fundamental_pass"}:
-        return ["bullish_entry"]
-    if normalized in {"watch", "hold", "hold_and_watch", "wait", "avoid", "avoid_or_wait", "continue_to_watch"}:
-        return ["watchlist"]
-    return []
-
-
-def _template_action_semantic_buckets(template_key: str, action_label: str | None) -> list[str]:
-    buckets = list(_action_semantic_buckets(action_label))
-    if template_key in {"cn_hammer_reversal", "cn_bullish_engulfing_reversal", "cn_macd_underwater_cross"}:
-        for bucket in ("buy_the_dip", "bullish_entry"):
-            if bucket not in buckets:
-                buckets.append(bucket)
-    elif template_key in {"cn_volume_breakout", "cn_bullish_ma_stack", "cn_three_white_soldiers", "tv_multi_timeframe_bullish"}:
-        for bucket in ("breakout_confirmation", "bullish_entry"):
-            if bucket not in buckets:
-                buckets.append(bucket)
-    elif template_key in {"cn_ma_cluster_breakout_watch", "cn_bollinger_squeeze_watch"}:
-        if "breakout_confirmation" not in buckets:
-            buckets.append("breakout_confirmation")
-    elif template_key in {
-        "global_growth_value",
-        "global_income_quality",
-        "cn_growth_value",
-        "cn_high_roe_steady_growth",
-        "cn_low_valuation_high_dividend",
-    }:
-        if "bullish_entry" not in buckets:
-            buckets.append("bullish_entry")
-    return buckets
-
-
 def _build_multi_screen_rows_from_snapshots(params: dict) -> tuple[list[dict], dict]:
     template_keys = _normalize_multi_model_templates(params.get("multi_model_templates"))
-    if len(template_keys) < 2:
-        return [], {"available_templates": [], "missing_templates": []}
     template_rows: dict[str, list[dict]] = {}
-    missing_templates: list[str] = []
-    available_templates: list[str] = []
     for template_key in template_keys:
         local_params = _build_default_params(
             template_key,
@@ -497,171 +441,27 @@ def _build_multi_screen_rows_from_snapshots(params: dict) -> tuple[list[dict], d
             market=str(params.get("market") or "CN"),
         )
         rows = load_exact_screener_snapshot_rows(local_params)
-        if rows is None:
-            missing_templates.append(template_key)
-            continue
-        template_rows[template_key] = rows
-        available_templates.append(template_key)
-    if not available_templates:
-        return [], {"available_templates": [], "missing_templates": missing_templates}
-
-    aggregated: dict[str, dict] = {}
-    for template_key in available_templates:
-        label = str((MODEL_TEMPLATES.get(template_key) or {}).get("label") or template_key)
-        rows = template_rows.get(template_key) or []
-        for row in rows:
-            ticker = str(row.get("ticker") or "").strip().upper()
-            if not ticker:
-                continue
-            score = float(row.get("snapshot_score") or row.get("trend_score") or 0.0)
-            existing = aggregated.get(ticker)
-            if existing is None or score > float(existing.get("_best_score") or 0.0):
-                previous_meta = {
-                    "_template_keys": list((existing or {}).get("_template_keys") or []),
-                    "_template_labels": list((existing or {}).get("_template_labels") or []),
-                    "_action_labels": list((existing or {}).get("_action_labels") or []),
-                    "_confluence_bucket_hits": dict((existing or {}).get("_confluence_bucket_hits") or {}),
-                    "_selection_reasons": list((existing or {}).get("_selection_reasons") or []),
-                    "_execution_tags": list((existing or {}).get("_execution_tags") or []),
-                }
-                base = dict(row)
-                base["_best_score"] = score
-                base.update(previous_meta)
-                aggregated[ticker] = base
-                existing = base
-            if existing.get("model_score") is None and row.get("model_score") is not None:
-                existing["model_score"] = row.get("model_score")
-            if existing.get("model_signal_strength") is None and row.get("model_signal_strength") is not None:
-                existing["model_signal_strength"] = row.get("model_signal_strength")
-            if existing.get("model_confidence") is None and row.get("model_confidence") is not None:
-                existing["model_confidence"] = row.get("model_confidence")
-            if existing.get("model_percentile") is None and row.get("model_percentile") is not None:
-                existing["model_percentile"] = row.get("model_percentile")
-            existing["_template_keys"].append(template_key)
-            existing["_template_labels"].append(label)
-            existing["_action_labels"].append(str(row.get("action_label") or "").strip())
-            row_risk_flags = {str(flag).strip().lower() for flag in (row.get("risk_flags") or []) if str(flag).strip()}
-            buckets = _template_action_semantic_buckets(template_key, row.get("action_label"))
-            if row_risk_flags.intersection({"rolled-over-after-spike", "do-not-chase"}):
-                buckets = [bucket for bucket in buckets if bucket not in {"bullish_entry", "breakout_confirmation", "buy_the_dip"}]
-                if "watchlist" not in buckets:
-                    buckets.append("watchlist")
-            for bucket in buckets:
-                hits = existing["_confluence_bucket_hits"].setdefault(bucket, [])
-                if template_key not in hits:
-                    hits.append(template_key)
-            reason = str(row.get("selection_reason") or "").strip()
-            if reason:
-                existing["_selection_reasons"].append(f"{label}: {reason}")
-            for tag in row.get("model_execution_tags") or []:
-                clean_tag = str(tag).strip()
-                if clean_tag:
-                    existing["_execution_tags"].append(clean_tag)
-
-    min_hits = max(2, int(params.get("min_multi_model_hits") or 2))
-    confluence_action_filter = _normalize_action_filter(params.get("confluence_action_filter"))
-    results: list[dict] = []
-    for item in aggregated.values():
-        template_keys_hit = list(dict.fromkeys(item.pop("_template_keys", [])))
-        if len(template_keys_hit) < min_hits:
-            continue
-        template_labels_hit = list(dict.fromkeys(item.pop("_template_labels", [])))
-        action_labels_hit = [label for label in dict.fromkeys(item.pop("_action_labels", [])) if label]
-        confluence_bucket_hits = item.pop("_confluence_bucket_hits", {})
-        selection_reasons = list(dict.fromkeys(item.pop("_selection_reasons", [])))
-        execution_tags = list(dict.fromkeys(item.pop("_execution_tags", [])))
-        item.pop("_best_score", None)
-        if confluence_action_filter not in {"", "all"}:
-            aligned_templates = confluence_bucket_hits.get(confluence_action_filter) or []
-            if len(aligned_templates) < min_hits:
-                continue
-        item["model_hit_count"] = len(template_keys_hit)
-        item["snapshot_hits"] = len(template_keys_hit)
-        item["snapshot_runs"] = len(template_keys)
-        item["matched_model_templates"] = template_keys_hit
-        item["matched_model_labels"] = template_labels_hit
-        item["matched_patterns"] = template_labels_hit
-        item["matched_action_buckets"] = sorted(confluence_bucket_hits.keys())
-        item["matched_action_bucket_hits"] = {
-            key: len(value or []) for key, value in confluence_bucket_hits.items()
-        }
-        if confluence_action_filter not in {"", "all"}:
-            item["confluence_alignment_count"] = int(item["matched_action_bucket_hits"].get(confluence_action_filter) or 0)
-        else:
-            item["confluence_alignment_count"] = max(
-                [int(value or 0) for value in item["matched_action_bucket_hits"].values()] or [0]
-            )
-        item["model_execution_tags"] = execution_tags
-        item["selection_reason"] = " | ".join(selection_reasons[:3]) if selection_reasons else item.get("selection_reason")
-        item["model_summary"] = (
-            f"{len(template_labels_hit)} model hits · " + " / ".join(template_labels_hit[:4])
-            if template_labels_hit
-            else item.get("model_summary")
-        )
-        item["model_highlights"] = [
-            "Matched templates: " + " / ".join(template_labels_hit[:5]),
-            "Action mix: " + " / ".join(action_labels_hit[:4]) if action_labels_hit else "",
-        ]
-        results.append(item)
-
-    sort_by = str(params.get("sort_by", "default"))
-    sort_order = str(params.get("sort_order", "desc"))
-    reverse = sort_order != "asc"
-    if sort_by in {"default", "confluence_rank"}:
-        results.sort(
-            key=lambda item: (
-                int(item.get("model_hit_count") or 0),
-                int(item.get("confluence_alignment_count") or 0),
-                float(item.get("trade_readiness_score") or 0.0),
-                float(item.get("model_signal_strength") or 0.0),
-                float(item.get("trend_score") or 0.0),
-                str(item.get("ticker") or ""),
-            ),
-            reverse=reverse,
-        )
-    else:
-        results.sort(
-            key=lambda item: (
-                int(item.get("model_hit_count") or 0),
-                float(item.get("trade_readiness_score") or 0.0),
-                str(item.get("ticker") or ""),
-            ),
-            reverse=reverse,
-        )
-    results = _apply_strategy_profile(results, profile=str(params.get("strategy_profile") or ""))
-    return results[: int(params.get("limit", 500) or 500)], {
-        "available_templates": available_templates,
-        "missing_templates": missing_templates,
-    }
-
-
-def _apply_strategy_profile(rows: list[dict], *, profile: str) -> list[dict]:
-    """Keep only the execution-ready candidates for the validated quality profile."""
-    if profile != "quality_confluence_v1":
-        return rows
-    blocked_tags = {"chase-risk", "weak-market", "weak-breadth", "do-not-chase", "missing-latest-price"}
-    approved: list[dict] = []
-    for row in rows:
-        tags = {str(item).strip().lower() for item in (row.get("risk_flags") or row.get("model_execution_tags") or []) if str(item).strip()}
-        readiness = float(row.get("trade_readiness_score") or 0.0)
-        ready = str(row.get("tradability_status") or "").upper() == "READY"
-        confluence = int(row.get("model_hit_count") or 0) >= 2
-        if ready and confluence and readiness >= 72.0 and not tags.intersection(blocked_tags):
-            row["strategy_tier"] = "A"
-            row["strategy_gate_reason"] = "双模型共振、市场状态与可成交性均通过"
-            approved.append(row)
-        else:
-            row["strategy_tier"] = "WATCH"
-            row["strategy_gate_reason"] = "未通过质量策略硬门槛"
-    approved.sort(
-        key=lambda row: (
-            float(row.get("trade_readiness_score") or 0.0),
-            int(row.get("model_hit_count") or 0),
-            float(row.get("trend_score") or 0.0),
-        ),
-        reverse=True,
+        if rows is not None:
+            template_rows[template_key] = rows
+    return aggregate_multi_model_rows(
+        template_rows,
+        template_keys=template_keys,
+        params=params,
     )
-    return approved
+
+
+TV_MULTI_TIMEFRAME_TEMPLATE = "tv_multi_timeframe_bullish"
+
+
+def _precompute_empty_reason(params: dict) -> str | None:
+    """Explain an empty precompute result so the run receipt is not silent (S-7)."""
+    if str(params.get("model_template") or "") == TV_MULTI_TIMEFRAME_TEMPLATE:
+        return (
+            "tv_multi_timeframe_bullish returned no aligned candidates: "
+            "TradingView daily/weekly/monthly ratings were unavailable, or no ticker "
+            "reached the 2-of-3 bullish multi-timeframe alignment gate."
+        )
+    return None
 
 
 def refresh_precomputed_screener_snapshots(
@@ -674,6 +474,7 @@ def refresh_precomputed_screener_snapshots(
     template_keys: list[str] | None = None,
     universes: list[str] | None = None,
     include_all_market: bool = True,
+    should_cancel=None,
 ) -> dict:
     started_at = time.perf_counter()
     created: list[dict] = []
@@ -708,10 +509,13 @@ def refresh_precomputed_screener_snapshots(
         ]
 
     for params in precompute_params:
+        if should_cancel is not None:
+            should_cancel()
         template_started_at = time.perf_counter()
         try:
             rows = _screen_with_lake_preferred(params)
             persisted_rows = _compact_snapshot_rows(rows, limit=int(params.get("limit", 5000)))
+            empty_reason = _precompute_empty_reason(params) if not persisted_rows else None
             updated_at = app_now_iso()
             input_meta = _snapshot_input_meta(params)
             with SessionLocal() as snapshot_db:
@@ -739,6 +543,7 @@ def refresh_precomputed_screener_snapshots(
                         "universe": params["universe"],
                         "input": input_meta,
                         "regime_diagnostics": regime_diagnostics,
+                        "empty_reason": empty_reason,
                         "candidate_stats": {
                             "returned_count": len(rows),
                             "persisted_count": len(persisted_rows),
@@ -757,6 +562,8 @@ def refresh_precomputed_screener_snapshots(
                     "duration_seconds": round(time.perf_counter() - template_started_at, 2),
                 }
             )
+        except JobCancelled:
+            raise
         except Exception as exc:
             failed.append(
                 {
@@ -784,10 +591,13 @@ def refresh_precomputed_multi_screener_snapshots(
     source_job_id: int | None = None,
     markets: list[str] | None = None,
     preset_keys: list[str] | None = None,
+    should_cancel=None,
 ) -> dict:
     created: list[dict] = []
     failed: list[dict] = []
     for params in build_multi_model_precompute_params(markets=markets, preset_keys=preset_keys):
+        if should_cancel is not None:
+            should_cancel()
         preset_key = str(params.get("preset_key") or "")
         try:
             rows, meta = _build_multi_screen_rows_from_snapshots(params)
@@ -839,6 +649,8 @@ def refresh_precomputed_multi_screener_snapshots(
                     "rows": len(persisted_rows),
                 }
             )
+        except JobCancelled:
+            raise
         except Exception as exc:
             failed.append(
                 {

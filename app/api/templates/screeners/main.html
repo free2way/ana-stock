@@ -1,0 +1,404 @@
+
+    <!DOCTYPE html>
+    <html lang="{{ fragments[0] }}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{{ fragments[1] }}</title>
+        <style>{{ fragments[2]|safe }}</style>
+      </head>
+      <body>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{{ fragments[3] }}</h1>
+              <p>{{ fragments[4] }}</p>
+            </div>
+            <nav class="side-nav">{{ fragments[5]|safe }}</nav>
+          </aside>
+          <main class="content">
+        <div class="wrap">
+          <div class="toolbar">
+            <a href="/dashboard">← {{ fragments[6] }}</a>
+            <a href="/watchlist">{{ fragments[7] }}</a>
+            <details style="position:relative;">
+              <summary style="display:inline-flex;align-items:center;min-height:32px;padding:6px 9px;border-radius:8px;border:1px solid rgba(255,255,255,0.05);background:rgba(17,28,40,0.52);color:var(--accent);font-size:12px;font-weight:800;cursor:pointer;">{{ fragments[8] }}</summary>
+              <div style="position:absolute;z-index:5;top:calc(100% + 6px);left:0;display:grid;gap:6px;min-width:190px;padding:8px;border:1px solid var(--line);border-radius:10px;background:#101b27;box-shadow:0 14px 28px rgba(0,0,0,0.28);">
+                <a href="/screeners/focus/today?lang={{ fragments[9] }}">{{ fragments[10] }}</a>
+                <a href="/screeners/market-snapshot?lang={{ fragments[11] }}">{{ fragments[12] }}</a>
+                <a href="/dashboard/model-performance?lang={{ fragments[13] }}&market={{ fragments[14] }}">{{ fragments[15] }}</a>
+                <a href="/screeners/kronos-validation?lang={{ fragments[16] }}">{{ fragments[17] }}</a>
+                <a href="/dashboard#cn-fundamental-tickers">{{ fragments[18] }}</a>
+              </div>
+            </details>
+            <div class="lang-switch">
+              <span class="muted">{{ fragments[19] }}:</span>
+              {{ fragments[20]|safe }}
+            </div>
+          </div>
+          {{ fragments[21]|safe }}
+          <div class="card">
+            <div class="eyebrow">{{ fragments[22] }}</div>
+            <h1>{{ fragments[23] }}</h1>
+            <p class="lead">{{ fragments[24] }}</p>
+            <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;">
+              <span class="default-chip">{{ fragments[25] }}: {{ fragments[26] }}</span>
+              {{ fragments[27]|safe }}
+            </div>
+          </div>
+          {{ fragments[28]|safe }}
+	          <section class="card" style="margin-bottom:12px;padding:12px;">
+	            <div class="eyebrow">{{ fragments[29] }}</div>
+	            <div class="muted">{{ fragments[30] }}</div>
+	            <div class="market-scope-switch" style="margin:10px 0 0;">{{ fragments[31]|safe }}</div>
+	          </section>
+	          <details class="research-fold">
+	            <summary>{{ fragments[32] }}</summary>
+	            <div class="research-fold-body">
+                {{ fragments[33]|safe }}
+                {{ fragments[34]|safe }}
+                {{ fragments[35]|safe }}
+                {{ fragments[36]|safe }}
+                {{ fragments[37]|safe }}
+                {{ fragments[38]|safe }}
+                {{ fragments[39]|safe }}
+                {{ fragments[40]|safe }}
+                {{ fragments[41]|safe }}
+                {{ fragments[42]|safe }}
+	            </div>
+	          </details>
+	          <section class="section-stack">
+	            <article id="single-model-rules" class="card">
+              <div class="eyebrow">{{ fragments[43] }}</div>
+              <h2 style="margin:0 0 6px;">{{ fragments[44] }}</h2>
+              <div class="muted">{{ fragments[45] }}</div>
+              <div class="template-group-stack">{{ fragments[46]|safe }}</div>
+              <form class="stack" method="get" action="/screeners">
+                <input type="hidden" name="lang" value="{{ fragments[47] }}" />
+                <input type="hidden" name="run" value="1" />
+                <input type="hidden" name="market" value="{{ fragments[48]|safe }}" />
+                <div class="screen-flow">
+                  <div class="flow-step">
+                    <div class="flow-step-num">03</div>
+                    <b>{{ fragments[49] }}</b>
+                    <small>{{ fragments[50] }}</small>
+                    <select name="universe">{{ fragments[51]|safe }}</select>
+                  </div>
+                  <div class="flow-step">
+                    <div class="flow-step-num">04</div>
+                    <b>{{ fragments[52] }}</b>
+                    <small>{{ fragments[53] }}</small>
+                    <select name="action_filter">{{ fragments[54]|safe }}</select>
+                  </div>
+                  <div class="flow-step">
+                    <div class="flow-step-num">05</div>
+                    <b>{{ fragments[55] }}</b>
+                    <small>{{ fragments[56] }}</small>
+                    <button class="run-screen" type="submit">{{ fragments[57] }}</button>
+                  </div>
+                </div>
+                <details class="selection-advanced">
+                  <summary>{{ fragments[58] }}</summary>
+                  <div class="selection-advanced-body">
+                  <div class="summary-note">{{ fragments[59] }}</div>
+                  <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;">{{ fragments[60]|safe }}</div>
+                  <div class="rules-grid" style="margin-top:12px;">
+                    <div>
+                      <label class="muted">{{ fragments[61] }}</label>
+                      <select name="model_template">{{ fragments[62]|safe }}</select>
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[63] }}</label>
+                      <input type="number" name="min_multi_model_hits" min="1" max="{{ fragments[64] }}" value="{{ fragments[65] }}" />
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[66] }}</label>
+                      <select name="confluence_action_filter">{{ fragments[67]|safe }}</select>
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[68] }}</label>
+                      <select name="sort_by">{{ fragments[69]|safe }}</select>
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[70] }}</label>
+                      <select name="sort_order">{{ fragments[71]|safe }}</select>
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[72] }}</label>
+                      <input type="number" name="min_trend_score" min="1" max="99" value="{{ fragments[73] }}" />
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[74] }}</label>
+                      <input type="number" name="min_volume_ratio" min="0" step="0.1" value="{{ fragments[75] }}" />
+                    </div>
+                  </div>
+                  <div id="multi-model-combos" class="summary-note">{{ fragments[76] }}</div>
+                  <div class="multi-template-stack">{{ fragments[77]|safe }}</div>
+                <details class="advanced-panel">
+                  <summary>{{ fragments[78] }}</summary>
+                  <div class="summary-note">{{ fragments[79] }}</div>
+                  <div style="height:12px;"></div>
+                  <div class="rules-grid">
+                    <div>
+                      <label class="muted">{{ fragments[80] }}</label>
+                      <input type="number" name="min_listing_days" min="1" value="{{ fragments[81] }}" />
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[82] }}</label>
+                      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+                        <input type="number" name="pe_min" step="0.1" value="{{ fragments[83] }}" />
+                        <input type="number" name="pe_max" step="0.1" value="{{ fragments[84] }}" />
+                      </div>
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[85] }}</label>
+                      <input type="number" name="min_roe_avg_3y" step="0.1" value="{{ fragments[86] }}" />
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[87] }}</label>
+                      <input type="number" name="min_net_profit_yoy" step="0.1" value="{{ fragments[88] }}" />
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[89] }}</label>
+                      <input type="number" name="min_revenue_yoy" step="0.1" value="{{ fragments[90] }}" />
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[91] }}</label>
+                      <input type="number" name="max_debt_to_assets" step="0.1" value="{{ fragments[92] }}" />
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[93] }}</label>
+                      <input type="number" name="min_dividend_yield" step="0.1" value="{{ fragments[94] }}" />
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[95] }}</label>
+                      <input type="number" name="exclude_bottom_market_cap_pct" min="0" max="49" step="1" value="{{ fragments[96] }}" />
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[97] }}</label>
+                      <input type="number" name="recent_snapshot_runs" min="0" max="10" step="1" value="{{ fragments[98] }}" />
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[99] }}</label>
+                      <input type="number" name="min_snapshot_hits" min="0" max="10" step="1" value="{{ fragments[100] }}" />
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[101] }}</label>
+                      <select name="model_signal_filter">{{ fragments[102]|safe }}</select>
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[103] }}</label>
+                      <input type="number" name="min_model_signal_strength" min="0" max="100" step="1" value="{{ fragments[104] }}" />
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[105] }}</label>
+                      <input type="text" name="execution_tag_filter" list="execution-tag-options" value="{{ fragments[106] }}" placeholder="gap-risk, earnings-soon" />
+                    </div>
+                    <div>
+                      <label class="muted">{{ fragments[107] }}</label>
+                      <input type="text" name="exclude_execution_tag_filter" list="execution-tag-options" value="{{ fragments[108] }}" placeholder="gap-risk, earnings-soon" />
+                    </div>
+                  </div>
+                  <div style="margin-top:12px;">
+                    <div class="muted" style="margin-bottom:8px;font-weight:700;">{{ fragments[109] }}</div>
+                    <div style="display:flex;flex-wrap:wrap;gap:8px;">
+                      <button type="button" onclick="appendExecutionTag('execution_tag_filter', 'gap-risk')">gap-risk</button>
+                      <button type="button" onclick="appendExecutionTag('execution_tag_filter', 'earnings-soon')">earnings-soon</button>
+                      <button type="button" onclick="appendExecutionTag('execution_tag_filter', 'thin-liquidity')">thin-liquidity</button>
+                      <button type="button" onclick="appendExecutionTag('exclude_execution_tag_filter', 'gap-risk')">{{ fragments[110] }}</button>
+                      <button type="button" onclick="clearExecutionTags()">{{ fragments[111] }}</button>
+                    </div>
+                  </div>
+                  <datalist id="execution-tag-options">
+                    <option value="gap-risk"></option>
+                    <option value="earnings-soon"></option>
+                    <option value="thin-liquidity"></option>
+                  </datalist>
+                </details>
+	                <button class="run-screen" type="submit">{{ fragments[112] }}</button>
+	                </div>
+	                </details>
+	              </form>
+	            </article>
+	            {{ fragments[113]|safe }}
+	            <article class="card">
+	              <div class="eyebrow">{{ fragments[114] }}</div>
+              <div class="rules-grid">
+                <div class="detail-card" style="background:#f9f7f0;">
+                  <div class="detail-label">{{ fragments[115] }}</div>
+                  <div style="font-size:28px;font-weight:800;margin:6px 0;">{{ fragments[116] }}</div>
+                  <div class="muted">{{ fragments[117] }}</div>
+                </div>
+                <div class="detail-card detail-card-wide" style="background:#f9f7f0;">
+                  <div class="detail-label">{{ fragments[118] }}</div>
+                  <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
+                    {{ fragments[119]|safe }}
+                  </div>
+                  <div class="muted">{{ fragments[120] }}: {{ fragments[121]|safe }}</div>
+                </div>
+              </div>
+            </article>
+            <article class="card">
+              <details class="selection-advanced" style="margin-top:0;">
+                <summary>{{ fragments[122] }}</summary>
+                <div class="selection-advanced-body">
+              <div class="action-grid" style="margin-bottom:14px;">
+                <form class="action-form" method="post" action="/screeners/save">
+                  <div class="action-head">
+                    <div>
+                      <div class="action-kicker">{{ fragments[123] }}</div>
+                      <div class="action-title">{{ fragments[124] }}</div>
+                    </div>
+                    <span class="action-icon">SAVE</span>
+                  </div>
+                  <div class="action-row">
+                    <label class="action-label">{{ fragments[125] }}</label>
+                    <div class="action-input-wrap">
+                      <input type="text" name="preset_name" placeholder="{{ fragments[126] }}" required />
+                    </div>
+                  </div>
+                  {{ fragments[127]|safe }}
+                  <div class="action-submit">
+                    <button type="submit">{{ fragments[128] }}</button>
+                  </div>
+                </form>
+                <form class="action-form" method="post" action="/screeners/add-all-to-watchlist">
+                  <div class="action-head">
+                    <div>
+                      <div class="action-kicker">{{ fragments[129] }}</div>
+                      <div class="action-title">{{ fragments[130] }}</div>
+                    </div>
+                    <span class="action-icon">LIST</span>
+                  </div>
+                  {{ fragments[131]|safe }}
+                  <div class="action-row">
+                    <label class="action-label">{{ fragments[132] }}</label>
+                    <div class="action-input-wrap">
+                      <input type="number" name="bulk_top_n" min="0" value="0" />
+                    </div>
+                  </div>
+                  <label class="action-checkbox">
+                    <input type="checkbox" name="auto_enable_sync" value="1" />
+                    {{ fragments[133] }}
+                  </label>
+                  <div class="action-submit">
+                  <button type="submit" {{ fragments[134] }}>{{ fragments[135] }}</button>
+                  </div>
+                </form>
+                <form class="action-form" method="post" action="/screeners/add-to-focus">
+                  <div class="action-head">
+                    <div>
+                      <div class="action-kicker">{{ fragments[136] }}</div>
+                      <div class="action-title">{{ fragments[137] }}</div>
+                    </div>
+                    <span class="action-icon">FOCUS</span>
+                  </div>
+                  {{ fragments[138]|safe }}
+                  <div class="action-row">
+                    <label class="action-label">{{ fragments[139] }}</label>
+                    <div class="action-input-wrap">
+                      <input type="number" name="focus_top_n" min="0" value="10" />
+                    </div>
+                  </div>
+                  <div class="action-submit">
+                    <button type="submit" {{ fragments[140] }}>{{ fragments[141] }}</button>
+                  </div>
+                </form>
+                <form class="action-form" method="post" action="/screeners/sync-top-results">
+                  <div class="action-head">
+                    <div>
+                      <div class="action-kicker">{{ fragments[142] }}</div>
+                      <div class="action-title">{{ fragments[143] }}</div>
+                    </div>
+                    <span class="action-icon">SYNC</span>
+                  </div>
+                  {{ fragments[144]|safe }}
+                  <div class="action-row">
+                    <label class="action-label">{{ fragments[145] }}</label>
+                    <div class="action-input-wrap">
+                      <input type="number" name="sync_top_n" min="0" value="5" />
+                    </div>
+                  </div>
+                  <div class="action-submit">
+                    <button type="submit" {{ fragments[146] }}>{{ fragments[147] }}</button>
+                  </div>
+                </form>
+              </div>
+                </div>
+              </details>
+              <div class="eyebrow">{{ fragments[148] }}</div>
+              <div class="results-toolbar">
+                <div class="muted">{{ fragments[149] }} {{ fragments[150] }}</div>
+                <form method="get" action="/screeners/export">
+                  {{ fragments[151]|safe }}
+                  <button type="submit" {{ fragments[152] }}>{{ fragments[153] }}</button>
+                </form>
+              </div>
+              <div class="muted" style="margin-bottom:12px;">{{ fragments[154] }}</div>
+              <div class="table-wrap results-table-wrap">
+                <table>
+                  <thead>
+                    <tr><th class='sticky-col sticky-col-1'>{{ fragments[155]|safe }}</th><th class='sticky-col sticky-col-2'>{{ fragments[156] }}</th><th class='sticky-col sticky-col-3'>{{ fragments[157] }}</th><th>{{ fragments[158]|safe }}</th><th>{{ fragments[159] }}</th><th>{{ fragments[160]|safe }}</th><th>{{ fragments[161]|safe }}</th><th>{{ fragments[162]|safe }}</th><th>{{ fragments[163]|safe }}</th><th>{{ fragments[164]|safe }}</th><th>{{ fragments[165]|safe }}</th><th>{{ fragments[166]|safe }}</th><th>{{ fragments[167]|safe }}</th><th>{{ fragments[168]|safe }}</th><th>{{ fragments[169]|safe }}</th><th>{{ fragments[170]|safe }}</th><th>{{ fragments[171]|safe }}</th><th>{{ fragments[172] }}</th></tr>
+                  </thead>
+                  <tbody>{{ fragments[173]|safe }}</tbody>
+                </table>
+              </div>
+              <div class="mobile-result-list">{{ fragments[174]|safe }}</div>
+              <div class="scroll-hint">{{ fragments[175] }}</div>
+            </article>
+          </section>
+          {{ fragments[176]|safe }}
+          <section id="strategy-workbench" class="workbench-grid">{{ fragments[177]|safe }}</section>
+          <section id="strategy-templates" class="strategy-template-section">
+            <article class="card">
+              <div class="eyebrow">{{ fragments[178] }}</div>
+              <h2 style="margin:0 0 6px;">{{ fragments[179] }}</h2>
+              <p class="lead">{{ fragments[180] }}</p>
+              <div class="strategy-template-actions" style="margin-top:12px;"><a class="detail-link" href="#my-strategies">{{ fragments[181] }}</a></div>
+            </article>
+            <div class="strategy-template-grid">{{ fragments[182]|safe }}</div>
+          </section>
+          <section id="my-strategies" class="card">
+            <div class="eyebrow">{{ fragments[183] }}</div>
+            <h2 style="margin:0 0 6px;">{{ fragments[184] }}</h2>
+            <p class="lead" style="margin-bottom:14px;">{{ fragments[185] }}</p>
+            <div class="table-wrap saved-strategies-wrap">
+            <table>
+              <thead>
+                <tr><th>{{ fragments[186] }}</th><th>{{ fragments[187] }}</th><th>{{ fragments[188] }}</th><th>{{ fragments[189] }}</th><th>{{ fragments[190] }}</th><th>{{ fragments[191] }}</th><th>{{ fragments[192] }}</th></tr>
+              </thead>
+              <tbody>{{ fragments[193]|safe }}</tbody>
+            </table>
+            </div>
+            <div class="mobile-preset-list">{{ fragments[194]|safe }}</div>
+          </section>
+        </div>
+          </main>
+        </div>
+        <script>
+          function appendExecutionTag(inputName, tag) {
+            const form = document.querySelector('form[action="/screeners"]');
+            if (!form) return;
+            const input = form.querySelector(`input[name="${inputName}"]`);
+            if (!input) return;
+            const values = input.value.split(",").map((item) => item.trim()).filter(Boolean);
+            if (!values.includes(tag)) {
+              values.push(tag);
+            }
+            input.value = values.join(", ");
+            input.focus();
+          }
+
+          function clearExecutionTags() {
+            const form = document.querySelector('form[action="/screeners"]');
+            if (!form) return;
+            const includeInput = form.querySelector('input[name="execution_tag_filter"]');
+            const excludeInput = form.querySelector('input[name="exclude_execution_tag_filter"]');
+            if (includeInput) includeInput.value = "";
+            if (excludeInput) excludeInput.value = "";
+            if (includeInput) includeInput.focus();
+          }
+        </script>
+      </body>
+    </html>

@@ -1,3 +1,4 @@
+import os
 import threading
 from pathlib import Path
 from urllib.parse import urlencode
@@ -7,6 +8,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.core.db import SessionLocal, get_db_session
+from app.models.tables import DataJob
 from app.services.auto_analysis import auto_analysis_service
 from app.services.auth import is_authenticated, login_redirect
 from app.services.backtester import BacktestRunner
@@ -28,6 +30,7 @@ from app.services.cn_concepts import sync_cn_concepts
 from app.services.cn_fundamentals import sync_cn_fundamentals
 from app.services.global_fundamentals import sync_global_fundamentals
 from app.services.job_response import build_job_payload, complete_job_and_build_payload, fail_job_and_build_payload
+from app.services import job_control
 from app.services.kronos_validation import KRONOS_VALIDATION_JOB_TYPE, save_kronos_validation_snapshot
 from app.services.hithink_market_data import import_hithink_market_dump
 from app.services.market_sync import sync_market_data
@@ -43,7 +46,7 @@ from app.services.nlp_snapshots import NEWS_ENRICHMENT_JOB_TYPE, refresh_nlp_sna
 from app.services.model_selection_guidance import save_model_selection_guidance_snapshots
 from app.services.model_output_importer import ExternalModelOutputImporter
 from app.services.push_notifications import PushNotificationService
-from app.services.repository import DataJobRepository, PriceSyncStateRepository
+from app.services.repository import DataJobRepository, PriceSyncStateRepository, utc_now_iso
 from app.services.market_refresh_audit import record_market_refresh_result
 from app.services.sample_data import seed_sample_data
 from app.services.screener_snapshots import (
@@ -68,6 +71,20 @@ from app.services.stock_selection.history_backfill import (
 
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        return max(1.0, float(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Wall-clock deadlines for the heavy full-market jobs (S-10).  They are
+# intentionally generous; the watchdog only fires when a run is genuinely
+# wedged, and it requests cooperative cancellation rather than killing threads.
+_PRECOMPUTE_TIMEOUT_SECONDS = _env_seconds("PQW_PRECOMPUTE_JOB_TIMEOUT_SECONDS", 6 * 3600)
+_TRAIN_TIMEOUT_SECONDS = _env_seconds("PQW_TRAIN_JOB_TIMEOUT_SECONDS", 12 * 3600)
 
 
 PROVIDER_OPTIONS = {
@@ -162,6 +179,20 @@ def _as_optional_int_except(value, blocked_values: set[str] | None = None):
         return None
 
 
+def _job_extra(result: dict) -> dict:
+    """Drop keys that collide with explicit ``complete_job_and_build_payload``
+    keyword arguments.
+
+    Service result dicts commonly carry their own ``status``/``message``. When
+    the route passes an explicit ``status``/``message`` *and* spreads the raw
+    result, Python raises ``TypeError: got multiple values for keyword
+    argument``. Filtering here keeps the explicit route semantics while still
+    exposing every other result field to the job payload.
+    """
+
+    return {key: value for key, value in result.items() if key not in {"status", "message"}}
+
+
 def _result_status(result: dict, *, partial_default: bool = True) -> str:
     raw = str(result.get("status") or "").strip().lower()
     if raw in {"success", "failed", "partial", "empty", "not_configured"}:
@@ -176,10 +207,72 @@ def _run_background_job(
     runner,
     post_success=None,
     record_market_refresh_batch: bool = True,
+    timeout_seconds: float | None = None,
+    heartbeat_seconds: float = 15.0,
 ) -> None:
-    """Keep long-running operational jobs off the single web-worker request thread."""
+    """Keep long-running operational jobs off the single web-worker request thread.
+
+    Adds the S-10 task controls: a persisted heartbeat, a wall-clock deadline
+    (watchdog requests cooperative cancellation when exceeded), and cooperative
+    cancellation requested through ``POST /jobs/{job_id}/cancel``.  The heavy
+    service loops call :func:`app.services.job_control.check_cancelled` at their
+    own checkpoints; runners without checkpoints still stop being tracked at the
+    next boundary.
+    """
+
+    job_control.register(job_id, timeout_seconds=timeout_seconds)
+    stop_heartbeat = threading.Event()
+
+    def _persist_runtime(**fields) -> None:
+        with SessionLocal() as heartbeat_db:
+            DataJobRepository(heartbeat_db).record_job_runtime(job_id, **fields)
+
+    def _publish_heartbeat(*, finished: bool = False) -> None:
+        fields = {
+            "heartbeat_at": utc_now_iso(),
+            "elapsed_seconds": round(job_control.elapsed_seconds(job_id) or 0.0, 2),
+            "cancel_requested": job_control.is_cancel_requested(job_id),
+        }
+        if timeout_seconds is not None:
+            fields["timeout_seconds"] = float(timeout_seconds)
+        if finished:
+            fields["finished"] = True
+        _persist_runtime(**fields)
+
+    def _watch(job_id: int) -> None:
+        interval = max(0.5, float(heartbeat_seconds))
+        while not stop_heartbeat.wait(interval):
+            job_control.heartbeat(job_id)
+            if timeout_seconds is not None and job_control.has_timed_out(job_id) and not job_control.is_cancel_requested(job_id):
+                job_control.request_cancel(
+                    job_id,
+                    reason=f"Timed out after {float(timeout_seconds):.0f}s.",
+                    timed_out=True,
+                )
+            try:
+                _publish_heartbeat()
+            except Exception:
+                # Best-effort liveness signal; never fail the job over a
+                # transient lock on the heartbeat write.
+                pass
+
+    def _finish(status: str, message: str, result: dict | None) -> None:
+        with SessionLocal() as worker_db:
+            DataJobRepository(worker_db).complete_job(
+                job_id,
+                status=status,
+                message=message,
+                result=result,
+            )
 
     def _work() -> None:
+        heartbeat = threading.Thread(
+            target=_watch,
+            args=(job_id,),
+            name=f"job-heartbeat-{job_id}",
+            daemon=True,
+        )
+        heartbeat.start()
         try:
             with SessionLocal() as worker_db:
                 DataJobRepository(worker_db).update_job(
@@ -187,18 +280,30 @@ def _run_background_job(
                     message=f"{label} is running in the background.",
                     progress={"step": "market_refresh"},
                 )
-            result = runner()
+            try:
+                _publish_heartbeat()
+            except Exception:
+                pass
+            try:
+                job_control.check_cancelled(job_id)
+                result = runner()
+            except job_control.JobCancelled as exc:
+                timed_out = job_control.has_timed_out(job_id)
+                status = "failed_timeout" if timed_out else "cancelled"
+                _finish(status, str(exc), {"cancelled": True, "timed_out": timed_out})
+                return
+            if job_control.is_cancel_requested(job_id):
+                # Cancellation arrived while the runner was past all checkpoints.
+                timed_out = job_control.has_timed_out(job_id)
+                status = "failed_timeout" if timed_out else "cancelled"
+                reason = (job_control.snapshot(job_id) or {}).get("cancel_reason") or "Cancellation requested."
+                _finish(status, str(reason), result if isinstance(result, dict) else None)
+                return
             if record_market_refresh_batch:
                 _record_market_refresh_batch(job_id=job_id, result=result)
             status = _result_status(result)
             message = str(result.get("message") or f"{label} finished.")
-            with SessionLocal() as worker_db:
-                DataJobRepository(worker_db).complete_job(
-                    job_id,
-                    status=status,
-                    message=message,
-                    result=result,
-                )
+            _finish(status, message, result)
             if status == "success" and post_success is not None:
                 try:
                     post_success()
@@ -207,19 +312,56 @@ def _run_background_job(
                     # carry the error without rewriting a successful training run.
                     pass
         except Exception as exc:
-            with SessionLocal() as worker_db:
-                DataJobRepository(worker_db).complete_job(
-                    job_id,
-                    status="failed",
-                    message=str(exc),
-                    result={"error": str(exc)},
-                )
+            _finish("failed", str(exc), {"error": str(exc)})
+        finally:
+            stop_heartbeat.set()
+            try:
+                _publish_heartbeat(finished=True)
+            except Exception:
+                pass
+            job_control.clear(job_id)
 
     threading.Thread(
         target=_work,
         name=f"background-job-{job_id}",
         daemon=True,
     ).start()
+
+
+_JOB_CLAIM_LOCK = threading.Lock()
+
+
+def _claim_background_job(
+    job_repo: DataJobRepository,
+    *,
+    job_types,
+    job_type: str,
+    params: dict,
+    message: str | None = None,
+):
+    """Atomically reuse a running job or create a new one.
+
+    Serializing the running-check and insert closes the double-click race that
+    a plain ``get_running_job`` check leaves open between two concurrent
+    requests.  The deployment runs a single uvicorn worker, so a process-level
+    lock is sufficient; multi-worker deployments would need a DB-level guard.
+    """
+
+    if isinstance(job_types, str):
+        normalized = [job_types]
+    else:
+        normalized = list(job_types)
+    with _JOB_CLAIM_LOCK:
+        existing = job_repo.get_running_job(normalized)
+        if existing:
+            return None, existing
+        job = job_repo.create_job(
+            job_type=job_type,
+            status="running",
+            params=params,
+            message=message,
+        )
+        return job, None
 
 
 def _record_market_refresh_batch(*, job_id: int, result: dict) -> None:
@@ -348,11 +490,115 @@ def _precompute_us_screeners_result(*, job_id: int, include_watchlist: bool, lak
             markets=["US"],
             include_watchlist=include_watchlist,
             lake_only=lake_only,
+            should_cancel=job_control.cancellation_checker(job_id),
         )
     result["message"] = (
         f"Precomputed {result.get('count', 0)} U.S. core candidate snapshot(s): "
         "LightGBM, Next Tesla Swing, and Technical Momentum."
     )
+    return result
+
+
+def _cn_core_precompute_result(*, job_id: int) -> dict:
+    with SessionLocal() as worker_db:
+        result = refresh_precomputed_screener_snapshots(
+            worker_db,
+            source_job_id=job_id,
+            markets=["CN"],
+            include_watchlist=False,
+            lake_only=False,
+            include_all_market=False,
+            template_keys=CORE_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
+            universes=["full_market"],
+            should_cancel=job_control.cancellation_checker(job_id),
+        )
+    result["message"] = f"Precomputed {result.get('count', 0)} core CN screener snapshot(s)."
+    return result
+
+
+def _cn_combos_precompute_result(*, job_id: int) -> dict:
+    with SessionLocal() as worker_db:
+        result = refresh_precomputed_multi_screener_snapshots(
+            worker_db,
+            source_job_id=job_id,
+            markets=["CN"],
+            should_cancel=job_control.cancellation_checker(job_id),
+        )
+    result["message"] = f"Precomputed {result.get('count', 0)} CN multi-model screener snapshot(s)."
+    return result
+
+
+def _cn_rest_precompute_result(*, job_id: int) -> dict:
+    should_cancel = job_control.cancellation_checker(job_id)
+    with SessionLocal() as worker_db:
+        result_full = refresh_precomputed_screener_snapshots(
+            worker_db,
+            source_job_id=job_id,
+            markets=["CN"],
+            include_watchlist=False,
+            lake_only=False,
+            include_all_market=False,
+            template_keys=REST_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
+            universes=["full_market"],
+            should_cancel=should_cancel,
+        )
+        result_watchlist = refresh_precomputed_screener_snapshots(
+            worker_db,
+            source_job_id=job_id,
+            markets=["CN"],
+            include_watchlist=True,
+            lake_only=False,
+            include_all_market=False,
+            template_keys=WATCHLIST_PRECOMPUTE_TEMPLATES,
+            universes=["watchlist"],
+            should_cancel=should_cancel,
+        )
+    count = int(result_full.get("count", 0) or 0) + int(result_watchlist.get("count", 0) or 0)
+    result = {
+        "status": "success" if count > 0 else "failed",
+        "count": count,
+        "failed_count": int(result_full.get("failed_count", 0) or 0) + int(result_watchlist.get("failed_count", 0) or 0),
+        "batches": [
+            {"batch": "cn_full_market_rest", **result_full},
+            {"batch": "watchlist", **result_watchlist},
+        ],
+    }
+    result["message"] = f"Precomputed {result.get('count', 0)} secondary CN screener snapshot(s)."
+    return result
+
+
+def _cn_staged_precompute_result(*, job_id: int) -> dict:
+    with SessionLocal() as worker_db:
+        result_core = refresh_precomputed_screener_snapshots(
+            worker_db,
+            source_job_id=job_id,
+            markets=["CN"],
+            include_watchlist=False,
+            lake_only=False,
+            include_all_market=False,
+            template_keys=CORE_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
+            universes=["full_market"],
+            should_cancel=job_control.cancellation_checker(job_id),
+        )
+    result = {
+        "status": _result_status(result_core),
+        "count": int(result_core.get("count", 0) or 0),
+        "failed_count": int(result_core.get("failed_count", 0) or 0),
+        "snapshots_created": list(result_core.get("snapshots_created") or []),
+        "failed_templates": list(result_core.get("failed_templates") or []),
+        "batches": [{"batch": "core", **result_core}],
+        "tail_jobs_scheduled": True,
+    }
+    result["message"] = (
+        f"Core CN screener precompute finished: {result.get('count', 0)} snapshot(s); "
+        "combo and rest jobs were scheduled in the background."
+    )
+    threading.Thread(
+        target=_run_cn_precompute_tail_jobs,
+        kwargs={"source_job_id": job_id, "parent_job_id": job_id},
+        name=f"manual-cn-precompute-tail-{job_id}",
+        daemon=True,
+    ).start()
     return result
 
 
@@ -426,7 +672,7 @@ def _train_us_signals_result(
         market="US",
         universe="full_market_us_lake",
     )
-    daily_rows_written = BacktestRunner().run(top_n=max(1, top_n))
+    daily_rows_written = BacktestRunner().run(top_n=max(1, top_n), engine_version="event_driven_daily_v2")
     with SessionLocal() as db:
         try:
             refresh_workspace_snapshots(db, source_job_id=job_id)
@@ -921,7 +1167,12 @@ async def run_precompute_us_screeners(request: Request, db: Session = Depends(ge
     include_watchlist = _as_bool(await _request_value(request, "include_watchlist", False), default=False)
     lake_only = _as_bool(await _request_value(request, "lake_only", True), default=True)
     job_repo = DataJobRepository(db)
-    existing = _existing_running_job(job_repo, {"precompute_us_screeners"})
+    job, existing = _claim_background_job(
+        job_repo,
+        job_types=("precompute_us_screeners",),
+        job_type="precompute_us_screeners",
+        params={"markets": ["US"], "include_watchlist": include_watchlist, "lake_only": lake_only},
+    )
     if existing:
         return _maybe_redirect(
             redirect_to,
@@ -931,11 +1182,6 @@ async def run_precompute_us_screeners(request: Request, db: Session = Depends(ge
                 message="U.S. candidate precompute is already running in the background.",
             ),
         )
-    job = job_repo.create_job(
-        job_type="precompute_us_screeners",
-        status="running",
-        params={"markets": ["US"], "include_watchlist": include_watchlist, "lake_only": lake_only},
-    )
     _run_background_job(
         job_id=job.id,
         label="U.S. candidate precompute",
@@ -944,6 +1190,7 @@ async def run_precompute_us_screeners(request: Request, db: Session = Depends(ge
             include_watchlist=include_watchlist,
             lake_only=lake_only,
         ),
+        timeout_seconds=_PRECOMPUTE_TIMEOUT_SECONDS,
     )
     return _maybe_redirect(
         redirect_to,
@@ -961,51 +1208,40 @@ async def run_precompute_cn_screeners(request: Request, db: Session = Depends(ge
         return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
     job_repo = DataJobRepository(db)
-    job = job_repo.create_job(
+    job, existing = _claim_background_job(
+        job_repo,
+        job_types=(
+            "screener_precompute",
+            "screener_precompute_core",
+            "screener_precompute_combos",
+            "screener_precompute_rest",
+        ),
         job_type="screener_precompute",
-        status="running",
         params={"markets": ["CN"], "universes": ["full_market", "watchlist"], "mode": "staged"},
     )
-    try:
-        result_core = refresh_precomputed_screener_snapshots(
-            db,
-            source_job_id=job.id,
-            markets=["CN"],
-            include_watchlist=False,
-            lake_only=False,
-            include_all_market=False,
-            template_keys=CORE_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
-            universes=["full_market"],
-        )
-        result = {
-            "status": _result_status(result_core),
-            "count": int(result_core.get("count", 0) or 0),
-            "failed_count": int(result_core.get("failed_count", 0) or 0),
-            "snapshots_created": list(result_core.get("snapshots_created") or []),
-            "failed_templates": list(result_core.get("failed_templates") or []),
-            "batches": [{"batch": "core", **result_core}],
-            "tail_jobs_scheduled": True,
-        }
-        payload = complete_job_and_build_payload(
-            job_repo,
-            job_id=job.id,
-            status=_result_status(result),
-            message=(
-                f"Core CN screener precompute finished: {result.get('count', 0)} snapshot(s); "
-                f"combo and rest jobs continue in background."
+    if existing:
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="running",
+                job_id=existing.get("id"),
+                message="A CN screener precompute is already running; this request reuses it.",
             ),
-            **{key: value for key, value in result.items() if key not in {"status", "message"}},
         )
-        threading.Thread(
-            target=_run_cn_precompute_tail_jobs,
-            kwargs={"source_job_id": job.id, "parent_job_id": job.id},
-            name=f"manual-cn-precompute-tail-{job.id}",
-            daemon=True,
-        ).start()
-        return _maybe_redirect(redirect_to, payload)
-    except Exception as exc:
-        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
-        return _maybe_redirect(redirect_to, payload)
+    _run_background_job(
+        job_id=job.id,
+        label="A-share screener precompute",
+        runner=lambda: _cn_staged_precompute_result(job_id=job.id),
+        timeout_seconds=_PRECOMPUTE_TIMEOUT_SECONDS,
+    )
+    return _maybe_redirect(
+        redirect_to,
+        build_job_payload(
+            status="running",
+            job_id=job.id,
+            message="A-share screener precompute started in the background. The task center stays responsive.",
+        ),
+    )
 
 
 @router.post("/precompute-cn-screeners-core")
@@ -1014,35 +1250,35 @@ async def run_precompute_cn_screeners_core(request: Request, db: Session = Depen
         return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
     job_repo = DataJobRepository(db)
-    job = job_repo.create_job(
+    job, existing = _claim_background_job(
+        job_repo,
+        job_types=("screener_precompute", "screener_precompute_core"),
         job_type="screener_precompute_core",
-        status="running",
         params={"markets": ["CN"], "universes": ["full_market"]},
     )
-    try:
-        result = refresh_precomputed_screener_snapshots(
-            db,
-            source_job_id=job.id,
-            markets=["CN"],
-            include_watchlist=False,
-            lake_only=False,
-            include_all_market=False,
-            template_keys=CORE_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
-            universes=["full_market"],
+    if existing:
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="running",
+                job_id=existing.get("id"),
+                message="A CN core precompute is already running; this request reuses it.",
+            ),
         )
-        status = _result_status(result)
-        extra = {key: value for key, value in result.items() if key not in {"status", "message"}}
-        payload = complete_job_and_build_payload(
-            job_repo,
+    _run_background_job(
+        job_id=job.id,
+        label="CN core screener precompute",
+        runner=lambda: _cn_core_precompute_result(job_id=job.id),
+        timeout_seconds=_PRECOMPUTE_TIMEOUT_SECONDS,
+    )
+    return _maybe_redirect(
+        redirect_to,
+        build_job_payload(
+            status="running",
             job_id=job.id,
-            status=status,
-            message=f"Precomputed {result.get('count', 0)} core CN screener snapshot(s).",
-            **extra,
-        )
-        return _maybe_redirect(redirect_to, payload)
-    except Exception as exc:
-        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
-        return _maybe_redirect(redirect_to, payload)
+            message="Core CN screener precompute started in the background.",
+        ),
+    )
 
 
 @router.post("/precompute-cn-screeners-combos")
@@ -1051,30 +1287,35 @@ async def run_precompute_cn_screeners_combos(request: Request, db: Session = Dep
         return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
     job_repo = DataJobRepository(db)
-    job = job_repo.create_job(
+    job, existing = _claim_background_job(
+        job_repo,
+        job_types=("screener_precompute", "screener_precompute_combos"),
         job_type="screener_precompute_combos",
-        status="running",
         params={"markets": ["CN"], "universes": ["full_market"]},
     )
-    try:
-        result = refresh_precomputed_multi_screener_snapshots(
-            db,
-            source_job_id=job.id,
-            markets=["CN"],
+    if existing:
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="running",
+                job_id=existing.get("id"),
+                message="A CN multi-model precompute is already running; this request reuses it.",
+            ),
         )
-        status = _result_status(result)
-        extra = {key: value for key, value in result.items() if key not in {"status", "message"}}
-        payload = complete_job_and_build_payload(
-            job_repo,
+    _run_background_job(
+        job_id=job.id,
+        label="CN multi-model screener precompute",
+        runner=lambda: _cn_combos_precompute_result(job_id=job.id),
+        timeout_seconds=_PRECOMPUTE_TIMEOUT_SECONDS,
+    )
+    return _maybe_redirect(
+        redirect_to,
+        build_job_payload(
+            status="running",
             job_id=job.id,
-            status=status,
-            message=f"Precomputed {result.get('count', 0)} CN multi-model screener snapshot(s).",
-            **extra,
-        )
-        return _maybe_redirect(redirect_to, payload)
-    except Exception as exc:
-        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
-        return _maybe_redirect(redirect_to, payload)
+            message="CN multi-model screener precompute started in the background.",
+        ),
+    )
 
 
 @router.post("/precompute-cn-screeners-rest")
@@ -1083,52 +1324,35 @@ async def run_precompute_cn_screeners_rest(request: Request, db: Session = Depen
         return login_redirect("/dashboard")
     redirect_to = await _request_value(request, "redirect_to")
     job_repo = DataJobRepository(db)
-    job = job_repo.create_job(
+    job, existing = _claim_background_job(
+        job_repo,
+        job_types=("screener_precompute", "screener_precompute_rest"),
         job_type="screener_precompute_rest",
-        status="running",
         params={"markets": ["CN"], "universes": ["full_market", "watchlist"]},
     )
-    try:
-        result_full = refresh_precomputed_screener_snapshots(
-            db,
-            source_job_id=job.id,
-            markets=["CN"],
-            include_watchlist=False,
-            lake_only=False,
-            include_all_market=False,
-            template_keys=REST_FULL_MARKET_CN_PRECOMPUTE_TEMPLATES,
-            universes=["full_market"],
+    if existing:
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="running",
+                job_id=existing.get("id"),
+                message="A CN secondary precompute is already running; this request reuses it.",
+            ),
         )
-        result_watchlist = refresh_precomputed_screener_snapshots(
-            db,
-            source_job_id=job.id,
-            markets=["CN"],
-            include_watchlist=True,
-            lake_only=False,
-            include_all_market=False,
-            template_keys=WATCHLIST_PRECOMPUTE_TEMPLATES,
-            universes=["watchlist"],
-        )
-        result = {
-            "status": "success" if int(result_full.get("count", 0) or 0) + int(result_watchlist.get("count", 0) or 0) > 0 else "failed",
-            "count": int(result_full.get("count", 0) or 0) + int(result_watchlist.get("count", 0) or 0),
-            "failed_count": int(result_full.get("failed_count", 0) or 0) + int(result_watchlist.get("failed_count", 0) or 0),
-            "batches": [
-                {"batch": "cn_full_market_rest", **result_full},
-                {"batch": "watchlist", **result_watchlist},
-            ],
-        }
-        payload = complete_job_and_build_payload(
-            job_repo,
+    _run_background_job(
+        job_id=job.id,
+        label="CN secondary screener precompute",
+        runner=lambda: _cn_rest_precompute_result(job_id=job.id),
+        timeout_seconds=_PRECOMPUTE_TIMEOUT_SECONDS,
+    )
+    return _maybe_redirect(
+        redirect_to,
+        build_job_payload(
+            status="running",
             job_id=job.id,
-            status=_result_status(result),
-            message=f"Precomputed {result.get('count', 0)} secondary CN screener snapshot(s).",
-            **result,
-        )
-        return _maybe_redirect(redirect_to, payload)
-    except Exception as exc:
-        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
-        return _maybe_redirect(redirect_to, payload)
+            message="Secondary CN screener precompute started in the background.",
+        ),
+    )
 
 
 @router.post("/model-selection-guidance-snapshot")
@@ -1473,6 +1697,7 @@ async def run_train_us_signals(request: Request, db: Session = Depends(get_db_se
                 universe_summary=universe_summary,
             ),
             post_success=lambda: _run_post_training_evaluation(source_job_id=job.id, market="US"),
+            timeout_seconds=_TRAIN_TIMEOUT_SECONDS,
         )
         return _maybe_redirect(
             redirect_to,
@@ -1490,7 +1715,7 @@ async def run_train_us_signals(request: Request, db: Session = Depends(get_db_se
             market="US",
             universe="full_market_us_lake",
         )
-        daily_rows_written = runner.run(top_n=max(1, top_n))
+        daily_rows_written = runner.run(top_n=max(1, top_n), engine_version="event_driven_daily_v2")
         message = (
             f"{run_name}: trained {len(us_tickers)} eligible U.S. common-stock symbols "
             f"({len(raw_us_tickers)} raw) with {model_type}, wrote {predictions_written} predictions "
@@ -1583,6 +1808,7 @@ async def run_train_cn_signals(request: Request, db: Session = Depends(get_db_se
                 tickers=cn_tickers,
             ),
             post_success=lambda: _run_post_training_evaluation(source_job_id=job.id, market="CN"),
+            timeout_seconds=_TRAIN_TIMEOUT_SECONDS,
         )
         return _maybe_redirect(
             redirect_to,
@@ -1854,7 +2080,7 @@ async def run_sync_cn_symbol_universe(request: Request, db: Session = Depends(ge
             job_id=job.id,
             status=status,
             message=result["message"],
-            **result,
+            **_job_extra(result),
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -1911,7 +2137,7 @@ async def run_init_cn_market_data(request: Request, db: Session = Depends(get_db
             job_id=job.id,
             status=status,
             message=result["message"],
-            **result,
+            **_job_extra(result),
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -1993,7 +2219,7 @@ async def run_refresh_cn_market_data(request: Request, db: Session = Depends(get
             job_id=job.id,
             status=status,
             message=result["message"],
-            **result,
+            **_job_extra(result),
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -2071,7 +2297,7 @@ async def run_refresh_cn_market_data_daily(request: Request, db: Session = Depen
             job_id=job.id,
             status=status,
             message=result["message"],
-            **result,
+            **_job_extra(result),
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -2142,7 +2368,7 @@ async def run_rebuild_technical_snapshots(request: Request, db: Session = Depend
             job_id=job.id,
             status=status,
             message=result["message"],
-            **result,
+            **_job_extra(result),
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -2240,7 +2466,7 @@ async def run_sync_cn_fundamentals(request: Request, db: Session = Depends(get_d
             job_id=job.id,
             status=status,
             message=result["message"],
-            **result_extra,
+            **_job_extra(result_extra),
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -2269,7 +2495,7 @@ async def run_sync_cn_concepts(request: Request, db: Session = Depends(get_db_se
             job_id=job.id,
             status=status,
             message=result["message"],
-            **result,
+            **_job_extra(result),
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -2299,7 +2525,7 @@ async def run_sync_global_fundamentals(request: Request, db: Session = Depends(g
             job_id=job.id,
             status=status,
             message=result["message"],
-            **result,
+            **_job_extra(result),
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -2501,6 +2727,8 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
     run_name = str(await _request_value(request, "run_name", "pipeline_run")).strip() or "pipeline_run"
     model_type = str(await _request_value(request, "model_type", "lightgbm")).strip() or "lightgbm"
     signal_type = str(await _request_value(request, "signal_type", "momentum")).strip() or "momentum"
+    market_raw = str(await _request_value(request, "market", "")).strip().upper()
+    market = market_raw or None
     lookback_raw = await _request_value(request, "lookback_days", 3)
     top_n_raw = await _request_value(request, "top_n", 1)
     lookback_days = _as_int(lookback_raw, 3)
@@ -2534,6 +2762,7 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
             "model_type": model_type,
             "signal_type": signal_type,
             "lookback_days": lookback_days,
+            "market": market,
             "top_n": top_n,
             "model_run_id": model_run_id,
             "holding_days": holding_days,
@@ -2561,6 +2790,7 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
             model_type=model_type,
             signal_type=signal_type,
             lookback_days=lookback_days,
+            market=market,
         )
         daily_rows_written = BacktestRunner().run(
             top_n=top_n,
@@ -2575,6 +2805,7 @@ async def run_pipeline(request: Request, db: Session = Depends(get_db_session)):
             min_adv=min_adv,
             max_gap_pct=max_gap_pct,
             rebalance_threshold=rebalance_threshold,
+            engine_version="event_driven_daily_v2",
         )
         message = (
             f"Pipeline complete: synced {len(sync_results)} ticker(s), "
@@ -2687,7 +2918,7 @@ async def run_import_model_output(request: Request, db: Session = Depends(get_db
             job_id=job.id,
             status="success",
             message=message,
-            **result,
+            **_job_extra(result),
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:
@@ -2706,6 +2937,48 @@ async def run_watchlist_analysis(request: Request):
     except Exception as exc:
         payload = {"status": "failed", "message": str(exc)}
         return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/{job_id}/cancel")
+async def cancel_job(job_id: int, request: Request, db: Session = Depends(get_db_session)):
+    """Request cooperative cancellation of a running background job (S-10)."""
+
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    reason = str(await _request_value(request, "reason", "")).strip() or None
+    job_repo = DataJobRepository(db)
+    job = db.get(DataJob, int(job_id))
+    if job is None:
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(status="not_found", job_id=int(job_id), message="Job not found."),
+        )
+    status = str(job.status or "").lower()
+    if status != "running":
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status=status or "unknown",
+                job_id=int(job_id),
+                message=f"Job is not running (status={status or 'unknown'}); nothing to cancel.",
+            ),
+        )
+    tracked = job_control.request_cancel(int(job_id), reason=reason or "Cancellation requested from the task center.")
+    job_repo.record_job_runtime(
+        int(job_id),
+        cancel_requested=True,
+        cancel_reason=reason or "Cancellation requested from the task center.",
+    )
+    message = (
+        "Cancellation requested; the job stops at its next checkpoint."
+        if tracked
+        else "Cancellation flags set. The job is not owned by this process and will stop at its next checkpoint."
+    )
+    return _maybe_redirect(
+        redirect_to,
+        build_job_payload(status="running", job_id=int(job_id), message=message),
+    )
 
 
 @router.post("/cleanup-stale-jobs")

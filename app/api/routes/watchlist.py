@@ -1176,7 +1176,7 @@ def watchlist_page(
         for _, label, hint in MARKET_OPTIONS
     )
     banner = (
-        f"<div class='banner'>{message}</div>"
+        f"<div class='banner'>{html.escape(message)}</div>"
         if message
         else ""
     )
@@ -1755,14 +1755,14 @@ def add_watchlist_symbol(
         _refresh_workspace_snapshots_async()
         result = results[0] if results else None
         if result and result["status"] == "success":
-            return _redirect_with_message(f"Added {ticker}, synced {result['rows']} rows, and updated dashboard watchlist.")
+            return _redirect_with_message(f"Added {ticker} and synced {result['rows']} rows.")
         if result:
             return _redirect_with_message(f"Added {ticker}; dashboard updated, but sync failed: {result.get('message', 'Unknown error')}")
         return _redirect_with_message(f"Added {ticker}; dashboard updated, but sync did not return a result.")
 
     _clear_watchlist_caches()
     _refresh_workspace_snapshots_async()
-    return _redirect_with_message(f"Added {ticker} to your watchlist and refreshed dashboard.")
+    return _redirect_with_message(f"Added {ticker} to your watchlist.")
 
 
 @router.post("/remove")

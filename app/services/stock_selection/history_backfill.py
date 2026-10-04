@@ -255,7 +255,11 @@ def backfill_cn_stock_selection_history(
                 raise RuntimeError(
                     "provider returned no rows for a known CN trading date"
                 )
-            parquet_paths = write_ohlcv_rows_to_lake(market="CN", rows=rows)
+            parquet_paths = write_ohlcv_rows_to_lake(
+                market="CN",
+                rows=rows,
+                provenance={"provider": "history_backfill", "source_reference": f"history_backfill:cn:{trade_date}"},
+            )
             after_count = count_lake_symbols_for_trade_date(
                 market="CN",
                 trade_date=trade_date,

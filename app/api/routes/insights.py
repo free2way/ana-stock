@@ -27,6 +27,9 @@ from app.services.repository import (
 from app.services.runtime_cache import get_or_set
 from app.services.ui_lang import resolve_request_lang
 from app.services.workspace_nav import WORKSPACE_COMPACT_STYLE, WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
+from app.api.presentation.tokens import (
+    ROOT_TOKENS_SOFT_MULTILINE,
+)
 
 
 router = APIRouter(prefix="/insights", tags=["insights"])
@@ -1122,7 +1125,7 @@ def insight_page(
     )
     nav_html = render_workspace_nav_html(lang=lang, active_key="watchlist")
 
-    return f"""
+    return (f"""
     <!DOCTYPE html>
     <html lang="en">
       <head>
@@ -1130,16 +1133,7 @@ def insight_page(
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{insight['ticker']} Insight</title>
         <style>
-          :root {{
-            --bg: #071018;
-            --panel: #111c28;
-            --panel-2: #152231;
-            --ink: #e6edf3;
-            --muted: #90a3b8;
-            --line: #223246;
-            --accent: #3dd9b6;
-            --accent-soft: rgba(61,217,182,0.12);
-          }}
+          """ + (ROOT_TOKENS_SOFT_MULTILINE) + f"""
           * {{ box-sizing: border-box; }}
           body {{ margin: 0; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--ink); background:
             radial-gradient(circle at top left, rgba(82,168,255,0.14) 0, transparent 28%),
@@ -1568,4 +1562,4 @@ def insight_page(
         </div>
       </body>
     </html>
-    """
+    """)

@@ -1,0 +1,216 @@
+
+    <!DOCTYPE html>
+    <html lang="{{ fragments[0]|safe }}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{{ fragments[1]|safe }}</title>
+        <style>{{ fragments[2]|safe }}</style>
+        <script>
+          function toggleDashboardPortfolioPrivacy(button) {
+            const card = button.closest("[data-dashboard-portfolio-privacy]");
+            if (!card) return;
+            const isVisible = card.classList.toggle("portfolio-values-visible");
+            const nextLabel = isVisible ? button.dataset.hideLabel : button.dataset.showLabel;
+            button.setAttribute("aria-pressed", String(isVisible));
+            button.setAttribute("aria-label", nextLabel);
+            button.setAttribute("title", nextLabel);
+          }
+        </script>
+      </head>
+      <body>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{{ fragments[3]|safe }}</h1>
+              <p>{{ fragments[4]|safe }}</p>
+            </div>
+            <nav class="side-nav">{{ fragments[5]|safe }}</nav>
+            <div class="sidebar-foot">
+              <div class="eyebrow">{{ fragments[6]|safe }}</div>
+              <div class="metric" style="font-size:20px;margin-bottom:6px;">{{ fragments[7]|safe }}</div>
+              <div class="muted">{{ fragments[8]|safe }}</div>
+              <div class="chip-row">
+                <span class="chip">{{ fragments[9]|safe }}: {{ fragments[10]|safe }}</span>
+                <span class="chip">{{ fragments[11]|safe }}: {{ fragments[12]|safe }}</span>
+              </div>
+            </div>
+          </aside>
+          <main class="content">
+            {{ fragments[13]|safe }}
+            <section class="topbar">
+              <div class="hero">
+                <h2>{{ fragments[14]|safe }}</h2>
+                <p>{{ fragments[15]|safe }}</p>
+              </div>
+              <div class="top-actions">
+                {{ fragments[16]|safe }}
+                {{ fragments[17]|safe }}
+              </div>
+            </section>
+
+            <section class="decision-card">
+              <div>
+                <div class="decision-kicker">{{ fragments[18]|safe }}</div>
+                <h3>{{ fragments[19]|safe }} · {{ fragments[20]|safe }}</h3>
+                <p>{{ fragments[21]|safe }} {{ fragments[22]|safe }} {{ fragments[23]|safe }} · {{ fragments[24]|safe }}</p>
+              </div>
+              <a class="cta primary" href="{{ fragments[25]|safe }}">{{ fragments[26]|safe }}</a>
+            </section>
+
+            <section class="workflow-steps">{{ fragments[27]|safe }}</section>
+
+            <details class="card home-digest">
+              <summary>
+                <span class="home-digest-title">
+                  <b>{{ fragments[28]|safe }}</b>
+                  <span>{{ fragments[29]|safe }}</span>
+                </span>
+              </summary>
+              <div class="home-digest-body">
+                <div class="muted">{{ fragments[30]|safe }}</div>
+                <div class="cta-row"><a class="cta primary" href="/dashboard/market?lang={{ fragments[31]|safe }}&lookback_runs={{ fragments[32]|safe }}">{{ fragments[33]|safe }}</a><a class="cta" href="/screeners?lang={{ fragments[34]|safe }}">{{ fragments[35]|safe }}</a></div>
+              </div>
+            </details>
+
+            <details class="card home-digest system-status"{{ fragments[36]|safe }}>
+              <summary>
+                <span class="home-digest-title">
+                  <b>{{ fragments[37]|safe }}</b>
+                  <span>{{ fragments[38]|safe }}</span>
+                </span>
+              </summary>
+              <div class="readiness-grid">{{ fragments[39]|safe }}</div>
+            </details>
+
+            <section class="workspace">
+              <div class="stack">
+                <article class="card home-list-card">
+                  <div class="panel-head">
+                    <div>
+                      <div class="eyebrow">{{ fragments[40]|safe }}</div>
+                      <h3>{{ fragments[41]|safe }}</h3>
+                      <p>{{ fragments[42]|safe }}</p>
+                    </div>
+                    <a class="cta" href="/watchlist?lang={{ fragments[43]|safe }}&mode={{ fragments[44]|safe }}">{{ fragments[45]|safe }}</a>
+                  </div>
+                  <div class="home-list-meta">
+                    <span>{{ fragments[46]|safe }} {{ fragments[47]|safe }}</span>
+                    <span>{{ fragments[48]|safe }}</span>
+                  </div>
+                  <div class="list-stack">{{ fragments[49]|safe }}</div>
+                </article>
+
+                <article class="card home-list-card" data-dashboard-portfolio-privacy>
+                  <div class="panel-head">
+                    <div>
+                      <div class="eyebrow">{{ fragments[50]|safe }}</div>
+                      <h3>{{ fragments[51]|safe }}</h3>
+                      <p>{{ fragments[52]|safe }}</p>
+                    </div>
+                    <div class="row-right">
+                      <button type="button" class="dashboard-privacy-toggle" onclick="toggleDashboardPortfolioPrivacy(this)" data-show-label="{{ fragments[53]|safe }}" data-hide-label="{{ fragments[54]|safe }}" aria-pressed="false" aria-label="{{ fragments[55]|safe }}" title="{{ fragments[56]|safe }}">
+                        <svg class="privacy-eye-closed" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3l18 18"></path><path d="M10.6 10.7a2 2 0 0 0 2.7 2.7"></path><path d="M9.9 4.3A10.8 10.8 0 0 1 12 4c5 0 8.6 4.4 9.5 6.1a3.9 3.9 0 0 1 0 3.8 13.5 13.5 0 0 1-2.1 2.8"></path><path d="M6.6 6.6A13.1 13.1 0 0 0 2.5 10a3.9 3.9 0 0 0 0 3.8C3.4 15.6 7 20 12 20a10.6 10.6 0 0 0 4.3-.9"></path></svg>
+                        <svg class="privacy-eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 10.1a3.9 3.9 0 0 0 0 3.8C3.4 15.6 7 20 12 20s8.6-4.4 9.5-6.1a3.9 3.9 0 0 0 0-3.8C20.6 8.4 17 4 12 4S3.4 8.4 2.5 10.1Z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                      </button>
+                      <a class="cta" href="/portfolio">{{ fragments[57]|safe }}</a>
+                    </div>
+                  </div>
+                  <div class="home-list-meta">
+                    <span>{{ fragments[58]|safe }} {{ fragments[59]|safe }}</span>
+                    <span>{{ fragments[60]|safe }} <span class="dashboard-portfolio-mask" aria-hidden="true">*****</span><span class="dashboard-portfolio-actual">{{ fragments[61]|safe }}%</span></span>
+                  </div>
+                  <div class="list-stack">{{ fragments[62]|safe }}</div>
+                </article>
+              </div>
+
+              <div class="stack">
+                <article class="card home-side-card">
+                  <div class="panel-head">
+                    <div>
+                      <div class="eyebrow">{{ fragments[63]|safe }}</div>
+                      <h3>{{ fragments[64]|safe }}</h3>
+                      <p>{{ fragments[65]|safe }}</p>
+                    </div>
+                  </div>
+                  <div class="list-stack">
+                    <article class="signal-row">
+                      <div><div class="ticker">{{ fragments[66]|safe }}</div><div class="subtle">{{ fragments[67]|safe }}</div></div>
+                      <div class="row-right"><div class="mini-metric">{{ fragments[68]|safe }}</div></div>
+                    </article>
+                    <article class="signal-row">
+                      <div><div class="ticker">{{ fragments[69]|safe }}</div><div class="subtle">{{ fragments[70]|safe }}</div></div>
+                      <div class="row-right"><div class="mini-metric">{{ fragments[71]|safe }}</div></div>
+                    </article>
+                  </div>
+                </article>
+                <article class="card home-side-card">
+                  <div class="panel-head">
+                    <div>
+                      <div class="eyebrow">{{ fragments[72]|safe }}</div>
+                      <h3>{{ fragments[73]|safe }}</h3>
+                      <p>{{ fragments[74]|safe }}</p>
+                    </div>
+                  </div>
+                  {{ fragments[75]|safe }}
+                  <div class="list-stack">{{ fragments[76]|safe }}</div>
+                  <div class="cta-row">
+                    <a class="cta primary" href="/screeners?lang={{ fragments[77]|safe }}">{{ fragments[78]|safe }}</a>
+                    <a class="cta" href="/dashboard/continuous-leaders?lang={{ fragments[79]|safe }}&lookback_runs={{ fragments[80]|safe }}">{{ fragments[81]|safe }}</a>
+                    <a class="cta" href="/dashboard/model-performance?lang={{ fragments[82]|safe }}">{{ fragments[83]|safe }}</a>
+                  </div>
+                </article>
+                <article class="card home-side-card">
+                  <div class="panel-head">
+                    <div>
+                      <div class="eyebrow">{{ fragments[84]|safe }}</div>
+                      <h3>{{ fragments[85]|safe }}</h3>
+                      <p>{{ fragments[86]|safe }}</p>
+                    </div>
+                    <a class="cta" href="/portfolio">{{ fragments[87]|safe }}</a>
+                  </div>
+                  <div class="list-stack">{{ fragments[88]|safe }}</div>
+                </article>
+
+                <details class="card home-digest">
+                  <summary>
+                    <span class="home-digest-title">
+                      <b>{{ fragments[89]|safe }}</b>
+                      <span>{{ fragments[90]|safe }}</span>
+                    </span>
+                  </summary>
+                  <div class="home-digest-body">
+                    <div class="cta-row"><a class="cta" href="/dashboard/ai-daily-report">{{ fragments[91]|safe }}</a></div>
+                    <div class="list-stack">{{ fragments[92]|safe }}</div>
+                  </div>
+                </details>
+
+                <details class="card home-digest">
+                  <summary>
+                    <span class="home-digest-title">
+                      <b>{{ fragments[93]|safe }}</b>
+                      <span>{{ fragments[94]|safe }}</span>
+                    </span>
+                  </summary>
+                  <div class="home-digest-body">
+                    {{ fragments[95]|safe }}
+                    <article class="card compact-card">
+                      <div class="panel-head compact-head">
+                        <div>
+                          <div class="eyebrow">{{ fragments[96]|safe }}</div>
+                          <h3>{{ fragments[97]|safe }}</h3>
+                        </div>
+                        <a class="cta" href="/dashboard/ops?lang={{ fragments[98]|safe }}&lookback_runs={{ fragments[99]|safe }}">{{ fragments[100]|safe }}</a>
+                      </div>
+                      <div class="list-stack" style="margin-bottom:8px;">{{ fragments[101]|safe }}</div>
+                      <div class="list-stack">{{ fragments[102]|safe }}</div>
+                    </article>
+                  </div>
+                </details>
+              </div>
+            </section>
+          </main>
+        </div>
+      </body>
+    </html>

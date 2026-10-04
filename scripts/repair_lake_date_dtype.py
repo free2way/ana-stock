@@ -17,6 +17,14 @@ NULL); rewriting hundreds of recent partitions would needlessly race with live
 app writes.
 
 Usage: .venv/bin/python scripts/repair_lake_date_dtype.py [--dry-run]
+
+Every rewritten v1 partition is mirrored into the provenance shadow
+(``data/lake/_lake_v2``) as ``provider=manual_repair`` / ``price_basis=raw`` so
+the manual repair cannot silently drift from the fail-closed v2 store.
+
+Operational note: after this repair completes, run
+``python scripts/verify_lake_manifest.py --check``; if it reports drift,
+rebaseline with ``python scripts/verify_lake_manifest.py --write``.
 """
 
 from __future__ import annotations
@@ -29,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import polars as pl
 
-from app.services.market_lake import market_lake_root
+from app.services.market_lake import market_lake_root, write_lake_v2_partition
 
 
 def main() -> int:
@@ -63,6 +71,24 @@ def main() -> int:
             tmp = path.with_name(f".{path.name}.repair-tmp")
             fixed.write_parquet(tmp, compression="zstd")
             tmp.replace(path)
+            market = market_dir.name.removesuffix("_daily").upper()
+            trade_date = part_dir.name.split("=", 1)[-1]
+            # Rebuild the v2 provenance shadow for the rewritten partition so the
+            # two stores stay in lockstep. These repairs restore raw-basis v1
+            # rows, so the manual-repair provenance is recorded as raw.
+            write_lake_v2_partition(
+                market=market,
+                trade_date=trade_date,
+                rows=[
+                    {
+                        **row,
+                        "provider": "manual_repair",
+                        "source_reference": f"repair_lake_date_dtype.py:{market}:{trade_date}",
+                        "price_basis": "raw",
+                    }
+                    for row in fixed.to_dicts()
+                ],
+            )
             repaired.append(str(part_dir))
 
     print(f"\nchecked={checked} repaired={len(repaired)} dry_run={args.dry_run}")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
+from app.services.fx_rates import market_data_supported, normalize_currency_aggregation
 from app.services.model_signal_summary import build_signal_label, entry_style
 from app.services.portfolio_book import load_portfolio_positions
 from app.services.price_snapshot import load_latest_closes
@@ -438,10 +439,7 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
         overviews = symbol_repo.list_overviews_for_tickers(tickers)
         latest_outputs = prediction_repo.get_latest_model_outputs_for_tickers(tickers)
         latest_prices = load_latest_closes(tickers)
-        sector_totals: dict[str, float] = {}
-        market_totals: dict[str, float] = {}
         row_actions: list[dict] = []
-        total_market_value = 0.0
 
         for item in positions:
             overview = overviews.get(item["ticker"]) or {
@@ -462,12 +460,9 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
             cost_basis = float(item.get("cost_basis") or 0.0)
             market_value = latest_price * quantity
             pnl_pct = ((latest_price / cost_basis) - 1.0) * 100 if cost_basis and not latest_price_missing else 0.0
-            total_market_value += market_value
 
             sector = str(overview.get("sector") or (overview.get("industry") or ("未分类" if lang == "zh" else "Unclassified")))
             market = str(overview.get("market") or item.get("market") or "-")
-            sector_totals[sector] = sector_totals.get(sector, 0.0) + market_value
-            market_totals[market] = market_totals.get(market, 0.0) + market_value
 
             score = (latest_signal or {}).get("score")
             row_actions.append(
@@ -477,6 +472,10 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
                     "sector": sector,
                     "market": market,
                     "market_value": market_value,
+                    # S-12: HK has no local price/lake source, so it is explicitly
+                    # data-unavailable rather than silently priced like a US name.
+                    "data_unavailable": not market_data_supported(market),
+                    "data_unavailable_reason": "unsupported_market" if not market_data_supported(market) else None,
                     "pnl_pct": pnl_pct,
                     "signal_label": build_signal_label(score, lang=lang) or ("持有" if lang == "zh" else "Hold"),
                     "action_hint": _action_from_score(score, lang=lang),
@@ -494,13 +493,25 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
                 }
             )
 
+        fx_summary = normalize_currency_aggregation(row_actions, value_key="market_value")
+        total_market_value = float(fx_summary.get("total_base") or 0.0)
+        sector_totals: dict[str, float] = {}
+        market_totals: dict[str, float] = {}
+        market_native_totals: dict[str, float] = {}
+        for row in row_actions:
+            base_value = float(row.get("market_value_base") or 0.0)
+            sector_totals[row["sector"]] = sector_totals.get(row["sector"], 0.0) + base_value
+            market_totals[row["market"]] = market_totals.get(row["market"], 0.0) + base_value
+            market_native_totals[row["market"]] = market_native_totals.get(row["market"], 0.0) + float(row.get("market_value") or 0.0)
+
         top_sector = max(sector_totals.items(), key=lambda item: item[1], default=((("未分类" if lang == "zh" else "Unclassified")), 0.0))
         top_market = max(market_totals.items(), key=lambda item: item[1], default=(("-", 0.0)))
         concentration_pct = round((top_sector[1] / total_market_value) * 100, 1) if total_market_value else 0.0
         market_rankings = [
             {
                 "market": market,
-                "market_value": value,
+                "market_value": market_native_totals.get(market, 0.0),
+                "market_value_base": value,
                 "weight_pct": round((value / total_market_value) * 100.0, 1) if total_market_value else 0.0,
             }
             for market, value in sorted(market_totals.items(), key=lambda item: (-item[1], item[0]))
@@ -514,14 +525,16 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
             for sector, value in sorted(sector_totals.items(), key=lambda item: (-item[1], item[0]))
         ]
         for row in row_actions:
-            weight_pct = (float(row["market_value"] or 0.0) / total_market_value * 100.0) if total_market_value else 0.0
+            weight_pct = (float(row.get("market_value_base") or 0.0) / total_market_value * 100.0) if total_market_value else 0.0
             row["weight_pct"] = round(weight_pct, 1)
-            if row.get("latest_price_missing"):
+            if row.get("data_unavailable"):
+                row["risk_tag"] = "数据不可用" if lang == "zh" else "Data unavailable"
+            elif row.get("latest_price_missing"):
                 row["risk_tag"] = "缺行情" if lang == "zh" else "Missing price"
             else:
                 row["risk_tag"] = _risk_tag(
                     pnl_pct=float(row["pnl_pct"] or 0.0),
-                    market_value=float(row["market_value"] or 0.0),
+                    market_value=float(row.get("market_value_base") or 0.0),
                     total_market_value=total_market_value,
                     lang=lang,
                 )
@@ -577,7 +590,7 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
         row_actions.sort(
             key=lambda item: (
                 priority_rank.get(str(item.get("action_priority") or ""), 3),
-                -abs(item["market_value"]),
+                -abs(item.get("market_value_base") or 0.0),
                 item["ticker"],
             )
         )
@@ -590,7 +603,7 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
                 action_mix["medium"] += 1
             else:
                 action_mix["low"] += 1
-        top_position = max(row_actions, key=lambda item: float(item.get("market_value") or 0.0), default=None)
+        top_position = max(row_actions, key=lambda item: float(item.get("market_value_base") or 0.0), default=None)
         drawdown_count = sum(1 for row in row_actions if float(row.get("pnl_pct") or 0.0) <= -8.0)
         profit_protection_count = sum(1 for row in row_actions if float(row.get("pnl_pct") or 0.0) >= 15.0)
         trim_candidates = sum(
@@ -637,6 +650,11 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
 
         return {
             "total_market_value": round(total_market_value, 2),
+            "base_currency": fx_summary.get("base_currency"),
+            "fx_status": fx_summary.get("fx_status"),
+            "fx_unavailable_markets": fx_summary.get("fx_unavailable_markets") or [],
+            "fx_as_of": fx_summary.get("fx_as_of"),
+            "fx_source": fx_summary.get("fx_source"),
             "total_positions": len(positions),
             "top_sector": top_sector[0],
             "top_market": top_market[0],

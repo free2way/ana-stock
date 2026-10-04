@@ -1,0 +1,47 @@
+
+    <!DOCTYPE html>
+    <html lang="{{ fragments[0]|safe }}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{{ fragments[1]|safe }}</title>
+        <style>{{ fragments[2]|safe }}</style>
+      </head>
+      <body>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{{ fragments[3]|safe }}</h1>
+              <p>{{ fragments[4]|safe }}</p>
+            </div>
+            <nav class="side-nav">{{ fragments[5]|safe }}</nav>
+          </aside>
+          <main class="main">
+            <div class="wrap">
+              <div class="toolbar">
+                <a class="pill" href="/dashboard/ai-daily-report?lang={{ fragments[6]|safe }}">← {{ fragments[7]|safe }}</a>
+                <a class="pill" href="/dashboard/ops?lang={{ fragments[8]|safe }}">{{ fragments[9]|safe }}</a>
+              </div>
+              <section class="card">
+                <div class="eyebrow">{{ fragments[10]|safe }}</div>
+                <h2>{{ fragments[11]|safe }}</h2>
+                <div class="muted">{{ fragments[12]|safe }}</div>
+                <div class="toolbar" style="margin-top:14px;">{{ fragments[13]|safe }}</div>
+                <div class="toolbar" style="margin-top:10px;">{{ fragments[14]|safe }}</div>
+                {{ fragments[15]|safe }}
+                <div class="muted" style="margin-top:12px;">{{ fragments[16]|safe }}</div>
+                <div class="table-wrap" style="margin-top:16px;"><table>
+                  <thead><tr><th>{{ fragments[17]|safe }}</th><th>{{ fragments[18]|safe }}</th><th>{{ fragments[19]|safe }}</th><th>1D</th><th>3D</th><th>5D</th><th>10D</th></tr></thead>
+                  <tbody>{{ fragments[20]|safe }}</tbody>
+                </table></div>
+                <div class="table-wrap"><table>
+                  <thead><tr><th>{{ fragments[21]|safe }}</th><th>{{ fragments[22]|safe }}</th><th>{{ fragments[23]|safe }}</th><th>{{ fragments[24]|safe }}</th><th>{{ fragments[25]|safe }}</th><th>{{ fragments[26]|safe }}</th></tr></thead>
+                  <tbody>{{ fragments[27]|safe }}</tbody>
+                </table></div>
+              </section>
+            </div>
+          </main>
+        </div>
+      </body>
+    </html>

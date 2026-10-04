@@ -128,6 +128,9 @@ class InsightEngine:
             "ma60": round(ma60, 2) if ma60 is not None else None,
             "momentum_5": round(momentum_5 * 100, 2) if momentum_5 is not None else None,
             "momentum_20": round(momentum_20 * 100, 2) if momentum_20 is not None else None,
+            # S-4: the insight engine has always emitted percent; declare it so
+            # consumers can assert the unit instead of guessing.
+            "momentum_units": "percent",
             "history": history,
             "explanation": explanation,
         }

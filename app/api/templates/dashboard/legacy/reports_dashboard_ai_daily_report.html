@@ -1,0 +1,113 @@
+
+    <!DOCTYPE html>
+    <html lang="{{ fragments[0]|safe }}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{{ fragments[1]|safe }}</title>
+        <style>{{ fragments[2]|safe }}</style>
+      </head>
+      <body>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{{ fragments[3]|safe }}</h1>
+              <p>{{ fragments[4]|safe }}</p>
+            </div>
+            <nav class="side-nav">{{ fragments[5]|safe }}</nav>
+          </aside>
+          <main class="main">
+            <div class="wrap">
+              <div class="toolbar">
+                <a class="pill" href="/dashboard?lang={{ fragments[6]|safe }}">← {{ fragments[7]|safe }}</a>
+                <a class="pill" href="/dashboard/ops?lang={{ fragments[8]|safe }}">{{ fragments[9]|safe }}</a>
+                <a class="pill" href="/dashboard/premarket-plan?lang={{ fragments[10]|safe }}">{{ fragments[11]|safe }}</a>
+                <a class="pill" href="/dashboard/realtime-monitor?lang={{ fragments[12]|safe }}">{{ fragments[13]|safe }}</a>
+                <a class="pill" href="/dashboard/ai-daily-report/message?lang={{ fragments[14]|safe }}">{{ fragments[15]|safe }}</a>
+                <a class="pill" href="/dashboard/ai-daily-report/history?lang={{ fragments[16]|safe }}">{{ fragments[17]|safe }}</a>
+              </div>
+              <section class="hero-grid">
+                <article class="card">
+                  <div class="eyebrow">{{ fragments[18]|safe }}</div>
+                  <div class="metric">{{ fragments[19]|safe }}</div>
+                  <div class="muted">{{ fragments[20]|safe }}</div>
+                  <div class="playbook">
+                    <div style="font-weight:800;margin-bottom:6px;">{{ fragments[21]|safe }}</div>
+                    <div class="muted">{{ fragments[22]|safe }}</div>
+                    <div class="muted" style="margin-top:8px;font-weight:700;color:var(--ink);">{{ fragments[23]|safe }}</div>
+                    <div class="muted" style="margin-top:6px;">{{ fragments[24]|safe }}</div>
+                    <div style="margin-top:8px;">
+                      {{ fragments[25]|safe }}
+                    </div>
+                  </div>
+                  <div class="action-row">
+                    <a class="cta" href="/dashboard/ai-daily-report/message?lang={{ fragments[26]|safe }}">{{ fragments[27]|safe }}</a>
+                    <form action="/jobs/send-ai-daily-report" method="post" style="display:inline;">
+                      <input type="hidden" name="redirect_to" value="/dashboard/ai-daily-report?lang={{ fragments[28]|safe }}" />
+                      <button type="submit">{{ fragments[29]|safe }}</button>
+                    </form>
+                    {{ fragments[30]|safe }}
+                  </div>
+                  {{ fragments[31]|safe }}
+                </article>
+                <article class="card">
+                  <div class="eyebrow">{{ fragments[32]|safe }}</div>
+                  <div class="muted">{{ fragments[33]|safe }}</div>
+                  <div class="playbook">
+                    <div style="font-weight:800;margin-bottom:6px;">{{ fragments[34]|safe }}</div>
+                    <div class="muted">{{ fragments[35]|safe }}</div>
+                    <div class="muted" style="margin-top:8px;">{{ fragments[36]|safe }}</div>
+                    <div class="muted" style="margin-top:8px;">{{ fragments[37]|safe }}: {{ fragments[38]|safe }}</div>
+                  </div>
+                </article>
+              </section>
+              {{ fragments[39]|safe }}
+              {{ fragments[40]|safe }}
+              {{ fragments[41]|safe }}
+              <section class="card">
+                <div class="eyebrow">{{ fragments[42]|safe }}</div>
+                <div class="muted">{{ fragments[43]|safe }}</div>
+                <div class="table-wrap"><table>
+              <thead>
+                <tr><th>名称</th><th>代码</th><th>数量</th><th>成本</th><th>最新价</th><th>盈亏</th><th>AI 判断</th><th>动作桶</th><th>Note</th></tr>
+              </thead>
+              <tbody>{{ fragments[44]|safe }}</tbody></table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ fragments[45]|safe }}</div>
+                <div class="muted">{{ fragments[46]|safe }}</div>
+                {{ fragments[47]|safe }}
+                {{ fragments[48]|safe }}
+                {{ fragments[49]|safe }}
+                <div class="table-wrap"><table>
+              <thead>
+                <tr><th>名称</th><th>代码</th><th>结论</th><th>置信度</th><th>量化 / 验证</th><th>策略 / 仓位</th><th>触发 / 失效</th><th>周期 / 流动性</th><th>验证 / 止损</th><th>Headline / Summary</th></tr>
+              </thead>
+              <tbody>{{ fragments[50]|safe }}</tbody></table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ fragments[51]|safe }}</div>
+                <div class="muted">{{ fragments[52]|safe }}</div>
+                <div class="table-wrap"><table>
+              <thead>
+                <tr><th>账号</th><th>股票</th><th>观点</th><th>验证分</th><th>模型</th><th>系统动作</th><th>原因</th></tr>
+              </thead>
+              <tbody>{{ fragments[53]|safe }}</tbody></table></div>
+              </section>
+              <section class="card">
+                <div class="eyebrow">{{ fragments[54]|safe }}</div>
+                <div class="muted">{{ fragments[55]|safe }}</div>
+                <div class="table-wrap"><table>
+              <thead>
+                <tr><th>账号</th><th>股票</th><th>X观点</th><th>美股模型</th><th>模型动作</th><th>验证结论</th></tr>
+              </thead>
+              <tbody>{{ fragments[56]|safe }}</tbody></table></div>
+              </section>
+              {{ fragments[57]|safe }}
+              {{ fragments[58]|safe }}
+            </div>
+          </main>
+        </div>
+      </body>
+    </html>

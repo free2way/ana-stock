@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ copy.title }}</title>
+    <style>{{ page_style|safe }}</style>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand"><span class="brand-tag">PQW</span><h1>{{ copy.title }}</h1><p>{{ copy.sidebar_description }}</p></div>
+        <nav class="side-nav">{{ nav_html|safe }}</nav>
+        <div class="sidebar-foot">{{ copy.sidebar_note }}</div>
+      </aside>
+      <main class="main"><div class="wrap">
+        <div class="toolbar">
+          <a href="{{ back_href }}" class="pill">← {{ copy.back }}</a>
+          <a href="{{ secondary_href }}" class="pill">{{ copy.secondary }}</a>
+          <a href="{{ language_hrefs.en }}" class="pill">English</a>
+          <a href="{{ language_hrefs.zh }}" class="pill">中文</a>
+        </div>
+        <div class="compare-row">{{ market_pills|safe }}</div>
+        <div class="card">
+          <div class="eyebrow">{{ copy.headline }}</div>
+          <h1 style="margin:0 0 8px;">{{ copy.headline }}</h1>
+          <p class="muted">{{ copy.description }}</p>
+          {{ heatmap_method_notice|safe }}
+        </div>
+        {{ loading_hint|safe }}
+        <section class="card">
+          <div class="eyebrow">{{ copy.snapshot_window }}</div><div class="compare-row">{{ lookback_pills|safe }}</div>
+          <div class="eyebrow" style="margin-top:12px;">{{ copy.market_scope }}</div><div class="compare-row">{{ market_pills|safe }}</div>
+          <div class="eyebrow" style="margin-top:12px;">{{ copy.color_metric }}</div><div class="compare-row">{{ heatmap_metric_pills|safe }}</div>
+          <div class="eyebrow" style="margin-top:12px;">{{ copy.signal_focus }}</div><div class="compare-row">{{ signal_pills|safe }}</div>
+          <form action="/dashboard/market/heatmap" method="get" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));align-items:end;">
+            <input type="hidden" name="lang" value="{{ lang }}" /><input type="hidden" name="lookback_runs" value="{{ lookback_runs }}" />
+            <input type="hidden" name="heatmap_sort" value="{{ heatmap_sort }}" /><input type="hidden" name="heatmap_metric" value="{{ heatmap_metric }}" />
+            <input type="hidden" name="market_filter" value="{{ market_filter }}" /><input type="hidden" name="signal_filter" value="{{ signal_filter }}" />
+            <div><label class="muted" style="display:block;margin-bottom:6px;">{{ copy.execution_tag }}</label><input type="text" name="execution_tag_filter" list="execution-tag-options" value="{{ execution_tag_value }}" placeholder="gap-risk, earnings-soon" /></div>
+            <div><label class="muted" style="display:block;margin-bottom:6px;">{{ copy.exclude_tag }}</label><input type="text" name="exclude_execution_tag_filter" list="execution-tag-options" value="{{ exclude_execution_tag_value }}" placeholder="gap-risk, earnings-soon" /></div>
+            <div style="grid-column:1 / -1;"><div class="muted" style="margin-bottom:6px;">{{ copy.quick_tags }}</div><div style="display:flex;flex-wrap:wrap;gap:8px;">
+              <button type="button" onclick="appendExecutionTag('/dashboard/market/heatmap', 'execution_tag_filter', 'gap-risk')">gap-risk</button>
+              <button type="button" onclick="appendExecutionTag('/dashboard/market/heatmap', 'execution_tag_filter', 'earnings-soon')">earnings-soon</button>
+              <button type="button" onclick="appendExecutionTag('/dashboard/market/heatmap', 'execution_tag_filter', 'thin-liquidity')">thin-liquidity</button>
+              <button type="button" onclick="appendExecutionTag('/dashboard/market/heatmap', 'exclude_execution_tag_filter', 'gap-risk')">{{ copy.exclude_gap }}</button>
+              <button type="button" onclick="clearExecutionTags('/dashboard/market/heatmap')">{{ copy.clear_tags }}</button>
+            </div></div>
+            <datalist id="execution-tag-options"><option value="gap-risk"></option><option value="earnings-soon"></option><option value="thin-liquidity"></option></datalist>
+            <div><label class="muted" style="display:block;margin-bottom:6px;">{{ copy.min_buy_count }}</label><input type="number" name="min_buy_signal_count" min="0" step="1" value="{{ min_buy_signal_count }}" /></div>
+            <div><label class="muted" style="display:block;margin-bottom:6px;">{{ copy.min_strength }}</label><input type="number" name="min_signal_strength" min="0" max="100" step="1" value="{{ min_signal_strength }}" /></div>
+            <button type="submit">{{ copy.apply }}</button>
+          </form>
+        </section>
+        <section class="card"><div class="eyebrow">{{ copy.risk_overview }}</div><div class="grid">
+          <article class="card"><div class="eyebrow">{{ copy.tagged_names }}</div><div style="font-size:28px;font-weight:800;margin:6px 0;">{{ tagged_names }}</div><div class="muted">{{ copy.risk_examples }}</div></article>
+          <article class="card"><div class="eyebrow">{{ copy.common_risks }}</div><div class="compare-row" style="margin-bottom:8px;">{{ risk_top_tags_html|safe }}</div><div class="muted">{{ copy.risk_examples }}: {{ risk_examples_html }}</div></article>
+        </div></section>
+        <section class="card"><div class="compare-row"><span class="muted">{{ copy.heatmap_sort }}:</span>{{ heatmap_sort_pills|safe }}</div>
+          <div class="heat-stage"><div class="muted">{{ copy.heatmap_help }}</div><div class="heat-grid">{{ heatmap_tiles|safe }}</div>
+            <div class="heat-legend"><span>{{ copy.current_metric }}: <strong>{{ heatmap_metric_label }}</strong></span><span class="legend-scale"><span style="background:#7f1d1d;"></span><span style="background:#475569;"></span><span style="background:#0f766e;"></span><span style="background:#14b8a6;"></span><span style="background:#22c55e;"></span></span></div>
+          </div>
+        </section>
+        {{ focus_detail_html|safe }}
+        <section class="grid">
+          <article class="card"><div class="eyebrow">{{ copy.signal_distribution }}</div><div class="market-scope-grid">{{ heatmap_scope_cards_html|safe }}</div><div class="market-scope-help">{{ heatmap_scope_help }}</div></article>
+          <article class="card"><div class="eyebrow">{{ copy.flow_proxy }}</div>{{ flow_summary_html|safe }}<div class="muted" style="margin-top:10px;">{{ copy.flow_help }}</div></article>
+          <article class="card"><div class="eyebrow">{{ copy.concept_resonance }}</div><div style="font-size:32px;font-weight:800;margin:6px 0;">{{ '%.1f'|format(resonance_score) }}%</div><div class="muted">{{ copy.concept_resonance_help }}</div><div class="muted" style="margin-top:8px;">{{ copy.tracked_signals }}: {{ tracked_signal_count }}</div></article>
+        </section>
+      </div></main>
+    </div>
+    <script>
+      function appendExecutionTag(formAction, inputName, tag) { const form = document.querySelector(`form[action="${formAction}"]`); if (!form) return; const input = form.querySelector(`input[name="${inputName}"]`); if (!input) return; const values = input.value.split(",").map((item) => item.trim()).filter(Boolean); if (!values.includes(tag)) values.push(tag); input.value = values.join(", "); input.focus(); }
+      function clearExecutionTags(formAction) { const form = document.querySelector(`form[action="${formAction}"]`); if (!form) return; const includeInput = form.querySelector('input[name="execution_tag_filter"]'); const excludeInput = form.querySelector('input[name="exclude_execution_tag_filter"]'); if (includeInput) includeInput.value = ""; if (excludeInput) excludeInput.value = ""; if (includeInput) includeInput.focus(); }
+    </script>
+  </body>
+</html>

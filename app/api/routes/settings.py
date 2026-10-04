@@ -17,6 +17,9 @@ from app.services.repository import DataJobRepository, SymbolRepository
 from app.services.time_utils import format_app_datetime
 from app.services.ui_lang import resolve_request_lang
 from app.services.workspace_nav import WORKSPACE_COMPACT_STYLE, WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
+from app.api.presentation.tokens import (
+    ROOT_TOKENS_BASE,
+)
 
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -52,7 +55,7 @@ def _settings_shell(*, lang: str, title: str, lead: str, body_html: str, active_
     active_base = active_links.get(active_path, "/settings")
     en_href = f"{active_base}?lang=en"
     zh_href = f"{active_base}?lang=zh"
-    return f"""
+    return (f"""
     <!DOCTYPE html>
     <html lang="{lang}">
       <head>
@@ -60,7 +63,7 @@ def _settings_shell(*, lang: str, title: str, lead: str, body_html: str, active_
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{title}</title>
         <style>
-          :root {{ --bg:#071018; --panel:#111c28; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; }}
+          """ + (ROOT_TOKENS_BASE) + f"""
           * {{ box-sizing:border-box; }}
           body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
           a {{ color:inherit; text-decoration:none; }}
@@ -129,7 +132,7 @@ def _settings_shell(*, lang: str, title: str, lead: str, body_html: str, active_
         </div>
       </body>
     </html>
-    """
+    """)
 
 
 def _display_time(value: str | None) -> str:
@@ -385,8 +388,8 @@ def kronos_settings_page(request: Request) -> str:
     env_example = "\n".join(
         [
             f"PQW_KRONOS_ENABLED={'true' if kronos['enabled'] else 'false'}",
-            'PQW_KRONOS_REPO_PATH="/Volumes/STORAGE_Jackyhu/code/Kronos"',
-            'PQW_KRONOS_RUNNER_COMMAND="/Volumes/STORAGE_Jackyhu/code/ana/.venv-kronos/bin/python /Volumes/STORAGE_Jackyhu/code/ana/scripts/kronos_runner.py"',
+            'PQW_KRONOS_REPO_PATH="/path/to/Kronos"',
+            'PQW_KRONOS_RUNNER_COMMAND="python scripts/kronos_runner.py"',
             f"PQW_KRONOS_MODEL_NAME={kronos['model']}",
             f"PQW_KRONOS_DEVICE={kronos['device']}",
             f"PQW_KRONOS_CANDIDATE_LIMIT={kronos['candidate_limit']}",
@@ -396,7 +399,7 @@ def kronos_settings_page(request: Request) -> str:
         [
             "python3.11 -m venv .venv-kronos",
             ".venv-kronos/bin/pip install torch transformers huggingface_hub pandas accelerate sentencepiece",
-            "git clone https://github.com/shiyu-coder/Kronos /Volumes/STORAGE_Jackyhu/code/Kronos",
+            "git clone https://github.com/shiyu-coder/Kronos",
         ]
     )
     body_html = f"""

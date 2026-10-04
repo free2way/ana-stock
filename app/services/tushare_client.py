@@ -36,6 +36,11 @@ class TushareClient:
         self.settings = get_settings()
         self.token = self.settings.tushare_token
         self.last_error: str | None = None
+        # S-14: trade dates whose daily fetch raised, so callers can surface a
+        # partial sync with an explicit missing-session list instead of a silent
+        # success.  Only provider failures land here; a legitimately empty
+        # response (weekend/holiday) is not a failure.
+        self.last_failed_trade_dates: list[str] = []
 
     def is_configured(self) -> bool:
         return bool(self.token)
@@ -317,6 +322,106 @@ class TushareClient:
         rows.sort(key=lambda item: item["date"] or "")
         return rows
 
+    def fetch_cn_adj_factor_bulk(self, trade_date: str) -> list[dict]:
+        """Adjustment factors for every symbol on one trade date.
+
+        One call per session instead of one per symbol; the derived factor
+        jumps become corporate-action records for the adjusted view.
+        """
+
+        self.last_error = None
+        if not self.token:
+            self.last_error = "TuShare token is not configured"
+            return []
+        try:
+            import tushare as ts  # type: ignore
+        except ImportError as exc:
+            self.last_error = f"TuShare SDK is unavailable: {exc}"
+            return []
+        pro = ts.pro_api(self.token)
+        if pro is None:
+            self.last_error = "TuShare client initialization returned no client"
+            return []
+        normalized = str(trade_date or "").replace("-", "")[:8]
+        if len(normalized) != 8 or not normalized.isdigit():
+            self.last_error = f"invalid trade_date `{trade_date}`"
+            return []
+        try:
+            frame = pro.adj_factor(trade_date=normalized, fields="ts_code,trade_date,adj_factor")
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            return []
+        if frame is None or frame.empty:
+            return []
+        rows: list[dict] = []
+        for _, row in frame.iterrows():
+            row_dict = row.to_dict()
+            symbol = self._to_app_ticker(str(row_dict.get("ts_code") or ""))
+            factor = self._to_float(row_dict.get("adj_factor"))
+            trade_day = self._normalize_date(row_dict.get("trade_date"))
+            if not symbol or factor is None or factor <= 0 or not trade_day:
+                continue
+            rows.append({"symbol": symbol, "trade_date": trade_day, "adj_factor": float(factor)})
+        rows.sort(key=lambda item: item["symbol"])
+        return rows
+
+    def fetch_cn_dividends(self, end_date: str) -> list[dict]:
+        """Dividend / bonus-share events for one fiscal period (bulk).
+
+        Returns implemented rows with an ex-date only; plans, cancellations
+        and rows without an ex-date carry no price adjustment.
+        """
+
+        self.last_error = None
+        if not self.token:
+            self.last_error = "TuShare token is not configured"
+            return []
+        try:
+            import tushare as ts  # type: ignore
+        except ImportError as exc:
+            self.last_error = f"TuShare SDK is unavailable: {exc}"
+            return []
+        pro = ts.pro_api(self.token)
+        if pro is None:
+            self.last_error = "TuShare client initialization returned no client"
+            return []
+        normalized = str(end_date or "").replace("-", "")[:8]
+        if len(normalized) != 8 or not normalized.isdigit():
+            self.last_error = f"invalid end_date `{end_date}`"
+            return []
+        try:
+            frame = pro.dividend(
+                end_date=normalized,
+                fields="ts_code,end_date,ex_date,cash_div_tax,stk_div,record_date,ann_date,div_proc",
+            )
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            return []
+        if frame is None or frame.empty:
+            return []
+        rows: list[dict] = []
+        for _, row in frame.iterrows():
+            row_dict = row.to_dict()
+            symbol = self._to_app_ticker(str(row_dict.get("ts_code") or ""))
+            process = str(row_dict.get("div_proc") or "").strip()
+            ex_date = self._normalize_date(row_dict.get("ex_date"))
+            if not symbol or not ex_date or process not in {"实施", "implemented"}:
+                continue
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "end_date": normalized,
+                    "ex_date": ex_date,
+                    "cash_div_tax": self._to_float(row_dict.get("cash_div_tax")),
+                    "stk_div": self._to_float(row_dict.get("stk_div")),
+                    "record_date": self._normalize_date(row_dict.get("record_date")),
+                    "ann_date": self._normalize_date(row_dict.get("ann_date")),
+                    "source": "tushare_dividend",
+                }
+            )
+        rows.sort(key=lambda item: (item["ex_date"], item["symbol"]))
+        return rows
+
     def fetch_cn_daily_history_bulk(
         self,
         tickers: list[str],
@@ -325,6 +430,7 @@ class TushareClient:
         end_date: str | None = None,
     ) -> dict[str, list[dict]]:
         self.last_error = None
+        self.last_failed_trade_dates = []
         if not self.token:
             self.last_error = "TuShare token is not configured"
             return {}
@@ -370,7 +476,15 @@ class TushareClient:
                 except Exception as exc:
                     self.last_error = f"{type(exc).__name__}: {exc}"
                     daily_df = None
-                if daily_df is None or daily_df.empty:
+                if daily_df is None:
+                    # Provider failure for this trade date: record it so the sync
+                    # can report ``partial`` with the missing sessions.  An empty
+                    # frame (non-trading day) is not a failure and is not listed.
+                    failed_date = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+                    if failed_date not in self.last_failed_trade_dates:
+                        self.last_failed_trade_dates.append(failed_date)
+                    break
+                if daily_df.empty:
                     break
 
                 for _, row in daily_df.iterrows():

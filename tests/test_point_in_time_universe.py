@@ -120,3 +120,27 @@ class PointInTimeUniverseTests(TestCase):
         )
         self.assertNotEqual(first.universe_version, second.universe_version)
         self.assertGreater(second.exclusion_counts.get("low_price", 0), 0)
+
+    def test_nonpositive_price_history_is_excluded(self) -> None:
+        rows = [_row("AAA", item) for item in self.dates]
+        rows += [_row("TOWCF", item) for item in self.dates]
+        # Legacy defect: a positive close with a negative adj_close.
+        rows[len(self.dates)].update({"adj_close": -1.0})
+        metadata = {
+            "AAA": SecurityMetadata(ticker="AAA", listing_date=self.dates[0]),
+            "TOWCF": SecurityMetadata(ticker="TOWCF", listing_date=self.dates[0]),
+        }
+        result = build_point_in_time_universe(
+            rows,
+            trading_dates=self.dates,
+            metadata=metadata,
+            rules=self.rules,
+            source_version="fixture-v1",
+        )
+        snapshots = {(item.ticker, item.trade_date): item for item in result.snapshots}
+        for index, trade_date in enumerate(self.dates):
+            self.assertFalse(snapshots[("TOWCF", trade_date)].included)
+            self.assertIn("nonpositive_price_history", snapshots[("TOWCF", trade_date)].exclusion_reason_codes)
+            if index >= 1:  # the first session has only one history bar
+                self.assertTrue(snapshots[("AAA", trade_date)].included)
+        self.assertGreater(result.exclusion_counts.get("nonpositive_price_history", 0), 0)

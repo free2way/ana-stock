@@ -97,12 +97,30 @@ def _aware_datetime(value: str) -> datetime:
     return parsed
 
 
+def validate_execution_effective_date(market: str, input_market_date: str, effective_date: str) -> None:
+    """E-5 ledger entry: a CN/US decision can never be executed on its signal date.
+
+    The ledger derives the effective date as the next market open date; this
+    assertion keeps that invariant enforced even if a caller passes explicit
+    dates (defence in depth against same-session execution, i.e. T+0).
+    """
+
+    if str(market or "").strip().upper() not in {"CN", "US"}:
+        return
+    if str(effective_date)[:10] <= str(input_market_date)[:10]:
+        raise ValueError(
+            f"{market} T+1 forbids same-session execution in the decision ledger; "
+            f"effective_trade_date ({effective_date}) must be after the signal date ({input_market_date})"
+        )
+
+
 def _market_decision_identity(payload: dict, market: str, details: dict, report: dict) -> tuple[str, str, str, str]:
     qualification = (report.get("model_qualification") or {}).get(market) or {}
     protocol_id = str(qualification.get("protocol_id") or f"legacy_unapproved:{market}:daily_report_v1")
     input_date = str(details.get("input_market_date") or payload["report_date"])[:10]
     date.fromisoformat(input_date)
     effective = next_market_open_date(market, input_date, include_self=False) if market in {"CN", "US"} else input_date
+    validate_execution_effective_date(market, input_date, effective)
     economic = {
         "schema_version": "stock_selection_economic_decision_v1", "market": market,
         "protocol_id": protocol_id, "effective_trade_date": effective,

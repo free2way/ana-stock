@@ -15,6 +15,14 @@ the same universe rules (mirroring `stock_selection/universe.py` defaults),
 the same label maturity queue (label usable only after its exit close is
 strictly before the prediction date) and the same evaluation.
 
+Stage 2 (same-day review, 2026-09-30): family-replacement challengers.
+The GBDT variants trailed in the first honest window while the linear
+profit_logit was the only positive head, so the arena now also races
+regularized linear models (ridge / elastic-net), a bagged tree ensemble
+(extra-trees), a GBDT-family control (CatBoost ordered boosting) and a
+linear+tree rank blend. Same features, labels, universe and execution
+convention; the walk-forward decides, not taste.
+
 This is a research script. It writes a JSON artifact under
 `data/artifacts/screening_model_arena/` and prints a summary. It never
 touches production tables.
@@ -385,9 +393,26 @@ MODEL_KEYS = (
     "exec_net_lgbm",
     "profit_logit",
     "rank_lambdarank",
+    "exec_ridge",
+    "exec_enet",
+    "exec_extratrees",
+    "exec_catboost",
+    "blend_linear_tree",
     "baseline_lowvol",
     "baseline_reversal_5d",
     "baseline_momentum_20d",
+)
+
+LEARNABLE_MODEL_KEYS = (
+    "legacy_composite_lgbm",
+    "exec_net_lgbm",
+    "profit_logit",
+    "rank_lambdarank",
+    "exec_ridge",
+    "exec_enet",
+    "exec_extratrees",
+    "exec_catboost",
+    "blend_linear_tree",
 )
 
 MODEL_LABELS = {
@@ -395,6 +420,11 @@ MODEL_LABELS = {
     "exec_net_lgbm": "Executable net-return LGBM (new default)",
     "profit_logit": "Net-profit logit (challenger)",
     "rank_lambdarank": "LambdaRank cross-section",
+    "exec_ridge": "Ridge on executable net-return (linear family)",
+    "exec_enet": "ElasticNet on executable net-return (sparse linear)",
+    "exec_extratrees": "ExtraTrees on executable net-return (bagged)",
+    "exec_catboost": "CatBoost on executable net-return (GBDT control)",
+    "blend_linear_tree": "Rank blend: ridge + extra-trees",
     "baseline_lowvol": "Baseline: low 20d volatility",
     "baseline_reversal_5d": "Baseline: 5d reversal",
     "baseline_momentum_20d": "Baseline: 20d momentum",
@@ -433,6 +463,61 @@ def profit_logit_model():
             max_iter=30, tol=1e-4, random_state=42, average=True,
         ),
     )
+
+
+def ridge_model():
+    from sklearn.linear_model import Ridge
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    return make_pipeline(StandardScaler(), Ridge(alpha=20.0))
+
+
+def enet_model():
+    from sklearn.linear_model import ElasticNet
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    return make_pipeline(
+        StandardScaler(),
+        ElasticNet(alpha=0.005, l1_ratio=0.2, max_iter=300, tol=1e-3,
+                   random_state=42),
+    )
+
+
+def extratrees_model():
+    from sklearn.ensemble import ExtraTreesRegressor
+    return ExtraTreesRegressor(
+        n_estimators=200, min_samples_leaf=25, max_features=0.5,
+        n_jobs=-1, random_state=42,
+    )
+
+
+def catboost_model():
+    from catboost import CatBoostRegressor
+    return CatBoostRegressor(
+        iterations=250, depth=4, learning_rate=0.05, l2_leaf_reg=10.0,
+        loss_function="RMSE", bootstrap_type="Bernoulli", subsample=0.8,
+        random_seed=42, verbose=0, allow_writing_files=False, thread_count=-1,
+    )
+
+
+class RankBlend:
+    """Cross-sectional rank average of fitted scorers.
+
+    `TrainedModels.scores()` is called once per test date, so a plain rank
+    average computed inside predict() is exactly the per-day cross-sectional
+    blend used for Top-N ranking. No training state of its own.
+    """
+
+    def __init__(self, models: list):
+        self.models = models
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        parts = []
+        for model in self.models:
+            raw = np.asarray(model.predict(X), dtype=np.float64)
+            ranks = raw.argsort().argsort().astype(np.float64)
+            parts.append(ranks / max(len(ranks) - 1, 1))
+        return np.mean(parts, axis=0)
 
 
 def static_scores(model_key: str, frame: pl.DataFrame) -> np.ndarray:
@@ -531,6 +616,29 @@ def fit_models(
         model.fit(Xr, rel, group=sizes)
         trained["rank_lambdarank"] = model
 
+    # --- Stage-2 family-replacement challengers (2026-09-30 review) --------
+    # Same matured sample, same executable label, same X preprocessing.
+    # Ridge/ElasticNet test the linear family with a proper solver (the
+    # profit_logit SGD is a noisy proxy); ExtraTrees tests bagging vs
+    # boosting; CatBoost controls for the GBDT family itself (ordered
+    # boosting, shallower trees, stronger L2 on small panels).
+    mask = np.isfinite(exec_y)
+    if mask.sum() >= 2000:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            trained["exec_ridge"] = ridge_model().fit(X[mask], exec_y[mask])
+            trained["exec_enet"] = enet_model().fit(X[mask], exec_y[mask])
+            trained["exec_extratrees"] = extratrees_model().fit(
+                X[mask], exec_y[mask]
+            )
+            trained["exec_catboost"] = catboost_model().fit(
+                X[mask], exec_y[mask]
+            )
+    if "exec_ridge" in trained and "exec_extratrees" in trained:
+        trained["blend_linear_tree"] = RankBlend(
+            [trained["exec_ridge"], trained["exec_extratrees"]]
+        )
+
     return TrainedModels(trained, feature_names)
 
 
@@ -606,7 +714,7 @@ def run_arena(cfg: ArenaConfig, verbose: bool = True) -> dict:
     )
     rng = np.random.default_rng(cfg.seed)
 
-    learnable = ("legacy_composite_lgbm", "exec_net_lgbm", "profit_logit", "rank_lambdarank")
+    learnable = LEARNABLE_MODEL_KEYS
     daily_rows: list[dict] = []
     reliability: dict[str, list[tuple[int, float]]] = {k: [] for k in MODEL_KEYS}
     universe_daily: list[dict] = []
@@ -855,7 +963,7 @@ def print_summary(artifact: dict, top_n: int = 5) -> None:
     )
 
     print("\nScore reliability (quintiles by score, mean net 5d bps / win rate):")
-    for model_key in ("legacy_composite_lgbm", "exec_net_lgbm", "profit_logit", "rank_lambdarank"):
+    for model_key in LEARNABLE_MODEL_KEYS:
         rel = artifact["summary"].get(model_key, {}).get("score_reliability", {})
         if not rel:
             continue

@@ -1,7 +1,9 @@
 """One-candidate execution ledger shared by labels and scheduled evaluation.
 
-Not a portfolio simulator or a certification of real broker fills. Missing
-source facts fail closed; adjusted prices and inferred CN limits are forbidden.
+Not a portfolio simulator or a certification of real broker fills. Adjusted
+prices are forbidden.  The v2 evidence policy deliberately treats historical
+suspension flags and explicit CN daily bounds as optional observations: this
+is an OHLCV/accounting replay, not proof that every order was exchange-fillable.
 Returns remain fractions. Positions use one reference share for reconciliation.
 """
 from collections import Counter
@@ -14,7 +16,8 @@ from pathlib import Path
 from app.services.execution_costs import FillCostModel
 from app.services.market_calendar import is_market_open_date, next_market_open_date
 
-VERSION = 'reconciled_execution_v1'
+VERSION = 'reconciled_execution_v2_observable_ohlcv'
+EVIDENCE_POLICY = 'raw_price_volume_company_action_v2'
 
 
 def implementation_identity():
@@ -34,9 +37,14 @@ def digest(value):
 
 
 def execution_contract(market, cost):
-    return dict(version=VERSION, market=market, calendar_version='market_calendar_2026_v1',
+    return dict(version=VERSION, market=market, calendar_version='market_calendar_2027_v2',
                 price_basis='raw', cost=cost.metadata(), entry_rule='next_session_open',
-                exit_rule='signal_plus_h_close_defer_until_executable')
+                exit_rule='signal_plus_h_close_defer_until_observed_volume',
+                evidence_policy=EVIDENCE_POLICY,
+                required_execution_facts=['raw_price', 'daily_provenance', 'volume',
+                                          'corporate_action_state'],
+                optional_execution_facts=['historical_suspension_state',
+                                          'explicit_daily_upper_lower_limits'])
 
 
 def validate_contract(contract, market):
@@ -69,6 +77,7 @@ def replay_candidate(*, ticker, market, signal_date, horizon_days, rows, contrac
     """No candidate drops: each input becomes one terminal/ongoing ledger row."""
     result = dict(ticker=ticker, market=market, trade_date=signal_date,
                   horizon_days=horizon_days, protocol=VERSION, contract_hash=digest(contract),
+                  evidence_policy=EVIDENCE_POLICY, optional_evidence_gaps=[],
                   status='UNVERIFIED', reason=None, net_return=None, gross_return=None,
                   entry_date=None, scheduled_exit_date=None, exit_date=None,
                   entry_fill=None, exit_fill=None, invested_capital=None,
@@ -122,24 +131,33 @@ def replay_candidate(*, ticker, market, signal_date, horizon_days, rows, contrac
             return 'corporate_action_state_unknown'
         if row.get('corporate_action_status') == 'action':
             return 'corporate_action_requires_account_replay'
-        if type(row.get('suspended')) is not bool:
-            return 'daily_suspension_state_unknown'
         return None
+
+    def observe_optional(row, *, phase):
+        if type(row.get('suspended')) is not bool:
+            result['optional_evidence_gaps'].append(
+                dict(date=str(row.get('date') or ''), phase=phase,
+                     fact='historical_suspension_state', status='NOT_PROVIDED_NON_BLOCKING'))
+        if market == 'CN':
+            field = 'upper_limit' if phase == 'entry' else 'lower_limit'
+            if _number(row, field) is None:
+                result['optional_evidence_gaps'].append(
+                    dict(date=str(row.get('date') or ''), phase=phase,
+                         fact='explicit_daily_upper_lower_limits', status='NOT_PROVIDED_NON_BLOCKING'))
 
     entry = by_date.get(entry_day)
     reason = evidence(entry)
     if reason:
         return finish('UNVERIFIED', reason)
     op, volume = _number(entry, 'open'), _number(entry, 'volume')
-    if entry['suspended'] or (volume is not None and volume <= 0):
+    observe_optional(entry, phase='entry')
+    if entry.get('suspended') is True or (volume is not None and volume <= 0):
         return finish('REJECTED', 'entry_suspended_or_no_volume')
     if op is None or op <= 0 or volume is None:
         return finish('UNVERIFIED', 'missing_or_invalid_open_volume')
     if market == 'CN':
         upper = _number(entry, 'upper_limit')
-        if upper is None or upper <= 0:
-            return finish('UNVERIFIED', 'daily_upper_limit_unknown')
-        if op >= upper:
+        if upper is not None and upper > 0 and op >= upper:
             return finish('REJECTED', 'limit_up_at_entry')
     buy = cost.fill(op, 1, side='buy')
     capital = -buy['cash_flow']
@@ -162,12 +180,11 @@ def replay_candidate(*, ticker, market, signal_date, horizon_days, rows, contrac
         result['position'].update(last_mark=close, mark_date=day, mark_stale=False)
         result['events'].append(dict(type='MARK', date=day, quantity=1.0, market_value=close))
         if day >= due:
-            reject = 'exit_suspended_or_no_volume' if row['suspended'] or volume <= 0 else None
+            observe_optional(row, phase='exit')
+            reject = 'exit_suspended_or_no_volume' if row.get('suspended') is True or volume <= 0 else None
             if market == 'CN' and not reject:
                 lower = _number(row, 'lower_limit')
-                if lower is None or lower <= 0:
-                    return finish('UNVERIFIED', 'daily_lower_limit_unknown')
-                if close <= lower:
+                if lower is not None and lower > 0 and close <= lower:
                     reject = 'limit_down_at_exit'
             if reject:
                 result['events'].append(dict(type='EXIT_DEFERRED', date=day, reason=reject))

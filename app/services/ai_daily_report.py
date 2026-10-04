@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime, timedelta
 from math import isnan
@@ -34,6 +35,8 @@ from app.services.ticker_format import infer_market_from_ticker, normalize_ticke
 from app.services.time_utils import app_now_iso, app_today_iso
 from app.services.tradability_filter import evaluate_candidate_tradability
 from app.services.model_score_contract import SCORE_CONTRACT_VERSION, first_present, rank_ratio
+
+logger = logging.getLogger(__name__)
 
 
 AI_DAILY_REPORT_KEY = "ai_daily_report"
@@ -2146,6 +2149,54 @@ def _market_structure_label_for_row(row: dict, *, market: str, market_label: str
     return f"{market_label}综合"
 
 
+_CN_SERVING_MODEL_TYPES = ["lightgbm_multifactor"]
+_CN_SERVING_UNIVERSES = ["full_market", "full_market_us_lake", "full_dataset"]
+
+
+def _resolve_cn_serving_promotion_report(db, model_run_id: object = None) -> object | None:
+    """Unified gate report for the CN daily report's *declared* source run.
+
+    The report must name its own source run (``model_run_id``); this **never**
+    walks the champion window. Borrowing the newest servable run's gate report
+    would attribute evidence to a report that run did not produce (and could
+    hide a REJECT behind an older ELIGIBLE run). Returns ``None`` when the run is
+    missing, is not a CN full-market serving run, or cannot be assessed, so the
+    caller marks the report's promotion-evidence provenance ``unresolved``.
+    """
+
+    from app.services.repository import ModelRunRepository
+    from app.services.stock_selection.promotion_enforcement import assess_run_for_serving
+
+    if model_run_id in (None, ""):
+        return None
+    try:
+        run_id = int(model_run_id)
+    except (TypeError, ValueError):
+        return None
+    try:
+        run = ModelRunRepository(db).get_run_by_id(run_id)
+        if run is None or str(getattr(run, "status", "") or "").strip().lower() != "success":
+            return None
+        if str(getattr(run, "market", "") or "").strip().upper() not in {"CN", "MIXED"}:
+            return None
+        if str(getattr(run, "model_type", "") or "").strip() not in _CN_SERVING_MODEL_TYPES:
+            return None
+        universe = str(getattr(run, "universe", "") or "").strip()
+        if not any(
+            universe == candidate or universe.startswith(candidate)
+            for candidate in _CN_SERVING_UNIVERSES
+        ):
+            return None
+        decision = assess_run_for_serving(run, db=db, log_warning=False)
+        return decision.report
+    except Exception:  # pragma: no cover - optional evidence must never block save
+        logger.warning(
+            "could not resolve declared CN serving promotion report for publication",
+            exc_info=True,
+        )
+    return None
+
+
 def save_ai_daily_report(
     payload: dict, *, db=None,
     publication_messages: list[dict] | None = None,
@@ -2163,9 +2214,14 @@ def save_ai_daily_report(
 
     publication_input = dict(payload or {})
     publication_input.setdefault("decision_cutoff_at", app_now_iso())
+    declared_run_id = publication_input.get("model_run_id")
+    promotion_report = _resolve_cn_serving_promotion_report(db, declared_run_id)
     enriched_payload = prepare_report_for_publication(
         publication_input, approved_qualifications=load_trusted_model_qualifications(db=db),
         trusted_regime_snapshots=load_trusted_regime_snapshots(db=db),
+        model_run_id=declared_run_id,
+        promotion_report=promotion_report,
+        promotion_evidence_provenance=None if promotion_report is not None else "unresolved",
     )
     if publication_messages:
         # A qualification can be revoked between rendering a message and this

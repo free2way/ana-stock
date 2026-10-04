@@ -82,7 +82,7 @@ class EventDrivenBacktestTests(unittest.TestCase):
             EngineConfig(
                 market="CN",
                 top_n=1,
-                holding_days=1,
+                holding_days=2,
                 initial_cash=10_000.0,
                 commission_bps=0.0,
                 slippage_bps=0.0,
@@ -93,6 +93,7 @@ class EventDrivenBacktestTests(unittest.TestCase):
             bars=[
                 _bar("000001.SZ", "2026-01-05", open_price=9.8, close=10.0),
                 _bar("000001.SZ", "2026-01-06", open_price=10.5, close=12.0),
+                _bar("000001.SZ", "2026-01-07", open_price=12.0, close=12.5),
             ],
             signals=[SignalCandidate("2026-01-05", "000001.SZ", score=1.0, rank_value=1.0)],
         )
@@ -101,10 +102,15 @@ class EventDrivenBacktestTests(unittest.TestCase):
         self.assertEqual("2026-01-06", result.fills[0]["fill_date"])
         self.assertEqual("buy", result.fills[0]["side"])
         self.assertEqual(10.5, result.fills[0]["fill_price"])
-        self.assertEqual(12.0, result.fills[1]["fill_price"])
-        self.assertEqual(11_350.0, result.end_nav)
-        self.assertEqual(1.135, result.metrics[-1]["nav"])
+        self.assertEqual("2026-01-07", result.fills[1]["fill_date"])
+        self.assertEqual(12.5, result.fills[1]["fill_price"])
+        self.assertEqual(10_800.0, result.end_nav)
+        self.assertEqual(1.08, result.metrics[-1]["nav"])
         self.assertEqual(0, result.open_position_count)
+
+    def test_cn_same_session_exit_is_rejected_at_configuration_time(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"T\+1"):
+            EngineConfig(market="CN", top_n=1, holding_days=1, initial_cash=10_000.0)
 
     def test_costs_are_charged_only_on_actual_fills_and_accounting_balances(self) -> None:
         engine = EventDrivenDailyEngine(
@@ -137,7 +143,7 @@ class EventDrivenBacktestTests(unittest.TestCase):
             EngineConfig(
                 market="CN",
                 top_n=2,
-                holding_days=1,
+                holding_days=2,
                 initial_cash=100_000.0,
                 commission_bps=8.0,
                 slippage_bps=12.0,
@@ -199,7 +205,7 @@ class EventDrivenBacktestTests(unittest.TestCase):
             EngineConfig(
                 market="CN",
                 top_n=2,
-                holding_days=1,
+                holding_days=2,
                 initial_cash=100_000.0,
                 commission_bps=0.0,
                 slippage_bps=0.0,
@@ -212,6 +218,8 @@ class EventDrivenBacktestTests(unittest.TestCase):
                 DailyBar("300001.SZ", "2026-01-05", 10.0, 10.0, 10.0, 10.0, 100_000.0, is_st=True),
                 DailyBar("600001.SS", "2026-01-06", 10.5, 10.5, 10.5, 10.5, 100_000.0, is_st=True),
                 DailyBar("300001.SZ", "2026-01-06", 10.5, 10.5, 10.5, 10.5, 100_000.0, is_st=True),
+                DailyBar("600001.SS", "2026-01-07", 10.5, 10.5, 10.5, 10.5, 100_000.0, is_st=True),
+                DailyBar("300001.SZ", "2026-01-07", 10.6, 10.6, 10.6, 10.6, 100_000.0, is_st=True),
             ],
             signals=[
                 SignalCandidate("2026-01-05", "600001.SS", score=1.0, rank_value=1.0),

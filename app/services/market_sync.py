@@ -64,7 +64,9 @@ def sync_market_data(
             if any(str(symbol.market or "").upper() != "CN" for symbol in symbols):
                 raise RuntimeError("a-stock-data Tencent supports A-share tickers only.")
 
+        lake_supported_markets = {"CN", "US"}
         bulk_rows_by_ticker: dict[str, list[dict]] = {}
+        bulk_failed_trade_dates: list[str] = []
         use_cn_tushare_bulk = (
             len(symbols) >= 100
             and normalized_provider in {"", "auto", "tushare"}
@@ -87,8 +89,13 @@ def sync_market_data(
                 end_date=end_date,
             )
             lake_rows = [row for ticker_rows in bulk_rows_by_ticker.values() for row in ticker_rows]
+            bulk_failed_trade_dates = list(getattr(bulk_client, "last_failed_trade_dates", []) or [])
             if lake_rows:
-                write_ohlcv_rows_to_lake(market="CN", rows=lake_rows)
+                write_ohlcv_rows_to_lake(
+                    market="CN",
+                    rows=lake_rows,
+                    provenance={"provider": "tushare", "source_reference": "tushare:cn_daily_history_bulk"},
+                )
 
         # A-share daily endpoints omit suspended symbols instead of returning
         # a zero-volume bar.  Keep the provider check optional and
@@ -132,9 +139,46 @@ def sync_market_data(
                             selected_provider_ticker = candidate
                             provider_used = getattr(price_provider, "last_source_used", provider) or provider
                 market_code = str(symbol.market or infer_market_from_ticker(symbol.ticker) or "").upper()
+                if market_code not in lake_supported_markets:
+                    # S-13: fail closed on markets we cannot store.  Previously an HK
+                    # symbol fetched through a US-shaped provider still reported a
+                    # "Wrote ... to Parquet lake" success while no partition existed.
+                    sorted_rows = sorted(rows, key=lambda row: str(row.get("date") or ""))
+                    last_synced_date = sorted_rows[-1]["date"] if sorted_rows else None
+                    if rows:
+                        message = (
+                            f"Fetched {len(rows)} row(s) for {selected_provider_ticker} via {provider_used}, but "
+                            f"{market_code or 'UNKNOWN'} market data is not supported by the Parquet lake; nothing was written."
+                        )
+                    else:
+                        message = (
+                            f"{market_code or 'UNKNOWN'} market data is not supported by the Parquet lake; "
+                            f"nothing was written for {selected_provider_ticker}."
+                        )
+                    sync_repo.upsert_state(
+                        symbol_id=symbol.id,
+                        provider=provider_used,
+                        last_synced_date=last_synced_date,
+                        status="unsupported_market",
+                        message=message,
+                    )
+                    results.append(
+                        {
+                            "ticker": symbol.ticker,
+                            "status": "unsupported_market",
+                            "rows": len(rows),
+                            "stored_rows": 0,
+                            "provider": provider_used,
+                            "provider_ticker": selected_provider_ticker,
+                            "last_synced_date": last_synced_date,
+                            "lake_paths": [],
+                            "message": message,
+                        }
+                    )
+                    continue
                 if not rows:
                     existing_rows = []
-                    if market_code in {"CN", "US"}:
+                    if market_code in lake_supported_markets:
                         existing_rows = load_lake_price_history(market=market_code, ticker=symbol.ticker, limit=5)
                     if existing_rows:
                         last_synced_date = str(existing_rows[-1].get("date") or "") or None
@@ -176,6 +220,7 @@ def sync_market_data(
                                 "status": status,
                                 "rows": 0,
                                 "stored_rows": 0,
+                                "provider": provider_used,
                                 "provider_ticker": selected_provider_ticker,
                                 "last_synced_date": last_synced_date,
                                 "no_trade": no_trade,
@@ -188,7 +233,17 @@ def sync_market_data(
                     raise RuntimeError(f"No market data returned for {selected_provider_ticker}")
                 lake_paths = []
                 if market_code in {"CN", "US"} and not bulk_rows_by_ticker:
-                    lake_paths = write_ohlcv_rows_to_lake(market=market_code, rows=rows, merge_existing=True)
+                    lake_paths = write_ohlcv_rows_to_lake(
+                        market=market_code,
+                        rows=rows,
+                        merge_existing=True,
+                        provenance={
+                            "provider": str(
+                                getattr(price_provider, "name", "") or normalized_provider or ""
+                            ).strip(),
+                            "source_reference": f"{selected_provider_ticker}:{market_code}:daily",
+                        },
+                    )
                 sorted_rows = sorted(rows, key=lambda row: str(row.get("date") or ""))
                 last_synced_date = sorted_rows[-1]["date"] if sorted_rows else None
                 is_current = is_as_of_current(last_synced_date, required_as_of_date)
@@ -209,6 +264,7 @@ def sync_market_data(
                         "status": status,
                         "rows": len(rows),
                         "stored_rows": len(rows),
+                        "provider": provider_used,
                         "provider_ticker": selected_provider_ticker,
                         "last_synced_date": last_synced_date,
                         "lake_paths": [str(path) for path in lake_paths],
@@ -228,9 +284,23 @@ def sync_market_data(
                         "ticker": symbol.ticker,
                         "status": "failed",
                         "rows": 0,
+                        "provider": provider,
                         "last_synced_date": None,
                         "message": str(exc),
                     }
                 )
+
+    if bulk_failed_trade_dates:
+        # S-14: a single failed trade date inside the bulk window must surface as
+        # ``partial`` with the explicit missing sessions, never a silent success.
+        missing = sorted(bulk_failed_trade_dates)
+        missing_note = " Missing trade date(s): " + ", ".join(missing) + "."
+        for item in results:
+            if str(item.get("provider") or "") != "tushare_bulk":
+                continue
+            item["missing_trade_dates"] = list(missing)
+            if item.get("status") == "success":
+                item["status"] = "partial"
+                item["message"] = f"{item.get('message') or ''}{missing_note}"
 
     return results

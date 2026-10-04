@@ -496,6 +496,8 @@ def persist_promotion_gate_report(
     report: PromotionGateReport,
     *,
     root: Path,
+    dataset_hash: str | None = None,
+    registry_path: Path | None = None,
 ) -> PromotionGateEvidenceWriteResult:
     payload = asdict(report)
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -514,6 +516,20 @@ def persist_promotion_gate_report(
             encoding="utf-8",
         )
         report_sha256 = hashlib.sha256(report_path.read_bytes()).hexdigest()
+        registry_stats = None
+        if dataset_hash:
+            from app.services.stock_selection.experiment_registry import attempt_stats, record_attempt
+
+            record_attempt(
+                model_key=report.model_key,
+                dataset_hash=dataset_hash,
+                protocol_id=f"{report.factor_set_key}:{report.horizon_days}d",
+                verdict=report.decision,
+                metrics={"top_n": report.top_n, "champion_action": report.champion_action},
+                rejected=report.decision.upper() not in {"PASS", "PROMOTE"},
+                path=registry_path,
+            )
+            registry_stats = attempt_stats(model_key=report.model_key, path=registry_path)
         manifest = {
             "schema_version": "stock_selection_promotion_gate_manifest_v1",
             "evidence_version": evidence_version,
@@ -522,6 +538,7 @@ def persist_promotion_gate_report(
             "decision": report.decision,
             "champion_action": report.champion_action,
             "source_evidence_versions": list(report.source_evidence_versions),
+            "experiment_registry": registry_stats,
         }
         (temporary_dir / "manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

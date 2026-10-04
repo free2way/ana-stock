@@ -47,6 +47,11 @@ class EngineConfig:
     initial_cash: float = 1_000_000.0
     commission_bps: float = 8.0
     slippage_bps: float = 12.0
+    sell_stamp_duty_bps_one_way: float = 0.0
+    transfer_fee_bps_one_way: float = 0.0
+    sell_regulatory_fee_bps_one_way: float = 0.0
+    sell_regulatory_fee_per_share: float = 0.0
+    min_commission: float = 0.0
     max_position_weight: float = 0.10
     max_sector_weight: float = 1.0
     max_gross_exposure: float = 1.0
@@ -55,14 +60,26 @@ class EngineConfig:
     min_adv: float = 0.0
     max_gap_pct: float = 1.0
     liquidate_at_end: bool = False
-    calendar_version: str = "market_calendar_2026_v1"
+    calendar_version: str = "market_calendar_2027_v2"
     engine_version: str = "event_driven_daily_v3"
     reality_model_version: str = "daily_ohlcv_basic_v2"
 
     def __post_init__(self) -> None:
         if str(self.market or "").upper() not in {"CN", "US"}:
             raise ValueError("market must be CN or US")
-        FillCostModel(self.commission_bps, self.slippage_bps)
+        if str(self.market or "").upper() == "CN" and self.holding_days < 2:
+            # A-share T+1: the entry session close is not sellable on the same
+            # session, so a one-session holding period is not executable.
+            raise ValueError("CN T+1 forbids a same-session exit; holding_days must be >= 2")
+        FillCostModel(
+            self.commission_bps,
+            self.slippage_bps,
+            sell_stamp_duty_bps_one_way=self.sell_stamp_duty_bps_one_way,
+            transfer_fee_bps_one_way=self.transfer_fee_bps_one_way,
+            sell_regulatory_fee_bps_one_way=self.sell_regulatory_fee_bps_one_way,
+            sell_regulatory_fee_per_share=self.sell_regulatory_fee_per_share,
+            min_commission=self.min_commission,
+        )
         if self.top_n <= 0 or self.holding_days <= 0:
             raise ValueError("top_n and holding_days must be positive")
         if self.initial_cash <= 0:

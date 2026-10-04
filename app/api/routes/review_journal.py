@@ -14,6 +14,9 @@ from app.services.review_journal import delete_review_entry, get_review_entry, l
 from app.services.time_utils import app_today_iso
 from app.services.ui_lang import resolve_request_lang
 from app.services.workspace_nav import WORKSPACE_COMPACT_STYLE, WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
+from app.api.presentation.tokens import (
+    ROOT_TOKENS_BASE_SIGNALS,
+)
 
 
 router = APIRouter(prefix="/review-journal", tags=["review-journal"])
@@ -192,7 +195,7 @@ def _render_page(request: Request, db: Session, *, saved: bool = False) -> str:
         if saved
         else ""
     )
-    return f"""
+    return (f"""
     <!DOCTYPE html>
     <html lang="{lang}">
       <head>
@@ -200,7 +203,7 @@ def _render_page(request: Request, db: Session, *, saved: bool = False) -> str:
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{'复盘心得' if lang == 'zh' else 'Review Journal'}</title>
         <style>
-          :root {{ --bg:#071018; --panel:#111c28; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; --warn:#fbbf24; --danger:#fb7185; --blue:#60a5fa; }}
+          """ + (ROOT_TOKENS_BASE_SIGNALS) + f"""
           * {{ box-sizing:border-box; }}
           body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(96,165,250,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.14), transparent 26%),linear-gradient(180deg,#08111a 0%,#071018 100%); }}
           a {{ color:inherit; text-decoration:none; }}
@@ -344,7 +347,7 @@ def _render_page(request: Request, db: Session, *, saved: bool = False) -> str:
         </div>
       </body>
     </html>
-    """
+    """)
 
 
 @router.get("", response_class=HTMLResponse)

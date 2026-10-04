@@ -23,7 +23,15 @@ class EventDrivenDailyEngine:
 
     def __init__(self, config: EngineConfig) -> None:
         self.config = config
-        self.cost_model = FillCostModel(config.commission_bps, config.slippage_bps)
+        self.cost_model = FillCostModel(
+            config.commission_bps,
+            config.slippage_bps,
+            sell_stamp_duty_bps_one_way=config.sell_stamp_duty_bps_one_way,
+            transfer_fee_bps_one_way=config.transfer_fee_bps_one_way,
+            sell_regulatory_fee_bps_one_way=config.sell_regulatory_fee_bps_one_way,
+            sell_regulatory_fee_per_share=config.sell_regulatory_fee_per_share,
+            min_commission=config.min_commission,
+        )
 
     @staticmethod
     def _prepare_bars(bars: list[DailyBar]) -> tuple[dict[tuple[str, str], DailyBar], list[str]]:

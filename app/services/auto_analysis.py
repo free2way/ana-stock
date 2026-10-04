@@ -27,7 +27,7 @@ AUTO_ANALYSIS_JOB_TYPE = "watchlist_auto_analysis"
 DEFAULT_AUTO_ANALYSIS_CONFIG = {
     "enabled": False,
     "interval_hours": 24,
-    "provider": "auto",
+    "provider": "tushare",
     "start_date": "2025-01-01",
     "model_type": "lightgbm",
     "signal_type": "momentum",
@@ -78,7 +78,7 @@ class AutoAnalysisService:
         config["interval_hours"] = max(1, _safe_int(config.get("interval_hours"), 24))
         config["lookback_days"] = max(1, _safe_int(config.get("lookback_days"), 3))
         config["top_n"] = max(1, _safe_int(config.get("top_n"), 1))
-        config["provider"] = str(config.get("provider") or "auto").strip() or "auto"
+        config["provider"] = str(config.get("provider") or "tushare").strip() or "tushare"
         config["model_type"] = str(config.get("model_type") or "lightgbm").strip() or "lightgbm"
         config["signal_type"] = str(config.get("signal_type") or "momentum").strip() or "momentum"
         config["start_date"] = str(config.get("start_date") or "2025-01-01").strip() or "2025-01-01"
@@ -217,7 +217,7 @@ class AutoAnalysisService:
                 ),
                 universe="local_watchlist",
             )
-            daily_rows_written = BacktestRunner().run(top_n=config["top_n"])
+            daily_rows_written = BacktestRunner().run(top_n=config["top_n"], engine_version="event_driven_daily_v2")
             risk_guardrail_result = None
             try:
                 with SessionLocal() as db:

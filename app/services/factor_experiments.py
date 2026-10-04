@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.services.market_lake import get_latest_lake_trade_date, load_lake_price_history, load_lake_rows
+from app.services.price_basis import preferred_close
 from app.services.repository import AppSettingRepository, WorkspaceSnapshotRepository
 from app.services.screener_snapshots import build_base_precompute_params
 from app.services.time_utils import app_now_iso, app_today_iso
@@ -726,19 +727,23 @@ def compute_forward_outcome(row: dict[str, Any], *, history: list[dict[str, Any]
     if index is None:
         return {"status": "trade_date_not_found", "trade_date": latest_trade_date}
     signal_bar = history[index]
-    signal_close = _to_float(signal_bar.get("close"))
+    # R2: return legs prefer the adjusted view.  `signal_raw_close` keeps the
+    # raw close for the raw open / raw low comparisons (overnight gap and path
+    # drawdown) so those ratios keep their original basis.
+    signal_close = preferred_close(signal_bar)
     if signal_close is None or signal_close <= 0:
         return {"status": "bad_signal_close", "trade_date": latest_trade_date}
+    signal_raw_close = _to_float(signal_bar.get("close")) or signal_close
     outcome: dict[str, Any] = {"status": "ok", "trade_date": signal_bar.get("date"), "signal_close": signal_close}
     next_bar = history[index + 1] if index + 1 < len(history) else None
     if next_bar:
         next_open = _to_float(next_bar.get("open"))
         next_high = _to_float(next_bar.get("high"))
         next_low = _to_float(next_bar.get("low"))
-        next_close = _to_float(next_bar.get("close"))
+        next_close = preferred_close(next_bar)
         outcome["next_trade_date"] = next_bar.get("date")
         if next_open and next_open > 0:
-            outcome["next_open_gap_pct"] = round((next_open / signal_close - 1.0) * 100.0, 2)
+            outcome["next_open_gap_pct"] = round((next_open / signal_raw_close - 1.0) * 100.0, 2)
             if next_high is not None:
                 outcome["next_open_to_high_pct"] = round((next_high / next_open - 1.0) * 100.0, 2)
             if next_low is not None:
@@ -749,7 +754,7 @@ def compute_forward_outcome(row: dict[str, Any], *, history: list[dict[str, Any]
     for horizon in (3, 5):
         target_index = index + horizon
         if target_index < len(history):
-            target_close = _to_float(history[target_index].get("close"))
+            target_close = preferred_close(history[target_index])
             if target_close is not None:
                 outcome[f"return_{horizon}d_pct"] = round((target_close / signal_close - 1.0) * 100.0, 2)
         lows: list[float] = []
@@ -758,7 +763,7 @@ def compute_forward_outcome(row: dict[str, Any], *, history: list[dict[str, Any]
             if low_value is not None:
                 lows.append(low_value)
         if lows:
-            outcome[f"max_drawdown_{horizon}d_pct"] = round((min(lows) / signal_close - 1.0) * 100.0, 2)
+            outcome[f"max_drawdown_{horizon}d_pct"] = round((min(lows) / signal_raw_close - 1.0) * 100.0, 2)
     return outcome
 
 

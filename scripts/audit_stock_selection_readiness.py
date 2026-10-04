@@ -22,6 +22,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--market", required=True, choices=("CN", "US"))
     parser.add_argument("--required-history-sessions", type=int, default=252)
     parser.add_argument("--artifact-root", type=Path)
+    parser.add_argument(
+        "--historical-universe-contract",
+        type=Path,
+        help=(
+            "Path to a historical-universe evidence contract artifact. Defaults to "
+            "PQW_HISTORICAL_UNIVERSE_CONTRACT_PATH or "
+            "<artifacts>/stock_selection_research/historical_universe_contract.json."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -31,6 +40,7 @@ def main() -> None:
         market=args.market,
         artifact_root=args.artifact_root,
         required_history_sessions=args.required_history_sessions,
+        historical_universe_contract_path=args.historical_universe_contract,
     )
     print(
         json.dumps(

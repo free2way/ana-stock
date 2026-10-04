@@ -32,6 +32,30 @@ def signal_strength(score: float | None) -> int | None:
     return min(100, max(8, int(abs(float(score)) * 280)))
 
 
+def model_direction_rank(score: float | None) -> int:
+    """Return 1 for the long side and 0 for the short side.
+
+    Unknown scores keep the long-side rank so legacy rows are not demoted.
+    """
+    if score is None:
+        return 1
+    return 0 if float(score) < 0 else 1
+
+
+def model_rank_strength(score: float | None) -> int:
+    """Magnitude used for ranking; short-side (SELL) rows must not outrank longs.
+
+    ``signal_strength`` stays an absolute display value. Ranking uses this
+    direction-aware counterpart so a large negative score cannot top the list.
+    """
+    if score is None:
+        return 0
+    if float(score) < 0:
+        return 0
+    strength = signal_strength(score)
+    return int(strength or 0)
+
+
 def conviction_bucket(score: float | None, *, lang: str) -> str | None:
     strength = signal_strength(score)
     if strength is None:

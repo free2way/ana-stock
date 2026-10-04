@@ -115,6 +115,9 @@ def load_portfolio_positions() -> list[dict]:
                 "market": item.get("market"),
                 "quantity": float(item.get("quantity") or 0.0),
                 "cost_basis": float(item.get("cost_basis") or 0.0),
+                # S-12: buy fees are booked into the position cost basis and kept
+                # for audit; older records simply have no recorded fee.
+                "buy_fee": float(item.get("buy_fee") or 0.0),
                 "note": item.get("note") or "",
             }
         )
@@ -180,9 +183,33 @@ def save_portfolio_trades(trades: list[dict]) -> None:
         AppSettingRepository(db).set(PORTFOLIO_TRADE_LOG_KEY, json.dumps(trades, ensure_ascii=False))
 
 
+def _book_buy_cost(*, quantity: float, price: float, fee: float) -> tuple[float, float]:
+    """Return ``(effective_cost_basis, booked_fee)`` for a buy fill.
+
+    S-12: a buy fee is part of the cost of the position.  It is spread over the
+    filled quantity so downstream PnL and rebalance math automatically include
+    it, and returned separately for audit rather than dropped.
+    """
+    booked_fee = max(0.0, float(fee or 0.0))
+    gross = float(quantity or 0.0) * float(price or 0.0)
+    if float(quantity or 0.0) > 0:
+        effective = (gross + booked_fee) / float(quantity)
+    else:
+        effective = float(price or 0.0)
+    return effective, booked_fee
+
+
 def upsert_portfolio_position(payload: dict) -> list[dict]:
     positions = load_portfolio_positions()
     ticker = str(payload.get("ticker") or "").strip().upper()
+    quantity = float(payload.get("quantity") or 0.0)
+    price = float(payload.get("cost_basis") or 0.0)
+    # An upsert replaces the whole position, so the fee belongs to this lot.
+    effective_cost_basis, buy_fee = _book_buy_cost(
+        quantity=quantity,
+        price=price,
+        fee=payload.get("fee"),
+    )
     updated: list[dict] = []
     replaced = False
     for item in positions:
@@ -192,8 +219,9 @@ def upsert_portfolio_position(payload: dict) -> list[dict]:
                     "ticker": ticker,
                     "name": payload.get("name") or item.get("name"),
                     "market": payload.get("market") or item.get("market"),
-                    "quantity": float(payload.get("quantity") or 0.0),
-                    "cost_basis": float(payload.get("cost_basis") or 0.0),
+                    "quantity": quantity,
+                    "cost_basis": effective_cost_basis,
+                    "buy_fee": buy_fee,
                     "note": payload.get("note") or "",
                 }
             )
@@ -206,8 +234,9 @@ def upsert_portfolio_position(payload: dict) -> list[dict]:
                 "ticker": ticker,
                 "name": payload.get("name"),
                 "market": payload.get("market"),
-                "quantity": float(payload.get("quantity") or 0.0),
-                "cost_basis": float(payload.get("cost_basis") or 0.0),
+                "quantity": quantity,
+                "cost_basis": effective_cost_basis,
+                "buy_fee": buy_fee,
                 "note": payload.get("note") or "",
             }
         )

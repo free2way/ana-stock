@@ -1,13 +1,28 @@
 from __future__ import annotations
 
+import json
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from math import sqrt
 
+from app.core.config import get_settings
 from app.core.db import SessionLocal
 from app.services.backtesting.engine import EventDrivenDailyEngine
-from app.services.backtesting.schemas import DailyBar, EngineConfig, SignalCandidate
+from app.services.backtesting.schemas import DailyBar, EngineConfig, MarketCorporateAction, SignalCandidate
+from app.services.execution_costs import default_fill_cost_model
+from app.services.adjustment_snapshot import adjustment_version_binding
+from app.services.price_basis_contract import (
+    DECISION_REJECT,
+    ENTRY_BACKTEST,
+    AdjustedViewProbe,
+    PriceBasisDecision,
+    PriceBasisRequirements,
+    decide_price_basis,
+    probe_adjusted_view,
+)
+from app.services.market_calendar import CALENDAR_VERSION
 from app.services.market_lake import load_lake_rows
+from app.services.optin_audit import build_optin_audit
 from app.services.repository import (
     ModelRunRepository,
     PredictionWriteRepository,
@@ -76,6 +91,163 @@ class EventDrivenBacktestRunner:
         allowed = set(calendar[start_index : end_index + 1])
         return [row for row in rows if str(row.get("date") or "")[:10] in allowed]
 
+    def _load_market_corporate_actions(
+        self,
+        *,
+        market: str,
+        tickers: set[str],
+        start_date: str,
+        end_date: str,
+        holding_days: int,
+    ) -> tuple[list[MarketCorporateAction], dict]:
+        """Map stored corporate actions onto the engine's action schema (A1).
+
+        Split-like events (split / stock_dividend) become factor actions;
+        cash dividends keep their cash amount. Event-day types the engine does
+        not model (merger / spinoff / delisting / rights / adjustment_factor)
+        are never silently dropped: they are counted under ``unsupported`` and
+        kept verbatim (symbol / action_type / effective_date) in
+        ``unsupported_details`` so callers can fail closed or audit them.
+
+        Scope: only the requested ``tickers`` (the traded universe passed by the
+        caller) and only the backtest window (extended by the holding tail) are
+        considered, so unrelated lake events cannot trip the guard.
+        """
+
+        from app.services.corporate_actions import load_actions
+
+        window_end = (date.fromisoformat(end_date) + timedelta(days=max(14, holding_days * 3 + 7))).isoformat()
+        wanted = {str(ticker).strip().upper() for ticker in tickers}
+        actions: list[MarketCorporateAction] = []
+        stats: dict = {"loaded": 0, "supported": 0, "unsupported": 0, "unsupported_details": []}
+        for record in load_actions(market):
+            if record.symbol not in wanted:
+                continue
+            effective = record.effective_date.isoformat()
+            if effective < start_date or effective > window_end:
+                continue
+            stats["loaded"] += 1
+            if record.action_type in {"split", "stock_dividend"} and record.factor:
+                actions.append(
+                    MarketCorporateAction(record.symbol, effective, "split", factor=float(record.factor))
+                )
+                stats["supported"] += 1
+            elif record.action_type == "cash_dividend" and record.cash_amount is not None:
+                actions.append(
+                    MarketCorporateAction(
+                        record.symbol, effective, "cash_dividend", cash_amount=float(record.cash_amount)
+                    )
+                )
+                stats["supported"] += 1
+            else:
+                stats["unsupported"] += 1
+                stats["unsupported_details"].append(
+                    {
+                        "symbol": record.symbol,
+                        "action_type": record.action_type,
+                        "effective_date": effective,
+                    }
+                )
+        actions.sort(key=lambda item: (item.effective_date, item.ticker))
+        stats["unsupported_details"].sort(
+            key=lambda item: (item["effective_date"], item["symbol"], item["action_type"])
+        )
+        return actions, stats
+
+    @staticmethod
+    def _format_unmodeled_corporate_actions(details: list[dict], *, limit: int = 5) -> str:
+        head = "; ".join(
+            f"{item['symbol']} {item['action_type']} {item['effective_date']}" for item in details[:limit]
+        )
+        remaining = len(details) - limit
+        suffix = f"; +{remaining} more" if remaining > 0 else ""
+        return f"{len(details)} event(s): {head}{suffix}"
+
+    @classmethod
+    def _enforce_unmodeled_corporate_actions(cls, details: list[dict], *, allow: bool) -> None:
+        """Fail closed when traded names carry corporate-action types the engine
+        cannot model (merger / spinoff / delisting / rights / adjustment_factor).
+
+        The check is conservative: it uses the traded signal universe and the
+        whole backtest window (plus holding tail), not a per-holding-day match.
+        Callers must opt in explicitly to run anyway.
+        """
+
+        if not details or allow:
+            return
+        raise RuntimeError(
+            "Event-driven backtest refused to run: "
+            + cls._format_unmodeled_corporate_actions(details)
+            + " fall(s) within the backtest window for a traded symbol, but the engine only "
+            "models splits, stock dividends and cash dividends. Positions spanning "
+            "merger/spinoff/delisting/rights/adjustment_factor events may be misvalued. "
+            "Expand the corporate-action model coverage, or re-run with "
+            "allow_unmodeled_corporate_actions=True to accept the risk explicitly "
+            "(the events and opt-in flag are recorded in the run manifest)."
+        )
+
+    @staticmethod
+    def _model_run_price_basis_binding(model_run: object) -> dict:
+        """Read the price-basis binding the model run was trained/published on."""
+
+        raw = getattr(model_run, "config_json", None)
+        if not raw:
+            return {}
+        try:
+            config = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(config, dict):
+            return {}
+        return config
+
+    @classmethod
+    def _resolve_price_basis_contract(
+        cls,
+        *,
+        market: str,
+        model_run: object,
+        tickers: set[str],
+    ) -> tuple[PriceBasisDecision, AdjustedViewProbe]:
+        """Probe the adjusted view and decide whether this backtest may run.
+
+        The backtest engine replays raw bars plus corporate actions and does not
+        read the adjusted view arithmetically, so coverage is only gated when the
+        model run itself declared it needed a full-coverage basis. It always
+        fails closed on an ``unreadable`` view and on a version mismatch against
+        the model run's recorded view hash: a backtest must never silently bind
+        to a different price basis than the model it is evaluating.
+        """
+
+        model_config = cls._model_run_price_basis_binding(model_run)
+        expected_view_sha256 = model_config.get("adjusted_view_sha256")
+        # Gate coverage only when the model run itself declared it needed a
+        # full-coverage adjusted basis. The engine replays raw bars + corporate
+        # actions, so a model that never required full coverage must not be
+        # blocked by an unrelated missing symbol.
+        require_full_coverage = bool(
+            model_config.get("require_full_adjusted_coverage", False)
+        )
+        allow_raw_fallback = bool(
+            getattr(get_settings(), "trainer_allow_raw_fallback", False)
+        )
+        probe = probe_adjusted_view(market, symbols=tickers, read_bars=require_full_coverage)
+        return (
+            decide_price_basis(
+                ENTRY_BACKTEST,
+                probe,
+                PriceBasisRequirements(
+                    entry_point=ENTRY_BACKTEST,
+                    requires_adjusted_prices=True,
+                    require_full_coverage=require_full_coverage,
+                    allow_raw_fallback=allow_raw_fallback,
+                    expected_view_sha256=expected_view_sha256,
+                    gates_coverage=require_full_coverage,
+                ),
+            ),
+            probe,
+        )
+
     def run(
         self,
         *,
@@ -88,7 +260,13 @@ class EventDrivenBacktestRunner:
         min_signal_score: float,
         min_adv: float,
         max_gap_pct: float,
+        max_sector_weight: float = 1.0,
+        max_gross_exposure: float = 1.0,
+        max_participation_rate: float = 1.0,
         initial_cash: float = 1_000_000.0,
+        allow_unmodeled_corporate_actions: bool = False,
+        optin_reason: str | None = None,
+        optin_operator: str | None = None,
     ) -> int:
         with SessionLocal() as db:
             model_repo = ModelRunRepository(db)
@@ -119,7 +297,38 @@ class EventDrivenBacktestRunner:
                 if prediction.symbol_id in ticker_by_id
             }
             market = self._infer_market(model_run.market, prediction_tickers)
+            adjustment_binding = adjustment_version_binding(market)
+            price_basis_decision, price_basis_probe = self._resolve_price_basis_contract(
+                market=market,
+                model_run=model_run,
+                tickers=prediction_tickers,
+            )
+            price_basis_fields = price_basis_decision.audit_fields()
+            cost_model = default_fill_cost_model(
+                market,
+                commission_bps_one_way=commission_bps,
+                slippage_bps_one_way=slippage_bps,
+            )
             signal_dates = sorted({str(prediction.trade_date)[:10] for prediction in predictions})
+            # Structured, accountable opt-in record. Built before any run row is
+            # created so an enabled opt-in without a reason refuses fail-closed
+            # without touching the database (same unified rule as the trainer's
+            # raw-label fallback: enable the opt-in ⇒ supply a reason). The
+            # legacy boolean is kept alongside it.
+            unmodeled_optin_audit = build_optin_audit(
+                enabled=allow_unmodeled_corporate_actions,
+                source="allow_unmodeled_corporate_actions",
+                scope={
+                    "entry_point": ENTRY_BACKTEST,
+                    "market": market,
+                    "model_run_id": model_run.id,
+                    "model_run_name": model_run.name,
+                    "start_date": signal_dates[0] if signal_dates else None,
+                    "end_date": signal_dates[-1] if signal_dates else None,
+                },
+                operator=optin_operator or getattr(get_settings(), "optin_operator", None),
+                reason=optin_reason or getattr(get_settings(), "optin_reason", None),
+            )
             strategy_run = strategy_repo.create_run(
                 model_run_id=model_run.id,
                 name=f"event_v2_top_n_{model_run.name}",
@@ -128,6 +337,11 @@ class EventDrivenBacktestRunner:
                 end_date=signal_dates[-1] if signal_dates else None,
                 config={
                     "engine_version": self.engine_version,
+                    "calendar_version": CALENDAR_VERSION,
+                    "adjustment_version": adjustment_binding["adjustment_version"],
+                    "actions_snapshot_sha256": adjustment_binding["actions_snapshot_sha256"],
+                    "adjusted_view_sha256": adjustment_binding["adjusted_view_sha256"],
+                    "price_basis_contract": price_basis_fields,
                     "reality_model_version": "daily_ohlcv_basic_v1",
                     "signal_cutoff": "close",
                     "entry_price_mode": "next_open",
@@ -137,16 +351,38 @@ class EventDrivenBacktestRunner:
                     "holding_days": holding_days,
                     "commission_bps_one_way": commission_bps,
                     "slippage_bps_one_way": slippage_bps,
+                    "cost_model_version": cost_model.version,
+                    "cost_model_hash": cost_model.model_hash,
+                    "sell_stamp_duty_bps_one_way": cost_model.sell_stamp_duty_bps_one_way,
+                    "transfer_fee_bps_one_way": cost_model.transfer_fee_bps_one_way,
+                    "sell_regulatory_fee_bps_one_way": cost_model.sell_regulatory_fee_bps_one_way,
+                    "sell_regulatory_fee_per_share": cost_model.sell_regulatory_fee_per_share,
+                    "min_commission": cost_model.min_commission,
                     "max_position_weight": max_position_weight,
+                    "max_sector_weight": max_sector_weight,
+                    "max_gross_exposure": max_gross_exposure,
+                    "max_participation_rate": max_participation_rate,
                     "min_signal_score": min_signal_score,
                     "min_adv": min_adv,
                     "max_gap_pct": max_gap_pct,
                     "initial_cash": initial_cash,
                     "model_run_name": model_run.name,
+                    "allow_unmodeled_corporate_actions": bool(allow_unmodeled_corporate_actions),
+                    "unmodeled_corporate_actions_optin_audit": unmodeled_optin_audit,
                 },
                 status="running",
             )
+            unmodeled: list[dict] = []
             try:
+                # Fail closed before touching the lake: a corrupt view or a view
+                # whose hash no longer matches the model run's recorded binding
+                # must not produce a backtest that claims that price basis.
+                if price_basis_decision.decision == DECISION_REJECT:
+                    raise RuntimeError(
+                        price_basis_decision.error_message(
+                            market=market, error=price_basis_probe.error
+                        )
+                    )
                 first_signal = datetime.strptime(signal_dates[0], "%Y-%m-%d").date()
                 last_signal = datetime.strptime(signal_dates[-1], "%Y-%m-%d").date()
                 raw_rows = load_lake_rows(
@@ -187,6 +423,36 @@ class EventDrivenBacktestRunner:
                     for prediction in predictions
                     if prediction.symbol_id in ticker_by_id
                 ]
+                # Conservative traded scope: signals that pass the score gate are
+                # the only names that can ever be bought, so restrict the
+                # unmodeled-action guard to them (a superset of actual holdings;
+                # no per-holding-day matching).
+                traded_tickers = {
+                    signal.ticker for signal in signals if float(signal.score) >= min_signal_score
+                }
+                corporate_actions, action_stats = self._load_market_corporate_actions(
+                    market=market,
+                    tickers=traded_tickers,
+                    start_date=signal_dates[0],
+                    end_date=signal_dates[-1],
+                    holding_days=holding_days,
+                )
+                unmodeled = action_stats["unsupported_details"]
+                # Persist the audit trail before the guard can abort: the detail
+                # list and the opt-in flag must survive in the run config even
+                # when the run is refused (fail closed) or the engine later
+                # errors, so config and summary tell the same story.
+                strategy_repo.merge_config(
+                    strategy_run.id,
+                    {
+                        "unmodeled_corporate_actions": unmodeled,
+                        "unmodeled_opt_in": bool(allow_unmodeled_corporate_actions),
+                        "unmodeled_corporate_actions_optin_audit": unmodeled_optin_audit,
+                    },
+                )
+                self._enforce_unmodeled_corporate_actions(
+                    unmodeled, allow=allow_unmodeled_corporate_actions
+                )
                 result = EventDrivenDailyEngine(
                     EngineConfig(
                         market=market,
@@ -195,12 +461,20 @@ class EventDrivenBacktestRunner:
                         initial_cash=initial_cash,
                         commission_bps=commission_bps,
                         slippage_bps=slippage_bps,
+                        sell_stamp_duty_bps_one_way=cost_model.sell_stamp_duty_bps_one_way,
+                        transfer_fee_bps_one_way=cost_model.transfer_fee_bps_one_way,
+                        sell_regulatory_fee_bps_one_way=cost_model.sell_regulatory_fee_bps_one_way,
+                        sell_regulatory_fee_per_share=cost_model.sell_regulatory_fee_per_share,
+                        min_commission=cost_model.min_commission,
                         max_position_weight=max_position_weight,
+                        max_sector_weight=max_sector_weight,
+                        max_gross_exposure=max_gross_exposure,
+                        max_participation_rate=max_participation_rate,
                         min_signal_score=min_signal_score,
                         min_adv=min_adv,
                         max_gap_pct=max_gap_pct,
                     )
-                ).run(bars=bars, signals=signals)
+                ).run(bars=bars, signals=signals, corporate_actions=corporate_actions)
                 benchmark_returns = self._benchmark_returns(bars)
                 metrics = []
                 benchmark_nav = 1.0
@@ -251,6 +525,15 @@ class EventDrivenBacktestRunner:
                 )
                 summary = {
                     "engine_version": self.engine_version,
+                    "corporate_actions": action_stats,
+                    "unmodeled_corporate_actions": unmodeled,
+                    "unmodeled_opt_in": bool(allow_unmodeled_corporate_actions),
+                    "unmodeled_corporate_actions_optin_audit": unmodeled_optin_audit,
+                    "calendar_version": CALENDAR_VERSION,
+                    "adjustment_version": adjustment_binding["adjustment_version"],
+                    "actions_snapshot_sha256": adjustment_binding["actions_snapshot_sha256"],
+                    "adjusted_view_sha256": adjustment_binding["adjusted_view_sha256"],
+                    "price_basis_contract": price_basis_fields,
                     "legacy": False,
                     "reality_model_version": "daily_ohlcv_basic_v1",
                     "model_run_id": model_run.id,
@@ -307,8 +590,15 @@ class EventDrivenBacktestRunner:
                     "cumulative_slippage": result.cumulative_slippage,
                     "commission_bps_one_way": commission_bps,
                     "slippage_bps_one_way": slippage_bps,
-                    "round_trip_cost_bps": 2.0 * (commission_bps + slippage_bps),
-                    "cost_assumption_bps": 2.0 * (commission_bps + slippage_bps),
+                    "cost_model_version": cost_model.version,
+                    "cost_model_hash": cost_model.model_hash,
+                    "sell_stamp_duty_bps_one_way": cost_model.sell_stamp_duty_bps_one_way,
+                    "transfer_fee_bps_one_way": cost_model.transfer_fee_bps_one_way,
+                    "sell_regulatory_fee_bps_one_way": cost_model.sell_regulatory_fee_bps_one_way,
+                    "sell_regulatory_fee_per_share": cost_model.sell_regulatory_fee_per_share,
+                    "min_commission": cost_model.min_commission,
+                    "round_trip_cost_bps": cost_model.nominal_round_trip_bps,
+                    "cost_assumption_bps": cost_model.nominal_round_trip_bps,
                     "gate_stats": result.gate_stats,
                     "audit_storage": "normalized_tables_v1",
                     "audit_counts": audit_counts,
@@ -321,6 +611,14 @@ class EventDrivenBacktestRunner:
                     status="failed",
                     summary={
                         "engine_version": self.engine_version,
+                        "calendar_version": CALENDAR_VERSION,
+                        "adjustment_version": adjustment_binding["adjustment_version"],
+                        "actions_snapshot_sha256": adjustment_binding["actions_snapshot_sha256"],
+                        "adjusted_view_sha256": adjustment_binding["adjusted_view_sha256"],
+                        "price_basis_contract": price_basis_fields,
+                        "unmodeled_corporate_actions": unmodeled,
+                        "unmodeled_opt_in": bool(allow_unmodeled_corporate_actions),
+                        "unmodeled_corporate_actions_optin_audit": unmodeled_optin_audit,
                         "legacy": False,
                         "error": str(exc),
                     },

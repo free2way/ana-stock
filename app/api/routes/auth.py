@@ -5,7 +5,15 @@ from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.core.config import get_settings
-from app.services.auth import AUTH_COOKIE_NAME, build_auth_cookie_value, sanitize_next_path, verify_credentials
+from app.services.auth import (
+    AUTH_COOKIE_NAME,
+    build_auth_cookie_value,
+    is_login_rate_limited,
+    register_login_failure,
+    reset_login_failures,
+    sanitize_next_path,
+    verify_credentials,
+)
 from app.services.ui_lang import resolve_request_lang
 
 
@@ -127,6 +135,7 @@ def login_page(request: Request, next: str = Query("/dashboard"), error: str | N
 
 @router.post("/login")
 def login_submit(
+    request: Request,
     username: str = Form(...),
     password: str = Form(...),
     next: str = Form("/dashboard"),
@@ -138,16 +147,30 @@ def login_submit(
             url=f"/login?next={quote(safe_next, safe='/?=&')}&error=Authentication+is+not+configured",
             status_code=303,
         )
+    client_key = request.client.host if request.client else "unknown"
+    if is_login_rate_limited(client_key):
+        return RedirectResponse(
+            url=f"/login?next={quote(safe_next, safe='/?=&')}&error=Too+many+failed+attempts%2C+try+again+later",
+            status_code=303,
+        )
     if verify_credentials(username, password):
+        reset_login_failures(client_key)
+        secure_flag = (
+            settings.auth_cookie_secure
+            if settings.auth_cookie_secure is not None
+            else request.url.scheme == "https"
+        )
         response = RedirectResponse(url=safe_next, status_code=303)
         response.set_cookie(
             AUTH_COOKIE_NAME,
             build_auth_cookie_value(settings.auth_username),
             httponly=True,
             samesite="lax",
+            secure=secure_flag,
             max_age=max(60, int(settings.auth_cookie_max_age_seconds)),
         )
         return response
+    register_login_failure(client_key)
     return RedirectResponse(
         url=f"/login?next={quote(safe_next, safe='/?=&')}&error=Invalid+username+or+password",
         status_code=303,

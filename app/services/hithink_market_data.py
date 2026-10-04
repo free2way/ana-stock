@@ -106,7 +106,12 @@ def import_hithink_market_dump(
 
     lake_paths: list[Path] = []
     if write_lake and rows:
-        lake_paths = write_ohlcv_rows_to_lake(market="CN", rows=rows, merge_existing=True)
+        lake_paths = write_ohlcv_rows_to_lake(
+            market="CN",
+            rows=rows,
+            merge_existing=True,
+            provenance={"provider": "hithink", "source_reference": "hithink:cn_daily"},
+        )
     status = "success" if rows and rejected_rows == 0 else "partial" if rows else "failed"
     now = datetime.now(SHANGHAI_TZ).isoformat()
     return {

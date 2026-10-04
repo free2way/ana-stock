@@ -11,6 +11,9 @@ from app.services.ai_chat import AI_CHAT_PROMPT_TEMPLATES, ask_ai_chat, load_ai_
 from app.services.auth import is_authenticated, login_redirect
 from app.services.ui_lang import resolve_request_lang
 from app.services.workspace_nav import WORKSPACE_COMPACT_STYLE, WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
+from app.api.presentation.tokens import (
+    ROOT_TOKENS_BASE_SIGNALS,
+)
 
 
 router = APIRouter(prefix="/ai-chat", tags=["ai-chat"])
@@ -67,7 +70,7 @@ def _render_ai_chat_page(
         </section>
         """
 
-    return f"""
+    return (f"""
     <!DOCTYPE html>
     <html lang="{lang}">
       <head>
@@ -75,7 +78,7 @@ def _render_ai_chat_page(
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{'AI 问答' if lang == 'zh' else 'AI Q&A'}</title>
         <style>
-          :root {{ --bg:#071018; --panel:#111c28; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; --warn:#fbbf24; --danger:#fb7185; --blue:#60a5fa; }}
+          """ + (ROOT_TOKENS_BASE_SIGNALS) + f"""
           * {{ box-sizing:border-box; }}
           body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(96,165,250,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.14), transparent 26%),linear-gradient(180deg,#08111a 0%,#071018 100%); }}
           a {{ color:inherit; text-decoration:none; }}
@@ -180,7 +183,7 @@ def _render_ai_chat_page(
         </script>
       </body>
     </html>
-    """
+    """)
 
 
 @router.get("", response_class=HTMLResponse)

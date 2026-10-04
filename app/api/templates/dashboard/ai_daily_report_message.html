@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ t(lang, 'A股 AI 日报推送文本', 'AI Report Push Text') }}</title>
+    <style>{{ style }}</style>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-tag">PQW</span>
+          <h1>{{ t(lang, '推送文本', 'Push Text') }}</h1>
+          <p>{{ t(lang, '把 AI 日报整理成可直接发送的文本。', 'Prepare the AI report as a push-ready message.') }}</p>
+        </div>
+        <nav class="side-nav">{{ nav_html }}</nav>
+      </aside>
+      <main class="main">
+        <div class="wrap">
+          <div class="toolbar">
+            <a class="pill" href="/dashboard/ai-daily-report?lang={{ lang }}">← {{ t(lang, '返回 AI 日报', 'Back to AI report') }}</a>
+          </div>
+          <section class="card">
+            <div class="eyebrow">A-Share Push Ready</div>
+            <div class="muted">{{ t(lang, '下面这段文本默认只包含 A 股，可直接复制到 Telegram、企业微信、飞书或邮件。', 'The text below is ready to copy into Telegram, WeCom, Feishu, or email.') }}</div>
+            <textarea readonly>{{ message }}</textarea>
+          </section>
+        </div>
+      </main>
+    </div>
+  </body>
+</html>

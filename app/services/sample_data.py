@@ -1,3 +1,6 @@
+import math
+from datetime import date as _date, timedelta as _timedelta
+
 from app.core.db import SessionLocal, init_db
 from app.models.schema import SymbolCreate
 from app.services.market_lake import write_ohlcv_rows_to_lake
@@ -34,7 +37,85 @@ SAMPLE_DATA = {
 }
 
 
-def seed_sample_data() -> list[dict]:
+def _trading_days_before(end_date: _date, count: int, *, market: str = "US") -> list[_date]:
+    from app.services.market_calendar import is_market_open_date
+
+    days: list[_date] = []
+    cursor = end_date
+    while len(days) < count:
+        cursor -= _timedelta(days=1)
+        if is_market_open_date(market, cursor):
+            days.append(cursor)
+    days.reverse()
+    return days
+
+
+def extend_sample_rows(ticker: str, *, days: int) -> list[dict]:
+    """Return the sample rows grown to ``days`` trading days.
+
+    History is synthesized *before* the curated window so the existing dates
+    stay the most recent ones: tests that assert on the curated tail keep
+    seeing the same recent sessions while the trainer gains enough warmup to
+    pass its minimum-history gate. The synthetic series is a deterministic,
+    low-volatility walk (daily moves well under the limit bands) built from
+    the first curated close, which keeps label eligibility meaningful.
+
+    Curated rows that fall on a closed session (e.g. ``2026-04-03`` is a US
+    holiday) are dropped here only: the backtest engine refuses to emit
+    signals on dates outside the explicit market calendar, and the curated
+    tail would otherwise leak such a date into the prediction window. The
+    default ``seed_sample_data()`` path is unaffected.
+    """
+
+    from app.services.market_calendar import is_market_open_date
+
+    base_rows = [
+        row for row in SAMPLE_DATA[ticker] if is_market_open_date("US", str(row["date"]))
+    ]
+    missing = int(days) - len(base_rows)
+    if missing <= 0:
+        return base_rows
+
+    first_date = _date.fromisoformat(str(base_rows[0]["date"]))
+    anchor = float(base_rows[0]["close"])
+    dates = _trading_days_before(first_date, missing, market="US")
+    total = len(dates)
+    synthetic: list[dict] = []
+    previous_close = anchor * 0.8
+    for index, day in enumerate(dates):
+        progress = (index + 1) / (total + 1)
+        close = anchor * (0.8 + 0.2 * progress + 0.01 * math.sin(index / 6.0))
+        close = round(close, 4)
+        open_price = round(previous_close, 4)
+        high = round(max(open_price, close) * 1.005, 4)
+        low = round(min(open_price, close) * 0.995, 4)
+        volume = 1_000_000 + (index % 5) * 25_000
+        synthetic.append(
+            {
+                "date": day.isoformat(),
+                "symbol": ticker,
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+                "adj_close": close,
+                "dividend": "",
+                "split_ratio": "",
+            }
+        )
+        previous_close = close
+    return synthetic + base_rows
+
+
+def seed_sample_data(*, days: int | None = None) -> list[dict]:
+    """Seed the sample universe.
+
+    ``days`` optionally stretches each ticker's history to that many trading
+    days (synthesizing the extra leading sessions). It defaults to ``None`` so
+    existing callers keep the original 5-10 session fixture.
+    """
+
     init_db()
     results: list[dict] = []
 
@@ -43,11 +124,17 @@ def seed_sample_data() -> list[dict]:
         sync_repo = PriceSyncStateRepository(db)
 
         for ticker, rows in SAMPLE_DATA.items():
+            if days is not None:
+                rows = extend_sample_rows(ticker, days=days)
             symbol = symbol_repo.get_by_ticker(ticker)
             if symbol is None:
                 symbol = symbol_repo.create_symbol(SymbolCreate(ticker=ticker, name=ticker, market="US"))
 
-            lake_paths = write_ohlcv_rows_to_lake(market="US", rows=rows)
+            lake_paths = write_ohlcv_rows_to_lake(
+                market="US",
+                rows=rows,
+                provenance={"provider": "sample", "source_reference": "sample_data:v1"},
+            )
 
             sync_repo.upsert_state(
                 symbol_id=symbol.id,

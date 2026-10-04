@@ -11,6 +11,7 @@ from sqlalchemy import select, text
 from app.api.routes import ai_chat, auth, backtests, dashboard, insights, jobs, portfolio, review_journal, screener, settings as settings_routes, signals, social_signals, symbols, watchlist
 from app.core.config import get_settings
 from app.core.db import init_db
+from app.services.auth import is_authenticated, login_redirect
 from app.services.auto_analysis import auto_analysis_service
 from app.services.cn_market_universe import _is_supported_cn_symbol
 from app.services.cn_market_scheduler import cn_market_scheduler_service
@@ -78,6 +79,26 @@ async def persist_language_preference(request: Request, call_next):
     logger.info(line)
     print(line, flush=True)
     return response
+
+
+# Paths reachable without a session. Everything else -- including every JSON
+# and form-POST endpoint -- is redirected to /login by the middleware below,
+# so a new route file can no longer silently ship an unauthenticated mutation.
+PUBLIC_AUTH_PATHS = {"/login", "/health", "/health/ready"}
+
+
+@app.middleware("http")
+async def enforce_authentication(request: Request, call_next):
+    # Registered after persist_language_preference, so this runs first
+    # (outermost) and unauthenticated requests never reach a handler.
+    path = request.url.path
+    if path in PUBLIC_AUTH_PATHS or is_authenticated(request):
+        return await call_next(request)
+    next_path = path
+    if request.url.query:
+        next_path = f"{path}?{request.url.query}"
+    return login_redirect(next_path)
+
 
 app.include_router(auth.router)
 app.include_router(symbols.router)

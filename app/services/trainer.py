@@ -9,7 +9,7 @@ import time
 import tracemalloc
 import warnings
 from dataclasses import asdict
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date, datetime
 
 from app.core.config import get_settings
@@ -35,6 +35,7 @@ from app.services.repository import (
     FundamentalSnapshotRepository,
     LivePredictionRepository,
     ModelRunRepository,
+    PointInTimeFeatureSnapshotRepository,
     PredictionArtifactRepository,
     PredictionDetailRepository,
     PredictionExplanationRepository,
@@ -51,11 +52,134 @@ from app.services.stock_selection.executable_outcomes import (
     limit_up_at_open,
     ExecutionEligibility,
 )
+from app.services.adjustment_snapshot import adjustment_version_binding
+from app.services.price_basis_contract import (
+    DECISION_REJECT,
+    ENTRY_INFERENCE,
+    ENTRY_TRAIN,
+    RAW_FALLBACK_AUTHORIZATION_SOURCE,
+    REASON_ADJUSTED_VIEW_ABSENT,
+    REASON_UNREADABLE_VIEW,
+    AdjustedViewProbe,
+    PriceBasisRequirements,
+    decide_price_basis,
+    read_adjusted_view_with_probe,
+)
+from app.services.optin_audit import build_optin_audit
+from app.services.ticker_format import infer_market_from_ticker
 from app.services.stock_selection.labels import PriceBar
 from app.services.stock_selection.training_window import TrainingWindowPolicy, TrainingWindowBlocked, select_training_window
 
 EXECUTABLE_LABEL_PROFILE = "executable_net_return_v1"
 LEGACY_LABEL_PROFILE = "legacy_short_horizon_composite_v1"
+
+# Label families whose prices are read through `_label_price` and therefore
+# must be tracked for adjusted-view coverage. The reconciled profile replays
+# raw-basis execution provenance by contract and is deliberately excluded.
+LABEL_PRICE_TRACKED_PROFILES = (EXECUTABLE_LABEL_PROFILE, LEGACY_LABEL_PROFILE)
+
+# Walk-forward OOS evidence written into the run config for the unified
+# promotion gate (``promotion_gate_v2`` reads ``oos_evaluation`` with an
+# ``evaluated_date_count`` and a ``mean_risk_adjusted_return``). The trainer
+# evaluates its own matured out-of-sample predictions, top-N by score per
+# prediction date; only return-based label profiles can supply it.
+OOS_EVALUATION_TOP_N = 5
+OOS_RETURN_LABEL_PROFILES = (EXECUTABLE_LABEL_PROFILE, RECONCILED_VERSION)
+
+# The trainer has no independent universe/metadata/industry readiness audit;
+# that evidence is produced by the research pipeline
+# (``audit_market_research_readiness``). Recorded next to the evidence it could
+# not supply so the omission is auditable rather than silently missing.
+DATA_READINESS_EVIDENCE_MISSING_REASON = (
+    "the trainer does not run a universe/metadata/industry readiness audit; "
+    "readiness evidence is produced by the research pipeline "
+    "(audit_market_research_readiness) and must be attached by promotion tooling"
+)
+
+
+def _empty_label_price_stats() -> dict[str, int]:
+    return {
+        "adjusted_count": 0,
+        "raw_fallback_count": 0,
+        "dropped_missing_adjusted_count": 0,
+    }
+
+# Fundamental features the trainer consumes. History now comes from the
+# point-in-time feature store so that the availability timestamp (publication
+# / ingestion), not the fiscal period end, decides when a row may be used.
+TRAINER_FUNDAMENTAL_FEATURES = (
+    "pe_ttm",
+    "dividend_yield",
+    "market_cap",
+    "roe_avg_3y",
+    "net_profit_yoy",
+    "revenue_yoy",
+    "debt_to_assets",
+)
+
+
+def group_point_in_time_fundamental_history(records: list[dict]) -> dict[str, list[dict]]:
+    """Pivot long-format PIT feature rows into per-report training history.
+
+    Each output item carries the *maximum* ``available_time`` of its feature
+    group so a partially published report is never treated as fully known
+    before its last feature became available. Items are ordered by
+    availability, which lets the cursor stop safely at the first row that is
+    not yet observable.
+    """
+
+    grouped: dict[tuple[str, str], dict] = {}
+    for record in records:
+        ticker = str(record.get("ticker") or "").strip().upper()
+        feature_name = str(record.get("feature_name") or "").strip()
+        if not ticker or feature_name not in TRAINER_FUNDAMENTAL_FEATURES:
+            continue
+        payload: dict = {}
+        raw_payload = record.get("payload_json")
+        if raw_payload:
+            try:
+                parsed = json.loads(raw_payload) if isinstance(raw_payload, str) else dict(raw_payload)
+                payload = parsed if isinstance(parsed, dict) else {}
+            except (TypeError, ValueError):
+                payload = {}
+        report_date = str(payload.get("report_date") or str(record.get("event_time") or "")[:10]).strip()
+        available_time = str(record.get("available_time") or "").strip()
+        ingested_time = str(record.get("ingested_time") or "").strip()
+        key = (ticker, report_date)
+        item = grouped.setdefault(
+            key,
+            {
+                "ticker": ticker,
+                "report_date": report_date,
+                "available_time": available_time,
+                "ingested_time": ingested_time,
+                "source": str(record.get("source") or "").strip(),
+            },
+        )
+        if available_time > str(item.get("available_time") or ""):
+            item["available_time"] = available_time
+        if ingested_time > str(item.get("ingested_time") or ""):
+            item["ingested_time"] = ingested_time
+        value = record.get("feature_value")
+        if value is not None:
+            try:
+                item[feature_name] = float(value)
+            except (TypeError, ValueError):
+                continue
+    history: dict[str, list[dict]] = defaultdict(list)
+    for item in grouped.values():
+        cleaned = {key: value for key, value in item.items() if value not in (None, "")}
+        if not cleaned.get("available_time"):
+            # Fail closed: a report without a publication timestamp is not
+            # allowed to enter training at an assumed date.
+            continue
+        history[str(item["ticker"])].append(cleaned)
+    for ticker in history:
+        history[ticker].sort(
+            key=lambda item: (str(item.get("available_time") or ""), str(item.get("report_date") or ""))
+        )
+    return dict(history)
+
 
 
 def resolve_label_profile_contract(label_profile_setting: str | None) -> tuple[str, str]:
@@ -94,6 +218,9 @@ except ImportError:  # pragma: no cover - optional challenger
 
 class SignalTrainer:
     """Train production signals and expose versioned challenger label adapters."""
+
+    # Label price basis: "raw" unless the adjusted view was attached (A1).
+    _label_basis: str = "raw"
 
     @staticmethod
     def executable_training_target(
@@ -150,6 +277,22 @@ class SignalTrainer:
 
     def __init__(self) -> None:
         self.settings = get_settings()
+        # Label-side price-basis bookkeeping (A1). `_adjusted_basis_expected`
+        # records whether an adjusted view was even applicable (CN/US); the
+        # counters describe how the samples that were actually built used it.
+        self._adjusted_basis_expected = False
+        # Three-state adjusted-view status (A1 fail-closed follow-up): one of
+        # ``absent`` / ``present`` / ``unreadable``. ``unreadable`` (file exists
+        # but cannot be read/parsed) is never downgraded to "no view".
+        self._adjusted_view_state = "absent"
+        self._adjusted_view_error: str | None = None
+        self._adjusted_view_market: str | None = None
+        # Shared price-basis contract state (train decision + the probe it came
+        # from) so the prediction product can persist the same audit fields.
+        self._adjusted_view_probe: AdjustedViewProbe | None = None
+        self._price_basis_decision = None
+        self._price_basis_requirements: PriceBasisRequirements | None = None
+        self._label_price_stats: dict[str, int] = _empty_label_price_stats()
 
     def _training_window_policy(self, market: str | None) -> TrainingWindowPolicy:
         prefix = "trainer_cn_window" if str(market or "").upper() == "CN" else "trainer_us_window"
@@ -489,6 +632,42 @@ class SignalTrainer:
         normalized = str(market or "").strip().upper()
         return normalized or None
 
+    def _sample_label_market(self, *, market: str | None, ticker: str) -> str:
+        """Resolve the market used to build executable labels for one ticker.
+
+        An explicit CN/US/HK market always wins; empty, ``ALL``, ``MIXED`` or
+        any other non-market code falls back to the repository's canonical
+        ticker-suffix rule (:func:`infer_market_from_ticker`) so a label is
+        never built against an ambiguous market.
+        """
+
+        normalized = self._normalize_market_code(market)
+        if normalized in {"CN", "US", "HK"}:
+            return normalized
+        return infer_market_from_ticker(ticker)
+
+    def _resolve_run_market(self, *, market: str | None, rows: list[dict]) -> str:
+        """Resolve the single concrete market a persisted run belongs to.
+
+        Physical/hot prediction storage rejects ambiguous markets
+        (``""``/``MIXED``), so when the caller does not pin CN/US/HK we fall
+        back to the tickers under training. Labels are still resolved
+        per symbol; this only supplies the run-level storage market.
+        """
+
+        normalized = self._normalize_market_code(market)
+        if normalized in {"CN", "US", "HK"}:
+            return normalized
+        tickers = {
+            str(row.get("symbol") or "").strip().upper()
+            for row in rows
+            if str(row.get("symbol") or "").strip()
+        }
+        if tickers:
+            counts = Counter(infer_market_from_ticker(ticker) for ticker in tickers)
+            return counts.most_common(1)[0][0]
+        return "US"
+
     def _filter_rows_by_market(self, rows: list[dict], *, market: str | None) -> list[dict]:
         normalized_market = self._normalize_market_code(market)
         if normalized_market in {None, "", "ALL"}:
@@ -517,7 +696,302 @@ class SignalTrainer:
         rows = load_lake_rows(tickers=tickers)
         rows = self._filter_rows_by_market(rows, market=market)
         rows.sort(key=lambda row: (row.get("symbol") or "", row.get("date") or ""))
+        self._attach_adjusted_basis(rows, market=market)
         return rows
+
+    def _attach_adjusted_basis(self, rows: list[dict], *, market: str | None) -> int:
+        """Attach the versioned adjusted view onto rows for label construction (A1).
+
+        Fields are namespaced (``adjusted_open``…): the legacy lake ``adj_close``
+        column is NOT trustworthy (F1), so labels must read the rebuilt view.
+        Raw ``open/high/low/close`` stay untouched for features and exchange
+        limit checks.
+
+        Every row is stamped with an explicit ``adjusted_view_attached`` flag so
+        label construction can verify *per window* that all of its price points
+        share one basis. The run-level ``_label_basis`` is only
+        ``"adjusted_view"`` when the attach is complete for this row set;
+        partial attaches are reported as ``"mixed"`` instead of silently
+        claiming an adjusted run.
+        """
+
+        normalized = str(market or "").strip().upper()
+        self._adjusted_basis_expected = False
+        self._adjusted_view_state = "absent"
+        self._adjusted_view_error = None
+        self._adjusted_view_market = None
+        self._adjusted_view_probe = None
+        if normalized not in {"CN", "US"} or not rows:
+            self._label_basis = "raw"
+            return 0
+        self._adjusted_basis_expected = True
+        self._adjusted_view_market = normalized
+        symbols = {str(row.get("symbol") or "").strip().upper() for row in rows}
+
+        # Three-state view detection (fail closed) via the shared price-basis
+        # contract. The attach itself never raises so prediction-only paths keep
+        # degrading gracefully, but an ``unreadable`` view is recorded with its
+        # path/reason and the run contract refuses to persist it rather than
+        # treating it as "no view".
+        adjusted, probe = read_adjusted_view_with_probe(
+            normalized, symbols=symbols, rows=rows
+        )
+        self._adjusted_view_probe = probe
+        self._adjusted_view_state = probe.state
+        self._adjusted_view_error = probe.error
+        attached = 0
+        for row in rows:
+            symbol = str(row.get("symbol") or "").strip().upper()
+            trade_date = str(row.get("date") or "")[:10]
+            bars = adjusted.get(symbol)
+            payload = bars.get(trade_date) if bars else None
+            usable = bool(payload) and all(
+                isinstance(payload.get(field), (int, float))
+                and math.isfinite(float(payload[field]))
+                and float(payload[field]) > 0
+                for field in ("open", "high", "low", "close")
+            )
+            if not usable:
+                # Never leave a stale adjusted price from a previous attach: a
+                # missing or unusable row must be unresolvable as adjusted
+                # downstream, otherwise `_label_price` would silently mix a raw
+                # fallback into a window we already accepted as adjusted.
+                for field in ("open", "high", "low", "close"):
+                    row.pop(f"adjusted_{field}", None)
+                row["adjusted_view_attached"] = False
+                continue
+            row["adjusted_open"] = float(payload["open"])
+            row["adjusted_high"] = float(payload["high"])
+            row["adjusted_low"] = float(payload["low"])
+            row["adjusted_close"] = float(payload["close"])
+            row["adjusted_view_attached"] = True
+            attached += 1
+        if attached and attached == len(rows):
+            self._label_basis = "adjusted_view"
+        elif attached == 0:
+            self._label_basis = "raw"
+        else:
+            self._label_basis = "mixed"
+        return attached
+
+    def _resolve_sample_price_basis(
+        self,
+        *,
+        symbol_rows: list[dict],
+        index: int,
+        label_profile: str,
+        horizon_days: int,
+    ) -> str | None:
+        """Classify one sample's label-window price basis.
+
+        Returns ``None`` when basis tracking does not apply (non CN/US row sets,
+        or the raw-basis reconciled profile), otherwise one of:
+
+        * ``"adjusted"`` — every price point of the window is adjusted.
+        * ``"raw_fallback"`` — no price point is adjusted; the whole window is
+          consistently raw, so the sample can still be labeled (and counted) on
+          raw prices while the run is reported as mixed.
+        * ``"drop_missing_adjusted"`` — the window mixes adjusted and raw points.
+          Mixed windows are never labeled: the sample is counted and its label
+          dropped (fail closed).
+        """
+
+        if not getattr(self, "_adjusted_basis_expected", False):
+            return None
+        if label_profile not in LABEL_PRICE_TRACKED_PROFILES:
+            return None
+        span = horizon_days if label_profile == EXECUTABLE_LABEL_PROFILE else 5
+        window = symbol_rows[index : index + span + 1]
+        flags = [bool(row.get("adjusted_view_attached")) for row in window]
+        if not flags or all(flags):
+            return "adjusted"
+        if not any(flags):
+            return "raw_fallback"
+        return "drop_missing_adjusted"
+
+    def _label_price_basis_contract(
+        self,
+        *,
+        label_profile: str,
+        require_full: bool | None = None,
+    ) -> dict[str, object]:
+        """Resolve the truthful run-level label price basis and enforce the gate.
+
+        ``adjusted_coverage_share`` is measured over the samples whose labels
+        were actually built (adjusted + raw fallback + dropped), never over the
+        raw lake width, so the gate follows label quality rather than an
+        unrelated row count.
+
+        The gate fires in three fail-closed situations for an applicable
+        (CN/US, price-tracked-profile) run:
+
+        * the view file is ``unreadable`` — always raise, never treat a corrupt
+          view as "no view";
+        * the view is ``absent`` and raw fallback was not explicitly opted into
+          via ``PQW_TRAINER_ALLOW_RAW_FALLBACK=true`` — raise, so a missing view
+          cannot silently produce raw labels;
+        * the view is ``present`` but does not fully cover the label windows —
+          raise (unless full coverage was explicitly waived).
+
+        Only an explicitly opted-in absent view is persisted: it is reported as
+        ``mixed:0.00000000`` (never ``adjusted_view``) with
+        ``raw_fallback_allowed=true``. The opt-in is additionally recorded as a
+        structured ``raw_fallback_optin_audit`` object (operator / decided_at /
+        scope / reason); an opt-in that carries no reason is refused fail-closed
+        so a waiver can never be persisted without an audit trail.
+        """
+
+        stats = getattr(self, "_label_price_stats", None) or _empty_label_price_stats()
+        adjusted_count = int(stats.get("adjusted_count") or 0)
+        raw_fallback_count = int(stats.get("raw_fallback_count") or 0)
+        dropped_missing_adjusted_count = int(stats.get("dropped_missing_adjusted_count") or 0)
+        candidate_count = adjusted_count + raw_fallback_count + dropped_missing_adjusted_count
+        adjusted_coverage_share = (
+            adjusted_count / candidate_count if candidate_count else 1.0
+        )
+        applicable = bool(getattr(self, "_adjusted_basis_expected", False)) and str(
+            label_profile or ""
+        ).strip().lower() in LABEL_PRICE_TRACKED_PROFILES
+        view_state = str(getattr(self, "_adjusted_view_state", "absent") or "absent")
+        view_present = view_state == "present"
+        view_market = getattr(self, "_adjusted_view_market", None)
+        allow_raw_fallback = bool(
+            getattr(self.settings, "trainer_allow_raw_fallback", False)
+        )
+        if require_full is None:
+            require_full = bool(
+                getattr(self.settings, "trainer_require_full_adjusted_coverage", True)
+            )
+        # Build the probe from live detector state. Production rows come from
+        # ``_attach_adjusted_basis`` (which stores the shared probe), while unit
+        # callers may set ``_adjusted_view_state`` directly; both feed the same
+        # decision table so train / inference / backtest cannot drift apart.
+        probe = getattr(self, "_adjusted_view_probe", None)
+        expected_market = str(view_market).strip().upper() if view_market else None
+        if probe is None or probe.state != view_state or probe.market != expected_market:
+            probe = AdjustedViewProbe(
+                market=expected_market,
+                state=view_state,
+                error=getattr(self, "_adjusted_view_error", None),
+                coverage_share=adjusted_coverage_share,
+            )
+        requirements = PriceBasisRequirements(
+            entry_point=ENTRY_TRAIN,
+            requires_adjusted_prices=applicable,
+            require_full_coverage=bool(require_full),
+            allow_raw_fallback=allow_raw_fallback,
+            adjusted_count=adjusted_count,
+            raw_fallback_count=raw_fallback_count,
+            dropped_missing_adjusted_count=dropped_missing_adjusted_count,
+            gates_coverage=True,
+        )
+        decision = decide_price_basis(ENTRY_TRAIN, probe, requirements)
+        self._adjusted_view_probe = probe
+        self._price_basis_decision = decision
+        self._price_basis_requirements = requirements
+        contract: dict[str, object] = {
+            "label_price_basis": decision.label_price_basis,
+            "label_price_basis_applicable": decision.applicable,
+            "adjusted_view_present": view_present,
+            "adjusted_view_state": decision.view_state,
+            "raw_fallback_allowed": allow_raw_fallback,
+            "adjusted_count": adjusted_count,
+            "raw_fallback_count": raw_fallback_count,
+            "dropped_missing_adjusted_count": dropped_missing_adjusted_count,
+            "adjusted_coverage_share": round(decision.coverage_share, 8),
+            "require_full_adjusted_coverage": bool(require_full),
+        }
+        if decision.decision != DECISION_REJECT:
+            # Structured, accountable opt-in record. Enabling the raw-label
+            # opt-in always requires a reason (same fail-closed rule as the
+            # runner's unmodeled corporate-action opt-in): an enabled opt-in
+            # without one raises MissingOptinReasonError here *before* the run is
+            # persisted. Whether the waiver is actually exercised on this run is
+            # deliberately irrelevant — a standing opt-in is still an operator
+            # decision that must be attributable.
+            contract["raw_fallback_optin_audit"] = build_optin_audit(
+                enabled=allow_raw_fallback,
+                source=RAW_FALLBACK_AUTHORIZATION_SOURCE,
+                scope={
+                    "entry_point": ENTRY_TRAIN,
+                    "market": expected_market,
+                    "label_profile": str(label_profile or "").strip().lower() or None,
+                    "adjusted_view_state": decision.view_state,
+                    "coverage_share": round(decision.coverage_share, 8),
+                    "require_full_adjusted_coverage": bool(require_full),
+                },
+                operator=getattr(self.settings, "optin_operator", None),
+                reason=getattr(self.settings, "optin_reason", None),
+            )
+            return contract
+        if REASON_UNREADABLE_VIEW in decision.reasons:
+            raise RuntimeError(
+                "Trainer refused an adjusted-view label run: the adjusted view "
+                f"exists but is unreadable for market={view_market} "
+                f"(reason={getattr(self, '_adjusted_view_error', None)}). A corrupt "
+                "or unreadable view is never treated as 'no view'. Rebuild it "
+                "(scripts/rebuild_adjusted_view.py) before training."
+            )
+        if REASON_ADJUSTED_VIEW_ABSENT in decision.reasons:
+            raise RuntimeError(
+                "Trainer refused a CN/US label run without an adjusted view: no "
+                f"adjusted view file exists for market={view_market}. Rebuild it "
+                "(scripts/rebuild_adjusted_view.py), or explicitly opt in to raw "
+                "labels with PQW_TRAINER_ALLOW_RAW_FALLBACK=true plus an auditable "
+                "reason (PQW_OPTIN_REASON); the run is then recorded as "
+                "mixed:0.00000000 with raw_fallback_allowed=true and a structured "
+                "raw_fallback_optin_audit record."
+            )
+        # Incomplete coverage (or any future reject reason) fails closed with the
+        # enumerable reason list so callers can explain the refusal.
+        raise RuntimeError(
+            "Trainer refused an adjusted-view label run with incomplete coverage: "
+            f"adjusted_count={adjusted_count}, raw_fallback_count={raw_fallback_count}, "
+            f"dropped_missing_adjusted_count={dropped_missing_adjusted_count}, "
+            f"adjusted_coverage_share={adjusted_coverage_share:.8f}, "
+            f"reasons={list(decision.reasons)}. "
+            "Complete the adjusted view or set "
+            "PQW_TRAINER_REQUIRE_FULL_ADJUSTED_COVERAGE=false to persist a "
+            "truthfully-labelled mixed-basis run."
+        )
+
+    def _prediction_price_basis_contract(self) -> dict[str, object] | None:
+        """Audit fields for the *inference* (prediction) product.
+
+        The trainer both fits labels and scores recent dates from one view; the
+        prediction product inherits the label basis. Reconciling the decision
+        through the same table keeps published predictions from ever claiming an
+        adjusted basis the run did not actually use.
+        """
+
+        decision = getattr(self, "_price_basis_decision", None)
+        requirements = getattr(self, "_price_basis_requirements", None)
+        probe = getattr(self, "_adjusted_view_probe", None)
+        if decision is None or probe is None:
+            return None
+        if requirements is None:
+            inference_requirements = PriceBasisRequirements(entry_point=ENTRY_INFERENCE)
+        else:
+            inference_requirements = PriceBasisRequirements(
+                entry_point=ENTRY_INFERENCE,
+                requires_adjusted_prices=requirements.requires_adjusted_prices,
+                require_full_coverage=requirements.require_full_coverage,
+                allow_raw_fallback=requirements.allow_raw_fallback,
+                adjusted_count=requirements.adjusted_count,
+                raw_fallback_count=requirements.raw_fallback_count,
+                dropped_missing_adjusted_count=requirements.dropped_missing_adjusted_count,
+                gates_coverage=True,
+            )
+        inference = decide_price_basis(ENTRY_INFERENCE, probe, inference_requirements)
+        return inference.audit_fields()
+
+    def _label_price(self, row: dict, field: str) -> float | None:
+        """Label-side price: adjusted view when attached, else raw (A1)."""
+
+        adjusted = self._safe_float(row.get(f"adjusted_{field}"))
+        if adjusted is not None and adjusted > 0:
+            return adjusted
+        return self._safe_float(row.get(field))
 
     def _moving_average(self, values: list[float], window: int) -> float | None:
         if not values:
@@ -614,13 +1088,17 @@ class SignalTrainer:
                 str(item.get("ticker") or "").strip().upper(): item
                 for item in FundamentalSnapshotRepository(db).list_latest_for_market(market, tickers=sorted(tickers))
             }
-            fundamental_history_rows = FundamentalSnapshotRepository(db).list_history_for_market(market, tickers=sorted(tickers))
+            # Training features come from the append-only point-in-time store:
+            # fiscal period end is not a knowledge date. The wide snapshot
+            # repository is only used above for non-training metadata
+            # (name / listing date).
+            pit_history_rows = PointInTimeFeatureSnapshotRepository(db).list_history_for_market(
+                market,
+                tickers=sorted(tickers),
+                feature_names=list(TRAINER_FUNDAMENTAL_FEATURES),
+            )
             concept_history_rows = ConceptSnapshotRepository(db).list_history_for_market(market, tickers=sorted(tickers))
-        fundamentals_by_ticker: dict[str, list[dict]] = defaultdict(list)
-        for item in fundamental_history_rows:
-            ticker = str(item.get("ticker") or "").strip().upper()
-            if ticker:
-                fundamentals_by_ticker[ticker].append(item)
+        fundamentals_by_ticker = group_point_in_time_fundamental_history(pit_history_rows)
         concepts_by_ticker_date: dict[str, dict[str, dict]] = defaultdict(dict)
         for item in concept_history_rows:
             ticker = str(item.get("ticker") or "").strip().upper()
@@ -670,17 +1148,34 @@ class SignalTrainer:
         cursor: int,
         trade_date: str,
     ) -> tuple[int, dict | None]:
+        """Advance by publication availability, never by fiscal period end.
+
+        History is ordered by ``available_time``. A report whose last feature
+        had not been published on ``trade_date`` must not be visible to the
+        sample. Rows without an availability timestamp are skipped rather than
+        assumed known at period end (fail closed).
+        """
+
         active: dict | None = None
         index = cursor
         while index < len(history):
-            report_date = str(history[index].get("report_date") or "").strip()
-            if report_date and report_date <= trade_date:
-                active = history[index]
+            item = history[index]
+            available_time = str(item.get("available_time") or "").strip()
+            if not available_time:
+                index += 1
+                continue
+            if available_time[:10] <= trade_date:
+                active = item
                 index += 1
                 continue
             break
-        if active is None and index > 0:
-            active = history[index - 1]
+        if active is None and cursor > 0:
+            previous = history[cursor - 1]
+            previous_available = str(previous.get("available_time") or "").strip()
+            if previous_available and previous_available[:10] <= trade_date:
+                # Between two publications the last published report stays in
+                # force. Timestamp-less rows are never used as fallback.
+                active = previous
         return index, active
 
     def _advance_concept_cursor(
@@ -719,17 +1214,17 @@ class SignalTrainer:
             return None, {}
 
         next_row = future_rows[0]
-        next_open = self._safe_float(next_row.get("open"))
-        next_high = self._safe_float(next_row.get("high"))
-        next_low = self._safe_float(next_row.get("low"))
-        next_close = self._safe_float(next_row.get("close"))
+        next_open = self._label_price(next_row, "open")
+        next_high = self._label_price(next_row, "high")
+        next_low = self._label_price(next_row, "low")
+        next_close = self._label_price(next_row, "close")
 
         future_3d = future_rows[:3]
         future_5d = future_rows[:5]
-        future_3d_highs = [self._safe_float(row.get("high")) for row in future_3d]
-        future_3d_lows = [self._safe_float(row.get("low")) for row in future_3d]
-        future_5d_highs = [self._safe_float(row.get("high")) for row in future_5d]
-        future_5d_lows = [self._safe_float(row.get("low")) for row in future_5d]
+        future_3d_highs = [self._label_price(row, "high") for row in future_3d]
+        future_3d_lows = [self._label_price(row, "low") for row in future_3d]
+        future_5d_highs = [self._label_price(row, "high") for row in future_5d]
+        future_5d_lows = [self._label_price(row, "low") for row in future_5d]
 
         next_1d_close_return = self._future_return(next_close, anchor_close)
         next_1d_open_gap = self._future_return(next_open, anchor_close)
@@ -741,7 +1236,7 @@ class SignalTrainer:
         next_5d_max_return = self._future_return(max(future_5d_highs), anchor_close) if len(future_5d) >= 5 else None
         next_5d_max_drawdown = self._future_return(min(future_5d_lows), anchor_close) if len(future_5d) >= 5 else None
         next_5d_close_return = (
-            self._future_return(self._safe_float(future_5d[-1].get("close")), anchor_close) if len(future_5d) >= 5 else None
+            self._future_return(self._label_price(future_5d[-1], "close"), anchor_close) if len(future_5d) >= 5 else None
         )
 
         failed_after_gap_up = 0.0
@@ -834,10 +1329,10 @@ class SignalTrainer:
                 bars.append(
                     PriceBar(
                         bar_date,
-                        self._safe_float(row.get("open")) or 0.0,
-                        self._safe_float(row.get("high")) or 0.0,
-                        self._safe_float(row.get("low")) or 0.0,
-                        self._safe_float(row.get("close")) or 0.0,
+                        (self._label_price(row, "open") or 0.0),
+                        (self._label_price(row, "high") or 0.0),
+                        (self._label_price(row, "low") or 0.0),
+                        (self._label_price(row, "close") or 0.0),
                         max(self._safe_float(row.get("volume")) or 0.0, 0.0),
                     )
                 )
@@ -892,6 +1387,16 @@ class SignalTrainer:
             profile["gross_return"] = float(gross)
         if net is not None:
             profile["net_return"] = float(net)
+        # Persist the label's own reference-adjusted returns so run-level OOS
+        # evidence can cite them directly instead of re-deriving a metric.
+        for return_key in (
+            "market_excess_return",
+            "industry_excess_return",
+            "risk_adjusted_return",
+        ):
+            value = getattr(outcome, return_key, None)
+            if value is not None:
+                profile[return_key] = float(value)
         if not getattr(outcome, "tradable", True) and str(reason or "").startswith("entry"):
             profile["entry_not_executable"] = True
             if policy == "exclude":
@@ -975,7 +1480,9 @@ class SignalTrainer:
             grouped[symbol].append(row)
 
         samples: list[dict] = []
+        self._label_price_stats = _empty_label_price_stats()
         for symbol, symbol_rows in grouped.items():
+            symbol_market = self._sample_label_market(market=market, ticker=symbol)
             context = (symbol_feature_context or {}).get(symbol) or {}
             fundamental_history = list(context.get("fundamental_history") or [])
             concept_history = list(context.get("concept_history") or [])
@@ -1078,11 +1585,14 @@ class SignalTrainer:
                 debt_to_assets = self._safe_float((active_fundamental or {}).get("debt_to_assets"))
                 concept_count = self._safe_float((active_concept or {}).get("concept_count"))
                 concept_strength = self._safe_float((active_concept or {}).get("max_strength"))
-                # P1 limit-up dynamics. All inputs are known at the signal
-                # close: limit-up days inside the trailing 20 sessions, the
-                # recency of the latest one, and the average next-day
-                # open-to-close follow-through after those limit-ups. Without
-                # a CN limit band (e.g. US runs) the factors stay neutral 0.0.
+                # P1 limit-up dynamics. Counts and recency use the trailing 20
+                # sessions including the signal day itself (known at the close).
+                # The next-day follow-through average, however, may only use
+                # probes whose following session has already closed: a limit-up
+                # on the signal day itself has no observable next session yet,
+                # so including it would leak the label window into the feature.
+                # Without a CN limit band (e.g. US runs) the factors stay
+                # neutral 0.0.
                 limit_band_for_factors = self._safe_float(context.get("limit_band_pct"), default=0.0) or 0.0
                 limit_up_count_20d = 0
                 days_since_limit_up = 20
@@ -1099,6 +1609,10 @@ class SignalTrainer:
                         if (probe_close / prev_close) - 1.0 >= limit_threshold:
                             limit_up_count_20d += 1
                             days_since_limit_up = index - probe
+                            if probe >= index:
+                                # Signal-day limit-up: its next session is part
+                                # of the label window and must not enter features.
+                                continue
                             next_row = symbol_rows[probe + 1] if probe + 1 < len(symbol_rows) else None
                             next_open = self._safe_float(next_row.get("open")) if next_row is not None else None
                             next_close = self._safe_float(next_row.get("close")) if next_row is not None else None
@@ -1150,6 +1664,9 @@ class SignalTrainer:
                     "label_start_date": None,
                     "label_end_date": None,
                     "label_available_date": None,
+                    # "adjusted" / "raw_fallback" / "dropped_missing_adjusted"
+                    # once a label window is resolved; None while unlabeled.
+                    "label_price_basis": None,
                 }
                 # P0 label switch. The scheduled CN profile builds execution-
                 # aware net-return labels (next-open entry, fixed-horizon
@@ -1165,24 +1682,52 @@ class SignalTrainer:
                 target_mode: str
                 target_value: float | None = None
                 target_profile: dict = {}
+                # Window-level price basis. A label window may never mix the
+                # adjusted view with raw fallbacks; the classification decides
+                # whether this sample is labeled adjusted, labeled raw (whole
+                # window consistently raw) or dropped.
+                sample_basis = self._resolve_sample_price_basis(
+                    symbol_rows=symbol_rows,
+                    index=index,
+                    label_profile=label_profile,
+                    horizon_days=horizon_days,
+                )
                 if label_profile == RECONCILED_VERSION or index + horizon_days < len(symbol_rows):
                     if label_profile == RECONCILED_VERSION:
+                        # Fail closed: the reconciled label path replays raw-basis
+                        # execution and needs per-row provenance columns the lake
+                        # loader does not select. Without this guard every sample
+                        # would silently degrade to UNVERIFIED/None labels.
+                        _required_reconciled_columns = (
+                            "price_basis",
+                            "execution_source_reference",
+                            "corporate_action_status",
+                        )
+                        _missing_reconciled_columns = [
+                            key for key in _required_reconciled_columns if key not in symbol_rows[index]
+                        ]
+                        if _missing_reconciled_columns:
+                            raise RuntimeError(
+                                "trainer_cn_label_profile=reconciled_v1 requires raw-basis provenance "
+                                f"columns {_missing_reconciled_columns} on every row; the lake loader "
+                                "does not provide them (use executable_net_return_v1 or pass enriched rows)"
+                            )
                         target_value, target_profile, target_mode = self.reconciled_training_target(
                             symbol_rows=symbol_rows, index=index, horizon_days=horizon_days,
-                            market=market, ticker=symbol)
+                            market=symbol_market, ticker=symbol)
                     elif label_profile == "executable_net_return_v1":
                         target_value, target_profile, target_mode = self._build_executable_net_return_target(
                             symbol_rows=symbol_rows,
                             index=index,
                             horizon_days=horizon_days,
-                            market=market,
+                            market=symbol_market,
                             limit_band_pct=self._safe_float(context.get("limit_band_pct"), default=0.0) or None,
                         )
                     elif label_profile == "legacy_short_horizon_composite_v1":
                         target_value, target_profile = self._build_short_horizon_target_profile(
                             symbol_rows=symbol_rows,
                             index=index,
-                            anchor_close=close,
+                            anchor_close=(self._label_price(row, "close") or close),
                             limit_band_pct=self._safe_float(context.get("limit_band_pct"), default=0.0) or None,
                         )
                         target_mode = "short_horizon_composite_v1"
@@ -1194,11 +1739,29 @@ class SignalTrainer:
                         )
                     sample["target_profile"] = target_profile
                     if target_value is not None:
-                        sample["target"] = target_value
-                        sample["target_profile"] = target_profile
-                        sample["label_start_date"] = str(symbol_rows[index + 1].get("date") or "").strip()
-                        sample["label_end_date"] = target_profile.get("label_available_date") or str(symbol_rows[index + horizon_days].get("date") or "").strip()
-                        sample["label_available_date"] = sample["label_end_date"]
+                        if sample_basis == "drop_missing_adjusted":
+                            # The window mixes adjusted and raw points. Never
+                            # persist such a label; count it and leave the row
+                            # as an unlabeled (prediction-only) feature sample.
+                            self._label_price_stats["dropped_missing_adjusted_count"] += 1
+                            sample["label_price_basis"] = "dropped_missing_adjusted"
+                            sample["target_profile"] = {
+                                **target_profile,
+                                "exclusion_reason": "label_window_mixed_price_basis",
+                                "label_price_basis": "dropped_missing_adjusted",
+                            }
+                        else:
+                            if sample_basis is not None:
+                                self._label_price_stats[
+                                    "adjusted_count" if sample_basis == "adjusted" else "raw_fallback_count"
+                                ] += 1
+                                sample["label_price_basis"] = sample_basis
+                                target_profile["label_price_basis"] = sample_basis
+                            sample["target"] = target_value
+                            sample["target_profile"] = target_profile
+                            sample["label_start_date"] = str(symbol_rows[index + 1].get("date") or "").strip()
+                            sample["label_end_date"] = target_profile.get("label_available_date") or str(symbol_rows[index + horizon_days].get("date") or "").strip()
+                            sample["label_available_date"] = sample["label_end_date"]
                     sample["label_mode"] = target_mode
                 samples.append(sample)
         samples.sort(key=lambda item: (item["trade_date"], item["symbol"]))
@@ -1286,6 +1849,89 @@ class SignalTrainer:
             if not values:
                 continue
             summary[f"{metric_key}_avg"] = round(sum(values) / len(values), 4)
+        return summary
+
+    @staticmethod
+    def _oos_metric_value(sample: dict) -> float | None:
+        """Return one matured prediction's realized gate metric.
+
+        The unified gate recognises a ``risk_adjusted_return``-style mean. The
+        trainer stores that exact field on each executable label; when a label
+        profile does not carry it (e.g. the reconciled replay) the realized net
+        target is used, which is the same cost-adjusted return.
+        """
+
+        profile = sample.get("target_profile") or {}
+        value = profile.get("risk_adjusted_return")
+        if value is None:
+            value = sample.get("target")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _summarize_oos_evaluation(
+        per_date: list[dict],
+        *,
+        horizon_days: int,
+        label_profile: str,
+        top_n: int,
+        window_capable_dates: int | None = None,
+    ) -> dict[str, object] | None:
+        """Aggregate matured walk-forward predictions into gate-readable evidence.
+
+        ``per_date`` holds one record per prediction date whose top-N scored
+        samples already had a matured label (the point-in-time pool guarantees
+        such labels were never trained on). Returns ``None`` when no prediction
+        date matured, so the run stays honestly unevaluated instead of reporting
+        an empty metric.
+
+        ``window_capable_dates`` declares the maximum number of matured
+        evaluation dates this run's prediction window can physically produce
+        (prediction dates minus the label horizon). The promotion gate uses it
+        only to lower an otherwise impossible date threshold, and records the
+        decision in its audit fields; it is never used to fake coverage.
+        """
+
+        evaluated = [row for row in per_date if row.get("metric_value") is not None]
+        if not evaluated:
+            return None
+        metric_values = [float(row["metric_value"]) for row in evaluated]
+        net_values = [
+            float(row["net_return"])
+            for row in evaluated
+            if row.get("net_return") is not None
+        ]
+        summary: dict[str, object] = {
+            "schema_version": "walk_forward_oos_evaluation_v1",
+            "source": "trainer_walk_forward_predictions",
+            "evaluated_date_count": len(evaluated),
+            "evaluated_sample_count": sum(
+                int(row.get("sample_count") or 0) for row in evaluated
+            ),
+            "mean_risk_adjusted_return": round(
+                sum(metric_values) / len(metric_values), 8
+            ),
+            "positive_date_rate": round(
+                sum(1 for value in metric_values if value > 0) / len(metric_values), 6
+            ),
+            "top_n": int(top_n),
+            "horizon_days": int(horizon_days),
+            "label_profile": label_profile,
+            "date_min": str(evaluated[0].get("trade_date") or ""),
+            "date_max": str(evaluated[-1].get("trade_date") or ""),
+            "metric_definition": (
+                "mean realized label risk_adjusted_return of the top-N scored "
+                "walk-forward predictions per matured prediction date; the label "
+                "path uses market/industry return 0.0, so this equals the "
+                "cost-adjusted net return"
+            ),
+        }
+        if window_capable_dates is not None:
+            summary["window_capable_dates"] = max(0, int(window_capable_dates))
+        if net_values:
+            summary["mean_net_return"] = round(sum(net_values) / len(net_values), 8)
         return summary
 
     def _summarize_symbol_feature_context(self, symbol_feature_context: dict[str, dict]) -> dict[str, float | int]:
@@ -1515,6 +2161,9 @@ class SignalTrainer:
             raise RuntimeError("The LightGBM trainer currently supports `momentum` signal_type only.")
 
         horizon_days = max(5, min(10, lookback_days * 2))
+        # Predictions must be persisted under one concrete market; infer it
+        # from the tickers when the caller did not pin CN/US/HK.
+        run_market = self._resolve_run_market(market=market, rows=rows)
         # Blank settings must resolve to the executable profile, never
         # silently regress to the legacy momentum composite.
         label_profile_setting = str(
@@ -1533,7 +2182,7 @@ class SignalTrainer:
             ),
         }
         feature_names = self._feature_names(lookback_days=lookback_days)
-        window_policy = self._training_window_policy(market)
+        window_policy = self._training_window_policy(run_market)
         symbol_feature_context = self._load_symbol_feature_context(
             rows=rows,
             market=market,
@@ -1548,6 +2197,15 @@ class SignalTrainer:
         )
         if not samples:
             raise RuntimeError("LightGBM trainer found no usable feature rows. The market lake may still be too short.")
+        # Fail closed before any run row is created: a partially covered
+        # adjusted view must not be persisted as an "adjusted" label run.
+        label_price_contract = self._label_price_basis_contract(
+            label_profile=label_profile_setting
+        )
+        # The prediction product inherits the (already gated) label basis; record
+        # the same contract fields under the inference entry point so consumers
+        # can never mislabel a run's predictions as adjusted.
+        prediction_price_basis_contract = self._prediction_price_basis_contract()
 
         samples_by_date: dict[str, list[dict]] = defaultdict(list)
         labeled_samples: list[dict] = []
@@ -1610,7 +2268,7 @@ class SignalTrainer:
         universe_version = f"{str(universe or ('local_watchlist' if normalized_tickers else 'full_dataset')).lower()}:{len(normalized_tickers or []) or 'all'}"
 
         enhancement_meta = self._feature_enhancement_meta(symbol_feature_context)
-        input_market_date = get_latest_lake_trade_date(market=market) if str(market or "").upper() in {"CN", "US"} else None
+        input_market_date = get_latest_lake_trade_date(market=run_market) if run_market in {"CN", "US"} else None
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
             model_repo = ModelRunRepository(db)
@@ -1622,10 +2280,16 @@ class SignalTrainer:
                 message_prefix="Trainer cleanup closed a stale running model run.",
             )
             symbol_map = {symbol.ticker.upper(): symbol.id for symbol in symbol_repo.list_symbols()}
+            binding_market = run_market
+            training_binding = (
+                adjustment_version_binding(binding_market)
+                if binding_market in {"CN", "US"}
+                else {"adjusted_view_sha256": None, "actions_snapshot_sha256": None}
+            )
             run = model_repo.create_run(
                 name=run_name,
                 model_type=f"{model_family}_multifactor",
-                market=market or "US",
+                market=run_market,
                 universe=universe or ("local_watchlist" if normalized_tickers else "full_dataset"),
                 train_start=initial_train_start,
                 train_end=initial_train_end,
@@ -1637,7 +2301,7 @@ class SignalTrainer:
                     "lookback_days": lookback_days,
                     "prediction_horizon_days": horizon_days,
                     "target_profile": target_profile_version,
-                    "execution_contract": (execution_contract(market, FillCostModel(**execution_cost_setting))
+                    "execution_contract": (execution_contract(run_market, FillCostModel(**execution_cost_setting))
                         if target_profile_version == RECONCILED_VERSION else None),
                     "training_weight_policy": TRAINING_WEIGHT_POLICY,
                     "training_window_policy": asdict(window_policy),
@@ -1678,6 +2342,27 @@ class SignalTrainer:
                     "embargo_sessions": 0,
                     "label_availability_rule": "strictly_before_prediction_date",
                     "universe_version": universe_version,
+                    "label_price_basis": label_price_contract["label_price_basis"],
+                    "label_price_basis_applicable": label_price_contract["label_price_basis_applicable"],
+                    "adjusted_view_present": label_price_contract["adjusted_view_present"],
+                    "adjusted_view_state": label_price_contract["adjusted_view_state"],
+                    "raw_fallback_allowed": label_price_contract["raw_fallback_allowed"],
+                    "raw_fallback_optin_audit": label_price_contract.get(
+                        "raw_fallback_optin_audit"
+                    ),
+                    "adjusted_count": label_price_contract["adjusted_count"],
+                    "raw_fallback_count": label_price_contract["raw_fallback_count"],
+                    "dropped_missing_adjusted_count": label_price_contract[
+                        "dropped_missing_adjusted_count"
+                    ],
+                    "adjusted_coverage_share": label_price_contract["adjusted_coverage_share"],
+                    "require_full_adjusted_coverage": label_price_contract[
+                        "require_full_adjusted_coverage"
+                    ],
+                    "adjustment_version": training_binding.get("adjustment_version"),
+                    "adjusted_view_sha256": training_binding["adjusted_view_sha256"],
+                    "actions_snapshot_sha256": training_binding["actions_snapshot_sha256"],
+                    "prediction_price_basis_contract": prediction_price_basis_contract,
                 },
                 artifact_path=None,
                 status="running",
@@ -1690,13 +2375,16 @@ class SignalTrainer:
             detail_rows: list[dict] = []
             explanation_rows: list[dict] = []
             retrain_interval = 5
-            normalized_market = str(market or "").upper()
+            normalized_market = run_market
             model = None
             feature_importance: dict[str, float] = {}
             feature_stats: dict[str, tuple[float, float]] = {}
             calibration_buckets: list[dict] = []
             latest_prediction_date = prediction_dates[-1]
             training_window_audits: list[dict] = []
+            # One matured top-N record per prediction date; aggregated after the
+            # loop into the gate-readable `oos_evaluation` evidence.
+            oos_evaluation_records: list[dict] = []
             oos_calibration_buckets, oos_calibration_meta = self._load_oos_score_calibration(market=normalized_market)
 
             for index, trade_date in enumerate(prediction_dates):
@@ -1786,6 +2474,44 @@ class SignalTrainer:
                     key=lambda pair: float(pair[1]),
                     reverse=True,
                 )
+                # Record genuine out-of-sample evidence: a prediction date whose
+                # top-N scored samples already carry a matured label. The
+                # point-in-time pool only ever trains on labels available
+                # strictly before this date, so these are never in-sample.
+                if label_profile_setting in OOS_RETURN_LABEL_PROFILES:
+                    matured_pairs = [
+                        sample
+                        for sample, _ in ranked_pairs
+                        if sample.get("target") is not None
+                    ]
+                    selected_pairs = matured_pairs[:OOS_EVALUATION_TOP_N]
+                    if selected_pairs:
+                        metric_values = [
+                            value
+                            for value in (
+                                self._oos_metric_value(sample)
+                                for sample in selected_pairs
+                            )
+                            if value is not None
+                        ]
+                        net_values = [
+                            self._safe_float(sample.get("target"))
+                            for sample in selected_pairs
+                        ]
+                        if metric_values:
+                            oos_evaluation_records.append(
+                                {
+                                    "trade_date": trade_date,
+                                    "metric_value": sum(metric_values)
+                                    / len(metric_values),
+                                    "net_return": (
+                                        sum(net_values) / len(net_values)
+                                        if net_values
+                                        else None
+                                    ),
+                                    "sample_count": len(selected_pairs),
+                                }
+                            )
                 for rank_index, (sample, raw_score) in enumerate(ranked_pairs, start=1):
                     symbol = sample["symbol"]
                     symbol_id = symbol_map.get(symbol)
@@ -1835,10 +2561,59 @@ class SignalTrainer:
                 model_repo.complete_run(run_id, status="failed", artifact_path=None)
                 raise RuntimeError("LightGBM trainer produced no predictions.")
 
-            model_repo.merge_config(run_id, {
+            # Promotion-gate evidence. Keys match what `promotion_gate_v2`
+            # reads from a run's config: `training_sample_count` (top level),
+            # `oos_evaluation` (evaluated_date_count + mean metric), while
+            # `purge_gap_days` / `embargo_sessions` / `prediction_price_basis_contract`
+            # were already persisted on `create_run`. Evidence the trainer
+            # genuinely cannot produce is recorded as an explicit omission
+            # reason rather than a fabricated pass.
+            latest_training_sample_count: int | None = None
+            for audit in reversed(training_window_audits):
+                candidate_sample_count = audit.get("sample_count")
+                if isinstance(candidate_sample_count, (int, float)) and not isinstance(
+                    candidate_sample_count, bool
+                ):
+                    latest_training_sample_count = int(candidate_sample_count)
+                    break
+            # The prediction window is a fixed trailing slice of the available
+            # sessions; a prediction date can only contribute matured OOS
+            # evidence once `horizon_days` further sessions exist. Declare that
+            # physical ceiling so the promotion gate does not demand more
+            # matured dates than this window can ever produce, and records the
+            # reason when it lowers the threshold.
+            window_capable_dates = max(0, len(prediction_dates) - horizon_days)
+            oos_evaluation = (
+                self._summarize_oos_evaluation(
+                    oos_evaluation_records,
+                    horizon_days=horizon_days,
+                    label_profile=label_profile_setting,
+                    top_n=OOS_EVALUATION_TOP_N,
+                    window_capable_dates=window_capable_dates,
+                )
+                if label_profile_setting in OOS_RETURN_LABEL_PROFILES
+                else None
+            )
+            promotion_evidence: dict[str, object] = {
                 "training_window_audits": training_window_audits,
                 "training_weight_policy": TRAINING_WEIGHT_POLICY,
-            })
+            }
+            if latest_training_sample_count is not None:
+                promotion_evidence["training_sample_count"] = (
+                    latest_training_sample_count
+                )
+            if oos_evaluation is not None:
+                promotion_evidence["oos_evaluation"] = oos_evaluation
+            else:
+                promotion_evidence["oos_evaluation_missing_reason"] = (
+                    "walk-forward OOS evidence requires a return-based label "
+                    f"profile and at least one matured prediction date "
+                    f"(label_profile={label_profile_setting!r})."
+                )
+            promotion_evidence["data_readiness_evidence_missing_reason"] = (
+                DATA_READINESS_EVIDENCE_MISSING_REASON
+            )
+            model_repo.merge_config(run_id, promotion_evidence)
             return self._persist_model_outputs(
                 db=db,
                 model_repo=model_repo,
@@ -1846,7 +2621,7 @@ class SignalTrainer:
                 detail_repo=detail_repo,
                 explanation_repo=explanation_repo,
                 run_id=run_id,
-                market=market,
+                market=run_market,
                 signal_rows=signal_rows,
                 detail_rows=detail_rows,
                 explanation_rows=explanation_rows,
@@ -1859,6 +2634,8 @@ class SignalTrainer:
                         "target_profile": label_profile_setting,
                         "training_weight_policy": TRAINING_WEIGHT_POLICY,
                         "training_window_audits": training_window_audits,
+                        "training_sample_count": latest_training_sample_count,
+                        "oos_evaluation": oos_evaluation,
                         "training_window_policy": asdict(window_policy),
                         "score_semantics": score_semantics_version,
                         "score_contract_version": SCORE_CONTRACT_VERSION,
@@ -1886,6 +2663,28 @@ class SignalTrainer:
                         "symbol_context_summary": enhancement_meta.get("coverage"),
                         "prediction_dates": prediction_dates,
                         "label_profile": label_profile_setting,
+                        "label_price_basis": label_price_contract["label_price_basis"],
+                        "label_price_basis_applicable": label_price_contract[
+                            "label_price_basis_applicable"
+                        ],
+                        "adjusted_view_present": label_price_contract["adjusted_view_present"],
+                        "adjusted_view_state": label_price_contract["adjusted_view_state"],
+                        "raw_fallback_allowed": label_price_contract["raw_fallback_allowed"],
+                        "raw_fallback_optin_audit": label_price_contract.get(
+                            "raw_fallback_optin_audit"
+                        ),
+                        "adjusted_count": label_price_contract["adjusted_count"],
+                        "raw_fallback_count": label_price_contract["raw_fallback_count"],
+                        "dropped_missing_adjusted_count": label_price_contract[
+                            "dropped_missing_adjusted_count"
+                        ],
+                        "adjusted_coverage_share": label_price_contract[
+                            "adjusted_coverage_share"
+                        ],
+                        "require_full_adjusted_coverage": label_price_contract[
+                            "require_full_adjusted_coverage"
+                        ],
+                        "prediction_price_basis_contract": prediction_price_basis_contract,
                         "entry_not_executable_policy": entry_not_executable_policy_setting,
                         "execution_cost_bps": execution_cost_setting,
                         "evaluation_protocol": "walk_forward_purged_v2",

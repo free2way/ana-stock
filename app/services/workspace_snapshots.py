@@ -4,6 +4,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from app.core.db import SessionLocal
 
+from app.services.fx_rates import market_data_supported, normalize_currency_aggregation
 from app.services.model_signal_summary import build_signal_label
 from app.services.nlp_snapshots import (
     SNAPSHOT_DASHBOARD_NLP,
@@ -517,8 +518,6 @@ def build_portfolio_workspace_snapshot(db: Session, *, lang: str = "zh") -> dict
         cost_value = cost_basis * quantity
         pnl = market_value - cost_value
         pnl_pct = ((latest_price / cost_basis) - 1.0) * 100 if cost_basis else 0.0
-        total_market_value += market_value
-        total_cost += cost_value
         position_drafts.append(
             {
                 "item": item,
@@ -527,11 +526,17 @@ def build_portfolio_workspace_snapshot(db: Session, *, lang: str = "zh") -> dict
                 "latest_price": latest_price,
                 "quantity": quantity,
                 "cost_basis": cost_basis,
+                "cost_value": cost_value,
+                "market": str(overview.get("market") or item.get("market") or "").strip().upper(),
                 "market_value": market_value,
                 "pnl": pnl,
                 "pnl_pct": pnl_pct,
             }
         )
+    # S-12: convert before aggregating; never add different currencies raw.
+    fx_summary = normalize_currency_aggregation(position_drafts, value_key="market_value", cost_key="cost_value")
+    total_market_value = float(fx_summary.get("total_base") or 0.0)
+    total_cost = float(fx_summary.get("total_cost_base") or 0.0)
     for draft in position_drafts:
         item = draft["item"]
         overview = draft["overview"]
@@ -545,7 +550,7 @@ def build_portfolio_workspace_snapshot(db: Session, *, lang: str = "zh") -> dict
         management = build_position_management_fields(
             latest_signal=latest_signal,
             pnl_pct=draft["pnl_pct"],
-            market_value=draft["market_value"],
+            market_value=draft.get("market_value_base") or 0.0,
             total_market_value=total_market_value,
             cost_basis=draft["cost_basis"],
             lang=lang,
@@ -559,6 +564,11 @@ def build_portfolio_workspace_snapshot(db: Session, *, lang: str = "zh") -> dict
                 "cost_basis": draft["cost_basis"],
                 "latest_price": draft["latest_price"],
                 "market_value": draft["market_value"],
+                "market_value_base": draft.get("market_value_base"),
+                "currency": draft.get("currency"),
+                "fx_rate": draft.get("fx_rate"),
+                "fx_unavailable": draft.get("fx_unavailable", False),
+                "data_unavailable": not market_data_supported(draft.get("market")),
                 "pnl": draft["pnl"],
                 "pnl_pct": draft["pnl_pct"],
                 "ai_headline": ai_summary["ai_headline"],
@@ -580,6 +590,9 @@ def build_portfolio_workspace_snapshot(db: Session, *, lang: str = "zh") -> dict
             "cost": total_cost,
             "pnl": total_market_value - total_cost,
             "pnl_pct": ((total_market_value / total_cost) - 1.0) * 100 if total_cost else 0.0,
+            "base_currency": fx_summary.get("base_currency"),
+            "fx_status": fx_summary.get("fx_status"),
+            "fx_unavailable_markets": fx_summary.get("fx_unavailable_markets") or [],
         },
         "intelligence": intelligence,
         "updated_at": _snapshot_now_iso(),
@@ -647,22 +660,22 @@ def _market_heatmap_fallback_label(row: dict, template: str) -> str:
         momentum_5 = float(row.get("momentum_5") or 0.0)
         volume_ratio = float(row.get("volume_ratio") or 0.0)
         if market == "US":
-            if momentum_20 >= 1.0:
+            if momentum_20 >= 100.0:
                 return "翻倍动量"
-            if momentum_20 >= 0.45:
+            if momentum_20 >= 45.0:
                 return "高弹性趋势"
-            if momentum_5 >= 0.6 and volume_ratio >= 4.0:
+            if momentum_5 >= 60.0 and volume_ratio >= 4.0:
                 return "放量加速"
-            if momentum_5 >= 0.3:
+            if momentum_5 >= 30.0:
                 return "趋势延续"
             if volume_ratio >= 4.0:
                 return "量价共振"
             if volume_ratio >= 1.5:
                 return "活跃放量"
             return "技术动量"
-        if momentum_20 >= 1.0:
+        if momentum_20 >= 100.0:
             return "翻倍动量"
-        if momentum_5 >= 0.25:
+        if momentum_5 >= 25.0:
             return "短线加速"
         if volume_ratio >= 1.5:
             return "量能放大"
@@ -685,18 +698,18 @@ def _market_heatmap_fallback_label(row: dict, template: str) -> str:
         momentum_5 = float(row.get("momentum_5") or 0.0)
         volume_ratio = float(row.get("volume_ratio") or 0.0)
         if market == "US":
-            if momentum_5 >= 1.0 and volume_ratio >= 2.0:
+            if momentum_5 >= 100.0 and volume_ratio >= 2.0:
                 return "高弹性加速"
-            if momentum_5 >= 0.6 and volume_ratio >= 3.0:
+            if momentum_5 >= 60.0 and volume_ratio >= 3.0:
                 return "放量突破"
-            if momentum_5 >= 0.45:
+            if momentum_5 >= 45.0:
                 return "强势延续"
             if volume_ratio >= 2.0:
                 return "量价共振"
             if volume_ratio >= 1.0:
                 return "回踩转强"
             return "趋势蓄势"
-        if momentum_20 >= 0.35:
+        if momentum_20 >= 35.0:
             return "成长加速"
         return template_label
     if template == "lightgbm_top_picks":
@@ -791,7 +804,9 @@ def build_market_heatmap_snapshot(db: Session | None, *, lang: str = "zh") -> di
             momentum_5 = row.get("momentum_5")
             if momentum_5 is not None:
                 try:
-                    move_5d = float(momentum_5) * 100.0
+                    # S-4: momentum_5 is already percent at every delivery
+                    # boundary; do not rescale it here.
+                    move_5d = float(momentum_5)
                     item["move_5d_total"] += move_5d
                     item["move_5d_count"] += 1
                     if move_5d > 0:

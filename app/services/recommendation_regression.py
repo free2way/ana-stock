@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections import defaultdict
 from statistics import mean
 
+from app.services.execution_costs import default_fill_cost_model
 from app.services.market_lake import load_lake_price_history
+from app.services.price_basis import preferred_close
 from app.services.repository import WorkspaceSnapshotRepository
 from app.services.runtime_cache import get_or_set
 from app.services.time_utils import app_now_iso, app_today_iso
@@ -11,6 +13,11 @@ from app.services.time_utils import app_now_iso, app_today_iso
 
 AI_DAILY_REPORT_HISTORY_SNAPSHOT_TYPE = "ai_daily_report_history"
 RECOMMENDATION_REGRESSION_SNAPSHOT_TYPE = "ai_report_recommendation_regression"
+
+# S-12 executable口径: next-session open -> horizon close, net of these costs.
+EXECUTABLE_HORIZON_DAYS = 5
+EXECUTABLE_COMMISSION_BPS = 8.0
+EXECUTABLE_SLIPPAGE_BPS = 12.0
 
 
 def _safe_float(value) -> float | None:
@@ -79,29 +86,38 @@ def _kronos_decision_bucket(row: dict) -> str:
     return "unknown"
 
 
-def _next_session_metrics(*, ticker: str, market: str, report_date: str) -> dict | None:
+def _next_session_metrics(*, ticker: str, market: str, report_date: str, horizon_days: int = EXECUTABLE_HORIZON_DAYS) -> dict | None:
     history = load_lake_price_history(market=market, ticker=ticker, limit=320)
     if not history:
         return None
-    baseline = None
-    next_row = None
+    ordered: list[tuple[str, dict]] = []
     for row in history:
         row_date = str(row.get("date") or row.get("trade_date") or "")[:10]
-        if not row_date:
-            continue
+        if row_date:
+            ordered.append((row_date, row))
+    ordered.sort(key=lambda item: item[0])
+    baseline_index = None
+    for index, (row_date, _row) in enumerate(ordered):
         if row_date <= report_date:
-            baseline = row
-            continue
-        if row_date > report_date:
-            next_row = row
+            baseline_index = index
+        else:
             break
-    if baseline is None or next_row is None:
+    if baseline_index is None or baseline_index + 1 >= len(ordered):
         return None
-    base_close = _safe_float(baseline.get("close"))
+    baseline = ordered[baseline_index][1]
+    entry_index = baseline_index + 1
+    next_row = ordered[entry_index][1]
+    # R2: close-to-close return prefers the adjusted view.  The raw close is
+    # retained for the overnight gap and intraday open-to-close ratios, whose
+    # other leg (raw open) is not adjusted -- mixing bases there would change
+    # their meaning, not just their scale.
+    raw_base_close = _safe_float(baseline.get("close"))
+    base_close = preferred_close(baseline) or raw_base_close
     next_open = _safe_float(next_row.get("open"))
     next_high = _safe_float(next_row.get("high"))
     next_low = _safe_float(next_row.get("low"))
-    next_close = _safe_float(next_row.get("close"))
+    raw_next_close = _safe_float(next_row.get("close"))
+    next_close = preferred_close(next_row) or raw_next_close
     if not base_close or not next_open or not next_high or not next_low or not next_close:
         return None
 
@@ -110,14 +126,48 @@ def _next_session_metrics(*, ticker: str, market: str, report_date: str) -> dict
 
     open_to_high = pct(next_open, next_high)
     open_to_low = pct(next_open, next_low)
-    open_to_close = pct(next_open, next_close)
+    open_to_close = pct(next_open, raw_next_close or next_close)
     close_1d = pct(base_close, next_close)
-    gap_open = pct(base_close, next_open)
+    gap_open = pct(raw_base_close or base_close, next_open)
+
+    # S-12 executable口径: enter at the next session open, exit at the horizon
+    # close (next session open -> expiry close), net of the round-trip cost
+    # model.  This is the metric a book could actually have realized, unlike
+    # the close-to-close observation口径 above.
+    exit_index = min(entry_index + max(1, int(horizon_days)) - 1, len(ordered) - 1)
+    exit_row = ordered[exit_index][1]
+    exit_close = preferred_close(exit_row) or _safe_float(exit_row.get("close"))
+    executable_metrics: dict = {
+        "executable_entry_date": ordered[entry_index][0],
+        "executable_exit_date": ordered[exit_index][0],
+        "executable_holding_days": exit_index - entry_index + 1,
+        "executable_gross_return_pct": None,
+        "executable_return_pct": None,
+        "executable_hit": None,
+        "round_trip_cost_bps": None,
+        "cost_model_version": None,
+    }
+    if exit_close:
+        cost_model = default_fill_cost_model(
+            market,
+            commission_bps_one_way=EXECUTABLE_COMMISSION_BPS,
+            slippage_bps_one_way=EXECUTABLE_SLIPPAGE_BPS,
+        )
+        round_trip = cost_model.round_trip(float(next_open), float(exit_close), quantity=1.0)
+        executable_metrics.update(
+            {
+                "executable_gross_return_pct": round(float(round_trip["gross_return"]) * 100.0, 2),
+                "executable_return_pct": round(float(round_trip["net_return"]) * 100.0, 2),
+                "executable_hit": float(round_trip["net_return"]) > 0,
+                "round_trip_cost_bps": round(float(cost_model.nominal_round_trip_bps), 2),
+                "cost_model_version": cost_model.version,
+            }
+        )
     return {
         "ticker": ticker,
         "market": market,
         "report_date": report_date,
-        "next_date": str(next_row.get("date") or next_row.get("trade_date") or "")[:10],
+        "next_date": ordered[entry_index][0],
         "gap_open_pct": gap_open,
         "open_to_high_pct": open_to_high,
         "open_to_low_pct": open_to_low,
@@ -127,6 +177,7 @@ def _next_session_metrics(*, ticker: str, market: str, report_date: str) -> dict
         "execution_hit": open_to_high >= 2.0 and open_to_low > -4.0,
         "gap_blocked": gap_open >= 7.0,
         "deep_intraday_drawdown": open_to_low <= -4.0,
+        **executable_metrics,
     }
 
 
@@ -178,7 +229,15 @@ def _dimensions_for_row(row: dict) -> list[str]:
     return dimensions
 
 
+def _bucket_hit_rate(bucket: dict) -> float:
+    """S-12: prefer the fee-adjusted executable hit rate for policy gates."""
+    if bucket.get("executable_hit_rate") is not None:
+        return float(bucket["executable_hit_rate"])
+    return float(bucket.get("execution_hit_rate") or 0.0)
+
+
 def _aggregate_records(records: list[dict]) -> dict:
+    executable_records = [item for item in records if item.get("executable_return_pct") is not None]
     if not records:
         return {
             "count": 0,
@@ -189,6 +248,9 @@ def _aggregate_records(records: list[dict]) -> dict:
             "avg_open_to_low_pct": None,
             "gap_blocked_rate": None,
             "deep_drawdown_rate": None,
+            "executable_count": 0,
+            "avg_executable_return_pct": None,
+            "executable_hit_rate": None,
             "examples": [],
         }
     return {
@@ -200,6 +262,18 @@ def _aggregate_records(records: list[dict]) -> dict:
         "avg_open_to_low_pct": round(mean(float(item["open_to_low_pct"]) for item in records), 2),
         "gap_blocked_rate": round(sum(1 for item in records if item.get("gap_blocked")) / len(records) * 100.0, 1),
         "deep_drawdown_rate": round(sum(1 for item in records if item.get("deep_intraday_drawdown")) / len(records) * 100.0, 1),
+        # S-12: the headline hit metric is the executable, fee-adjusted口径.
+        "executable_count": len(executable_records),
+        "avg_executable_return_pct": (
+            round(mean(float(item["executable_return_pct"]) for item in executable_records), 2)
+            if executable_records
+            else None
+        ),
+        "executable_hit_rate": (
+            round(sum(1 for item in executable_records if item.get("executable_hit")) / len(executable_records) * 100.0, 1)
+            if executable_records
+            else None
+        ),
         "examples": [
             {
                 "ticker": item.get("ticker"),
@@ -208,6 +282,7 @@ def _aggregate_records(records: list[dict]) -> dict:
                 "next_date": item.get("next_date"),
                 "close_1d_pct": item.get("close_1d_pct"),
                 "open_to_high_pct": item.get("open_to_high_pct"),
+                "executable_return_pct": item.get("executable_return_pct"),
             }
             for item in records[:6]
         ],
@@ -247,6 +322,10 @@ def _recent_record_view(records: list[dict], *, limit: int = 30) -> list[dict]:
             "close_1d_pct": item.get("close_1d_pct"),
             "close_hit": item.get("close_hit"),
             "execution_hit": item.get("execution_hit"),
+            "executable_entry_date": item.get("executable_entry_date"),
+            "executable_exit_date": item.get("executable_exit_date"),
+            "executable_return_pct": item.get("executable_return_pct"),
+            "executable_hit": item.get("executable_hit"),
             "gap_blocked": item.get("gap_blocked"),
             "deep_intraday_drawdown": item.get("deep_intraday_drawdown"),
         }
@@ -286,17 +365,25 @@ def _policy_from_dimension_stats(stats: dict[str, dict], *, summary: dict | None
         if int(bucket.get("count") or 0) < min_count:
             return False
         execution_hit = float(bucket.get("execution_hit_rate") or 0.0)
-        close_hit = float(bucket.get("close_hit_rate") or 0.0)
-        avg_close = float(bucket.get("avg_close_1d_pct") or 0.0)
-        return execution_hit < 45.0 or close_hit < 42.0 or avg_close <= -0.2
+        hit = bucket.get("executable_hit_rate")
+        if hit is None:
+            hit = bucket.get("close_hit_rate")
+        avg_return = bucket.get("avg_executable_return_pct")
+        if avg_return is None:
+            avg_return = bucket.get("avg_close_1d_pct")
+        return execution_hit < 45.0 or float(hit or 0.0) < 42.0 or float(avg_return or 0.0) <= -0.2
 
     def _is_strong(bucket: dict, *, min_count: int = 12) -> bool:
         if int(bucket.get("count") or 0) < min_count:
             return False
         execution_hit = float(bucket.get("execution_hit_rate") or 0.0)
-        close_hit = float(bucket.get("close_hit_rate") or 0.0)
-        avg_close = float(bucket.get("avg_close_1d_pct") or 0.0)
-        return execution_hit >= 58.0 and close_hit >= 48.0 and avg_close >= 0.2
+        hit = bucket.get("executable_hit_rate")
+        if hit is None:
+            hit = bucket.get("close_hit_rate")
+        avg_return = bucket.get("avg_executable_return_pct")
+        if avg_return is None:
+            avg_return = bucket.get("avg_close_1d_pct")
+        return execution_hit >= 58.0 and float(hit or 0.0) >= 48.0 and float(avg_return or 0.0) >= 0.2
 
     if int(actionable_missing.get("count") or 0) >= 2 and (
         float(actionable_missing.get("close_hit_rate") or 0.0) < 45.0
@@ -376,14 +463,14 @@ def _policy_from_dimension_stats(stats: dict[str, dict], *, summary: dict | None
 
     if (
         int(actionable_summary.get("count") or 0) >= 20
-        and float(actionable_summary.get("execution_hit_rate") or 0.0) < 55.0
+        and _bucket_hit_rate(actionable_summary) < 55.0
     ):
         policy["min_actionable_quality_score"] = 52.0
         policy["notes"].append("整体可执行池命中率未到 55%，临时抬高 Top 5 质量门槛。")
 
     recent_actionable = (summary or {}).get("recent_actionable") or {}
     if int(recent_actionable.get("count") or 0) >= 12:
-        recent_hit = float(recent_actionable.get("execution_hit_rate") or 0.0)
+        recent_hit = _bucket_hit_rate(recent_actionable)
         recent_close = float(recent_actionable.get("close_hit_rate") or 0.0)
         recent_avg_close = float(recent_actionable.get("avg_close_1d_pct") or 0.0)
         recent_drawdown = float(recent_actionable.get("deep_drawdown_rate") or 0.0)
@@ -424,11 +511,16 @@ def summarize_recommendation_regression(payload: dict | None, *, lang: str = "zh
             return "-"
 
     action_hit = actionable.get("execution_hit_rate")
+    # S-12: the headline "复盘命中" is the executable, fee-adjusted口径 when
+    # available; the intraday observation metric stays as a secondary line.
+    action_executable_hit = actionable.get("executable_hit_rate")
+    action_executable_return = actionable.get("avg_executable_return_pct")
     action_close = actionable.get("close_hit_rate")
     action_open_high = actionable.get("avg_open_to_high_pct")
     deep_drawdown = actionable.get("deep_drawdown_rate")
     gap_blocked = actionable.get("gap_blocked_rate")
     watch_hit = watch.get("execution_hit_rate")
+    headline_hit = action_executable_hit if action_executable_hit is not None else action_hit
 
     if sample_count <= 0:
         return {
@@ -444,11 +536,11 @@ def summarize_recommendation_regression(payload: dict | None, *, lang: str = "zh
         }
 
     stance = "balanced"
-    if action_hit is not None and float(action_hit) >= 55.0 and deep_drawdown is not None and float(deep_drawdown) <= 25.0:
+    if headline_hit is not None and float(headline_hit) >= 55.0 and deep_drawdown is not None and float(deep_drawdown) <= 25.0:
         stance = "trust_actionable"
-    elif action_hit is not None and float(action_hit) < 45.0:
+    elif headline_hit is not None and float(headline_hit) < 45.0:
         stance = "tighten"
-    elif watch_hit is not None and action_hit is not None and float(watch_hit) > float(action_hit) + 8.0:
+    elif watch_hit is not None and headline_hit is not None and float(watch_hit) > float(headline_hit) + 8.0:
         stance = "prefer_watch_confirm"
 
     if lang == "zh":
@@ -487,6 +579,8 @@ def summarize_recommendation_regression(payload: dict | None, *, lang: str = "zh
         "stance": stance,
         "metrics": [
             {"label": "可执行样本" if lang == "zh" else "Executable samples", "value": str(actionable.get("count") or 0)},
+            {"label": "可执行命中率(扣费)" if lang == "zh" else "Executable hit rate (net)", "value": _fmt_pct(headline_hit)},
+            {"label": "可执行净收益" if lang == "zh" else "Executable net return", "value": _fmt_pct(action_executable_return)},
             {"label": "执行命中率" if lang == "zh" else "Execution hit rate", "value": _fmt_pct(action_hit)},
             {"label": "收盘命中率" if lang == "zh" else "Close hit rate", "value": _fmt_pct(action_close)},
             {"label": "观察池命中" if lang == "zh" else "Watch hit rate", "value": _fmt_pct(watch_hit)},

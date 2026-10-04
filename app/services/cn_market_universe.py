@@ -575,7 +575,18 @@ def refresh_cn_market_data_lake_only(
                     provider_used = "tencent_gtimg"
             except Exception as exc:
                 fallback_errors.append(f"tencent_gtimg: {exc}")
-    parquet_paths = write_ohlcv_rows_to_lake(market="CN", rows=rows) if rows else []
+    parquet_paths = (
+        write_ohlcv_rows_to_lake(
+            market="CN",
+            rows=rows,
+            provenance={
+                "provider": str(provider_used or "").strip(),
+                "source_reference": f"{provider_used or ''}:cn_spot:{required_as_of_date}",
+            },
+        )
+        if rows
+        else []
+    )
     touched = {str(row.get("symbol") or "").upper() for row in rows if row.get("symbol")}
     state_summary = _upsert_lake_only_sync_state(rows, required_as_of_date=required_as_of_date)
     fresh_count = int(state_summary.get("fresh_count") or 0)

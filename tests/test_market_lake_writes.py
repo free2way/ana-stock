@@ -1,3 +1,4 @@
+import json
 import tempfile
 from pathlib import Path
 from unittest import TestCase
@@ -17,6 +18,8 @@ def _row(symbol: str, close: float, trade_date: str = "2026-06-22") -> dict:
     return {
         "date": trade_date,
         "symbol": symbol,
+        "provider": "fixture",
+        "source_reference": f"fixture:{symbol}:{trade_date}",
         "open": close,
         "high": close,
         "low": close,
@@ -134,6 +137,56 @@ class MarketLakeWriteTests(TestCase):
             rows = pl.read_parquet(path).to_dicts()
             self.assertEqual(["000001.SZ"], [row["symbol"] for row in rows])
             self.assertEqual(12, rows[0]["close"])
+
+    def test_shadow_commit_with_failed_v1_write_records_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "app.services.market_lake.market_lake_root",
+            return_value=Path(temp_dir),
+        ), patch(
+            "app.services.market_lake._write_partition_file",
+            side_effect=OSError("disk full"),
+        ):
+            with self.assertRaises(OSError):
+                write_daily_ohlcv_parquet(
+                    market="CN",
+                    trade_date="2026-06-22",
+                    rows=[_row("000001.SZ", 10)],
+                    merge_existing=False,
+                )
+
+            divergence = Path(temp_dir) / "_lake_v2" / "write_divergence.jsonl"
+            self.assertTrue(divergence.exists())
+            record = json.loads(divergence.read_text(encoding="utf-8").strip())
+            self.assertEqual("CN", record["market"])
+            self.assertEqual("2026-06-22", record["trade_date"])
+            self.assertEqual(["000001.SZ"], record["symbols"])
+            # Shadow committed, canonical missing: the divergence is recorded.
+            self.assertTrue((Path(temp_dir) / "_lake_v2" / "cn_daily" / "date=2026-06-22" / "part.parquet").exists())
+            self.assertFalse((Path(temp_dir) / "cn_daily" / "date=2026-06-22" / "part.parquet").exists())
+
+    def test_preparation_failure_happens_before_shadow_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "app.services.market_lake.market_lake_root",
+            return_value=Path(temp_dir),
+        ):
+            path = Path(temp_dir) / "cn_daily" / "date=2026-06-22" / "part.parquet"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"not-a-parquet-file")
+
+            with self.assertRaises(Exception):
+                write_daily_ohlcv_parquet(
+                    market="CN",
+                    trade_date="2026-06-22",
+                    rows=[_row("000001.SZ", 10)],
+                    merge_existing=True,
+                )
+
+            # The unreadable canonical partition must be detected before the
+            # shadow is written, otherwise the two stores diverge.
+            self.assertFalse(
+                (Path(temp_dir) / "_lake_v2" / "cn_daily" / "date=2026-06-22" / "part.parquet").exists()
+            )
+            self.assertEqual(b"not-a-parquet-file", path.read_bytes())
 
     def test_future_market_rows_are_rejected_before_writing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, patch(

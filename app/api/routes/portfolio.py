@@ -16,6 +16,7 @@ from app.api.rendering import render_daily_change_chip as _render_daily_change_c
 from app.core.db import SessionLocal, get_db_session
 from app.models.schema import SymbolCreate
 from app.services.auth import is_authenticated, login_redirect
+from app.services.fx_rates import market_data_supported, normalize_currency_aggregation
 from app.services.price_snapshot import load_daily_change_pct as _load_portfolio_daily_change_pct
 from app.services.portfolio_intelligence import (
     build_position_management_fields,
@@ -201,7 +202,7 @@ def _render_private_portfolio_value(value: object) -> str:
 
 
 def _redirect(message: str | None = None) -> RedirectResponse:
-    suffix = f"?message={message}" if message else ""
+    suffix = f"?{urlencode({'message': message})}" if message else ""
     return RedirectResponse(url=f"/portfolio{suffix}", status_code=303)
 
 
@@ -385,8 +386,6 @@ def portfolio_page(
                 cost_value = cost_basis * quantity
                 pnl = 0.0 if latest_price_missing else market_value - cost_value
                 pnl_pct = ((latest_price / cost_basis) - 1.0) * 100 if cost_basis and not latest_price_missing else 0.0
-                total_market_value += market_value
-                total_cost += cost_value
                 position_drafts.append(
                     {
                         "item": item,
@@ -395,12 +394,22 @@ def portfolio_page(
                         "latest_price": latest_price,
                         "quantity": quantity,
                         "cost_basis": cost_basis,
+                        "cost_value": cost_value,
+                        "market": str(overview.get("market") or item.get("market") or "").strip().upper(),
                         "market_value": market_value,
                         "pnl": pnl,
                         "pnl_pct": pnl_pct,
                         "latest_price_missing": latest_price_missing,
                     }
                 )
+            # S-12: never sum different currencies together.  Convert to a base
+            # currency when an operator-supplied FX table exists; otherwise keep
+            # the convertible portion and flag the rest as fx-unavailable.
+            fx_summary = normalize_currency_aggregation(
+                position_drafts, value_key="market_value", cost_key="cost_value"
+            )
+            total_market_value = float(fx_summary.get("total_base") or 0.0)
+            total_cost = float(fx_summary.get("total_cost_base") or 0.0)
             for draft in position_drafts:
                 item = draft["item"]
                 overview = draft["overview"]
@@ -414,7 +423,7 @@ def portfolio_page(
                 management = build_position_management_fields(
                     latest_signal=latest_signal,
                     pnl_pct=draft["pnl_pct"],
-                    market_value=draft["market_value"],
+                    market_value=draft.get("market_value_base") or 0.0,
                     total_market_value=total_market_value,
                     cost_basis=draft["cost_basis"],
                     lang=lang,
@@ -428,6 +437,11 @@ def portfolio_page(
                         "cost_basis": draft["cost_basis"],
                         "latest_price": draft["latest_price"],
                         "market_value": draft["market_value"],
+                        "market_value_base": draft.get("market_value_base"),
+                        "currency": draft.get("currency"),
+                        "fx_rate": draft.get("fx_rate"),
+                        "fx_unavailable": draft.get("fx_unavailable", False),
+                        "data_unavailable": not market_data_supported(draft.get("market")),
                         "pnl": draft["pnl"],
                         "pnl_pct": draft["pnl_pct"],
                         "latest_price_missing": draft.get("latest_price_missing", False),
@@ -496,7 +510,7 @@ def portfolio_page(
         f"<div class='hint'><strong>{label}:</strong> {hint}</div>"
         for _, label, hint in MARKET_OPTIONS
     )
-    banner = f"<div class='banner'>{message}</div>" if message else ""
+    banner = f"<div class='banner'>{html.escape(message)}</div>" if message else ""
     trades = sorted(load_portfolio_trades(), key=lambda item: str(item.get("created_at") or ""), reverse=True)
     unresolved_trade_count = sum(1 for row in trades if str(row.get("reason") or "").strip() == "其他")
     resolved_trade_count = max(0, len(trades) - unresolved_trade_count)
@@ -1549,6 +1563,7 @@ def portfolio_page(
                 </select>
                 <input id="portfolio-quantity" type="number" step="1" min="0" name="quantity" placeholder="Quantity" required />
                 <input id="portfolio-cost-basis" type="number" step="0.01" min="0" name="cost_basis" placeholder="Cost Basis" required />
+                <input id="portfolio-buy-fee" type="number" step="0.01" min="0" name="fee" value="0" placeholder="{'买入费用（计入成本）' if lang == 'zh' else 'Buy fee (booked into cost)'}" />
                 <input type="text" name="note" placeholder="Note" />
                 <button type="submit">Save Position</button>
               </form>
@@ -1636,6 +1651,7 @@ def add_portfolio_position(
     market: str | None = Form(None),
     quantity: float = Form(...),
     cost_basis: float = Form(...),
+    fee: float = Form(0.0),
     note: str | None = Form(None),
     db: Session = Depends(get_db_session),
 ) -> RedirectResponse:
@@ -1652,6 +1668,7 @@ def add_portfolio_position(
             "market": market,
             "quantity": quantity,
             "cost_basis": cost_basis,
+            "fee": fee,
             "note": note,
         }
     )

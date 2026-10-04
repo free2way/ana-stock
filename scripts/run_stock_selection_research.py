@@ -50,6 +50,15 @@ def parse_args() -> argparse.Namespace:
         choices=tuple(sorted(research_factor_sets())),
     )
     parser.add_argument("--artifact-root", type=Path)
+    parser.add_argument(
+        "--historical-universe-contract",
+        type=Path,
+        help=(
+            "Path to a historical-universe evidence contract artifact. Defaults to "
+            "PQW_HISTORICAL_UNIVERSE_CONTRACT_PATH or "
+            "<artifacts>/stock_selection_research/historical_universe_contract.json."
+        ),
+    )
     args = parser.parse_args()
     if args.label_protocol == "cash_net_v2":
         if args.execution_evidence is None or args.commission_bps_one_way is None or args.slippage_bps_one_way is None:
@@ -90,6 +99,7 @@ def main() -> None:
         ),
         artifact_root=args.artifact_root,
         execution_evidence=execution_evidence,
+        historical_universe_contract_path=args.historical_universe_contract,
     )
     payload = {
         "status": "success",

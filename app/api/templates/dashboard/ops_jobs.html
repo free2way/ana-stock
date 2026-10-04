@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+  <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>{{ t(lang, '任务记录', 'Job History') }}</title>
+  <style>{{ style }}</style></head>
+  <body><div class="app"><aside class="sidebar"><div class="brand"><span class="brand-tag">PQW</span><h1>{{ t(lang, '任务记录', 'Job History') }}</h1><p>{{ t(lang, '最近一次同步、训练、回测和失败信息，都在这里回看。', 'Review recent sync, training, backtest, and failure details here.') }}</p></div><nav class="side-nav">{{ nav_html }}</nav><div class="sidebar-foot">{{ t(lang, '这页适合看参数、错误和状态，不适合承载复杂分析，所以保持轻量。', 'This page stays light and focuses on params, errors, and status history.') }}</div></aside><main class="main"><div class="wrap">
+    <div class="toolbar">
+      <a href="/dashboard/ops?lang={{ lang }}&lookback_runs={{ lookback_runs }}" class="pill">← {{ t(lang, '返回运维操作台', 'Back to Operations') }}</a>
+      <a href="/dashboard/ops/jobs?lang=en&lookback_runs={{ lookback_runs }}" class="pill">English</a>
+      <a href="/dashboard/ops/jobs?lang=zh&lookback_runs={{ lookback_runs }}" class="pill">中文</a>
+    </div>
+    <div class="card"><div class="eyebrow">{{ t(lang, '任务记录', 'Job History') }}</div><h1>{{ t(lang, '最近任务与参数', 'Recent Jobs and Parameters') }}</h1><p class="muted">{{ t(lang, '单独查看任务成功、失败和参数详情。', 'Inspect recent success, failure, and run parameters in one place.') }}</p></div>
+    <section class="card"><div class="eyebrow">{{ t(lang, 'A股预计算分层', 'CN Precompute Stages') }}</div><h1 style="font-size:26px;margin:0 0 8px;">{{ t(lang, '先看是哪一层失败', 'See which stage failed first') }}</h1><p class="muted">{{ t(lang, '总控、核心、组合、补全四层结果在这里集中展开，便于快速判断是前置依赖没准备好，还是某一批模板本身失败。', 'Controller, core, combo, and rest stages are expanded here so you can quickly tell whether prerequisites are missing or a specific batch failed.') }}</p>
+      {% for stage in stage_rows %}<article style='padding:14px 0;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:16px;align-items:flex-start;'>
+        <div><div style='font-weight:800;'>{{ stage.label }}</div><div class='job-subtle'>{{ stage.detail }}</div></div>
+        <div style='display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end;'><span style='display:inline-flex;padding:4px 8px;border-radius:999px;background:rgba(82,168,255,0.12);color:#9acbff;font-size:12px;font-weight:700;'>{{ stage.summary }}</span><span style='display:inline-block;padding:4px 8px;border-radius:999px;background:{{ stage.status_view.background }};color:{{ stage.status_view.foreground }};font-size:12px;font-weight:700;'>{{ stage.status_view.label }}</span></div>
+      </article>{% else %}<div class='job-subtle'>{{ t(lang, '暂无预计算阶段记录', 'No precompute stage records yet') }}</div>{% endfor %}<div class="inline-actions">{{ actions_html }}</div></section>
+    <section class="card"><div class="eyebrow">{{ t(lang, '最近任务', 'Recent Jobs') }}</div><div class="table-wrap"><table><thead><tr><th>ID</th><th>{{ t(lang, '类型', 'Type') }}</th><th>{{ t(lang, '状态', 'Status') }}</th><th>{{ t(lang, '开始', 'Started') }}</th><th>{{ t(lang, '完成', 'Finished') }}</th><th>{{ t(lang, '参数', 'Params') }}</th><th>{{ t(lang, '消息', 'Message') }}</th></tr></thead><tbody>
+      {% for job in jobs %}<tr><td>{{ job.id }}</td><td title='{{ job.job_type }}'>{{ job.job_type_display }}</td><td><span style='display:inline-block;padding:4px 8px;border-radius:999px;background:{{ job.status_view.background }};color:{{ job.status_view.foreground }};font-size:12px;font-weight:700;'>{{ job.status_view.label }}</span></td><td>{{ job.started_display }}</td><td>{{ job.finished_display }}</td><td title='{{ job.params_title }}'><code>{{ job.params_display }}</code></td><td><div title='{{ job.message_title }}'>{{ job.message_display }}</div><div class='job-subtle' title='{{ job.result_summary }}'>{{ job.result_summary }}</div></td></tr>{% else %}<tr><td colspan='7'>{{ t(lang, '暂无任务', 'No jobs yet') }}</td></tr>{% endfor %}
+    </tbody></table></div></section>
+  </div></main></div></body>
+</html>

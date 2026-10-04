@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ copy.title }}</title>
+    <style>{{ page_style|safe }}</style>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-tag">PQW</span>
+          <h1>{{ copy.title }}</h1>
+          <p>{{ copy.description }}</p>
+        </div>
+        <nav class="side-nav">{{ nav_html|safe }}</nav>
+        <div class="sidebar-foot">{{ copy.sidebar_note }}</div>
+      </aside>
+      <main class="content">
+        <div class="wrap">
+          <div class="toolbar">
+            <a href="/screeners?lang={{ lang }}">← {{ copy.back_to_screener }}</a>
+            <a href="/watchlist?lang={{ lang }}">{{ copy.open_watchlist }}</a>
+          </div>
+          <div class="card">
+            <div class="eyebrow">{{ copy.title }}</div>
+            <h1 style="margin:0 0 8px;">{{ copy.title }}</h1>
+            <p style="margin:0;color:#6b7280;">{{ copy.holding_area }}</p>
+          </div>
+          <div class="card">
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>{{ copy.ticker }}</th>
+                    <th>{{ copy.name }}</th>
+                    <th>{{ copy.market }}</th>
+                    <th>{{ copy.patterns }}</th>
+                    <th>{{ copy.signal }}</th>
+                    <th>{{ copy.strength }}</th>
+                    <th>{{ copy.watchlist }}</th>
+                    <th>{{ copy.last_sync }}</th>
+                    <th>{{ copy.insight }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in rows %}
+                  <tr>
+                    <td><a href="/insights/{{ row.ticker|urlencode }}?lang={{ lang }}">{{ row.ticker }}</a></td>
+                    <td>{{ row.name }}</td>
+                    <td>{{ row.market }}</td>
+                    <td>{{ row.patterns }}</td>
+                    <td>{{ row.model_signal_label }}</td>
+                    <td>{{ row.model_signal_strength }}</td>
+                    <td>{{ row.watchlist_html|safe }}</td>
+                    <td>{{ row.sync_badge_html|safe }}</td>
+                    <td><a class="main-open-link" href="/insights/{{ row.ticker|urlencode }}?lang={{ lang }}">{{ copy.open_insight }}</a></td>
+                  </tr>
+                  {% else %}
+                  <tr><td colspan="9">{{ copy.empty }}</td></tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+  </body>
+</html>

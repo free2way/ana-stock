@@ -1,0 +1,250 @@
+
+    <!DOCTYPE html>
+    <html lang="{{ fragments[0]|safe }}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{{ fragments[1]|safe }}</title>
+        <style>{{ fragments[2]|safe }}</style>
+      </head>
+      <body>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{{ fragments[3]|safe }}</h1>
+              <p>{{ fragments[4]|safe }}</p>
+            </div>
+            <nav class="side-nav">{{ fragments[5]|safe }}</nav>
+            <div class="sidebar-foot">{{ fragments[6]|safe }}</div>
+          </aside>
+          <main class="main">
+          <div class="wrap">
+          <div class="toolbar">
+            <a href="/dashboard/ops?lang={{ fragments[7]|safe }}&lookback_runs={{ fragments[8]|safe }}" class="pill">← {{ fragments[9]|safe }}</a>
+            <a href="/dashboard/ops/sync?lang=en&lookback_runs={{ fragments[10]|safe }}" class="pill">English</a>
+            <a href="/dashboard/ops/sync?lang=zh&lookback_runs={{ fragments[11]|safe }}" class="pill">中文</a>
+          </div>
+          <div class="card">
+            <div class="eyebrow">{{ fragments[12]|safe }}</div>
+            <h1>{{ fragments[13]|safe }}</h1>
+            <p class="muted">{{ fragments[14]|safe }}</p>
+          </div>
+          {{ fragments[15]|safe }}
+          {{ fragments[16]|safe }}
+          <section class="card">
+            <div class="eyebrow">{{ fragments[17]|safe }}</div>
+            <div class="muted">{{ fragments[18]|safe }}: <strong>{{ fragments[19]|safe }}</strong></div>
+            <div class="muted">{{ fragments[20]|safe }}: <strong>{{ fragments[21]|safe }}</strong></div>
+            <div class="muted">{{ fragments[22]|safe }}: <strong>{{ fragments[23]|safe }}</strong></div>
+            <div class="muted">{{ fragments[24]|safe }}: <strong>{{ fragments[25]|safe }}</strong></div>
+            <div class="muted">{{ fragments[26]|safe }}: <strong>{{ fragments[27]|safe }}</strong> · {{ fragments[28]|safe }}</div>
+            <div class="muted">{{ fragments[29]|safe }}: <strong>{{ fragments[30]|safe }}</strong></div>
+            <div class="muted" style="margin-top:8px;">{{ fragments[31]|safe }}: <strong>{{ fragments[32]|safe }}</strong></div>
+            <div style="margin-top:10px;height:12px;border-radius:999px;background:#efe7d7;overflow:hidden;">
+              <div style="height:100%;width:{{ fragments[33]|safe }}%;background:linear-gradient(90deg,#0f766e,#34d399);"></div>
+            </div>
+            <div class="muted" style="margin-top:8px;">{{ fragments[34]|safe }}% ({{ fragments[35]|safe }}/{{ fragments[36]|safe }})</div>
+            <div class="muted" style="margin-top:8px;">{{ fragments[37]|safe }}</div>
+            <div style="margin-top:12px;">
+              <a class="action-link" href="/screeners?lang={{ fragments[38]|safe }}&market=CN&universe=full_market&model_template=cn_bullish_ma_stack">{{ fragments[39]|safe }}</a>
+            </div>
+          </section>
+          <section class="card">
+            <div class="eyebrow">{{ fragments[40]|safe }}</div>
+            <div class="muted">{{ fragments[41]|safe }}</div>
+            <div class="grid" style="margin-top:14px;">
+              <article class="card" style="margin:0;padding:16px;border-radius:18px;">
+                <div class="eyebrow">{{ fragments[42]|safe }}</div>
+                <div style="font-size:28px;font-weight:900;line-height:1;">{{ fragments[43]|safe }}</div>
+                <div class="muted" style="margin-top:8px;">{{ fragments[44]|safe }}</div>
+                <div class="muted" style="margin-top:10px;">
+                  {{ fragments[45]|safe }}:
+                  <strong>{{ fragments[46]|safe }}/{{ fragments[47]|safe }}</strong>
+                  ({{ fragments[48]|safe }}%)
+                </div>
+                <div class="muted">
+                  {{ fragments[49]|safe }}:
+                  <strong>{{ fragments[50]|safe }}/{{ fragments[51]|safe }}</strong>
+                  ({{ fragments[52]|safe }}%)
+                </div>
+                <div class="muted">
+                  {{ fragments[53]|safe }}:
+                  <strong>{{ fragments[54]|safe }}</strong> ·
+                  {{ fragments[55]|safe }}
+                </div>
+                <div style="margin-top:10px;">{{ fragments[56]|safe }}</div>
+                <div class="muted" style="margin-top:14px;">
+                  {{ fragments[57]|safe }}
+                  ({{ fragments[58]|safe }} 16:00):
+                  <strong>{{ fragments[59]|safe }}</strong>
+                </div>
+                <div class="muted">
+                  {{ fragments[60]|safe }}:
+                  <strong>{{ fragments[61]|safe }}/{{ fragments[62]|safe }}</strong>
+                  ({{ fragments[63]|safe }}%)
+                </div>
+                <div style="margin-top:10px;">{{ fragments[64]|safe }}</div>
+              </article>
+              <article class="card" style="margin:0;padding:16px;border-radius:18px;">
+                <div class="eyebrow">{{ fragments[65]|safe }}</div>
+                <div style="font-size:28px;font-weight:900;line-height:1;">{{ fragments[66]|safe }}</div>
+                <div class="muted" style="margin-top:8px;">{{ fragments[67]|safe }}</div>
+              </article>
+              <article class="card" style="margin:0;padding:16px;border-radius:18px;">
+                <div class="eyebrow">{{ fragments[68]|safe }}</div>
+                <div style="font-size:28px;font-weight:900;line-height:1;">
+                  {{ fragments[69]|safe }}/{{ fragments[70]|safe }}
+                </div>
+                <div class="muted" style="margin-top:8px;">
+                  {{ fragments[71]|safe }}:
+                  <strong>{{ fragments[72]|safe }}</strong> ·
+                  {{ fragments[73]|safe }}:
+                  <strong>{{ fragments[74]|safe }}</strong>
+                </div>
+                <div class="muted">
+                  {{ fragments[75]|safe }}:
+                  <strong>{{ fragments[76]|safe }}</strong> ·
+                  {{ fragments[77]|safe }}
+                </div>
+                <div class="muted" style="margin-top:8px;">
+                  {{ fragments[78]|safe }}: <strong>{{ fragments[79]|safe }}</strong>
+                </div>
+              </article>
+            </div>
+          </section>
+          <section class="grid">
+            <article class="card">
+              <div class="eyebrow">{{ fragments[80]|safe }}</div>
+              <form action="/jobs/sync-market-data" method="post">
+                <input type="hidden" name="redirect_to" value="{{ fragments[81]|safe }}" />
+                <input type="hidden" name="lang" value="{{ fragments[82]|safe }}" />
+                <input type="text" name="tickers" placeholder="AAPL,MSFT" />
+                <select name="provider"><option value="auto">auto</option><option value="alpaca">Alpaca</option><option value="tushare">TuShare</option><option value="hithink_finance">同花顺 Financial API</option><option value="yfinance">yfinance</option><option value="openbb">OpenBB</option></select>
+                <input type="text" name="start_date" placeholder="YYYY-MM-DD" />
+                <input type="text" name="end_date" placeholder="YYYY-MM-DD" />
+                <button type="submit">{{ fragments[83]|safe }}</button>
+              </form>
+              <div style="height:14px;"></div>
+              <div class="eyebrow">{{ fragments[84]|safe }}</div>
+              <form action="/jobs/refresh-us-grouped-daily" method="post">
+                <input type="hidden" name="redirect_to" value="{{ fragments[85]|safe }}" />
+                <input type="hidden" name="background" value="true" />
+                <div class="muted">{{ fragments[86]|safe }}</div>
+                <input type="text" name="trade_date" placeholder="YYYY-MM-DD ({{ fragments[87]|safe }})" />
+                <input type="number" name="limit" min="0" step="1" value="0" placeholder="{{ fragments[88]|safe }}" />
+                <label class="muted" style="display:flex;gap:8px;align-items:center;"><input type="checkbox" name="write_lake" value="true" checked style="width:auto;" /> {{ fragments[89]|safe }}</label>
+                <button type="submit">{{ fragments[90]|safe }}</button>
+              </form>
+              <div style="height:14px;"></div>
+              <div class="eyebrow">{{ fragments[91]|safe }}</div>
+              <form action="/jobs/precompute-us-screeners" method="post">
+                <input type="hidden" name="redirect_to" value="{{ fragments[92]|safe }}" />
+                <div class="muted">{{ fragments[93]|safe }}</div>
+                <button type="submit">{{ fragments[94]|safe }}</button>
+              </form>
+              <div style="height:14px;"></div>
+              <div class="eyebrow">{{ fragments[95]|safe }}</div>
+              <form action="/jobs/train-us-signals" method="post">
+                <input type="hidden" name="redirect_to" value="{{ fragments[96]|safe }}" />
+                <div class="muted">{{ fragments[97]|safe }}</div>
+                <input type="text" name="run_name" value="us_close_lightgbm" />
+                <input type="number" name="lookback_days" min="1" step="1" value="3" />
+                <input type="number" name="top_n" min="1" step="1" value="5" />
+                <button type="submit">{{ fragments[98]|safe }}</button>
+              </form>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{{ fragments[99]|safe }}</div>
+              <form action="/jobs/sync-cn-symbol-universe" method="post">
+                <input type="hidden" name="redirect_to" value="{{ fragments[100]|safe }}" />
+                <div class="muted">{{ fragments[101]|safe }}</div>
+                <button type="submit">{{ fragments[102]|safe }}</button>
+              </form>
+              <div style="height:10px;"></div>
+              <div class="eyebrow">{{ fragments[103]|safe }}</div>
+              <form action="/jobs/import-hithink-market-dump" method="post">
+                <input type="hidden" name="redirect_to" value="{{ fragments[104]|safe }}" />
+                <input type="hidden" name="background" value="true" />
+                <input type="hidden" name="write_lake" value="true" />
+                <select name="kind">
+                  <option value="daily-k-10d">{{ fragments[105]|safe }}</option>
+                  <option value="daily-k">{{ fragments[106]|safe }}</option>
+                </select>
+                <div class="muted">{{ fragments[107]|safe }}</div>
+                <button type="submit">{{ fragments[108]|safe }}</button>
+              </form>
+              <div style="height:10px;"></div>
+              <div class="eyebrow">{{ fragments[109]|safe }}</div>
+              <form action="/jobs/init-cn-market-data" method="post">
+                <input type="hidden" name="redirect_to" value="{{ fragments[110]|safe }}" />
+                <input type="number" name="days_back" min="30" step="1" value="180" placeholder="{{ fragments[111]|safe }}" />
+                <input type="number" name="offset" min="0" step="1" value="{{ fragments[112]|safe }}" placeholder="{{ fragments[113]|safe }}" />
+                <input type="number" name="batch_size" min="0" step="1" value="{{ fragments[114]|safe }}" placeholder="{{ fragments[115]|safe }}" />
+                <input type="number" name="limit" min="0" step="1" value="0" placeholder="{{ fragments[116]|safe }}" />
+                <select name="provider"><option value="auto">auto</option><option value="tushare">TuShare</option></select>
+                <button type="submit">{{ fragments[117]|safe }}</button>
+              </form>
+              <div style="height:10px;"></div>
+              <div class="eyebrow">{{ fragments[118]|safe }}</div>
+              <form action="/jobs/refresh-cn-market-data" method="post">
+                <input type="hidden" name="redirect_to" value="{{ fragments[119]|safe }}" />
+                <input type="hidden" name="background" value="true" />
+                <input type="number" name="days_back" min="2" step="1" value="7" placeholder="{{ fragments[120]|safe }}" />
+                <input type="number" name="limit" min="0" step="1" value="0" placeholder="{{ fragments[121]|safe }}" />
+                <select name="provider"><option value="auto">auto</option><option value="tushare">TuShare</option></select>
+                <button type="submit">{{ fragments[122]|safe }}</button>
+              </form>
+              <div style="height:10px;"></div>
+              <div class="eyebrow">{{ fragments[123]|safe }}</div>
+              <form action="/jobs/rebuild-technical-snapshots" method="post">
+                <input type="hidden" name="redirect_to" value="{{ fragments[124]|safe }}" />
+                <select name="market">
+                  <option value="CN">CN</option>
+                  <option value="ALL">ALL</option>
+                </select>
+                <input type="number" name="limit" min="0" step="1" value="0" placeholder="{{ fragments[125]|safe }}" />
+                <button type="submit">{{ fragments[126]|safe }}</button>
+              </form>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{{ fragments[127]|safe }}</div>
+              <div class="muted" style="margin-bottom:10px;">{{ fragments[128]|safe }}</div>
+              <form action="/jobs/sync-cn-fundamentals" method="post">
+                <input type="hidden" name="redirect_to" value="{{ fragments[129]|safe }}" />
+                <input type="hidden" name="background" value="true" />
+                <input type="text" name="tickers" placeholder="600519.SH,000001.SZ" />
+                <select name="provider"><option value="community">免费源（东方财富 / AKShare）</option><option value="tushare">TuShare</option><option value="hithink_finance">同花顺 Financial API（官方财报/估值）</option></select>
+                <input type="number" name="offset" min="0" step="1" value="{{ fragments[130]|safe }}" placeholder="{{ fragments[131]|safe }}" />
+                <input type="number" name="batch_size" min="1" max="800" step="1" value="20" placeholder="{{ fragments[132]|safe }}" />
+                <input type="number" name="max_batches" min="0" step="1" value="1" placeholder="{{ fragments[133]|safe }}" />
+                <div class="muted">{{ fragments[134]|safe }}</div>
+                <button type="submit">{{ fragments[135]|safe }}</button>
+              </form>
+              <div style="height:10px;"></div>
+              <div class="eyebrow">{{ fragments[136]|safe }}</div>
+              <div class="muted" style="margin-bottom:10px;">{{ fragments[137]|safe }}</div>
+              <form action="/jobs/sync-cn-concepts" method="post">
+                <input type="hidden" name="redirect_to" value="{{ fragments[138]|safe }}" />
+                <input type="text" name="tickers" placeholder="600519.SH,000001.SZ" />
+                <button type="submit">{{ fragments[139]|safe }}</button>
+              </form>
+              <div style="height:10px;"></div>
+              <div class="eyebrow">{{ fragments[140]|safe }}</div>
+              <form action="/jobs/sync-global-fundamentals" method="post">
+                <input type="hidden" name="redirect_to" value="{{ fragments[141]|safe }}" />
+                <input type="text" name="tickers" placeholder="ASTS,RKLB,0700.HK,0883.HK" />
+                <button type="submit">{{ fragments[142]|safe }}</button>
+              </form>
+            </article>
+          </section>
+          <section class="card">
+            <div class="eyebrow">{{ fragments[143]|safe }}</div>
+            <div class="muted" style="margin-bottom:10px;">{{ fragments[144]|safe }}</div>
+            <div class="table-wrap"><table><thead><tr><th>{{ fragments[145]|safe }}</th><th>{{ fragments[146]|safe }}</th><th>{{ fragments[147]|safe }}</th><th>{{ fragments[148]|safe }}</th></tr></thead><tbody>{{ fragments[149]|safe }}</tbody></table></div>
+          </section>
+          </div>
+          </main>
+        </div>
+      </body>
+    </html>

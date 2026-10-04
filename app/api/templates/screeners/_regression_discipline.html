@@ -1,0 +1,9 @@
+<article class="card" style="background:linear-gradient(180deg, rgba(17,28,40,0.98), rgba(12,21,32,0.96));border-color:rgba(246,200,95,0.28);">
+  <div class="eyebrow">{{ title }}</div>
+  <div style="font-size:18px;font-weight:900;color:var(--ink);margin-bottom:6px;">{{ headline }}</div>
+  <div class="muted">{{ subtitle }}</div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;">{% for item in stats %}<span class="default-chip">{{ item.label }}: {{ item.value }}</span>{% endfor %}</div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;">{% for item in metrics %}<span class="default-chip">{{ item.label }}: {{ item.value }}</span>{% endfor %}</div>
+  <div class="summary-note" style="margin-top:12px;">{{ workflow }}</div>
+  <div class="detail-card" style="margin-top:12px;background:rgba(11,19,29,0.82);border-color:rgba(255,255,255,0.06);">{% for note in notes %}<div class="muted">• {{ note }}</div>{% else %}<div class="muted">-</div>{% endfor %}</div>
+</article>

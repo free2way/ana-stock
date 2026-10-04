@@ -21,7 +21,7 @@ def main() -> None:
     runner = BacktestRunner()
     args = parse_args()
     try:
-        count = runner.run(top_n=args.top_n)
+        count = runner.run(top_n=args.top_n, engine_version="event_driven_daily_v2")
         print(f"Stored {count} daily backtest rows.")
     except Exception as exc:
         print(exc)

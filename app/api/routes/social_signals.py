@@ -28,6 +28,9 @@ from app.services.ticker_format import infer_market_from_ticker, normalize_ticke
 from app.services.ui_lang import resolve_request_lang
 from app.services.workspace_nav import WORKSPACE_COMPACT_STYLE, WORKSPACE_SIDEBAR_STYLE, render_workspace_nav_html
 from app.services.workspace_snapshots import refresh_workspace_snapshots
+from app.api.presentation.tokens import (
+    ROOT_TOKENS_BASE,
+)
 
 
 router = APIRouter(prefix="/social-signals", tags=["social-signals"])
@@ -205,7 +208,7 @@ def social_signals_page(
     default_handle = summary["accounts"][0].get("handle") if summary["accounts"] else ""
     tracked_handles = ", ".join(str(item.get("handle") or "") for item in summary["accounts"]) or "-"
     banner = f"<div class='banner'>{_h(message)}</div>" if message else ""
-    return f"""
+    return (f"""
     <!DOCTYPE html>
     <html lang="{lang}">
       <head>
@@ -213,7 +216,7 @@ def social_signals_page(
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{'社交信号' if lang == 'zh' else 'Social Signals'}</title>
         <style>
-          :root {{ --bg:#071018; --panel:#111c28; --ink:#e6edf3; --muted:#90a3b8; --line:#223246; --accent:#3dd9b6; }}
+          """ + (ROOT_TOKENS_BASE) + f"""
           * {{ box-sizing:border-box; }}
           body {{ margin:0; font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:radial-gradient(circle at top left, rgba(82,168,255,0.16), transparent 28%),radial-gradient(circle at bottom right, rgba(61,217,182,0.12), transparent 26%),linear-gradient(180deg, #08111a 0%, #071018 100%); }}
           a {{ color:inherit; text-decoration:none; }}
@@ -316,7 +319,7 @@ def social_signals_page(
         </div>
       </body>
     </html>
-    """
+    """)
 
 
 @router.post("/accounts/add")

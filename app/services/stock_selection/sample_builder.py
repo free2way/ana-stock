@@ -42,11 +42,13 @@ class SampleBuildConfig:
             raise ValueError("net_return target must not require relative returns")
         if self.target_mode == "industry_excess_return" and not self.require_relative_returns:
             raise ValueError("industry excess requires relative returns")
+        if self.market.upper() == "CN" and 1 in self.horizons:
+            # A-share T+1: a next-open entry cannot exit at the same session
+            # close, so a one-day horizon is not an executable label.
+            raise ValueError("CN T+1 forbids a same-session exit; horizons must not contain 1")
         if self.fill_cost_model is not None:
             if self.label_version != FILL_COST_OUTCOME_VERSION or self.round_trip_cost_bps != 0 or self.drawdown_penalty != 0:
                 raise ValueError("fill-cost samples require v2 label and zero legacy cost/penalty")
-            if self.market.upper() == "CN" and 1 in self.horizons:
-                raise ValueError("CN fill-cost samples cannot use same-session exit")
         elif self.label_version == FILL_COST_OUTCOME_VERSION:
             raise ValueError("v2 label requires fill_cost_model")
 

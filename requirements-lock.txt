@@ -1,0 +1,25 @@
+# Exact pins for reproducible container builds (validated on the dev runtime).
+# requirements.txt remains the ranged manifest for local development; install
+# this file in CI/Docker so a rebuild cannot silently upgrade the stack.
+catboost==1.2.10
+duckdb==1.5.2
+exchange_calendars==4.11.1
+fastapi==0.128.8
+jinja2==3.1.6
+httpx==0.28.1
+korean_lunar_calendar==0.4.0
+lightgbm==4.6.0
+pandas==2.3.3
+polars==1.39.3
+psycopg[binary]==3.3.3
+pyarrow==22.0.0
+pydantic==2.12.5
+pydantic-settings==2.13.1
+pyluach==2.3.0
+python-dateutil==2.9.0.post0
+python-multipart==0.0.22
+scikit-learn==1.8.0
+SQLAlchemy==2.0.48
+toolz==1.1.0
+uvicorn==0.40.0
+xgboost==3.3.0

@@ -12,6 +12,7 @@ from app.services import screener as screener_service
 from app.services import execution_tag_filters
 from app.services import symbol_details, technical_patterns, price_snapshot, ticker_format
 from app.services import template_evaluation
+from app.services import display_compaction
 
 
 class SharedReturnCalculationTests(TestCase):
@@ -28,16 +29,12 @@ class SharedReturnCalculationTests(TestCase):
                 {"ticker": "A", "score_history": history}, "trend"))
         self.assertEqual((0, 0.0, "A"), dashboard._continuous_leader_sort_key({"ticker": "A"}, "hits"))
 
-    def test_page_and_export_use_same_sort_helper_without_changing_direction(self):
-        tree = ast.parse(Path(dashboard.__file__).read_text())
-        for name in ("dashboard_continuous_leaders_page", "dashboard_continuous_leaders_export"):
-            function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
-            key = next(n for n in ast.walk(function) if isinstance(n, ast.FunctionDef) and n.name == "sort_rank")
-            self.assertEqual("return _continuous_leader_sort_key(item, continuous_sort_by)", ast.unparse(key.body[0]))
-            sort = next(n for n in ast.walk(function) if isinstance(n, ast.Call)
-                        and isinstance(n.func, ast.Attribute) and ast.unparse(n.func) == "rows_source.sort")
-            self.assertEqual({"key": "sort_rank", "reverse": "continuous_sort_order != 'asc'"},
-                             {kw.arg: ast.unparse(kw.value) for kw in sort.keywords})
+    def test_compatibility_sort_export_keeps_service_identity(self):
+        from app.services.continuous_leaders import continuous_leader_sort_key
+
+        self.assertIs(dashboard._continuous_leader_sort_key, continuous_leader_sort_key)
+        # Page/export ordering is exercised through HTTP in
+        # test_continuous_leaders_routes, without freezing route internals.
 
     def test_consumers_keep_shared_calculation_identity(self):
         self.assertIs(dashboard._aggregate_window_stats, template_evaluation.aggregate_window_stats)
@@ -140,6 +137,14 @@ class ExecutionTagFilterTests(TestCase):
 
 
 class SharedPresentationTests(TestCase):
+    def test_dashboard_compaction_exports_keep_shared_service_identity(self):
+        from app.api.routes.dashboard import _common, ops
+
+        self.assertIs(_common._compact_label, display_compaction.compact_label)
+        self.assertIs(_common._compact_run_name, display_compaction.compact_run_name)
+        self.assertIs(_common._compact_job_type, display_compaction.compact_job_type)
+        self.assertIs(ops._compact_json_summary, display_compaction.compact_json_summary)
+
     def test_existing_route_names_reference_shared_functions(self):
         for route in (screener, portfolio):
             self.assertIs(route._compact_text, rendering.compact_text)
@@ -172,7 +177,7 @@ class PublicCompatibilityTests(TestCase):
         imports = {alias.asname or alias.name: (node.module, alias.name)
                    for node in tree.body if isinstance(node, ast.ImportFrom)
                    for alias in node.names}
-        self.assertEqual(189, len(imports))
+        self.assertEqual(200, len(imports))
         self.assertEqual(set(imports), set(package.__all__))
         self.assertEqual(len(imports), len(package.__all__))
         for name, (module, original) in imports.items():

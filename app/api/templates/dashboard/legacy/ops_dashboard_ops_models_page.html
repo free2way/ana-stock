@@ -1,0 +1,52 @@
+
+    <!DOCTYPE html>
+    <html lang="{{ fragments[0]|safe }}">
+      <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>{{ fragments[1]|safe }}</title>
+      <style>{{ fragments[2]|safe }}</style></head>
+      <body><div class="app"><aside class="sidebar"><div class="brand"><span class="brand-tag">PQW</span><h1>{{ fragments[3]|safe }}</h1><p>{{ fragments[4]|safe }}</p></div><nav class="side-nav">{{ fragments[5]|safe }}</nav><div class="sidebar-foot">{{ fragments[6]|safe }}</div></aside><main class="main"><div class="wrap">
+        <div class="toolbar">
+          <a href="/dashboard/ops?lang={{ fragments[7]|safe }}&lookback_runs={{ fragments[8]|safe }}" class="pill">← {{ fragments[9]|safe }}</a>
+          <a href="/dashboard/ops/models?lang=en&lookback_runs={{ fragments[10]|safe }}" class="pill">English</a>
+          <a href="/dashboard/ops/models?lang=zh&lookback_runs={{ fragments[11]|safe }}" class="pill">中文</a>
+        </div>
+        <div class="card"><div class="eyebrow">{{ fragments[12]|safe }}</div><h1>{{ fragments[13]|safe }}</h1><p class="muted">{{ fragments[14]|safe }}</p></div>
+        <section class="card">
+          <div class="eyebrow">{{ fragments[15]|safe }}</div>
+          <form action="/jobs/train" method="post" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));align-items:end;">
+            <input type="hidden" name="redirect_to" value="{{ fragments[16]|safe }}" />
+            <input type="text" name="run_name" value="lightgbm_momentum" placeholder="{{ fragments[17]|safe }}" />
+            <input type="hidden" name="model_type" value="lightgbm" />
+            <select name="signal_type"><option value="momentum">Momentum</option></select>
+            <input type="number" name="lookback_days" min="1" step="1" value="3" />
+            <button type="submit">{{ fragments[18]|safe }}</button>
+          </form>
+        </section>
+        <section class="card">
+          <div class="eyebrow">{{ fragments[19]|safe }}</div>
+          <div class="table-wrap"><table><thead><tr><th>ID</th><th>{{ fragments[20]|safe }}</th><th>{{ fragments[21]|safe }}</th><th>{{ fragments[22]|safe }}</th><th>{{ fragments[23]|safe }}</th><th>{{ fragments[24]|safe }}</th></tr></thead><tbody>{{ fragments[25]|safe }}</tbody></table></div>
+        </section>
+        <section class="grid">
+          <article class="card">
+            <div class="eyebrow">{{ fragments[26]|safe }}</div>
+            <div class="muted">{{ fragments[27]|safe }}</div>
+            <div>{{ fragments[28]|safe }}</div>
+            <div class="tag-row">{{ fragments[29]|safe }}</div>
+          </article>
+          <article class="card">
+            <div class="eyebrow">{{ fragments[30]|safe }}</div>
+            <div class="muted">{{ fragments[31]|safe }}</div>
+            <div>{{ fragments[32]|safe }}</div>
+          </article>
+          <article class="card">
+            <div class="eyebrow">{{ fragments[33]|safe }}</div>
+            <div class="muted">{{ fragments[34]|safe }}</div>
+            <div>{{ fragments[35]|safe }}</div>
+          </article>
+          <article class="card">
+            <div class="eyebrow">{{ fragments[36]|safe }}</div>
+            <div class="muted">{{ fragments[37]|safe }}</div>
+            <div>{{ fragments[38]|safe }}</div>
+          </article>
+        </section>
+        <section class="card"><div class="eyebrow">{{ fragments[39]|safe }}</div><div style="margin-bottom:12px;">{{ fragments[40]|safe }}</div><pre>{{ fragments[41]|safe }}</pre></section>
+      </div></main></div></body></html>

@@ -19,7 +19,8 @@ from app.services.us_market_scheduler import USMarketSchedulerService
 
 
 class ScheduledExecutionContractTests(ApplicationPostgresTestCase):
-    def exercise(self, market, *, missing_open=False, contract=None, verified_prices=False):
+    def exercise(self, market, *, missing_open=False, contract=None, verified_prices=False,
+                 optional_facts=True):
         with SessionLocal() as db:
             parent = DataJobRepository(db).create_job(
                 job_type='execution_contract_fixture', status='success', params={})
@@ -50,9 +51,10 @@ class ScheduledExecutionContractTests(ApplicationPostgresTestCase):
                    for day in range(1, 23)]
         if verified_prices:
             from app.services.market_calendar import is_market_open_date
-            history = [dict(row, price_basis='raw', suspended=False,
-                            corporate_action_status='none', upper_limit=120.0,
-                            lower_limit=80.0, execution_source_reference='synthetic-golden-v1')
+            optional = (dict(suspended=False, upper_limit=120.0, lower_limit=80.0)
+                        if optional_facts else {})
+            history = [dict(row, price_basis='raw', corporate_action_status='none',
+                            execution_source_reference='synthetic-golden-v1', **optional)
                        for row in history if is_market_open_date(market, row['date'])]
         if missing_open:
             for row in history:
@@ -93,11 +95,8 @@ class ScheduledExecutionContractTests(ApplicationPostgresTestCase):
 
     def assert_valid_contract_computes(self, market):
         from app.services.execution_costs import FillCostModel
-        contract = {'version': 'reconciled_execution_v1', 'market': market,
-                    'calendar_version': 'market_calendar_2026_v1',
-                    'price_basis': 'raw', 'cost': FillCostModel(8, 12).metadata(),
-                    'entry_rule': 'next_session_open',
-                    'exit_rule': 'signal_plus_h_close_defer_until_executable'}
+        from app.services.execution_reconciliation import execution_contract, VERSION
+        contract = execution_contract(market, FillCostModel(8, 12))
         payload = self.exercise(market, contract=contract, verified_prices=True)
         ledger = payload['summary']['candidate_outcomes']
         self.assertEqual(5, len(ledger))
@@ -106,7 +105,7 @@ class ScheduledExecutionContractTests(ApplicationPostgresTestCase):
         # Independent arithmetic, not the shared fee helper as oracle.
         expected = (105 * (1 - .0012) * (1 - .0008) / (100 * (1 + .0012) * (1 + .0008))) - 1
         self.assertAlmostEqual(expected, five['net_return'], places=12)
-        self.assertEqual('reconciled_execution_v1', payload['summary']['outcome_protocol'])
+        self.assertEqual(VERSION, payload['summary']['outcome_protocol'])
         self.assertFalse(payload['summary']['legacy_fallback_used'])
 
     def test_cn_valid_contract_has_successful_trade_not_blanket_block(self):
@@ -114,3 +113,13 @@ class ScheduledExecutionContractTests(ApplicationPostgresTestCase):
 
     def test_us_valid_contract_has_successful_trade_not_blanket_block(self):
         self.assert_valid_contract_computes('US')
+
+    def test_cn_v2_optional_suspension_and_bounds_absent_still_computes(self):
+        from app.services.execution_costs import FillCostModel
+        from app.services.execution_reconciliation import execution_contract
+        payload = self.exercise('CN', contract=execution_contract('CN', FillCostModel(8, 12)),
+                                verified_prices=True, optional_facts=False)
+        five = next(row for row in payload['summary']['candidate_outcomes']
+                    if row['horizon_days'] == 5)
+        self.assertEqual('CLOSED', five['status'])
+        self.assertTrue(five['optional_evidence_gaps'])

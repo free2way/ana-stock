@@ -91,7 +91,14 @@ def refresh_us_grouped_daily(
     lake_write_seconds = 0.0
     if write_lake:
         lake_started_at = time.perf_counter()
-        lake_path = write_daily_ohlcv_parquet(market="US", trade_date=effective_trade_date, rows=rows)
+        lake_path = write_daily_ohlcv_parquet(
+            market="US",
+            trade_date=effective_trade_date,
+            rows=[
+                {**row, "provider": "polygon", "source_reference": f"polygon:grouped_daily:{effective_trade_date}"}
+                for row in rows
+            ],
+        )
         lake_write_seconds = round(time.perf_counter() - lake_started_at, 3)
     upsert_started_at = time.perf_counter()
     result = _bulk_upsert_grouped_daily_state(rows, trade_date=effective_trade_date)

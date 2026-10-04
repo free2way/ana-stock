@@ -1,0 +1,250 @@
+
+    <!DOCTYPE html>
+    <html lang="{{ fragments[0]|safe }}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{{ fragments[1]|safe }}</title>
+        <style>{{ fragments[2]|safe }}</style>
+      </head>
+      <body>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{{ fragments[3]|safe }}</h1>
+              <p>{{ fragments[4]|safe }}</p>
+            </div>
+            <nav class="side-nav">{{ fragments[5]|safe }}</nav>
+          </aside>
+          <main class="main">
+            <div class="wrap">
+              <div class="toolbar">
+                <a class="pill" href="/dashboard?lang={{ fragments[6]|safe }}&mode=monitor">← {{ fragments[7]|safe }}</a>
+                <a class="pill" href="/dashboard/premarket-plan?lang={{ fragments[8]|safe }}">{{ fragments[9]|safe }}</a>
+                <a class="pill" href="/dashboard/ai-daily-report?lang={{ fragments[10]|safe }}">{{ fragments[11]|safe }}</a>
+                <a class="pill" href="/portfolio?lang={{ fragments[12]|safe }}">{{ fragments[13]|safe }}</a>
+              </div>
+              <section class="hero">
+                <div class="eyebrow">{{ fragments[14]|safe }}</div>
+                <h1>{{ fragments[15]|safe }}</h1>
+                <div class="muted">{{ fragments[16]|safe }}</div>
+                <div class="toolbar" style="margin:14px 0 0;">
+                  <span class="pill">{{ fragments[17]|safe }}: {{ fragments[18]|safe }}</span>
+                  <span class="pill">{{ fragments[19]|safe }}: {{ fragments[20]|safe }}</span>
+                </div>
+              </section>
+              <section class="toolbar" style="margin-top:0;">{{ fragments[21]|safe }}</section>
+              <section class="metrics">
+                <button class="metric filter-metric" type="button" data-monitor-filter="in_zone" aria-pressed="false" title="{{ '点击筛选进入买入区的股票' if fragments[0] == 'zh' else 'Filter names in the buy zone' }}"><span>{{ fragments[22]|safe }}</span><strong>{{ fragments[23]|safe }}</strong></button>
+                <button class="metric filter-metric" type="button" data-monitor-filter="risk" aria-pressed="false" title="{{ '点击筛选触及风险位的股票' if fragments[0] == 'zh' else 'Filter names at risk triggers' }}"><span>{{ fragments[24]|safe }}</span><strong>{{ fragments[25]|safe }}</strong></button>
+                <button class="metric filter-metric" type="button" data-monitor-filter="extended" aria-pressed="false" title="{{ '点击筛选不应追高的股票' if fragments[0] == 'zh' else 'Filter names that should not be chased' }}"><span>{{ fragments[26]|safe }}</span><strong>{{ fragments[27]|safe }}</strong></button>
+                <button class="metric filter-metric" type="button" data-monitor-filter="no_price" aria-pressed="false" title="{{ '点击筛选缺少行情的股票' if fragments[0] == 'zh' else 'Filter names without a current price' }}"><span>{{ fragments[28]|safe }}</span><strong>{{ fragments[29]|safe }}</strong></button>
+              </section>
+              <div class="monitor-filter-state" id="monitor-filter-state" role="status" aria-live="polite" hidden></div>
+              <section class="cards" id="monitor-cards">
+                {{ fragments[30]|safe }}
+                <article class="monitor-card" id="monitor-filter-empty" hidden><div class="monitor-detail">{{ '当前标签下没有股票。' if fragments[0] == 'zh' else 'No names match this status.' }}</div></article>
+              </section>
+            </div>
+          </main>
+        </div>
+        <div class="kline-modal" id="kline-modal" hidden>
+          <div class="kline-dialog" role="dialog" aria-modal="true" aria-labelledby="kline-title">
+            <div class="kline-head">
+              <div>
+                <div class="kline-title" id="kline-title">{{ fragments[31]|safe }}</div>
+                <div class="kline-meta" id="kline-meta">{{ fragments[32]|safe }}</div>
+              </div>
+              <button class="kline-close" id="kline-close" type="button" aria-label="Close">×</button>
+            </div>
+            <div class="kline-chart-wrap">
+              <canvas id="kline-canvas"></canvas>
+            </div>
+            <div class="kline-message" id="kline-message"></div>
+          </div>
+        </div>
+        <script>
+          const monitorLang = {{ fragments[33]|safe }};
+          const monitorCards = [...document.querySelectorAll('#monitor-cards .monitor-card[data-monitor-status]')];
+          const monitorFilterButtons = [...document.querySelectorAll('[data-monitor-filter]')];
+          const monitorFilterState = document.getElementById('monitor-filter-state');
+          const monitorFilterEmpty = document.getElementById('monitor-filter-empty');
+          const monitorFilterLabels = Object.fromEntries(monitorFilterButtons.map(button => [button.dataset.monitorFilter, button.querySelector('span').textContent]));
+          let activeMonitorFilter = '';
+
+          function applyMonitorFilter(status) {
+            const selected = status === activeMonitorFilter ? '' : status;
+            activeMonitorFilter = selected;
+            let visibleCount = 0;
+            monitorCards.forEach(card => {
+              const visible = !selected || card.dataset.monitorStatus === selected;
+              card.hidden = !visible;
+              if (visible) visibleCount++;
+            });
+            monitorFilterButtons.forEach(button => {
+              button.setAttribute('aria-pressed', String(button.dataset.monitorFilter === selected));
+              button.classList.toggle('active', button.dataset.monitorFilter === selected);
+            });
+            monitorFilterEmpty.hidden = !selected || visibleCount > 0;
+            monitorFilterState.hidden = !selected;
+            monitorFilterState.textContent = selected
+              ? `${monitorFilterLabels[selected]} · ${visibleCount} ${monitorLang === 'zh' ? '只' : 'names'}`
+              : '';
+          }
+
+          monitorFilterButtons.forEach(button => {
+            button.addEventListener('click', () => applyMonitorFilter(button.dataset.monitorFilter));
+          });
+          const modal = document.getElementById('kline-modal');
+          const closeBtn = document.getElementById('kline-close');
+          const titleEl = document.getElementById('kline-title');
+          const metaEl = document.getElementById('kline-meta');
+          const messageEl = document.getElementById('kline-message');
+          const canvas = document.getElementById('kline-canvas');
+          const ctx = canvas.getContext('2d');
+
+          function openModal() {
+            modal.hidden = false;
+            document.body.classList.add('modal-open');
+          }
+
+          function closeModal() {
+            modal.hidden = true;
+            document.body.classList.remove('modal-open');
+          }
+
+          function resizeCanvas() {
+            const ratio = window.devicePixelRatio || 1;
+            const rect = canvas.getBoundingClientRect();
+            canvas.width = Math.max(320, Math.floor(rect.width * ratio));
+            canvas.height = Math.max(260, Math.floor(rect.height * ratio));
+            ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+            return { width: rect.width, height: rect.height };
+          }
+
+          function drawEmpty(message) {
+            const size = resizeCanvas();
+            ctx.clearRect(0, 0, size.width, size.height);
+            ctx.fillStyle = 'rgba(255,255,255,0.62)';
+            ctx.font = '14px ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
+            ctx.fillText(message || (monitorLang === 'zh' ? '暂无日内K线数据' : 'No intraday bars'), 22, 44);
+          }
+
+          function drawCandles(bars) {
+            const size = resizeCanvas();
+            ctx.clearRect(0, 0, size.width, size.height);
+            const padL = 48, padR = 14, padT = 18, padB = 34;
+            const w = size.width - padL - padR;
+            const h = size.height - padT - padB;
+            if (!bars || bars.length === 0) {
+              drawEmpty(monitorLang === 'zh' ? '暂无日内K线数据' : 'No intraday bars');
+              return;
+            }
+            const highs = bars.map(b => Number(b.h)).filter(Number.isFinite);
+            const lows = bars.map(b => Number(b.l)).filter(Number.isFinite);
+            const maxP = Math.max(...highs);
+            const minP = Math.min(...lows);
+            const span = Math.max(0.0001, maxP - minP);
+            const y = price => padT + ((maxP - price) / span) * h;
+            ctx.strokeStyle = 'rgba(148,163,184,0.16)';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 4; i++) {
+              const yy = padT + h * i / 4;
+              ctx.beginPath();
+              ctx.moveTo(padL, yy);
+              ctx.lineTo(padL + w, yy);
+              ctx.stroke();
+              const label = (maxP - span * i / 4).toFixed(2);
+              ctx.fillStyle = 'rgba(203,213,225,0.72)';
+              ctx.font = '11px ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
+              ctx.fillText(label, 6, yy + 4);
+            }
+            const slot = w / bars.length;
+            const bodyW = Math.max(3, Math.min(10, slot * 0.58));
+            bars.forEach((bar, index) => {
+              const o = Number(bar.o), c = Number(bar.c), hi = Number(bar.h), lo = Number(bar.l);
+              if (![o, c, hi, lo].every(Number.isFinite)) return;
+              const x = padL + slot * index + slot / 2;
+              const up = c >= o;
+              const color = up ? '#34d399' : '#fb7185';
+              ctx.strokeStyle = color;
+              ctx.fillStyle = color;
+              ctx.lineWidth = 1.25;
+              ctx.beginPath();
+              ctx.moveTo(x, y(hi));
+              ctx.lineTo(x, y(lo));
+              ctx.stroke();
+              const top = y(Math.max(o, c));
+              const bottom = y(Math.min(o, c));
+              const bodyH = Math.max(2, bottom - top);
+              ctx.fillRect(x - bodyW / 2, top, bodyW, bodyH);
+            });
+            const first = bars[0];
+            const last = bars[bars.length - 1];
+            ctx.fillStyle = 'rgba(203,213,225,0.68)';
+            ctx.font = '11px ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
+            ctx.fillText(String(first.t || '').slice(11, 16), padL, size.height - 10);
+            ctx.fillText(String(last.t || '').slice(11, 16), Math.max(padL, size.width - 68), size.height - 10);
+          }
+
+          async function fetchIntradayBars(url, retries) {
+            let lastData = null;
+            for (let attempt = 0; attempt <= retries; attempt++) {
+              const response = await fetch(url, { headers: { 'Accept': 'application/json' } });
+              const data = await response.json();
+              const bars = Array.isArray(data.bars) ? data.bars : [];
+              if (bars.length > 0 || attempt >= retries) return data;
+              lastData = data;
+              await new Promise(resolve => window.setTimeout(resolve, 700));
+            }
+            return lastData || { status: 'empty', bars: [] };
+          }
+
+          async function loadChart(button) {
+            const ticker = button.dataset.ticker || '';
+            const name = button.dataset.name || ticker;
+            const market = button.dataset.market || 'US';
+            titleEl.textContent = `${name} (${ticker}) · ${monitorLang === 'zh' ? '日内 K 线' : 'Intraday Chart'}`;
+            metaEl.textContent = monitorLang === 'zh' ? '正在加载 5 分钟K线...' : 'Loading 5-minute bars...';
+            messageEl.textContent = '';
+            openModal();
+            drawEmpty(monitorLang === 'zh' ? '正在加载...' : 'Loading...');
+            try {
+              const url = `/dashboard/realtime-monitor/intraday?ticker=${encodeURIComponent(ticker)}&market=${encodeURIComponent(market)}&timeframe=5Min`;
+              const data = await fetchIntradayBars(url, market === 'CN' ? 2 : 0);
+              const bars = Array.isArray(data.bars) ? data.bars : [];
+              metaEl.textContent = `${ticker} · ${data.timeframe || '5Min'} · ${data.feed ? String(data.feed).toUpperCase() : market} · ${bars.length} bars`;
+              messageEl.textContent = data.message || '';
+              if (data.status !== 'success' || bars.length === 0) {
+                drawEmpty(data.message || (monitorLang === 'zh' ? '暂无日内K线数据' : 'No intraday bars'));
+                return;
+              }
+              drawCandles(bars);
+            } catch (error) {
+              const message = monitorLang === 'zh' ? '加载日内K线失败，请稍后重试。' : 'Failed to load intraday bars.';
+              metaEl.textContent = message;
+              messageEl.textContent = String(error && error.message ? error.message : error);
+              drawEmpty(message);
+            }
+          }
+
+          document.querySelectorAll('.track-button').forEach(button => {
+            button.addEventListener('click', () => loadChart(button));
+          });
+          closeBtn.addEventListener('click', closeModal);
+          modal.addEventListener('click', event => {
+            if (event.target === modal) closeModal();
+          });
+          window.addEventListener('keydown', event => {
+            if (event.key === 'Escape' && !modal.hidden) closeModal();
+          });
+          window.addEventListener('resize', () => {
+            if (!modal.hidden) drawEmpty(monitorLang === 'zh' ? '窗口大小已变化，请重新点击加载。' : 'Window resized. Click again to reload.');
+          });
+          window.setInterval(() => {
+            if (modal.hidden) window.location.reload();
+          }, 60000);
+        </script>
+      </body>
+    </html>

@@ -1,4 +1,5 @@
 import csv
+import json
 from collections import defaultdict
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from app.models.schema import SymbolCreate
 from app.services.market_hot_predictions import MarketHotPredictionRepository
 from app.services.market_storage_routing import legacy_mirror_write_enabled
 from app.services.model_signal_summary import enrich_model_output, summarize_model_output
+from app.services.price_basis_contract import probe_adjusted_view
 from app.services.prediction_artifacts import select_hot_prediction_rows
 from app.services.repository import (
     ModelChartSignalRepository,
@@ -48,6 +50,85 @@ def _optional_int(value: str | None) -> int | None:
     if number is None:
         return None
     return int(number)
+
+
+def _read_artifact_price_basis_binding(artifact_path: str | None) -> str | None:
+    """View hash the exported artifact was produced against, if declared.
+
+    External/native artifacts may carry ``adjusted_view_sha256`` (top level) or
+    a ``price_basis_contract`` / ``price_basis`` block with ``view_sha256`` in
+    their ``manifest.json``. Missing / malformed manifests simply mean "no
+    declared basis" and never raise.
+    """
+
+    if not artifact_path:
+        return None
+    artifact = Path(artifact_path)
+    if not artifact.is_dir():
+        return None
+    manifest_path = artifact / "manifest.json"
+    if not manifest_path.exists() or not manifest_path.is_file():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    nested = payload.get("price_basis_contract") or payload.get("price_basis") or {}
+    if not isinstance(nested, dict):
+        nested = {}
+    declared = payload.get("adjusted_view_sha256") or nested.get("view_sha256")
+    return str(declared) if declared else None
+
+
+def _external_price_basis_contract(market: str, *, artifact_path: str | None) -> dict:
+    """Audit the local adjusted-view state for an imported prediction artifact.
+
+    Imported predictions are produced outside this app, so the adjusted view is
+    not *consumed* here and the contract is recorded as ``not applicable`` (a
+    raw basis) — it must never be mislabelled as an adjusted run. Two guardrails
+    still fail closed: a *corrupt* local view for the target market, and an
+    artifact that declares a view hash differing from the current view.
+    """
+
+    probe = probe_adjusted_view(market, read_bars=False)
+    declared_sha256 = _read_artifact_price_basis_binding(artifact_path)
+    if probe.unreadable:
+        raise RuntimeError(
+            "[inference] price-basis contract refused the import: the adjusted view "
+            f"for market={market} exists but is unreadable "
+            f"(reason={probe.error}). A corrupt view is never treated as 'no view'; "
+            "rebuild it (scripts/rebuild_adjusted_view.py) before importing predictions."
+        )
+    if declared_sha256 is not None and probe.view_sha256 != declared_sha256:
+        raise RuntimeError(
+            "[inference] price-basis contract refused the import: the artifact "
+            f"declares adjusted_view_sha256={declared_sha256} but the current view "
+            f"for market={market} is {probe.view_sha256}. The artifact was produced "
+            "on a different price basis than the one on disk; rebuild or re-export "
+            "it before importing."
+        )
+    return {
+        "entry_point": "inference",
+        "decision": "allow_raw_with_authorization",
+        "reasons": [],
+        "applicable": False,
+        "source": "external_model_artifact",
+        "view_state": probe.state,
+        "view_sha256": probe.view_sha256,
+        "actions_sha256": probe.actions_sha256,
+        "coverage_share": round(float(probe.coverage_share), 8),
+        "missing_rows": probe.missing_rows,
+        "missing_symbols": list(probe.missing_symbols),
+        "fallback_policy": "external_artifact",
+        "authorized_by": "external_model_artifact",
+        "declared_view_sha256": declared_sha256,
+        "version_match": (
+            None if declared_sha256 is None else probe.view_sha256 == declared_sha256
+        ),
+        "label_price_basis": "raw",
+    }
 
 
 class ExternalModelOutputImporter:
@@ -106,6 +187,14 @@ class ExternalModelOutputImporter:
 
         prepared_predictions: list[dict] = []
         prepared_details: list[dict] = []
+        # Probe/record the shared price-basis contract before any run row exists:
+        # a corrupt local view or a basis-mismatched artifact must not create a
+        # model run that downstream consumers could trust.
+        price_basis_contract = (
+            _external_price_basis_contract(requested_market, artifact_path=artifact_path)
+            if requested_market in {"CN", "US"}
+            else None
+        )
 
         with SessionLocal() as db:
             symbol_repo = SymbolRepository(db)
@@ -124,7 +213,11 @@ class ExternalModelOutputImporter:
                 train_end=all_dates[-1] if all_dates else None,
                 test_start=all_dates[0] if all_dates else None,
                 test_end=all_dates[-1] if all_dates else None,
-                config={"source": "external_csv", "csv_path": str(csv_path)},
+                config={
+                    "source": "external_csv",
+                    "csv_path": str(csv_path),
+                    "price_basis_contract": price_basis_contract,
+                },
                 artifact_path=artifact_path,
                 status="running",
             )

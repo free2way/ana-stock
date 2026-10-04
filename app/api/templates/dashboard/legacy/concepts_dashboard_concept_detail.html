@@ -1,0 +1,221 @@
+
+    <!DOCTYPE html>
+    <html lang="{{ fragments[0]|safe }}">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{{ fragments[1]|safe }}</title>
+        <style>{{ fragments[2]|safe }}</style>
+      </head>
+      <body>
+        <div class="app">
+          <aside class="sidebar">
+            <div class="brand">
+              <span class="brand-tag">PQW</span>
+              <h1>{{ fragments[3]|safe }}</h1>
+              <p>{{ fragments[4]|safe }}</p>
+            </div>
+            <nav class="side-nav">{{ fragments[5]|safe }}</nav>
+            <div class="sidebar-foot">{{ fragments[6]|safe }}</div>
+          </aside>
+          <main class="main">
+            <div class="wrap">
+              {{ fragments[7]|safe }}
+          <div class="card">
+            <div class="compare-row">
+              <a class="compare-pill" href="/dashboard/market?lang={{ fragments[8]|safe }}&lookback_runs={{ fragments[9]|safe }}">← {{ fragments[10]|safe }}</a>
+              <a class="compare-pill" href="/dashboard/market/heatmap?lang={{ fragments[11]|safe }}&lookback_runs={{ fragments[12]|safe }}">{{ fragments[13]|safe }}</a>
+              <a class="compare-pill" href="/dashboard/market/concepts?lang={{ fragments[14]|safe }}&lookback_runs={{ fragments[15]|safe }}">{{ fragments[16]|safe }}</a>
+            </div>
+            {{ fragments[17]|safe }}
+            <div class="eyebrow" style="margin-top:12px;">{{ fragments[18]|safe }}</div>
+            <div class="metric">{{ fragments[19]|safe }}</div>
+            <div class="muted">{{ fragments[20]|safe }}</div>
+          </div>
+          <section class="grid">
+            <article class="card">
+              <div class="eyebrow">{{ fragments[21]|safe }}</div>
+              <div class="metric">{{ fragments[22]|safe }}</div>
+              <div class="muted">{{ fragments[23]|safe }}</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{{ fragments[24]|safe }}</div>
+              <div class="metric">{{ fragments[25]|safe }}{{ fragments[26]|safe }}</div>
+              <div class="muted">{{ fragments[27]|safe }}</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{{ fragments[28]|safe }}</div>
+              <div class="metric">{{ fragments[29]|safe }}</div>
+              <div class="muted">{{ fragments[30]|safe }}</div>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{{ fragments[31]|safe }}</div>
+              {{ fragments[32]|safe }}
+              <div class="muted">{{ fragments[33]|safe }}</div>
+            </article>
+          </section>
+          <section class="card">
+            <div class="eyebrow">{{ fragments[34]|safe }}</div>
+            <div class="muted" style="margin-bottom:14px;">{{ fragments[35]|safe }}</div>
+            <div class="grid" style="margin-bottom:0;">
+              <article class="card" style="margin-bottom:0;background:rgba(21,34,49,0.82);">
+                <div class="eyebrow">{{ fragments[36]|safe }}</div>
+                <div class="metric">{{ fragments[37]|safe }}</div>
+                <div class="muted">Average 5-day move across tickers inside this concept.</div>
+              </article>
+              <article class="card" style="margin-bottom:0;background:rgba(21,34,49,0.82);">
+                <div class="eyebrow">{{ fragments[38]|safe }}</div>
+                <div class="metric">{{ fragments[39]|safe }}</div>
+                <div class="muted">Average 20-day move across tickers inside this concept.</div>
+              </article>
+              <article class="card" style="margin-bottom:0;background:rgba(21,34,49,0.82);">
+                <div class="eyebrow">{{ fragments[40]|safe }}</div>
+                <div class="metric">{{ fragments[41]|safe }}</div>
+                <div class="muted">{{ fragments[42]|safe }}</div>
+              </article>
+              <article class="card" style="margin-bottom:0;background:rgba(21,34,49,0.82);">
+                <div class="eyebrow">{{ fragments[43]|safe }}</div>
+                <div class="metric">{{ fragments[44]|safe }}</div>
+                <div class="muted">{{ fragments[45]|safe }}</div>
+              </article>
+              <article class="card" style="margin-bottom:0;background:rgba(21,34,49,0.82);">
+                <div class="eyebrow">{{ fragments[46]|safe }}</div>
+                <div class="metric">{{ fragments[47]|safe }}</div>
+                <div class="muted">{{ fragments[48]|safe }}</div>
+              </article>
+            </div>
+          </section>
+          <section class="card">
+            <div class="eyebrow">Snapshot Window</div>
+            <div class="compare-row">{{ fragments[49]|safe }}</div>
+            <div class="eyebrow" style="margin-top:12px;">Signal Filter</div>
+            <div class="compare-row">{{ fragments[50]|safe }}</div>
+            <form action="/dashboard/concepts/{{ fragments[51]|safe }}" method="get" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));align-items:end;margin-top:12px;">
+              <input type="hidden" name="lang" value="{{ fragments[52]|safe }}" />
+              <input type="hidden" name="sort_by" value="{{ fragments[53]|safe }}" />
+              <input type="hidden" name="sort_order" value="{{ fragments[54]|safe }}" />
+              <input type="hidden" name="comparison_sort" value="{{ fragments[55]|safe }}" />
+              <input type="hidden" name="lookback_runs" value="{{ fragments[56]|safe }}" />
+              <input type="hidden" name="signal_filter" value="{{ fragments[57]|safe }}" />
+              <div>
+                <label class="muted" style="display:block;margin-bottom:6px;">{{ fragments[58]|safe }}</label>
+                <input type="text" name="execution_tag_filter" list="execution-tag-options" value="{{ fragments[59]|safe }}" placeholder="gap-risk, earnings-soon" />
+              </div>
+              <div>
+                <label class="muted" style="display:block;margin-bottom:6px;">{{ fragments[60]|safe }}</label>
+                <input type="text" name="exclude_execution_tag_filter" list="execution-tag-options" value="{{ fragments[61]|safe }}" placeholder="gap-risk, earnings-soon" />
+              </div>
+              <div style="grid-column:1 / -1;">
+                <div class="muted" style="margin-bottom:6px;">{{ fragments[62]|safe }}</div>
+                <div style="display:flex;flex-wrap:wrap;gap:8px;">
+                  <button type="button" onclick="appendExecutionTag('/dashboard/concepts/{{ fragments[63]|safe }}', 'execution_tag_filter', 'gap-risk')">gap-risk</button>
+                  <button type="button" onclick="appendExecutionTag('/dashboard/concepts/{{ fragments[64]|safe }}', 'execution_tag_filter', 'earnings-soon')">earnings-soon</button>
+                  <button type="button" onclick="appendExecutionTag('/dashboard/concepts/{{ fragments[65]|safe }}', 'execution_tag_filter', 'thin-liquidity')">thin-liquidity</button>
+                  <button type="button" onclick="appendExecutionTag('/dashboard/concepts/{{ fragments[66]|safe }}', 'exclude_execution_tag_filter', 'gap-risk')">{{ fragments[67]|safe }}</button>
+                  <button type="button" onclick="clearExecutionTags('/dashboard/concepts/{{ fragments[68]|safe }}')">{{ fragments[69]|safe }}</button>
+                </div>
+              </div>
+              <datalist id="execution-tag-options">
+                <option value="gap-risk"></option>
+                <option value="earnings-soon"></option>
+                <option value="thin-liquidity"></option>
+              </datalist>
+              <div>
+                <label class="muted" style="display:block;margin-bottom:6px;">{{ fragments[70]|safe }}</label>
+                <input type="number" name="min_buy_signal_count" min="0" step="1" value="{{ fragments[71]|safe }}" />
+              </div>
+              <div>
+                <label class="muted" style="display:block;margin-bottom:6px;">{{ fragments[72]|safe }}</label>
+                <input type="number" name="min_signal_strength" min="0" max="100" step="1" value="{{ fragments[73]|safe }}" />
+              </div>
+              <button type="submit">{{ fragments[74]|safe }}</button>
+            </form>
+            <div class="muted">Concept trend and delta are currently based on the most recent {{ fragments[75]|safe }} model snapshots.</div>
+          </section>
+          <section class="action-grid">
+            <article class="card">
+              <div class="eyebrow">{{ fragments[76]|safe }}</div>
+              <form action="/dashboard/concepts/{{ fragments[77]|safe }}/watchlist" method="post" class="stack">
+                <input type="hidden" name="tickers_csv" value="{{ fragments[78]|safe }}" />
+                <input type="hidden" name="lang" value="{{ fragments[79]|safe }}" />
+                <label class="checkline">
+                  <input type="checkbox" name="auto_enable_sync" value="1" />
+                  {{ fragments[80]|safe }}
+                </label>
+                <label class="checkline">
+                  <input type="checkbox" name="sync_after_add" value="1" />
+                  {{ fragments[81]|safe }}
+                </label>
+                <button type="submit">{{ fragments[82]|safe }}</button>
+              </form>
+            </article>
+            <article class="card">
+              <div class="eyebrow">{{ fragments[83]|safe }}</div>
+              <form action="/dashboard/concepts/{{ fragments[84]|safe }}/watchlist-top" method="post" class="stack">
+                <input type="hidden" name="tickers_csv" value="{{ fragments[85]|safe }}" />
+                <input type="hidden" name="lang" value="{{ fragments[86]|safe }}" />
+                <label class="muted">{{ fragments[87]|safe }}</label>
+                <input type="number" name="top_n" min="1" max="{{ fragments[88]|safe }}" value="{{ fragments[89]|safe }}" />
+                <label class="checkline">
+                  <input type="checkbox" name="auto_enable_sync" value="1" />
+                  {{ fragments[90]|safe }}
+                </label>
+                <label class="checkline">
+                  <input type="checkbox" name="sync_after_add" value="1" />
+                  {{ fragments[91]|safe }}
+                </label>
+                <button type="submit">{{ fragments[92]|safe }}</button>
+              </form>
+            </article>
+          </section>
+          <section class="card">
+            <div class="eyebrow">{{ fragments[93]|safe }}</div>
+            <div class="compare-row">{{ fragments[94]|safe }}</div>
+            <div class="mini-grid">{{ fragments[95]|safe }}</div>
+          </section>
+          <section class="card">
+            <div class="eyebrow">{{ fragments[96]|safe }}</div>
+            <div class="table-wrap"><table>
+              <thead>
+                <tr>
+                  <th><a href="{{ fragments[97]|safe }}&lookback_runs={{ fragments[98]|safe }}">{{ fragments[99]|safe }}{{ fragments[100]|safe }}</a></th>
+                  <th><a href="{{ fragments[101]|safe }}&lookback_runs={{ fragments[102]|safe }}">{{ fragments[103]|safe }}{{ fragments[104]|safe }}</a></th>
+                  <th><a href="{{ fragments[105]|safe }}&lookback_runs={{ fragments[106]|safe }}">{{ fragments[107]|safe }}{{ fragments[108]|safe }}</a></th>
+                  <th><a href="{{ fragments[109]|safe }}&lookback_runs={{ fragments[110]|safe }}">{{ fragments[111]|safe }}{{ fragments[112]|safe }}</a></th>
+                  <th><a href="{{ fragments[113]|safe }}&lookback_runs={{ fragments[114]|safe }}">{{ fragments[115]|safe }}{{ fragments[116]|safe }}</a></th>
+                  <th><a href="{{ fragments[117]|safe }}&lookback_runs={{ fragments[118]|safe }}">{{ fragments[119]|safe }}{{ fragments[120]|safe }}</a></th>
+                  <th>{{ fragments[121]|safe }}</th>
+                </tr>
+              </thead>
+              <tbody>{{ fragments[122]|safe }}</tbody>
+            </table></div>
+          </section>
+            </div>
+          </main>
+        </div>
+        <script>
+          function appendExecutionTag(formAction, inputName, tag) {
+            const form = document.querySelector(`form[action="${formAction}"]`);
+            if (!form) return;
+            const input = form.querySelector(`input[name="${inputName}"]`);
+            if (!input) return;
+            const values = input.value.split(",").map((item) => item.trim()).filter(Boolean);
+            if (!values.includes(tag)) {
+              values.push(tag);
+            }
+            input.value = values.join(", ");
+            input.focus();
+          }
+
+          function clearExecutionTags(formAction) {
+            const form = document.querySelector(`form[action="${formAction}"]`);
+            if (!form) return;
+            const includeInput = form.querySelector('input[name="execution_tag_filter"]');
+            const excludeInput = form.querySelector('input[name="exclude_execution_tag_filter"]');
+            if (includeInput) includeInput.value = "";
+            if (excludeInput) excludeInput.value = "";
+            if (includeInput) includeInput.focus();
+          }
+        </script>
+      </body>
+    </html>

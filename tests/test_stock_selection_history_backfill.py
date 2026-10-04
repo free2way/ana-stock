@@ -75,7 +75,7 @@ class StockSelectionHistoryBackfillTests(TestCase):
         counts = {"2026-08-14": 10, "2026-08-13": 2, "2026-08-12": 2}
         client = _FakeClient()
 
-        def write_rows(*, market, rows):
+        def write_rows(*, market, rows, provenance=None):
             counts[str(rows[0]["date"])] = len({row["symbol"] for row in rows})
             return [Path(f"/{rows[0]['date']}.parquet")]
 

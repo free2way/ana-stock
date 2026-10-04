@@ -17,6 +17,15 @@ class Settings(BaseSettings):
     normalized_data_dir: Path = Field(default=ROOT_DIR / "data" / "normalized")
     qlib_data_dir: Path = Field(default=ROOT_DIR / "data" / "qlib")
     artifacts_dir: Path = Field(default=ROOT_DIR / "data" / "artifacts")
+    # Optional override for the historical-universe evidence contract artifact
+    # consumed by the formal full-market readiness gate.  When unset, the
+    # conventional path
+    # ``artifacts_dir/stock_selection_research/historical_universe_contract.json``
+    # is used.  A missing file keeps the gate fail-closed (unchanged behaviour).
+    historical_universe_contract_path: Path | None = Field(default=None)
+    # P0B shadow write: canonical OHLCV plus provenance to data/lake_v2.
+    # v1 readers are unaffected; disable only for a documented incident.
+    lake_v2_shadow_enabled: bool = Field(default=True)
     database_url: str | None = Field(default=None)
     postgres_pool_size: int = Field(default=20)
     postgres_max_overflow: int = Field(default=20)
@@ -59,6 +68,63 @@ class Settings(BaseSettings):
     # cutoff would be wrong on 20%-band boards.
     trainer_cn_label_profile: str = Field(default="executable_net_return_v1")
     trainer_cn_entry_not_executable_policy: str = Field(default="exclude")
+    # Fail-closed label price basis (A1 follow-up). Adjusted-view labels are only
+    # trustworthy when every price point of every label window comes from the
+    # rebuilt view. When a view is present for the market but only partially
+    # covers the label windows, the run must not silently mix raw fallbacks into
+    # "adjusted" labels: by default the trainer raises before persisting a run.
+    # Operators who knowingly want a mixed run may set
+    # PQW_TRAINER_REQUIRE_FULL_ADJUSTED_COVERAGE=false, in which case the run
+    # config records the real basis (`mixed:<share>`) plus the adjusted/raw/
+    # dropped sample counts. A market with no view at all is trained and
+    # reported as `mixed:0` rather than `adjusted_view`, but is not blocked:
+    # there is no adjusted basis for the coverage to be inconsistent with.
+    trainer_require_full_adjusted_coverage: bool = Field(default=True)
+    # Raw-label explicit opt-in (A1 fail-closed follow-up). A CN/US training run
+    # whose adjusted view file is entirely absent must not silently fall back to
+    # raw prices: by default the trainer refuses to start. Operators who
+    # knowingly want a raw-basis run set
+    # PQW_TRAINER_ALLOW_RAW_FALLBACK=true, in which case the run is persisted as
+    # `mixed:0.00000000` with `raw_fallback_allowed=true`. A view that exists but
+    # cannot be read (`unreadable`) is never covered by this opt-in: it always
+    # raises, so a corrupt view cannot masquerade as "no view".
+    trainer_allow_raw_fallback: bool = Field(default=False)
+    # Structured opt-in audit (operator / reason). Both fail-closed opt-ins
+    # (raw-label fallback, unmodeled corporate-action acceptance) record who
+    # waived the gate and why. A missing reason refuses the opt-in; the operator
+    # defaults to `unknown` but is always recorded. See app/services/optin_audit.py.
+    optin_operator: str | None = Field(default=None)
+    optin_reason: str | None = Field(default=None)
+    # Serve-time enforcement of the unified promotion gate (v2). When True
+    # (fail-closed default) a serving/recommendation path must not adopt a run
+    # whose gate decision is REJECT (an explicit FAIL: research scope, a data
+    # -readiness/point-in-time blocker, a rejected price basis, unmodeled
+    # corporate actions without opt-in, too few samples, negative OOS, a purge
+    # violation or a rejected statistical sub-gate). Non-promotable evidence is
+    # still surfaced on the product payloads. Set
+    # PQW_PROMOTION_GATE_ENFORCE=false to observe only: runs stay served, are
+    # still labelled "非晋级/研究口径", and a WARNING is logged for each.
+    promotion_gate_enforce: bool = Field(default=True)
+    # Tighten the serve-time gate from "REJECT only" to "REJECT or OBSERVE".
+    # When True, a run whose unified gate decision is OBSERVE (missing evidence
+    # rather than an explicit failure) is *also* withheld from serving, so an
+    # evidence-less legacy run can no longer be adopted as a champion. Default
+    # False preserves historical serving for runs that never persisted
+    # promotion evidence: the trainer does not yet persist data_readiness /
+    # statistical_gate / OOS-mean evidence, so blocking OBSERVE today would
+    # withhold every current artifact. Once that upstream evidence is actually
+    # written for new runs, set this to True (fail-closed). Interception is
+    # always subordinate to ``promotion_gate_enforce``: with enforcement
+    # disabled a REJECT/OBSERVE run is still labelled and is not withheld.
+    promotion_gate_require_complete_evidence: bool = Field(default=False)
+    # Unified gate (v2) evidence thresholds. The defaults are aligned with what
+    # the production trainer can actually produce: a 60-session walk-forward
+    # prediction window yields at most ~54 matured OOS evaluation dates, so the
+    # historical 120-date requirement would turn every fresh trainer run into an
+    # explicit REJECT under the fail-closed serve-time enforcement default. The
+    # formal promotion protocol may raise these; lowering them requires approval.
+    promotion_gate_minimum_oos_dates: int = Field(default=40, ge=1)
+    promotion_gate_minimum_training_samples: int = Field(default=1000, ge=1)
     trainer_cn_execution_commission_bps: float = Field(default=2.5, ge=0.0, le=200.0)
     trainer_cn_execution_slippage_bps: float = Field(default=15.0, ge=0.0, le=200.0)
     trainer_us_window_mode: str = Field(default="legacy_row_budget_v1")
@@ -129,6 +195,10 @@ class Settings(BaseSettings):
     auth_password: str | None = Field(default=None)
     auth_secret: str | None = Field(default=None)
     auth_cookie_max_age_seconds: int = Field(default=60 * 60 * 24 * 7)
+    # None = derive the Secure flag from the request scheme (https -> Secure).
+    # Set explicitly via PQW_AUTH_COOKIE_SECURE=true/false when the app sits
+    # behind a TLS-terminating proxy whose forwarded scheme is not visible.
+    auth_cookie_secure: bool | None = Field(default=None)
     backtest_commission_bps: float = Field(default=8.0)
     backtest_slippage_bps: float = Field(default=12.0)
     # P0 #1: the scheduled production chain labels and evaluates on next-open

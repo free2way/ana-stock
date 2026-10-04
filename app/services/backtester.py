@@ -382,10 +382,15 @@ class BacktestRunner:
         min_signal_score: float | None = None,
         benchmark_symbol: str | None = None,
         max_sector_weight: float | None = None,
+        max_gross_exposure: float | None = None,
+        max_participation_rate: float | None = None,
         min_adv: float | None = None,
         max_gap_pct: float | None = None,
         rebalance_threshold: float | None = None,
-        engine_version: str = "legacy_forward_return_v1",
+        engine_version: str = "event_driven_daily_v2",
+        allow_unmodeled_corporate_actions: bool = False,
+        optin_reason: str | None = None,
+        optin_operator: str | None = None,
     ) -> int:
         holding_days = max(1, int(holding_days or self.settings.backtest_default_holding_days))
         commission_bps = float(commission_bps if commission_bps is not None else self.settings.backtest_commission_bps)
@@ -395,10 +400,16 @@ class BacktestRunner:
         min_signal_score = float(min_signal_score if min_signal_score is not None else self.settings.backtest_min_signal_score)
         benchmark_symbol = str(benchmark_symbol).strip().upper() if benchmark_symbol not in (None, "") else self.settings.backtest_benchmark_symbol
         max_sector_weight = self._coerce_weight(max_sector_weight, self.settings.backtest_max_sector_weight)
+        max_gross_exposure = self._coerce_weight(max_gross_exposure, 1.0)
+        max_participation_rate = (
+            min(1.0, max(0.0, float(max_participation_rate))) if max_participation_rate is not None else 1.0
+        )
+        if max_participation_rate <= 0:
+            raise ValueError("max_participation_rate must be positive")
         min_adv = float(min_adv if min_adv is not None else self.settings.backtest_min_adv)
         max_gap_pct = float(max_gap_pct if max_gap_pct is not None else self.settings.backtest_max_gap_pct)
         rebalance_threshold = float(rebalance_threshold if rebalance_threshold is not None else self.settings.backtest_rebalance_threshold)
-        engine_version = str(engine_version or "legacy_forward_return_v1").strip().lower()
+        engine_version = str(engine_version or "event_driven_daily_v2").strip().lower()
         if engine_version == "event_driven_daily_v2":
             from app.services.backtesting.runner import EventDrivenBacktestRunner
 
@@ -410,8 +421,14 @@ class BacktestRunner:
                 slippage_bps=slippage_bps,
                 max_position_weight=max_position_weight,
                 min_signal_score=min_signal_score,
+                max_sector_weight=max_sector_weight,
+                max_gross_exposure=max_gross_exposure,
+                max_participation_rate=max_participation_rate,
                 min_adv=min_adv,
                 max_gap_pct=max_gap_pct,
+                allow_unmodeled_corporate_actions=allow_unmodeled_corporate_actions,
+                optin_reason=optin_reason,
+                optin_operator=optin_operator,
             )
         if engine_version != "legacy_forward_return_v1":
             raise ValueError(
@@ -644,6 +661,12 @@ class BacktestRunner:
             summary = {
                 "model_run_id": model_run.id,
                 "model_run_name": model_run.name,
+                "engine_version": "legacy_forward_return_v1",
+                "engine_status": "legacy_unverified",
+                "metrics_interpretation": (
+                    "Legacy engine compounds multi-day forward returns as daily returns and charges "
+                    "round-trip cost per exposed day; NAV/Sharpe/IR/annualized figures are not interpretable."
+                ),
                 "start_nav": 1.0,
                 "end_nav": metrics[-1]["nav"],
                 "total_return": total_return,

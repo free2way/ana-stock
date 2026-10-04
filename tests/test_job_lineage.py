@@ -69,7 +69,7 @@ class JobLineageRepositoryTests(ApplicationPostgresTestCase):
                 "headers": [],
                 "query_string": b"lang=zh",
             }
-            with patch("app.api.routes.dashboard.is_authenticated", return_value=True):
+            with patch("app.api.routes.dashboard.ops.is_authenticated", return_value=True):
                 response = dashboard_ops_job_detail(job.id, Request(scope), lang="zh", db=db)
 
         self.assertIn("输入与执行追溯", response)
