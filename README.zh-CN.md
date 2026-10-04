@@ -7,6 +7,7 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
+[![GitHub Stars](https://img.shields.io/github/stars/free2way/ana-stock?style=social)](https://github.com/free2way/ana-stock/stargazers)
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=flat-square&logo=postgresql&logoColor=white)
@@ -44,6 +45,20 @@ ANA 将盘后行情、量化筛选、自选股、持仓复盘和 AI 日报整合
 - **本地优先存储**：PostgreSQL 管理业务状态，Parquet 保存历史行情。
 
 功能可用性取决于数据源权限、配置、数据新鲜度及后台任务完成情况；输入未就绪时，AI 日报也可能不可用。
+
+## 为可核查的量化研究而设计
+
+ANA 力求让从行情数据到研究决策的关键依据都能被检查：
+
+| 能力 | 带来的改进 |
+| :--- | :--- |
+| **统一价格口径** | 训练、预测与回测共享带版本的价格口径合同，检查复权视图是否存在、可读及覆盖完整；raw 价格回退必须显式授权并留下审计信息。 |
+| **时间点研究约束** | 时间点数据与历史标的池检查，帮助避免把未来信息带入历史研究；滚动评估记录训练和评测窗口。 |
+| **更贴近交易的回放** | 事件驱动回测处理已支持的拆股、分红，并纳入可配置交易成本与组合约束；未建模公司行为默认阻止回测，事件明细保留在审计记录中。 |
+| **证据驱动的晋级** | 晋级门禁综合数据就绪度、价格口径、公司行为证据、样本规模与样本外结果；明确失败的模型会被挡在推荐路径之外。 |
+| **运行状态可见** | 只读风险快照集中呈现行情新鲜度、复权覆盖、公司行为覆盖、门禁结果与模型漂移。 |
+
+这些控制提升可追溯性，但不代表策略已证明盈利，也不代表所有数据源都具备完整历史覆盖。
 
 ## System Logic
 
@@ -83,7 +98,7 @@ flowchart TD
 
 ANA 是研究工具。模型分数不等于经过校准的胜率，历史表现也不保证未来收益；AI 生成的文字需要人工核实。
 
-统一训练、评测和成交回放的新契约仍在验证中。执行证据不完整时，应保持阻断或未验证状态；旧成绩不能冒充新契约下已通过验证的结果。本项目不宣称已证明稳定盈利，也不宣称成交模拟已全部验收。
+统一价格口径合同与明确失败项的晋级拦截已实现。为兼容旧模型，证据不完整的历史运行仍可能以**仅供研究／未晋级**状态展示，除非启用完整证据强制门禁。本项目不宣称已证明稳定盈利，也不宣称成交模拟已全部验收。
 
 ## 技术构成
 
@@ -110,5 +125,7 @@ ANA 是研究工具。模型分数不等于经过校准的胜率，历史表现�
 **更好的研究，始于可检查的证据。**
 
 辅助研究 · 人工决策 · 不承诺收益
+
+[⭐ 在 GitHub 为 ANA 点 Star](https://github.com/free2way/ana-stock) · [浏览源码](https://github.com/free2way/ana-stock/tree/main) · [反馈问题](https://github.com/free2way/ana-stock/issues)
 
 </div>

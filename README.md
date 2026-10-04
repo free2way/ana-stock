@@ -7,6 +7,7 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
+[![GitHub stars](https://img.shields.io/github/stars/free2way/ana-stock?style=social)](https://github.com/free2way/ana-stock/stargazers)
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=flat-square&logo=postgresql&logoColor=white)
@@ -44,6 +45,20 @@ Built for deliberate post-close analysis—not high-frequency execution or autom
 - **Keep research local.** PostgreSQL for application state; a Parquet lake for market history.
 
 Availability depends on provider permissions, configuration, data freshness, and completed jobs. AI reports may be unavailable when their inputs are not ready.
+
+## Research controls, built in
+
+ANA is designed to make the path from raw market data to a research decision easier to inspect:
+
+| Capability | What it adds |
+| :--- | :--- |
+| **Consistent price basis** | A shared, versioned contract checks adjusted-price availability, coverage, and view integrity across training, prediction, and backtesting. Raw-price fallback requires explicit, auditable authorization. |
+| **Time-aware research** | Point-in-time data and universe checks help keep future information out of historical research. Walk-forward evaluation records the training and evaluation window used. |
+| **More realistic replay** | Event-driven backtests account for supported splits and dividends, with configurable transaction costs and portfolio constraints. Unsupported corporate actions block a run by default and remain visible in its audit record. |
+| **Evidence-led promotion** | A promotion gate brings data readiness, price basis, corporate-action evidence, sample size, and out-of-sample results into one decision. Explicit failures are withheld from the recommendation path. |
+| **Operational visibility** | A read-only risk snapshot brings together market-data freshness, adjusted-view coverage, corporate-action coverage, gate outcomes, and model drift. |
+
+These controls improve traceability; they do not establish that a strategy is profitable or that every data source has complete historical coverage.
 
 ## System logic
 
@@ -83,7 +98,7 @@ Solid paths summarize the application workflow. Dashed paths show the execution-
 
 ANA is a research tool. Model scores are not guaranteed win probabilities, historical performance does not promise future returns, and AI-generated narratives need human review.
 
-The stricter training/evaluation/replay contract remains under validation. Incomplete execution evidence must remain blocked or unverified; legacy results must not be presented as newly validated results. This project does not claim a proven profitable strategy or fully certified execution simulation.
+The shared price-basis contract and explicit-failure promotion checks are implemented. For compatibility, legacy runs with incomplete promotion evidence can still be shown as **research-only / not promoted** unless complete-evidence enforcement is enabled. This project does not claim a proven profitable strategy or fully certified execution simulation.
 
 ## Built with
 
@@ -110,5 +125,7 @@ This repository includes source, tests, dependency manifests, and generic runtim
 **Better research starts with visible evidence.**
 
 Research software · Human decisions · No return guarantees
+
+[⭐ Star ANA on GitHub](https://github.com/free2way/ana-stock) · [Explore the source](https://github.com/free2way/ana-stock/tree/main) · [Report an issue](https://github.com/free2way/ana-stock/issues)
 
 </div>
