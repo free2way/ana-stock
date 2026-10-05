@@ -1,7 +1,20 @@
+import bisect
+import hashlib
+import json
 import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 
 CALIBRATED_ESTIMATE_SCHEMA_V1 = "calibrated_estimates_v1"
+
+# Probability calibration provenance.  A raw regression/ranking score is never a
+# probability; callers must surface one of these statuses next to any value.
+CALIBRATION_STATUS_CALIBRATED = "calibrated"
+CALIBRATION_STATUS_UNAVAILABLE = "unavailable"
+CALIBRATION_STATUS_INSUFFICIENT_DATA = "unavailable:insufficient_calibration_data"
+CALIBRATION_STATUS_NO_SPEC = "unavailable:no_calibration_spec"
+CALIBRATION_STATUS_MISSING_SCORE = "unavailable:missing_calibration_score"
 
 
 def _clamp(value: float, lower: float, upper: float) -> float:
@@ -436,3 +449,259 @@ def summarize_model_output(model_output: dict | None, *, lang: str) -> str:
         f"The latest model run {run_name} scores this stock at {float(score):.3f}, reads as {stance} "
         f"with {confidence_text}{regime_text}{horizon_text}, and lands {percentile_text}."
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ProbabilityCalibrator:
+    """A monotone score -> positive-probability map fitted from matured labels.
+
+    ``method="isotonic"`` carries piece-wise linear interpolation so the map is
+    non-decreasing; ``method="bins"`` carries the step function emitted by the
+    quantile-binned ``selective_calibration`` research artifact.  Either way the
+    output is only meaningful when ``source`` names the fitted artifact.
+    """
+
+    method: str
+    thresholds: tuple[float, ...]
+    probabilities: tuple[float, ...]
+    sample_count: int
+    positive_count: int
+    source: str
+    score_field: str
+    version: str
+
+    def predict(self, score: float) -> float:
+        if not self.thresholds:
+            raise ValueError("probability calibrator has no thresholds")
+        value = float(score)
+        if not math.isfinite(value):
+            raise ValueError("probability calibration score must be finite")
+        if self.method == "bins":
+            index = bisect.bisect_left(self.thresholds, value)
+            index = min(index, len(self.thresholds) - 1)
+            return float(self.probabilities[index])
+        if value <= self.thresholds[0]:
+            return float(self.probabilities[0])
+        if value >= self.thresholds[-1]:
+            return float(self.probabilities[-1])
+        upper = bisect.bisect_left(self.thresholds, value)
+        lower = max(0, upper - 1)
+        low_t, high_t = self.thresholds[lower], self.thresholds[upper]
+        low_p, high_p = self.probabilities[lower], self.probabilities[upper]
+        if high_t == low_t:
+            return float(high_p)
+        ratio = (value - low_t) / (high_t - low_t)
+        return float(low_p + (high_p - low_p) * ratio)
+
+
+def calibration_status(calibrator: ProbabilityCalibrator | None) -> str:
+    return CALIBRATION_STATUS_CALIBRATED if calibrator is not None else CALIBRATION_STATUS_UNAVAILABLE
+
+
+def _calibration_version(payload: Mapping) -> str:
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"probability_calibration_v1:{digest}"
+
+
+def _iter_calibration_samples(samples: Sequence | None):
+    for item in samples or ():
+        if isinstance(item, Mapping):
+            score = item.get("score", item.get("raw_score"))
+            label = item.get("label", item.get("outcome", item.get("label_value")))
+        else:
+            values = list(item)
+            if len(values) != 2:
+                raise ValueError("calibration samples must be (score, label) pairs")
+            score, label = values
+        if score is None or label is None:
+            raise ValueError("calibration samples require both score and label")
+        score_value = float(score)
+        label_value = float(label)
+        if not math.isfinite(score_value) or not math.isfinite(label_value):
+            raise ValueError("calibration samples must be finite")
+        yield score_value, 1.0 if label_value > 0 else 0.0
+
+
+def fit_isotonic_probability_calibrator(
+    samples: Sequence | None,
+    *,
+    source: str,
+    score_field: str = "model_score",
+    min_samples: int = 2,
+) -> ProbabilityCalibrator | None:
+    """Pool-adjacent-violators fit of a monotone positive-probability curve.
+
+    Returns ``None`` when fewer than ``min_samples`` matured observations are
+    available.  It never fabricates a probability from a score alone.
+    """
+    if min_samples < 1:
+        raise ValueError("min_samples must be positive")
+    rows = list(_iter_calibration_samples(samples))
+    if len(rows) < min_samples:
+        return None
+    rows.sort(key=lambda item: item[0])
+
+    grouped: list[list[float]] = []  # [score, count, positive_count]
+    for score_value, label_value in rows:
+        if grouped and grouped[-1][0] == score_value:
+            grouped[-1][1] += 1.0
+            grouped[-1][2] += label_value
+        else:
+            grouped.append([score_value, 1.0, label_value])
+
+    # PAVA over per-score positive rates, weighting each pooled block by its
+    # observation count.  ``block_upper`` tracks the largest score each pooled
+    # block covers so the step/interpolation map stays monotone.
+    probabilities = [positive / count for _score, count, positive in grouped]
+    weights = [count for _score, count, _positive in grouped]
+    block_upper = [score_value for score_value, _count, _positive in grouped]
+    index = 0
+    while index < len(probabilities) - 1:
+        if probabilities[index] <= probabilities[index + 1] + 1e-12:
+            index += 1
+            continue
+        merged_weight = weights[index] + weights[index + 1]
+        probabilities[index] = (
+            probabilities[index] * weights[index]
+            + probabilities[index + 1] * weights[index + 1]
+        ) / merged_weight
+        weights[index] = merged_weight
+        block_upper[index] = block_upper[index + 1]
+        del probabilities[index + 1]
+        del weights[index + 1]
+        del block_upper[index + 1]
+        if index > 0:
+            index -= 1
+    thresholds = block_upper
+
+    positive_count = int(sum(1 for _s, label in rows if label > 0))
+    return ProbabilityCalibrator(
+        method="isotonic",
+        thresholds=tuple(thresholds),
+        probabilities=tuple(probabilities),
+        sample_count=len(rows),
+        positive_count=positive_count,
+        source=str(source or "provided_isotonic"),
+        score_field=str(score_field or "model_score"),
+        version=_calibration_version(
+            {
+                "method": "isotonic",
+                "thresholds": thresholds,
+                "probabilities": probabilities,
+                "source": source,
+                "sample_count": len(rows),
+            }
+        ),
+    )
+
+
+def build_probability_calibrator_from_bins(
+    bins: Sequence | None,
+    *,
+    source: str,
+    score_field: str = "model_score",
+) -> ProbabilityCalibrator:
+    """Adapt quantile bins (e.g. ``selective_calibration`` output) to a step map."""
+
+    if not bins:
+        raise ValueError("probability calibration bins must not be empty")
+    parsed: list[tuple[float, float]] = []
+    for item in bins:
+        if not isinstance(item, Mapping):
+            raise ValueError("calibration bins must be mappings")
+        upper = item.get("upper_score", item.get("upper_bound", item.get("threshold")))
+        probability = item.get(
+            "calibrated_positive_probability",
+            item.get("probability", item.get("positive_probability")),
+        )
+        if upper is None or probability is None:
+            raise ValueError("calibration bins require an upper bound and a probability")
+        upper_value = float(upper)
+        probability_value = float(probability)
+        if not math.isfinite(upper_value) or not 0.0 <= probability_value <= 1.0:
+            raise ValueError("calibration bin values must be finite with probability in [0, 1]")
+        parsed.append((upper_value, probability_value))
+    parsed.sort(key=lambda item: item[0])
+    thresholds: list[float] = []
+    probabilities: list[float] = []
+    running_max = 0.0
+    for upper_value, probability_value in parsed:
+        if thresholds and upper_value == thresholds[-1]:
+            probabilities[-1] = probability_value
+            continue
+        running_max = max(running_max, probability_value)
+        thresholds.append(upper_value)
+        probabilities.append(running_max)
+    return ProbabilityCalibrator(
+        method="bins",
+        thresholds=tuple(thresholds),
+        probabilities=tuple(probabilities),
+        sample_count=len(parsed),
+        positive_count=-1,
+        source=str(source or "provided_bins"),
+        score_field=str(score_field or "model_score"),
+        version=_calibration_version(
+            {
+                "method": "bins",
+                "thresholds": thresholds,
+                "probabilities": probabilities,
+                "source": source,
+            }
+        ),
+    )
+
+
+def resolve_probability_calibrator(
+    params: Mapping | None,
+) -> tuple[ProbabilityCalibrator | None, str]:
+    """Build a calibrator from a screen/run param spec, flagging provenance.
+
+    The spec (``params["probability_calibration"]``) is intentionally explicit:
+    ``{"method": "isotonic", "samples": [[score, label], ...], "source": ...}``
+    or ``{"method": "bins", "bins": [...], "source": ...}``.  Without a spec the
+    result is ``(None, "unavailable:no_calibration_spec")`` -- never a guessed
+    probability.
+    """
+    if not params:
+        return None, CALIBRATION_STATUS_NO_SPEC
+    spec = params.get("probability_calibration")
+    if spec is None:
+        return None, CALIBRATION_STATUS_NO_SPEC
+    if isinstance(spec, ProbabilityCalibrator):
+        return spec, CALIBRATION_STATUS_CALIBRATED
+    if not isinstance(spec, Mapping):
+        raise ValueError("probability_calibration must be a mapping or ProbabilityCalibrator")
+    method = str(spec.get("method") or "isotonic").strip().lower()
+    score_field = str(spec.get("score_field") or "model_score")
+    source = str(spec.get("source") or "provided")
+    if method in {"bins", "quantile_bins"}:
+        return (
+            build_probability_calibrator_from_bins(spec.get("bins"), source=source, score_field=score_field),
+            CALIBRATION_STATUS_CALIBRATED,
+        )
+    if method in {"isotonic", "pava"}:
+        calibrator = fit_isotonic_probability_calibrator(
+            spec.get("samples"),
+            source=source,
+            score_field=score_field,
+            min_samples=int(spec.get("min_samples", 2)),
+        )
+        if calibrator is None:
+            return None, CALIBRATION_STATUS_INSUFFICIENT_DATA
+        return calibrator, CALIBRATION_STATUS_CALIBRATED
+    raise ValueError(f"unsupported probability calibration method: {method}")
+
+
+def expected_hit_probability(calibrator: ProbabilityCalibrator | None, score: object) -> float | None:
+    """Return the calibrated probability or ``None`` -- never a raw-score guess."""
+    if calibrator is None or score is None:
+        return None
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return round(calibrator.predict(value), 6)

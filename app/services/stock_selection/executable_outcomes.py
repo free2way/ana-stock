@@ -57,11 +57,14 @@ def confirmed_outcome(
     eligibility: ExecutionEligibility,
     industry_return: float = 0.0, market_return: float = 0.0,
     cost_model: FillCostModel | None = None,
+    drawdown_penalty: float = 0.0,
 ) -> ExecutableLabel | None:
     if (cost_model is None) == (cost_bps is None):
         raise ValueError("choose exactly one cost model: flat bps or per-fill")
     if cost_bps is not None and (not math.isfinite(cost_bps) or cost_bps < 0):
         raise ValueError("cost_bps must be finite and non-negative")
+    if not math.isfinite(drawdown_penalty) or drawdown_penalty < 0:
+        raise ValueError("drawdown_penalty must be finite and non-negative")
     if market not in {"CN", "US", "HK"}:
         raise ValueError("explicit market required")
     if horizon_days < 1 or (market == "CN" and horizon_days == 1):
@@ -88,7 +91,7 @@ def confirmed_outcome(
     result = build_executable_label(
         [by_date[day] for day in wanted], signal_index=0, horizon_days=horizon_days,
         round_trip_cost_bps=cost_bps if cost_model is None else 0.0, market_return=market_return,
-        industry_return=industry_return, drawdown_penalty=0.0,
+        industry_return=industry_return, drawdown_penalty=drawdown_penalty,
         entry_is_executable=reason is None, exclusion_reason=reason,
     )
     if cost_model is None:
@@ -101,6 +104,11 @@ def confirmed_outcome(
     # Labels keep raw reference prices and raw gross return. Net uses actual
     # per-fill notional fees and entry cash outlay, identical to the engine.
     net = cost_model.round_trip(result.entry_price, result.exit_price)["net_return"]
+    penalty = (
+        drawdown_penalty * abs(min(result.path_drawdown, 0.0))
+        if result.path_drawdown is not None
+        else 0.0
+    )
     return replace(result, net_return=net, market_excess_return=net - market_return,
                    industry_excess_return=net - industry_return,
-                   risk_adjusted_return=net - industry_return, is_profitable=net > 0)
+                   risk_adjusted_return=net - industry_return - penalty, is_profitable=net > 0)

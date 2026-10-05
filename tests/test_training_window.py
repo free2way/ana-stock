@@ -132,7 +132,7 @@ class TrainingWindowTests(TestCase):
 
 
 class ScheduledWindowIntegrationTests(TestCase):
-    def run_fixture(self, *, days=320, max_rows=1_500_000, expected_failure=None):
+    def run_fixture(self, *, days=340, max_rows=1_500_000, expected_failure=None):
         rows = samples(days, 100)
         calendar = sorted({row["trade_date"] for row in rows})
         for row in rows:

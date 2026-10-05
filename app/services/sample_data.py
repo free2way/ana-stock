@@ -81,15 +81,32 @@ def extend_sample_rows(ticker: str, *, days: int) -> list[dict]:
     dates = _trading_days_before(first_date, missing, market="US")
     total = len(dates)
     synthetic: list[dict] = []
-    previous_close = anchor * 0.8
+    previous_close = anchor * 0.6
     for index, day in enumerate(dates):
         progress = (index + 1) / (total + 1)
-        close = anchor * (0.8 + 0.2 * progress + 0.01 * math.sin(index / 6.0))
+        # The synthetic warm-up walks from 0.6x to 1.0x the curated anchor, so
+        # the fixture presents a genuine positive forward-return edge. The
+        # trainer's OOS gate now scores the drawdown-penalized return, and a
+        # flatter 0.8x->1.0x ramp left the toy edge below its own tail risk,
+        # which fail-closed the promotion gate and emptied the dashboard
+        # fixtures. The noise term and per-symbol shape are unchanged.
+        close = anchor * (0.6 + 0.4 * progress + 0.01 * math.sin(index / 6.0))
         close = round(close, 4)
         open_price = round(previous_close, 4)
         high = round(max(open_price, close) * 1.005, 4)
         low = round(min(open_price, close) * 0.995, 4)
         volume = 1_000_000 + (index % 5) * 25_000
+        # The point-in-time universe filter rejects sessions whose trailing
+        # 20-session dollar ADV is below the market floor (50M). A flat ~1M
+        # share volume is liquid for high-priced names (AAPL, MSFT) but leaves
+        # low-priced tickers (ASTS at ~$20) artificially below the floor, so
+        # the fixture would silently drop a name the curated tail intends to be
+        # tradable. Scale the synthetic share count up to a target turnover
+        # only for those shortfall names; high-priced symbols keep their
+        # original volume.
+        target_dollar_volume = 80_000_000.0
+        if close > 0 and volume * close < target_dollar_volume:
+            volume = int(round(target_dollar_volume / close))
         synthetic.append(
             {
                 "date": day.isoformat(),

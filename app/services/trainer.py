@@ -8,6 +8,7 @@ import sys
 import time
 import tracemalloc
 import warnings
+from bisect import bisect_right
 from dataclasses import asdict
 from collections import Counter, defaultdict
 from datetime import date, datetime
@@ -44,6 +45,7 @@ from app.services.repository import (
     WorkspaceSnapshotRepository,
 )
 from app.services.stock_selection.walk_forward import PointInTimeTrainingPool
+from app.services.stock_selection.universe import default_universe_rules
 from app.services.stock_selection.training_weights import (
     TRAINING_WEIGHT_POLICY, date_balanced_training_weights,
 )
@@ -293,6 +295,10 @@ class SignalTrainer:
         self._price_basis_decision = None
         self._price_basis_requirements: PriceBasisRequirements | None = None
         self._label_price_stats: dict[str, int] = _empty_label_price_stats()
+        # Point-in-time universe filter outcome for the most recent `_load_rows`
+        # call. Persisted into the run config so a filtered run is auditable;
+        # `None` when rows were supplied without going through `_load_rows`.
+        self._universe_filter_stats: dict | None = None
 
     def _training_window_policy(self, market: str | None) -> TrainingWindowPolicy:
         prefix = "trainer_cn_window" if str(market or "").upper() == "CN" else "trainer_us_window"
@@ -695,9 +701,165 @@ class SignalTrainer:
     def _load_rows(self, *, tickers: set[str] | None = None, market: str | None = None) -> list[dict]:
         rows = load_lake_rows(tickers=tickers)
         rows = self._filter_rows_by_market(rows, market=market)
+        rows, self._universe_filter_stats = self._apply_pit_universe_filter(rows, market=market)
         rows.sort(key=lambda row: (row.get("symbol") or "", row.get("date") or ""))
         self._attach_adjusted_basis(rows, market=market)
         return rows
+
+    @staticmethod
+    def _linear_quantile(sorted_values: list[float], quantile: float) -> float:
+        """Deterministic linear-interpolation quantile (numpy ``linear``)."""
+
+        if not sorted_values:
+            raise ValueError("quantile of an empty sample")
+        if len(sorted_values) == 1:
+            return float(sorted_values[0])
+        position = quantile * (len(sorted_values) - 1)
+        lower_index = int(math.floor(position))
+        upper_index = min(lower_index + 1, len(sorted_values) - 1)
+        fraction = position - lower_index
+        return float(
+            sorted_values[lower_index]
+            + (sorted_values[upper_index] - sorted_values[lower_index]) * fraction
+        )
+
+    def _apply_pit_universe_filter(
+        self, rows: list[dict], *, market: str | None
+    ) -> tuple[list[dict], dict]:
+        """Filter lake rows through the point-in-time tradable-universe rules.
+
+        Thresholds are reused verbatim from
+        ``stock_selection.universe.default_universe_rules``. Every decision for
+        a symbol on date D reads only that symbol's rows up to and including D,
+        so the filter borrows no future liquidity or history. The signal-day
+        limit-up rule reuses the same band-relative threshold as the label-side
+        entry check; it removes the *signal-day close lock* (a name that cannot
+        be entered the next session), while the existing executable-label path
+        keeps its own next-open unbuyable check, so the two never double-count
+        the same exclusion.
+        """
+
+        enabled = bool(getattr(self.settings, "trainer_universe_filter_enabled", True))
+        stats: dict = {
+            "enabled": enabled,
+            "applied": False,
+            "input_rows": len(rows),
+            "output_rows": len(rows),
+            "excluded_rows": 0,
+            "exclusion_counts": {},
+        }
+        if not enabled:
+            stats["skipped_reason"] = "trainer_universe_filter_enabled=false"
+            return list(rows), stats
+        if not rows:
+            stats["skipped_reason"] = "no_rows"
+            return rows, stats
+        market_code = self._normalize_market_code(market)
+        if market_code not in {"CN", "US"}:
+            inferred = Counter(
+                infer_market_from_ticker(str(row.get("symbol") or "").strip().upper())
+                for row in rows
+                if str(row.get("symbol") or "").strip()
+            )
+            market_code = inferred.most_common(1)[0][0] if inferred else None
+        if market_code not in {"CN", "US"}:
+            stats["skipped_reason"] = f"unsupported_market:{market_code or 'unknown'}"
+            return list(rows), stats
+        rules = default_universe_rules(market_code)
+        stats["rule_market"] = market_code
+        stats["rules"] = {
+            "min_price": rules.min_price,
+            "min_adv20": rules.min_adv20,
+            "min_history_sessions": rules.min_history_sessions,
+            "adv_lookback_sessions": rules.adv_lookback_sessions,
+            "exclude_st": rules.exclude_st,
+            "exclude_suspended": rules.exclude_suspended,
+            "exclude_signal_day_limit_up": rules.exclude_signal_day_limit_up,
+        }
+        # The lake row schema carries no ST / suspension state; record the two
+        # rules that therefore could not be evaluated instead of implying they
+        # ran.
+        stats["unapplied_rules"] = ["st_security", "suspended"]
+
+        grouped: dict[str, list[dict]] = defaultdict(list)
+        missing_symbol = 0
+        for row in rows:
+            symbol = str(row.get("symbol") or "").strip().upper()
+            if not symbol:
+                missing_symbol += 1
+                continue
+            grouped[symbol].append(row)
+
+        exclusion_counter: Counter[str] = Counter()
+        if missing_symbol:
+            exclusion_counter["missing_symbol"] = missing_symbol
+        kept: list[dict] = []
+        for symbol in sorted(grouped):
+            symbol_rows = sorted(grouped[symbol], key=lambda item: str(item.get("date") or ""))
+            closes = [self._safe_float(item.get("close")) for item in symbol_rows]
+            volumes = [self._safe_float(item.get("volume")) for item in symbol_rows]
+            # Valid history mirrors universe.py: only positive closes with a
+            # non-negative volume contribute to session count and ADV.
+            valid_dollar: list[float] = []
+            valid_positions: list[int] = []
+            for index, item in enumerate(symbol_rows):
+                raw_volume = item.get("volume")
+                if (
+                    closes[index] is not None
+                    and closes[index] > 0
+                    and raw_volume not in (None, "")
+                    and volumes[index] >= 0
+                ):
+                    valid_dollar.append(closes[index] * volumes[index])
+                    valid_positions.append(index)
+            limit_band = (
+                self._resolve_cn_limit_band_pct(ticker=symbol, exchange=None, name=None)
+                if market_code == "CN" and rules.exclude_signal_day_limit_up
+                else None
+            )
+            for index, item in enumerate(symbol_rows):
+                reasons: list[str] = []
+                close = closes[index]
+                if close is None or close <= 0:
+                    reasons.append("invalid_price")
+                elif close < rules.min_price:
+                    reasons.append("low_price")
+                raw_volume = item.get("volume")
+                if raw_volume in (None, ""):
+                    reasons.append("invalid_volume")
+                history_sessions = bisect_right(valid_positions, index)
+                if history_sessions < rules.min_history_sessions:
+                    reasons.append("insufficient_history")
+                lookback = valid_dollar[
+                    max(0, history_sessions - rules.adv_lookback_sessions):history_sessions
+                ]
+                adv20 = (sum(lookback) / len(lookback)) if lookback else 0.0
+                if adv20 < rules.min_adv20:
+                    reasons.append("low_adv20")
+                if (
+                    limit_band is not None
+                    and index > 0
+                    and close is not None
+                    and close > 0
+                    and closes[index - 1] is not None
+                    and closes[index - 1] > 0
+                    and (close / closes[index - 1]) - 1.0 >= (limit_band / 100.0) - 0.002
+                ):
+                    reasons.append("signal_day_limit_up_locked")
+                if reasons:
+                    for reason in reasons:
+                        exclusion_counter[reason] += 1
+                    continue
+                kept.append(item)
+        stats.update(
+            {
+                "applied": True,
+                "output_rows": len(kept),
+                "excluded_rows": len(rows) - len(kept),
+                "exclusion_counts": dict(sorted(exclusion_counter.items())),
+            }
+        )
+        return kept, stats
 
     def _attach_adjusted_basis(self, rows: list[dict], *, market: str | None) -> int:
         """Attach the versioned adjusted view onto rows for label construction (A1).
@@ -1318,6 +1480,7 @@ class SignalTrainer:
         commission_bps = float(getattr(self.settings, "trainer_cn_execution_commission_bps", 2.5) or 0.0)
         slippage_bps = float(getattr(self.settings, "trainer_cn_execution_slippage_bps", 15.0) or 0.0)
         cost_model = FillCostModel(commission_bps, slippage_bps)
+        drawdown_penalty = float(getattr(self.settings, "trainer_drawdown_penalty", 0.25) or 0.0)
 
         window_rows = symbol_rows[index : index + horizon_days + 1]
         bars: list[PriceBar] = []
@@ -1347,6 +1510,7 @@ class SignalTrainer:
             "commission_bps_one_way": commission_bps,
             "slippage_bps_one_way": slippage_bps,
             "cost_model_hash": cost_model.model_hash,
+            "drawdown_penalty": drawdown_penalty,
         }
         previous_close = bars[0].close
         next_open = bars[1].open
@@ -1371,6 +1535,7 @@ class SignalTrainer:
                 market=market,
                 eligibility=eligibility,
                 cost_model=cost_model,
+                drawdown_penalty=drawdown_penalty,
             )
         except (ValueError, TypeError):
             profile["exclusion_reason"] = "executable_label_input_error"
@@ -1393,6 +1558,7 @@ class SignalTrainer:
             "market_excess_return",
             "industry_excess_return",
             "risk_adjusted_return",
+            "path_drawdown",
         ):
             value = getattr(outcome, return_key, None)
             if value is not None:
@@ -1779,6 +1945,264 @@ class SignalTrainer:
             stats[feature_name] = (mean, std)
         return stats
 
+    def _label_winsorize_config(self, market: str | None) -> dict:
+        """Resolve the per-market target winsorization contract."""
+
+        prefix = "trainer_cn" if str(market or "").upper() == "CN" else "trainer_us"
+        return {
+            "enabled": bool(getattr(self.settings, "trainer_label_winsorize_enabled", True)),
+            "lower_quantile": float(
+                getattr(self.settings, f"{prefix}_label_winsorize_lower", 0.025)
+            ),
+            "upper_quantile": float(
+                getattr(self.settings, f"{prefix}_label_winsorize_upper", 0.975)
+            ),
+        }
+
+    def _winsorize_targets(
+        self, values: list, config: dict
+    ) -> tuple[list, dict]:
+        """Clip training targets to the configured quantile band.
+
+        Bounds are computed from the *training window only*, so the clip uses
+        no label that a strict point-in-time protocol would hide from this fit.
+        """
+
+        audit = {
+            "enabled": bool(config.get("enabled")),
+            "lower_quantile": config.get("lower_quantile"),
+            "upper_quantile": config.get("upper_quantile"),
+            "winsorized_count": 0,
+        }
+        if not config.get("enabled"):
+            return list(values), audit
+        finite = sorted(
+            float(value)
+            for value in values
+            if value is not None and math.isfinite(float(value))
+        )
+        if not finite:
+            return list(values), audit
+        lower_bound = self._linear_quantile(finite, float(config.get("lower_quantile", 0.025)))
+        upper_bound = self._linear_quantile(finite, float(config.get("upper_quantile", 0.975)))
+        clipped: list = []
+        winsorized = 0
+        for value in values:
+            if value is None:
+                clipped.append(value)
+                continue
+            numeric = float(value)
+            if numeric < lower_bound:
+                clipped.append(lower_bound)
+                winsorized += 1
+            elif numeric > upper_bound:
+                clipped.append(upper_bound)
+                winsorized += 1
+            else:
+                clipped.append(numeric)
+        audit.update(
+            {
+                "lower_bound": round(lower_bound, 10),
+                "upper_bound": round(upper_bound, 10),
+                "winsorized_count": winsorized,
+            }
+        )
+        return clipped, audit
+
+    def _feature_transform_config(self) -> dict:
+        return {
+            "enabled": bool(
+                getattr(self.settings, "trainer_feature_transform_enabled", True)
+            ),
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": float(
+                getattr(self.settings, "trainer_feature_transform_winsor_lower", 0.025)
+            ),
+            "winsor_upper": float(
+                getattr(self.settings, "trainer_feature_transform_winsor_upper", 0.975)
+            ),
+            "zscore_clip": float(
+                getattr(self.settings, "trainer_feature_transform_zscore_clip", 3.0)
+            ),
+        }
+
+    def _cross_sectional_block(
+        self, block: "object", config: dict
+    ) -> "object":
+        """Winsorize + MAD robust z-score each column of one date's block.
+
+        The block is a 2-D float array of one trade date's cross-section
+        (rows = samples, columns = features). Columns with fewer than two finite
+        values or zero robust scale are left untouched rather than collapsed to
+        a constant zero, so a degenerate cross-section never destroys the level.
+        """
+
+        import numpy as np
+
+        lower_quantile = float(config.get("winsor_lower", 0.025))
+        upper_quantile = float(config.get("winsor_upper", 0.975))
+        clip = float(config.get("zscore_clip", 3.0))
+
+        def _quantile(ordered: "object", quantile: float) -> float:
+            if ordered.size == 1:
+                return float(ordered[0])
+            position = quantile * (ordered.size - 1)
+            lower_index = int(np.floor(position))
+            upper_index = min(lower_index + 1, ordered.size - 1)
+            fraction = position - lower_index
+            return float(
+                ordered[lower_index]
+                + (ordered[upper_index] - ordered[lower_index]) * fraction
+            )
+
+        for column in range(block.shape[1]):
+            values = np.nan_to_num(block[:, column], nan=0.0, posinf=0.0, neginf=0.0)
+            finite = values[np.isfinite(values)]
+            if finite.size < 2:
+                block[:, column] = values
+                continue
+            ordered = np.sort(finite)
+            lower = _quantile(ordered, lower_quantile)
+            upper = _quantile(ordered, upper_quantile)
+            clipped = np.clip(values, lower, upper)
+            median = float(np.median(clipped))
+            mad = float(np.median(np.abs(clipped - median)))
+            scale = mad * 1.4826
+            if scale <= 1e-12:
+                scale = float(np.std(clipped))
+            if scale <= 1e-12:
+                block[:, column] = values
+                continue
+            block[:, column] = np.clip((clipped - median) / scale, -clip, clip)
+        return block
+
+    def _cross_sectional_feature_matrix(
+        self, samples: list[dict], feature_names: list[str]
+    ) -> "object":
+        """Build the feature matrix with a strict point-in-time cross-section.
+
+        Values for trade date D are normalized with D's own cross-section only,
+        so no other (especially future) session can influence them. Fitting and
+        scoring both call this with the same contract.
+        """
+
+        import numpy as np
+
+        config = self._feature_transform_config()
+        matrix = np.empty((len(samples), len(feature_names)), dtype=np.float64)
+        for row, sample in enumerate(samples):
+            features = sample.get("features", {})
+            for column, name in enumerate(feature_names):
+                matrix[row, column] = self._safe_float(features.get(name))
+        if not config.get("enabled") or not samples:
+            return matrix
+        grouped: dict[str, list[int]] = defaultdict(list)
+        for position, sample in enumerate(samples):
+            grouped[str(sample.get("trade_date") or "")].append(position)
+        for positions in grouped.values():
+            indices = np.asarray(positions, dtype=np.int64)
+            transformed = self._cross_sectional_block(matrix[indices, :], config)
+            matrix[indices, :] = transformed
+        return matrix
+
+    def _resolve_embargo_sessions(self, horizon_days: int) -> int:
+        """Embargo gap in sessions; unset resolves to one label horizon."""
+
+        setting = getattr(self.settings, "trainer_embargo_sessions", None)
+        if setting is None:
+            return int(horizon_days)
+        value = int(setting)
+        if value < 0:
+            raise RuntimeError("trainer_embargo_sessions must not be negative")
+        return value
+
+    def _resolve_objective(self) -> dict:
+        raw = str(getattr(self.settings, "trainer_objective", "huber") or "huber").strip().lower()
+        if raw in {"l2", "mse", "regression", "reg:squarederror", "rmse"}:
+            objective = "l2"
+        else:
+            objective = raw or "huber"
+        return {
+            "objective": objective,
+            "alpha": float(getattr(self.settings, "trainer_huber_alpha", 0.9)),
+        }
+
+    def _fit_target_config(self) -> str:
+        """Name of the field the GBDT actually fits.
+
+        ``net_return`` is the historical (zero-regression) target; opt in to
+        ``risk_adjusted_return`` so the drawdown penalty changes the fit instead
+        of only the OOS metric. Both fields live on the same executable label,
+        so this switch never changes label construction, only the ``y`` selected
+        when the training matrix is assembled.
+        """
+
+        enabled = bool(getattr(self.settings, "trainer_fit_on_risk_adjusted", False))
+        return "risk_adjusted_return" if enabled else "net_return"
+
+    def _fit_target_value(self, sample: dict) -> float:
+        """Resolve one training sample's ``y`` under the configured fit target.
+
+        Mirrors ``_safe_float(sample["target"])`` exactly when the switch is off
+        (default), so the fitted matrix is byte-identical to the prior
+        behaviour. When on, the label's ``risk_adjusted_return`` is used and a
+        profile that does not carry it (e.g. the reconciled replay) falls back
+        to the net target, matching the OOS metric's own fallback.
+        """
+
+        if not bool(getattr(self.settings, "trainer_fit_on_risk_adjusted", False)):
+            return self._safe_float(sample.get("target"))
+        profile = sample.get("target_profile") or {}
+        value = profile.get("risk_adjusted_return")
+        if value is None:
+            value = sample.get("target")
+        return self._safe_float(value)
+
+    def _resolve_random_seed(self) -> int:
+        """GBDT random_state; 42 is the historical single-seed default."""
+
+        try:
+            return int(getattr(self.settings, "trainer_random_seed", 42))
+        except (TypeError, ValueError):
+            return 42
+
+    def _build_regressor(self, model_family: str, objective_config: dict) -> object:
+        """Construct the estimator honouring the configured robust objective."""
+
+        is_huber = str(objective_config.get("objective")) == "huber"
+        alpha = float(objective_config.get("alpha", 0.9))
+        seed = self._resolve_random_seed()
+        if model_family == "lightgbm":
+            return lgb.LGBMRegressor(
+                objective="huber" if is_huber else "regression",
+                alpha=alpha,
+                n_estimators=260, learning_rate=0.05,
+                num_leaves=63, min_child_samples=40, subsample=0.8,
+                colsample_bytree=0.8, reg_alpha=0.05, reg_lambda=0.1,
+                random_state=seed, n_jobs=-1, verbosity=-1,
+            )
+        if model_family == "xgboost":
+            return xgb.XGBRegressor(
+                objective="reg:pseudohubererror" if is_huber else "reg:squarederror",
+                huber_slope=alpha,
+                n_estimators=260, learning_rate=0.05,
+                max_depth=6, min_child_weight=40, subsample=0.8,
+                colsample_bytree=0.8, reg_alpha=0.05, reg_lambda=0.1,
+                random_state=seed, n_jobs=-1,
+            )
+        return cat.CatBoostRegressor(
+            loss_function=(f"Huber:delta={alpha}" if is_huber else "RMSE"),
+            iterations=260, learning_rate=0.05,
+            depth=6, l2_leaf_reg=3.0, random_seed=seed,
+            verbose=False, thread_count=-1,
+        )
+
+    def _feature_matrix(
+        self, samples: list[dict], feature_names: list[str]
+    ) -> "object":
+        return self._cross_sectional_feature_matrix(samples, feature_names)
+
     def _predict_scores(self, model: object, rows: list[list[float]]) -> list[float]:
         if len(rows) == 0:
             return []
@@ -1856,9 +2280,10 @@ class SignalTrainer:
         """Return one matured prediction's realized gate metric.
 
         The unified gate recognises a ``risk_adjusted_return``-style mean. The
-        trainer stores that exact field on each executable label; when a label
-        profile does not carry it (e.g. the reconciled replay) the realized net
-        target is used, which is the same cost-adjusted return.
+        trainer stores that exact field on each executable label (now
+        ``net - drawdown_penalty * |path_drawdown|``); when a label profile does
+        not carry it (e.g. the reconciled replay) the realized net target is
+        used, which is the same cost-adjusted return minus the tail penalty.
         """
 
         profile = sample.get("target_profile") or {}
@@ -1925,7 +2350,7 @@ class SignalTrainer:
                 "mean realized label risk_adjusted_return of the top-N scored "
                 "walk-forward predictions per matured prediction date; the label "
                 "path uses market/industry return 0.0, so this equals the "
-                "cost-adjusted net return"
+                "cost-adjusted net return minus the configured drawdown penalty"
             ),
         }
         if window_capable_dates is not None:
@@ -2183,6 +2608,26 @@ class SignalTrainer:
         }
         feature_names = self._feature_names(lookback_days=lookback_days)
         window_policy = self._training_window_policy(run_market)
+        # Training-side robustness contract resolved once per run so the loop,
+        # the fit and the persisted run config all describe the same choices.
+        label_winsorize_config = self._label_winsorize_config(run_market)
+        objective_config = self._resolve_objective()
+        feature_transform_config = self._feature_transform_config()
+        drawdown_penalty_setting = float(
+            getattr(self.settings, "trainer_drawdown_penalty", 0.25) or 0.0
+        )
+        fit_target_setting = self._fit_target_config()
+        random_seed_setting = self._resolve_random_seed()
+        embargo_sessions = self._resolve_embargo_sessions(horizon_days)
+        universe_filter_stats = getattr(self, "_universe_filter_stats", None) or {
+            "enabled": bool(getattr(self.settings, "trainer_universe_filter_enabled", True)),
+            "applied": False,
+            "skipped_reason": "rows_supplied_without_load_rows",
+            "input_rows": len(rows),
+            "output_rows": len(rows),
+            "excluded_rows": 0,
+            "exclusion_counts": {},
+        }
         symbol_feature_context = self._load_symbol_feature_context(
             rows=rows,
             market=market,
@@ -2245,7 +2690,7 @@ class SignalTrainer:
             label_available_date=lambda sample: _required_sample_date(sample, "label_available_date"),
             sample_id=lambda sample: f"{sample['symbol']}:{sample['trade_date']}",
             purge_sessions=horizon_days,
-            embargo_sessions=0,
+            embargo_sessions=embargo_sessions,
         )
         first_prediction_day = self._parse_iso_date(first_prediction_date)
         if first_prediction_day is None:
@@ -2301,6 +2746,13 @@ class SignalTrainer:
                     "lookback_days": lookback_days,
                     "prediction_horizon_days": horizon_days,
                     "target_profile": target_profile_version,
+                    # Same recorded cost tuple as the artifact manifest
+                    # (``model_metadata['execution_cost_bps']``).  Persisting it
+                    # on the run config lets ``resolve_execution_contract``
+                    # re-derive the identical contract for the default
+                    # executable profile, which the trainer otherwise leaves as
+                    # a null ``execution_contract``.
+                    "execution_cost_bps": execution_cost_setting,
                     "execution_contract": (execution_contract(run_market, FillCostModel(**execution_cost_setting))
                         if target_profile_version == RECONCILED_VERSION else None),
                     "training_weight_policy": TRAINING_WEIGHT_POLICY,
@@ -2339,9 +2791,16 @@ class SignalTrainer:
                     "training_protocol": "point_in_time_purged_v2",
                     "oos_start_date": first_prediction_date,
                     "purge_gap_days": horizon_days,
-                    "embargo_sessions": 0,
+                    "embargo_sessions": embargo_sessions,
                     "label_availability_rule": "strictly_before_prediction_date",
                     "universe_version": universe_version,
+                    "universe_filter_stats": universe_filter_stats,
+                    "label_winsorize": label_winsorize_config,
+                    "objective": objective_config,
+                    "drawdown_penalty": drawdown_penalty_setting,
+                    "fit_target": fit_target_setting,
+                    "random_seed": random_seed_setting,
+                    "feature_transform": feature_transform_config,
                     "label_price_basis": label_price_contract["label_price_basis"],
                     "label_price_basis_applicable": label_price_contract["label_price_basis_applicable"],
                     "adjusted_view_present": label_price_contract["adjusted_view_present"],
@@ -2404,13 +2863,14 @@ class SignalTrainer:
                         model_repo.complete_run(run_id, status="failed", artifact_path=None)
                         db.commit()
                         raise
-                    # Allocate a single compact matrix instead of millions of Python lists.
-                    import numpy as np
-                    x_train = np.empty((len(train_window), len(feature_names)), dtype=np.float64)
-                    for row_index, sample in enumerate(train_window):
-                        for col_index, name in enumerate(feature_names):
-                            x_train[row_index, col_index] = self._safe_float(sample["features"].get(name))
-                    y_train = [self._safe_float(sample.get("target")) for sample in train_window]
+                    # One compact matrix, built with a strict point-in-time
+                    # cross-sectional transform (per trade date, same-day
+                    # cross-section only).
+                    x_train = self._feature_matrix(train_window, feature_names)
+                    raw_targets = [self._fit_target_value(sample) for sample in train_window]
+                    y_train, winsorize_audit = self._winsorize_targets(
+                        raw_targets, label_winsorize_config
+                    )
                     sample_weights, weight_audit = date_balanced_training_weights(train_window)
                     training_window_audits.append({
                         **weight_audit, "prediction_date": trade_date,
@@ -2418,29 +2878,11 @@ class SignalTrainer:
                         "window_selection": selection_audit,
                         "available_date_count": len({row["trade_date"] for row in train_pool}),
                         "meets_252_session_research_window": weight_audit["date_count"] >= 252,
+                        "label_winsorize": winsorize_audit,
                     })
-                    if model_family == "lightgbm":
-                        model = lgb.LGBMRegressor(
-                            objective="regression", n_estimators=260, learning_rate=0.05,
-                            num_leaves=63, min_child_samples=40, subsample=0.8,
-                            colsample_bytree=0.8, reg_alpha=0.05, reg_lambda=0.1,
-                            random_state=42, n_jobs=-1, verbosity=-1,
-                        )
-                    elif model_family == "xgboost":
-                        model = xgb.XGBRegressor(
-                            objective="reg:squarederror", n_estimators=260, learning_rate=0.05,
-                            max_depth=6, min_child_weight=40, subsample=0.8,
-                            colsample_bytree=0.8, reg_alpha=0.05, reg_lambda=0.1,
-                            random_state=42, n_jobs=-1,
-                        )
-                    else:
-                        model = cat.CatBoostRegressor(
-                            loss_function="RMSE", iterations=260, learning_rate=0.05,
-                            depth=6, l2_leaf_reg=3.0, random_seed=42,
-                            verbose=False, thread_count=-1,
-                        )
+                    model = self._build_regressor(model_family, objective_config)
                     model.fit(x_train, y_train, sample_weight=sample_weights)
-                    del x_train, y_train, sample_weights
+                    del x_train, y_train, sample_weights, raw_targets
                     raw_importance_obj = getattr(model, "feature_importances_", None)
                     if raw_importance_obj is None:
                         raw_importance = [0.0] * len(feature_names)
@@ -2464,10 +2906,7 @@ class SignalTrainer:
                 date_samples = samples_by_date.get(trade_date) or []
                 if not date_samples:
                     continue
-                x_date = [
-                    [self._safe_float(sample["features"].get(feature_name)) for feature_name in feature_names]
-                    for sample in date_samples
-                ]
+                x_date = self._feature_matrix(date_samples, feature_names)
                 predicted_scores = self._predict_scores(model, x_date) if model is not None else []
                 ranked_pairs = sorted(
                     zip(date_samples, predicted_scores, strict=False),
@@ -2691,9 +3130,16 @@ class SignalTrainer:
                         "training_protocol": "point_in_time_purged_v2",
                         "oos_start_date": first_prediction_date,
                         "purge_gap_days": horizon_days,
-                        "embargo_sessions": 0,
+                        "embargo_sessions": embargo_sessions,
                         "label_availability_rule": "strictly_before_prediction_date",
                         "universe_version": universe_version,
+                        "universe_filter_stats": universe_filter_stats,
+                        "label_winsorize": label_winsorize_config,
+                        "objective": objective_config,
+                        "drawdown_penalty": drawdown_penalty_setting,
+                        "fit_target": fit_target_setting,
+                        "random_seed": random_seed_setting,
+                        "feature_transform": feature_transform_config,
                 },
             )
 

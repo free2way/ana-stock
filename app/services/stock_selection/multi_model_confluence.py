@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import math
+import re
 from collections.abc import Mapping, Sequence
 
-from app.services.model_signal_summary import model_rank_strength
+from app.services.model_signal_summary import (
+    CALIBRATION_STATUS_CALIBRATED,
+    CALIBRATION_STATUS_MISSING_SCORE,
+    expected_hit_probability,
+    model_rank_strength,
+    resolve_probability_calibrator,
+)
 from app.services.screener import MODEL_TEMPLATES
 from app.services.stock_selection.selection_policy import apply_snapshot_strategy_profile, normalize_action_filter
 
@@ -12,6 +20,26 @@ _MODEL_CONTEXT_FIELDS = (
     "model_signal_strength",
     "model_confidence",
     "model_percentile",
+)
+
+# Fallback chain used to read a model's ex-ante reliability off its own rows
+# when no explicit weights were supplied.  ``metric`` selects the transform:
+# hit rates are already probabilities, IC is signed so its magnitude is used.
+_RELIABILITY_ROW_FIELDS: tuple[tuple[str, str], ...] = (
+    ("model_oos_hit_rate", "oos_hit_rate"),
+    ("model_oos_ic", "oos_ic"),
+    ("model_reliability", "reliability"),
+)
+
+_EQUAL_WEIGHT_SOURCE = "equal_weight_fallback"
+_PROVIDED_WEIGHT_SOURCE = "provided_model_reliability_weights"
+
+# Same order the fusion consumes; the first populated field wins.
+_CALIBRATION_SCORE_FALLBACK_FIELDS = (
+    "model_score",
+    "snapshot_score",
+    "trend_score",
+    "confluence_score_mean",
 )
 
 
@@ -91,12 +119,194 @@ def _numeric(value: object) -> float:
         return float("-inf")
 
 
+def _coerce_reliability_weight(value: object, *, metric: str) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    if metric == "oos_ic":
+        number = abs(number)
+    return number
+
+
+def _normalize_model_weights(raw: Mapping[str, float], template_keys: Sequence[str]) -> dict[str, float]:
+    """Clamp to non-negative, rescale percent-style inputs, fill partial gaps.
+
+    A missing model gets the mean of the supplied weights so it is neither
+    silently zeroed (which would erase an unmeasured model) nor allowed to
+    dominate.  A degenerate all-zero map falls back to equal weight.
+    """
+    cleaned = {key: max(0.0, float(value)) for key, value in raw.items() if value is not None}
+    if not cleaned:
+        return {key: 1.0 for key in template_keys}
+    maximum = max(cleaned.values())
+    if maximum > 1.0:
+        cleaned = {key: value / maximum for key, value in cleaned.items()}
+    mean = sum(cleaned.values()) / len(cleaned)
+    weights = {key: cleaned.get(key, mean) for key in template_keys}
+    if sum(weights.values()) <= 0.0:
+        return {key: 1.0 for key in template_keys}
+    return weights
+
+
+def resolve_model_weights(
+    template_keys: Sequence[str],
+    *,
+    params: Mapping[str, object],
+    template_rows: Mapping[str, Sequence[dict]],
+) -> tuple[dict[str, float], str]:
+    """Resolve per-model reliability weights, newest reliable source first.
+
+    Priority:
+      1. ``params["model_reliability_weights"]`` (explicit mapping, optionally
+         ``{template: {"metric": ..., "value": ...}}``).
+      2. Per-model row metadata (``model_oos_hit_rate`` / ``model_oos_ic`` /
+         ``model_reliability``) carried by the prediction rows.
+      3. Equal weights, clearly labelled ``equal_weight_fallback``.
+    """
+    active = [key for key in template_keys if key in template_rows] or list(template_keys)
+    provided = params.get("model_reliability_weights")
+    if isinstance(provided, Mapping) and provided:
+        raw: dict[str, float] = {}
+        for key in active:
+            entry = provided.get(key)
+            if entry is None:
+                continue
+            if isinstance(entry, Mapping):
+                metric = str(entry.get("metric") or entry.get("weight_source") or "reliability")
+                value = entry.get("value", entry.get("weight"))
+            else:
+                metric = "reliability"
+                value = entry
+            number = _coerce_reliability_weight(value, metric=metric)
+            if number is not None:
+                raw[key] = number
+        if raw:
+            return _normalize_model_weights(raw, active), _PROVIDED_WEIGHT_SOURCE
+
+    raw = {}
+    metric_used: str | None = None
+    for key in active:
+        for field, metric in _RELIABILITY_ROW_FIELDS:
+            found = next(
+                (row.get(field) for row in (template_rows.get(key) or []) if row.get(field) is not None),
+                None,
+            )
+            if found is None:
+                continue
+            number = _coerce_reliability_weight(found, metric=metric)
+            if number is not None:
+                raw[key] = number
+                metric_used = metric_used or metric
+                break
+    if raw:
+        return _normalize_model_weights(raw, active), f"row_metadata:{metric_used or 'reliability'}"
+
+    return {key: 1.0 for key in active}, _EQUAL_WEIGHT_SOURCE
+
+
+def _weight_field_name(template_key: str) -> str:
+    sanitized = re.sub(r"[^0-9a-zA-Z]+", "_", str(template_key)).strip("_").lower()
+    return f"model_weight_{sanitized or 'model'}"
+
+
+def _calibration_score(row: Mapping[str, object], score_field: str | None) -> object | None:
+    fields = [score_field] if score_field else []
+    fields.extend(field for field in _CALIBRATION_SCORE_FALLBACK_FIELDS if field != score_field)
+    for field in fields:
+        value = row.get(field) if field else None
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            return number
+    return None
+
+
+def apply_probability_gate(
+    rows: Sequence[dict],
+    *,
+    min_hit_probability: float | None,
+    outcome_key: str | None = None,
+) -> tuple[list[dict], dict]:
+    """Optional abstention gate on calibrated ``expected_hit_probability``.
+
+    Disabled by default (``min_hit_probability=None``).  When enabled, rows
+    whose probability is missing (uncalibrated) or below the threshold abstain.
+    Coverage falls as the threshold rises; when a truth ``outcome_key`` is
+    present the realized precision of the retained subset is reported too.
+    """
+    total = len(rows)
+    probabilities = [row.get("expected_hit_probability") for row in rows]
+    uncalibrated = sum(1 for value in probabilities if value is None)
+    if min_hit_probability is None:
+        present = [float(value) for value in probabilities if value is not None]
+        report = {
+            "enabled": False,
+            "threshold": None,
+            "total_candidates": total,
+            "selected_count": total,
+            "excluded_count": 0,
+            "excluded_uncalibrated": uncalibrated,
+            "coverage": 1.0 if total else 0.0,
+            "mean_expected_hit_probability": (
+                round(sum(present) / len(present), 6) if present else None
+            ),
+            "precision": None,
+        }
+        return list(rows), report
+
+    threshold = float(min_hit_probability)
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("min_hit_probability must be finite and in [0, 1]")
+    kept: list[dict] = []
+    for row in rows:
+        value = row.get("expected_hit_probability")
+        if value is None or float(value) < threshold:
+            continue
+        kept.append(row)
+    precision: float | None = None
+    if outcome_key:
+        outcomes = [
+            float(row[outcome_key])
+            for row in kept
+            if row.get(outcome_key) is not None and _numeric(row.get(outcome_key)) != float("-inf")
+        ]
+        if outcomes:
+            precision = sum(1 for value in outcomes if value > 0) / len(outcomes)
+    selected_probabilities = [float(row["expected_hit_probability"]) for row in kept]
+    report = {
+        "enabled": True,
+        "threshold": threshold,
+        "total_candidates": total,
+        "selected_count": len(kept),
+        "excluded_count": total - len(kept),
+        "excluded_uncalibrated": uncalibrated,
+        "coverage": (len(kept) / total) if total else 0.0,
+        "mean_expected_hit_probability": (
+            round(sum(selected_probabilities) / len(selected_probabilities), 6)
+            if selected_probabilities
+            else None
+        ),
+        "precision": round(precision, 6) if precision is not None else None,
+    }
+    return kept, report
+
+
 def _sort_multi_model_rows(rows: list[dict], *, sort_by: str, sort_order: str) -> list[dict]:
     reverse = sort_order != "asc"
     if sort_by in {"default", "confluence_rank"}:
         return sorted(
             rows,
             key=lambda item: (
+                # Reliability-weighted agreement leads; hit count stays a
+                # transparent tie-break so ``min_hits`` semantics are unchanged.
+                _numeric(item.get("weighted_score")),
                 int(item.get("model_hit_count") or 0),
                 int(item.get("confluence_alignment_count") or 0),
                 float(item.get("trade_readiness_score") or 0.0),
@@ -112,6 +322,7 @@ def _sort_multi_model_rows(rows: list[dict], *, sort_by: str, sort_order: str) -
             rows,
             key=lambda item: (
                 int(item.get(primary_key) or 0),
+                _numeric(item.get("weighted_score")),
                 int(item.get("model_hit_count") or 0),
                 int(item.get("confluence_alignment_count") or 0),
                 float(item.get("snapshot_score") or 0.0),
@@ -135,6 +346,9 @@ def _sort_multi_model_rows(rows: list[dict], *, sort_by: str, sort_order: str) -
         "snapshot_hits",
         "model_signal_strength",
         "trade_readiness_score",
+        "weighted_score",
+        "weighted_score_normalized",
+        "expected_hit_probability",
     }
     if sort_by == "model_signal_strength":
         return sorted(
@@ -172,6 +386,22 @@ def aggregate_multi_model_rows(
     }
     if len(normalized_keys) < 2 or not available_templates:
         return [], meta
+
+    model_weights, weight_source = resolve_model_weights(
+        normalized_keys,
+        params=params,
+        template_rows=template_rows,
+    )
+    calibrator, calibration_reason = resolve_probability_calibrator(params)
+    meta["model_weights"] = dict(model_weights)
+    meta["weight_source"] = weight_source
+    meta["calibration_status"] = (
+        CALIBRATION_STATUS_CALIBRATED if calibrator is not None else calibration_reason
+    )
+    if calibrator is not None:
+        meta["calibration_source"] = calibrator.source
+        meta["calibration_version"] = calibrator.version
+    total_active_weight = sum(model_weights.values())
 
     aggregated: dict[str, dict] = {}
     for template_key in available_templates:
@@ -302,6 +532,30 @@ def aggregate_multi_model_rows(
             if scores
             else None
         )
+        # Reliability weighting: a high-reliability model's vote counts more
+        # than a low-reliability one, while ``model_hit_count`` keeps the raw
+        # AND-style agreement count used by ``min_multi_model_hits``.
+        matched_weights = {key: float(model_weights.get(key) or 0.0) for key in template_keys_hit}
+        weighted_score = sum(matched_weights.values())
+        item["weighted_score"] = round(weighted_score, 6)
+        item["weighted_score_normalized"] = (
+            round(weighted_score / total_active_weight, 6) if total_active_weight > 0 else None
+        )
+        item["model_weights"] = {key: round(value, 6) for key, value in matched_weights.items()}
+        for key, value in matched_weights.items():
+            item[_weight_field_name(key)] = round(value, 6)
+        item["weight_source"] = weight_source
+        calibration_score = _calibration_score(item, calibrator.score_field if calibrator else None)
+        probability = expected_hit_probability(calibrator, calibration_score)
+        item["expected_hit_probability"] = probability
+        if calibrator is not None and probability is not None:
+            item["calibration_status"] = CALIBRATION_STATUS_CALIBRATED
+            item["calibration_source"] = calibrator.source
+            item["calibration_method"] = calibrator.method
+        elif calibrator is not None:
+            item["calibration_status"] = CALIBRATION_STATUS_MISSING_SCORE
+        else:
+            item["calibration_status"] = calibration_reason
         results.append(item)
 
     results = _sort_multi_model_rows(
@@ -313,6 +567,15 @@ def aggregate_multi_model_rows(
         results,
         profile=str(params.get("strategy_profile") or ""),
     )
+    min_hit_probability = params.get("min_hit_probability")
+    if min_hit_probability is not None:
+        min_hit_probability = float(min_hit_probability)
+    results, probability_gate = apply_probability_gate(
+        results,
+        min_hit_probability=min_hit_probability,
+        outcome_key=str(params.get("probability_outcome_key") or "") or None,
+    )
+    meta["probability_gate"] = probability_gate
     if not apply_limit:
         return results, meta
     return results[: int(params.get("limit") or 500)], meta

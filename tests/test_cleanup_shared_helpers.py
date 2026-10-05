@@ -177,7 +177,7 @@ class PublicCompatibilityTests(TestCase):
         imports = {alias.asname or alias.name: (node.module, alias.name)
                    for node in tree.body if isinstance(node, ast.ImportFrom)
                    for alias in node.names}
-        self.assertEqual(200, len(imports))
+        self.assertEqual(218, len(imports))
         self.assertEqual(set(imports), set(package.__all__))
         self.assertEqual(len(imports), len(package.__all__))
         for name, (module, original) in imports.items():

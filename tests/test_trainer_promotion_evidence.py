@@ -155,9 +155,36 @@ class TrainerPromotionEvidenceTests(TestCase):
 
         # Pre-existing protocol evidence is reused, not rebuilt.
         self.assertGreaterEqual(int(create_config["purge_gap_days"]), 1)
-        self.assertEqual(0, create_config["embargo_sessions"])
+        # The embargo now defaults to one horizon (purge already covers the
+        # label window; the embargo adds an equal forward gap).
+        self.assertEqual(
+            create_config["purge_gap_days"], create_config["embargo_sessions"]
+        )
+        self.assertGreater(create_config["embargo_sessions"], 0)
         self.assertEqual("walk_forward_purged_v2", create_config["evaluation_protocol"])
         self.assertIsInstance(create_config["prediction_price_basis_contract"], dict)
+        # Training-side robustness contract persisted for audit.
+        self.assertTrue(create_config["universe_filter_stats"]["enabled"])
+        self.assertTrue(create_config["label_winsorize"]["enabled"])
+        self.assertEqual(0.025, create_config["label_winsorize"]["lower_quantile"])
+        self.assertEqual("huber", create_config["objective"]["objective"])
+        self.assertEqual(0.25, create_config["drawdown_penalty"])
+        self.assertTrue(create_config["feature_transform"]["enabled"])
+        self.assertEqual(
+            "cross_sectional_winsor_mad_zscore",
+            create_config["feature_transform"]["method"],
+        )
+        # The run config and the artifact manifest must carry the identical
+        # execution cost tuple so the default executable profile's execution
+        # contract can be re-derived downstream.
+        self.assertIn("execution_cost_bps", create_config)
+        self.assertEqual(
+            create_config["execution_cost_bps"], artifact_meta["execution_cost_bps"]
+        )
+        self.assertEqual(
+            {"commission_bps_one_way", "slippage_bps_one_way"},
+            set(create_config["execution_cost_bps"]),
+        )
 
         self.assertGreater(int(merged["training_sample_count"]), 1000)
         evaluation = merged["oos_evaluation"]
