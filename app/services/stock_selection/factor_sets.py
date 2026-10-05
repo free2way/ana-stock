@@ -4,7 +4,12 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 
-from app.services.stock_selection.factor_pipeline import FactorDirection, FactorSpec
+from app.services.stock_selection.factor_pipeline import (
+    CrossSectionalFactorPipeline,
+    FactorDirection,
+    FactorSpec,
+    MissingFactorPolicy,
+)
 from app.services.stock_selection.sentiment_features import (
     SENTIMENT_FACTOR_SET_KEY,
     sentiment_feature_definitions,
@@ -235,3 +240,28 @@ def registered_factor_sets() -> dict[str, ResearchFactorSet]:
     """All factory-loadable factor sets: frozen research candidates + sentiment."""
 
     return {**research_factor_sets(), **sentiment_factor_sets()}
+
+
+def missing_factor_policy_for_factor_set(factor_set: ResearchFactorSet) -> MissingFactorPolicy:
+    """Pick the cross-sectional missing-factor policy for a factor set.
+
+    Sparse, forward-only families (``sentiment_v1``) carry legitimately unknown
+    cells for out-of-coverage dates, so they must exclude missing factors instead
+    of scoring them as a neutral zero. Every frozen price/P1 family keeps the
+    legacy neutral-zero contract so existing research output is unchanged.
+    """
+
+    if factor_set.key == SENTIMENT_FACTOR_SET_KEY:
+        return MissingFactorPolicy.EXCLUDE
+    return MissingFactorPolicy.NEUTRAL_ZERO
+
+
+def factor_pipeline_for_factor_set(
+    factor_set: ResearchFactorSet,
+) -> CrossSectionalFactorPipeline:
+    """Build the cross-sectional pipeline with the family-appropriate missing policy."""
+
+    return CrossSectionalFactorPipeline(
+        factor_set.specs,
+        missing_policy=missing_factor_policy_for_factor_set(factor_set),
+    )

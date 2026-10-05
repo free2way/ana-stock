@@ -27,7 +27,11 @@ from app.services.stock_selection.data_readiness import (
     persist_data_readiness_report,
 )
 from app.services.stock_selection.factor_pipeline import CrossSectionalFactorPipeline
-from app.services.stock_selection.factor_sets import ResearchFactorSet, get_research_factor_set
+from app.services.stock_selection.factor_sets import (
+    ResearchFactorSet,
+    factor_pipeline_for_factor_set,
+    get_research_factor_set,
+)
 from app.services.stock_selection.historical_universe_contract import (
     load_historical_universe_contract_for_market,
 )
@@ -62,6 +66,8 @@ from app.services.execution_costs import FillCostModel
 from app.services.stock_selection.executable_outcomes import FILL_COST_OUTCOME_VERSION
 from app.services.stock_selection.execution_evidence import ResearchExecutionEvidence
 from app.services.json_payload_artifacts import JsonPayloadArtifactStore
+from app.services.stock_selection.sentiment_features import SENTIMENT_FACTOR_SET_KEY
+from app.services.stock_selection.sentiment_research import SentimentResearchFeatureConfig
 from app.services.stock_selection.universe import (
     SecurityMetadata,
     default_universe_rules,
@@ -102,6 +108,9 @@ class ProductionResearchRunConfig:
     fill_cost_model: FillCostModel | None = None
     regime_policy_mode: str = "historical_required"
     training_sampling: P1SamplingConfig | None = None
+    # Optional, default-off HiThink sentiment family. The pre-open auction path
+    # is only reachable through an explicit SentimentResearchFeatureConfig.
+    sentiment_research: SentimentResearchFeatureConfig | None = None
 
     def __post_init__(self) -> None:
         if str(self.market or "").strip().upper() not in {"CN", "US"}:
@@ -138,6 +147,13 @@ class ProductionResearchRunConfig:
                 "history_limit_per_symbol must cover feature warm-up, training, OOS dates, and labels"
             )
         get_research_factor_set(self.factor_set_key)
+        if self.factor_set_key == SENTIMENT_FACTOR_SET_KEY and (
+            self.sentiment_research is None or not self.sentiment_research.enabled
+        ):
+            raise ValueError(
+                "sentiment_v1 factor set requires an enabled sentiment_research "
+                "config; it is never enabled silently"
+            )
         allowed_models = {"equal_weight", "ridge", "lambdarank", "top_tail", "two_stage"}
         if not self.model_keys or any(item not in allowed_models for item in self.model_keys):
             raise ValueError("model_keys contains an unsupported model")
@@ -496,6 +512,7 @@ def run_production_research_challenger(
         source_version=inputs.source_version,
         execution_evidence=execution_evidence,
         p1_feature_config=p1_feature_config,
+        sentiment_research_config=config.sentiment_research,
     )
     if execution_evidence is not None:
         store = JsonPayloadArtifactStore(root / "execution_evidence")
@@ -509,7 +526,7 @@ def run_production_research_challenger(
         }))
     universe_artifact = persist_universe_artifact(dataset.universe_result, root=root / "universes")
     sample_artifact = persist_sample_artifact(dataset.sample_result, root=root / "datasets")
-    factor_pipeline = CrossSectionalFactorPipeline(factor_set.specs)
+    factor_pipeline = factor_pipeline_for_factor_set(factor_set)
     feature_names = factor_set.feature_names
     comparisons: dict[int, WalkForwardComparisonResult] = {}
     evidence: dict[int, ResearchEvidenceWriteResult] = {}

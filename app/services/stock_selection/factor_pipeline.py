@@ -16,6 +16,22 @@ class FactorDirection(StrEnum):
     LOWER_BETTER = "lower_better"
 
 
+class MissingFactorPolicy(StrEnum):
+    """How an unknown (``None``/non-finite) factor cell joins the composite score.
+
+    ``NEUTRAL_ZERO`` is the legacy, explicitly-audited contract: a missing factor
+    is scored as the neutral ``0.0`` z-score and the sample's ``missing_factors``
+    records it. ``EXCLUDE`` omits the factor from ``factor_values`` and
+    renormalizes the composite over the present factors, so an unknown value can
+    never masquerade as a real zero. Sparse, forward-only families such as the
+    bounded ``sentiment_v1`` window must use ``EXCLUDE`` because their
+    out-of-coverage cells are legitimately unknown rather than zero.
+    """
+
+    NEUTRAL_ZERO = "neutral_zero"
+    EXCLUDE = "exclude"
+
+
 @dataclass(frozen=True, slots=True)
 class FactorSpec:
     name: str
@@ -87,6 +103,9 @@ class FactorScore:
     cross_sectional_rank: float
     label_value: float | None
     label_components: Mapping[str, float] = field(default_factory=dict)
+    # Explicit record of how missing factors were treated; defaults to the legacy
+    # neutral-zero contract so existing direct constructors stay valid.
+    missing_policy: str = MissingFactorPolicy.NEUTRAL_ZERO.value
 
 
 def _quantile(sorted_values: list[float], probability: float) -> float:
@@ -121,7 +140,13 @@ def _percentile_ranks(values: list[float]) -> list[float]:
 class CrossSectionalFactorPipeline:
     """Fit-free same-date transforms that cannot borrow another date's data."""
 
-    def __init__(self, specs: Iterable[FactorSpec], *, zscore_clip: float = 3.0) -> None:
+    def __init__(
+        self,
+        specs: Iterable[FactorSpec],
+        *,
+        zscore_clip: float = 3.0,
+        missing_policy: MissingFactorPolicy | str = MissingFactorPolicy.NEUTRAL_ZERO,
+    ) -> None:
         self.specs = tuple(specs)
         if not self.specs:
             raise ValueError("at least one factor spec is required")
@@ -132,6 +157,10 @@ class CrossSectionalFactorPipeline:
             raise ValueError("zscore_clip must be positive")
         if sum(item.weight for item in self.specs) <= 0:
             raise ValueError("at least one factor must have positive weight")
+        try:
+            self.missing_policy = MissingFactorPolicy(missing_policy)
+        except ValueError as exc:
+            raise ValueError(f"unsupported missing_policy: {missing_policy!r}") from exc
         self.zscore_clip = zscore_clip
 
     def transform(
@@ -153,6 +182,8 @@ class CrossSectionalFactorPipeline:
 
         output: list[FactorScore] = []
         total_weight = sum(item.weight for item in self.specs)
+        weight_by_name = {item.name: item.weight for item in self.specs}
+        exclude_missing = self.missing_policy == MissingFactorPolicy.EXCLUDE
         for group_key in sorted(grouped):
             group = sorted(grouped[group_key], key=lambda item: (item.ticker, item.observation_id))
             normalized_by_factor: dict[str, dict[str, float]] = {}
@@ -191,11 +222,31 @@ class CrossSectionalFactorPipeline:
             composites: list[float] = []
             factor_rows: list[dict[str, float]] = []
             for sample in group:
-                values = {
-                    spec.name: normalized_by_factor[spec.name].get(sample.observation_id, 0.0)
+                present = {
+                    spec.name: normalized_by_factor[spec.name][sample.observation_id]
                     for spec in self.specs
+                    if sample.observation_id in normalized_by_factor[spec.name]
                 }
-                composite = sum(values[spec.name] * spec.weight for spec in self.specs) / total_weight
+                if exclude_missing:
+                    # Unknown cells are omitted entirely; renormalize over the
+                    # factors that are actually present so a missing value never
+                    # enters the composite as a functional zero.
+                    values = dict(present)
+                    present_weight = sum(weight_by_name[name] for name in present)
+                    composite = (
+                        sum(present[name] * weight_by_name[name] for name in present)
+                        / present_weight
+                        if present_weight > 0
+                        else 0.0
+                    )
+                else:
+                    values = {
+                        spec.name: present.get(spec.name, 0.0) for spec in self.specs
+                    }
+                    composite = (
+                        sum(values[spec.name] * spec.weight for spec in self.specs)
+                        / total_weight
+                    )
                 factor_rows.append(values)
                 composites.append(composite)
             ranks = _percentile_ranks(composites)
@@ -212,6 +263,7 @@ class CrossSectionalFactorPipeline:
                     cross_sectional_rank=rank,
                     label_value=sample.label_value,
                     label_components=sample.label_components,
+                    missing_policy=self.missing_policy.value,
                 )
                 for sample, factor_values, composite, rank in zip(
                     group,

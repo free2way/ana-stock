@@ -27,6 +27,9 @@ from app.services.stock_selection.experiment_registry import (  # noqa: E402
     attempt_stats,
     record_attempt,
 )
+from app.services.stock_selection.sentiment_features import (  # noqa: E402
+    SENTIMENT_FACTOR_SET_KEY,
+)
 
 DEFAULT_OUTPUT_DIR = Path("data") / "artifacts" / "acceptance-20261002"
 
@@ -55,6 +58,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strata-json", type=Path, help="行业/市值/流动性桶映射（可选）。")
     parser.add_argument("--market-key", default=None, help="registry 分组键；默认用 experiment_id。")
     parser.add_argument("--factor-set-key", default="original_v1")
+    parser.add_argument(
+        "--sentiment-metadata-json",
+        type=Path,
+        default=None,
+        help=(
+            "sentiment_v1 覆盖/cutoff 元数据 JSON（sentiment_factor_set_key/source_version/"
+            "coverage_start/coverage_end/missing_policy/decision_cutoff/cutoff_time_local/"
+            "auction_path_enabled）。启用 --factor-set-key sentiment_v1 时必填，否则 fail-closed。"
+        ),
+    )
     parser.add_argument("--source-version", default=None, help="market_lake 来源版本覆盖（离线复算用）。")
     parser.add_argument("--registry-path", type=Path, default=None)
     parser.add_argument("--attempts", type=int, default=None, help="覆盖 registry 中的 attempts 计数。")
@@ -494,6 +507,8 @@ def _recompute_command(args: argparse.Namespace, spec: SelectionExperimentSpec) 
     if args.strata_json is not None:
         parts.append(f"--strata-json {args.strata_json}")
     parts.append(f"--factor-set-key {args.factor_set_key}")
+    if args.sentiment_metadata_json is not None:
+        parts.append(f"--sentiment-metadata-json {args.sentiment_metadata_json}")
     if args.source_version:
         parts.append(f"--source-version {args.source_version}")
     parts.append(f"--output-dir {args.output_dir}")
@@ -501,10 +516,37 @@ def _recompute_command(args: argparse.Namespace, spec: SelectionExperimentSpec) 
     return " ".join(parts)
 
 
+def _load_sentiment_components(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Load and cross-check optional sentiment coverage/cutoff metadata.
+
+    ``sentiment_v1`` must declare its coverage window and decision cutoff: if the
+    factor set is requested without metadata the run fails closed instead of
+    silently reusing a price-only dataset hash.
+    """
+
+    metadata_path = args.sentiment_metadata_json
+    if metadata_path is None:
+        if args.factor_set_key == SENTIMENT_FACTOR_SET_KEY:
+            raise SystemExit(
+                "--factor-set-key sentiment_v1 requires --sentiment-metadata-json "
+                "(coverage window + decision cutoff must be declared)"
+            )
+        return None
+    if args.factor_set_key != SENTIMENT_FACTOR_SET_KEY:
+        raise SystemExit(
+            "--sentiment-metadata-json requires --factor-set-key sentiment_v1"
+        )
+    raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, Mapping):
+        raise SystemExit("sentiment metadata JSON must be an object")
+    return dict(raw)
+
+
 def main() -> None:
     args = parse_args()
     spec = load_experiment_spec(args.spec)
     lake_meta: dict[str, Any] = {}
+    sentiment_components = _load_sentiment_components(args)
 
     if args.panel_json is not None:
         treated, control, in_sample = _load_panel_json(args.panel_json, spec)
@@ -552,6 +594,7 @@ def main() -> None:
         label_version=spec.panel.label_version,
         universe_version=spec.panel.universe_version,
         source_version=args.source_version,
+        sentiment=sentiment_components,
     )
 
     market_key = args.market_key or spec.experiment_id
@@ -610,6 +653,7 @@ def main() -> None:
                 "markdown_report": str(files.markdown_path),
                 "recorded_attempt": recorded["entry_hash"] if recorded else None,
                 "lake_panel_meta": lake_meta or None,
+                "sentiment_metadata": sentiment_components,
             },
             ensure_ascii=False,
             indent=2,

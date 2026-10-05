@@ -277,11 +277,16 @@ def freeze_dataset_hash(
     label_version: str,
     universe_version: str,
     source_version: str | None = None,
+    sentiment: Mapping[str, object] | None = None,
 ) -> DatasetHashResult:
     """冻结 dataset_hash：market_lake 来源版本 + factor_set + label + universe。
 
     ``source_version`` 可显式传入（测试/复算用）；省略时懒加载
     ``market_lake_source_version``，因此模块导入本身不触碰 DB/文件系统。
+
+    ``sentiment`` 可选：传入时把情绪覆盖窗口与决定 cutoff 语义并入哈希（情绪
+    因子集不得在未声明覆盖/cutoff 的情况下复用同一 dataset_hash）；缺省不改变
+    既有价格/P1 数据集的哈希。
     """
 
     market_code = str(market or "").strip().upper()
@@ -299,6 +304,23 @@ def freeze_dataset_hash(
         "label_version": str(label_version),
         "universe_version": str(universe_version),
     }
+    if sentiment is not None:
+        from app.services.stock_selection.sentiment_research import (
+            validate_sentiment_hash_components,
+        )
+
+        resolved_sentiment = validate_sentiment_hash_components(sentiment)
+        for key in (
+            "factor_set_key",
+            "source_version",
+            "coverage_start",
+            "coverage_end",
+            "missing_policy",
+            "decision_cutoff",
+            "cutoff_time_local",
+            "auction_path_enabled",
+        ):
+            components[f"sentiment_{key}"] = resolved_sentiment.get(key)
     canonical = json.dumps(components, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
     return DatasetHashResult(

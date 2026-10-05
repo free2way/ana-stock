@@ -7,6 +7,7 @@ import statistics
 from collections import defaultdict
 from dataclasses import asdict, dataclass, replace
 from datetime import date
+from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from app.services.stock_selection.factor_pipeline import FactorSpec
@@ -19,6 +20,12 @@ from app.services.stock_selection.point_in_time_features import (
     PointInTimeFeatureJoinResult,
     build_point_in_time_feature_join,
     merge_point_in_time_features,
+)
+from app.services.stock_selection.sentiment_features import HithinkSentimentObservation
+from app.services.stock_selection.sentiment_research import (
+    SentimentResearchFeatureConfig,
+    SentimentResearchJoinResult,
+    build_sentiment_research_join,
 )
 from app.services.stock_selection.p1_factors import (
     P1FeatureBuildResult,
@@ -78,7 +85,7 @@ class PriceFeatureConfig:
 class PriceFeatureBuildResult:
     feature_set_version: str
     feature_names: tuple[str, ...]
-    features_by_key: Mapping[tuple[str, date], Mapping[str, float]]
+    features_by_key: Mapping[tuple[str, date], Mapping[str, float | None]]
     row_count: int
     ticker_count: int
 
@@ -104,6 +111,15 @@ class ProductionResearchDataset:
     invalid_row_count: int
     point_in_time_feature_result: PointInTimeFeatureJoinResult | None
     p1_feature_result: P1FeatureBuildResult | None = None
+    sentiment_feature_result: SentimentResearchJoinResult | None = None
+
+    @property
+    def sentiment_metadata(self) -> Mapping[str, object]:
+        """Recorded sentiment coverage/cutoff metadata (empty when disabled)."""
+
+        if self.sentiment_feature_result is None:
+            return {}
+        return dict(self.sentiment_feature_result.metadata())
 
 
 def default_price_factor_specs() -> tuple[FactorSpec, ...]:
@@ -321,6 +337,9 @@ def build_production_research_dataset(
     point_in_time_source_version: str | None = None,
     execution_evidence: ResearchExecutionEvidence | None = None,
     p1_feature_config: P1PriceVolumeFeatureConfig | None = None,
+    sentiment_research_config: SentimentResearchFeatureConfig | None = None,
+    sentiment_observations: Iterable[HithinkSentimentObservation] | None = None,
+    sentiment_store_root: Path | None = None,
 ) -> ProductionResearchDataset:
     market_code = str(market or "").strip().upper()
     if market_code not in {"CN", "US"}:
@@ -434,6 +453,40 @@ def build_production_research_dataset(
             row_count=len(merged_features),
             ticker_count=len({key[0] for key in merged_features}),
         )
+    sentiment_result: SentimentResearchJoinResult | None = None
+    if sentiment_research_config is not None and sentiment_research_config.enabled:
+        sentiment_result = build_sentiment_research_join(
+            feature_result.features_by_key,
+            config=sentiment_research_config,
+            observations=sentiment_observations,
+            root=sentiment_store_root,
+        )
+        if sentiment_result is not None:
+            # Coverage window and cutoff semantics are part of the feature set
+            # version, so a dataset built on a different sentiment slice or a
+            # different decision cutoff is never mistaken for the same basis.
+            combined_payload = ":".join(
+                (
+                    feature_result.feature_set_version,
+                    sentiment_result.source_version,
+                    sentiment_result.cutoff_semantics,
+                    sentiment_result.missing_policy,
+                    sentiment_result.coverage_start.isoformat()
+                    if sentiment_result.coverage_start
+                    else "none",
+                    sentiment_result.coverage_end.isoformat()
+                    if sentiment_result.coverage_end
+                    else "none",
+                )
+            )
+            combined_digest = hashlib.sha256(combined_payload.encode("utf-8")).hexdigest()[:16]
+            feature_result = PriceFeatureBuildResult(
+                feature_set_version=f"price_plus_sentiment_v1:{combined_digest}",
+                feature_names=sentiment_result.merged_feature_names,
+                features_by_key=sentiment_result.features_by_key,
+                row_count=len(sentiment_result.features_by_key),
+                ticker_count=len({key[0] for key in sentiment_result.features_by_key}),
+            )
     benchmark_result = build_relative_return_benchmarks(
         trading_dates=trading_dates,
         bars_by_ticker=bars_by_ticker,
@@ -469,4 +522,5 @@ def build_production_research_dataset(
         invalid_row_count=invalid_count,
         point_in_time_feature_result=point_in_time_result,
         p1_feature_result=p1_feature_result,
+        sentiment_feature_result=sentiment_result,
     )
