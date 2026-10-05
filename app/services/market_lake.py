@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import threading
 import time
 from pathlib import Path
@@ -459,6 +460,226 @@ def load_lake_price_history(*, market: str, ticker: str, limit: int = 120) -> li
     history.sort(key=lambda item: item.get("date") or "", reverse=True)
     history = history[: max(1, int(limit))]
     history.sort(key=lambda item: item.get("date") or "")
+    return history
+
+
+# ---------------------------------------------------------------------------
+# Provenance-aware price history (raw-basis execution replay input)
+# ---------------------------------------------------------------------------
+# The reconciliation contract (`execution_reconciliation.replay_candidate`)
+# demands three fields on every bar it replays: ``price_basis`` (must be
+# ``raw``), ``execution_source_reference`` (non-empty, traceable) and
+# ``corporate_action_status`` (``none``/``action``).  The plain lake reader
+# only returns OHLCV, so evaluation could never promote a candidate.  These
+# helpers add the fields without touching the OHLCV values.
+LAKE_V2_STORE_DIRNAME = "_lake_v2"
+EXECUTION_SOURCE_REFERENCE_STORES = ("lake_v2", "lake_v1")
+_CORPORATE_ACTION_DATES_LOCK = threading.Lock()
+_CORPORATE_ACTION_DATES_CACHE: dict[tuple[str, str], dict[str, list[str]]] = {}
+
+
+def _lake_partition_files(store_dir: Path, *, limit: int | None = None) -> list[str]:
+    """Partition parquet paths for one store dir, newest partition first.
+
+    Mirrors ``_all_parquet_files`` ordering (partition-name descending) but is
+    root-parameterised so tests can point the loader at a temp lake.
+    """
+    if not store_dir.is_dir():
+        return []
+    files = sorted(
+        (
+            path
+            for path in store_dir.glob("date=*/*.parquet")
+            if path.is_file() and path.stat().st_size >= LAKE_MIN_PARQUET_BYTES
+        ),
+        key=lambda path: path.parent.name,
+        reverse=True,
+    )
+    if limit is not None and limit > 0:
+        files = files[: int(limit)]
+    return [str(path) for path in files]
+
+
+def _corporate_action_dates_by_symbol(
+    market: str, *, root: Path | None = None
+) -> dict[str, list[str]]:
+    """Sorted effective dates per symbol from the corporate-action store.
+
+    Loaded once per (market, store root) and cached: the store is append-only
+    parquet, so a full read is cheap relative to per-symbol lookups.  No
+    ``as_of`` filter is applied -- provenance asks whether an event *happened*
+    in the replayed window, not what was known at signal time.
+    """
+    market_code = str(market or "").strip().upper()
+    cache_key = (market_code, str(root) if root is not None else "")
+    with _CORPORATE_ACTION_DATES_LOCK:
+        cached = _CORPORATE_ACTION_DATES_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    from app.services.corporate_actions import load_actions
+
+    index: dict[str, list[str]] = {}
+    for record in load_actions(market_code, root=root):
+        symbol = str(record.symbol or "").strip().upper()
+        if symbol:
+            index.setdefault(symbol, []).append(record.effective_date.isoformat())
+    for dates in index.values():
+        dates.sort()
+    with _CORPORATE_ACTION_DATES_LOCK:
+        _CORPORATE_ACTION_DATES_CACHE[cache_key] = index
+    return index
+
+
+def _corporate_action_status(
+    bar_date: str, previous_date: str | None, action_dates: list[str]
+) -> tuple[str, list[str]]:
+    """Deterministic per-bar corporate-action state.
+
+    Decision rule (documented, auditable, no provider knowledge required): a
+    bar is ``action`` when at least one recorded corporate-action effective
+    date falls in the half-open session gap ``(previous_date, bar_date]`` --
+    i.e. the raw price on ``bar_date`` is the first bar that carries the event
+    relative to the previous observed close.  The earliest bar of a loaded
+    window has no observed predecessor, so only an exact-date event is
+    attributed to it.  Returns ``none`` plus the offending dates otherwise.
+
+    The ``action`` state is intentionally fail-closed: reconciliation cannot
+    reconstruct an account-level entitlement (cash dividend, split shares)
+    from raw OHLCV, so such a window must not be certified closed.
+    """
+    day = str(bar_date or "")[:10]
+    if not day or not action_dates:
+        return "none", []
+    if previous_date:
+        start = bisect.bisect_right(action_dates, str(previous_date)[:10])
+        stop = bisect.bisect_right(action_dates, day)
+    else:
+        start = bisect.bisect_left(action_dates, day)
+        stop = bisect.bisect_right(action_dates, day)
+    hits = action_dates[start:stop]
+    return ("action", hits) if hits else ("none", [])
+
+
+def load_lake_price_history_with_provenance(
+    *,
+    market: str,
+    ticker: str,
+    limit: int = 320,
+    lake_root: Path | None = None,
+    actions_root: Path | None = None,
+) -> list[dict]:
+    """Raw OHLCV history plus execution-grade provenance, oldest bar first.
+
+    Provenance rules
+    ----------------
+    * ``price_basis``: taken verbatim from the Lake v2 shadow partition when
+      present.  When only the v1 store exists the value is ``raw``: v1 lake
+      partitions hold provider *unadjusted* OHLCV (the adjusted series lives in
+      the separate ``_adjusted_v2`` / adjusted-view store), which is exactly how
+      the v2 backfill labelled every v1 row.  No provider name is invented.
+    * ``execution_source_reference``: ``lake_v2:<market>:<date>:<symbol>`` when
+      the v2 shadow supplied the row, else ``lake_v1:<market>:<date>:<symbol>``.
+      Either form resolves to a concrete ``<market>_daily/date=<date>``
+      partition.  The raw v2 ``source_reference`` (e.g.
+      ``legacy_v1_lake:cn_daily/date=.../part.parquet``) is preserved separately
+      as ``lake_source_reference`` for the audit trail.
+    * ``corporate_action_status`` / ``corporate_action_evidence``: see
+      :func:`_corporate_action_status`.  Values are the exact vocabulary the
+      reconciliation contract consumes (``none``/``action``); no new status
+      names are introduced.
+    * Optional ``suspended``/limit fields are deliberately *not* synthesised:
+      reconciliation treats them as explicitly optional, so absence is honest.
+
+    v2 shadow is preferred (it carries the provenance columns); v1 is the
+    fallback and is only used when no v2 partition exists for the market.
+    """
+    market_code = str(market or "").strip().upper()
+    symbol = str(ticker or "").strip().upper()
+    if market_code not in {"CN", "US"} or not symbol:
+        return []
+    base_root = Path(lake_root) if lake_root is not None else market_lake_root()
+    file_limit = max(20, int(limit) * 2)
+    v2_files = _lake_partition_files(
+        base_root / LAKE_V2_STORE_DIRNAME / f"{market_code.lower()}_daily", limit=file_limit
+    )
+    v2_mode = bool(v2_files)
+    parquet_files = v2_files or _lake_partition_files(
+        base_root / f"{market_code.lower()}_daily", limit=file_limit
+    )
+    if not parquet_files:
+        return []
+    store_tag = EXECUTION_SOURCE_REFERENCE_STORES[0] if v2_mode else EXECUTION_SOURCE_REFERENCE_STORES[1]
+    if v2_mode:
+        sql = """
+            SELECT
+                CAST(date AS VARCHAR) AS date,
+                symbol,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                adj_close,
+                price_basis,
+                source_reference
+            FROM read_parquet(?, hive_partitioning = true)
+            WHERE symbol = ?
+              AND CAST(date AS DATE) <= CAST(? AS DATE)
+            ORDER BY CAST(date AS DATE) DESC
+        """
+    else:
+        sql = """
+            SELECT
+                CAST(date AS VARCHAR) AS date,
+                symbol,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                adj_close
+            FROM read_parquet(?, hive_partitioning = true)
+            WHERE symbol = ?
+              AND CAST(date AS DATE) <= CAST(? AS DATE)
+            ORDER BY CAST(date AS DATE) DESC
+        """
+    history: list[dict] = []
+    columns: list[str] = []
+    for file_chunk in _chunked_paths(parquet_files):
+        rows, chunk_columns = _duckdb_fetchall(
+            sql,
+            [file_chunk, symbol, latest_completed_market_date(market_code)],
+            label="lake_price_history_provenance",
+        )
+        if not columns:
+            columns = chunk_columns
+        history.extend(_json_ready_row(dict(zip(columns, row, strict=False))) for row in rows)
+    if not history:
+        return []
+    history.sort(key=lambda item: item.get("date") or "", reverse=True)
+    history = history[: max(1, int(limit))]
+    history.sort(key=lambda item: item.get("date") or "")
+
+    action_dates = _corporate_action_dates_by_symbol(market_code, root=actions_root).get(symbol, [])
+    for position, row in enumerate(history):
+        day = str(row.get("date") or "")[:10]
+        basis = str(row.get("price_basis") or "").strip().lower()
+        if basis not in LAKE_V2_PRICE_BASIS_VALUES:
+            basis = "raw"
+        source_reference = str(row.get("source_reference") or "").strip()
+        if source_reference.lower() in LAKE_V2_PLACEHOLDER_REFERENCES:
+            source_reference = ""
+        previous_date = str(history[position - 1].get("date") or "")[:10] if position else None
+        status, evidence = _corporate_action_status(day, previous_date, action_dates)
+        row["date"] = day
+        row["price_basis"] = basis
+        row["execution_source_reference"] = f"{store_tag}:{market_code}:{day}:{symbol}"
+        row["lake_source_reference"] = (
+            source_reference
+            or f"{market_code.lower()}_daily/date={day}/part.parquet"
+        )
+        row["corporate_action_status"] = status
+        row["corporate_action_evidence"] = evidence
     return history
 
 
@@ -1153,6 +1374,69 @@ def screen_cn_lake_momentum(*, trade_date: str | None = None, limit: int = 160, 
     return screen_lake_momentum(market="CN", trade_date=trade_date, limit=limit, min_dollar_volume=min_dollar_volume)
 
 
+def _cn_limit_band_pct_by_code(symbol: str) -> float | None:
+    """Code-prefix CN price-limit band (fallback when the profile is unavailable)."""
+    upper = str(symbol or "").strip().upper()
+    if not upper.endswith((".SS", ".SZ", ".BJ")) and not (upper.isdigit() and len(upper) == 6):
+        return None
+    code = upper.split(".", 1)[0]
+    if upper.endswith(".BJ"):
+        return 30.0
+    if code.startswith(("688", "689", "300", "301")):
+        return 20.0
+    return 10.0
+
+
+def _resolve_cn_limit_bands(symbols: list[str]) -> dict[str, float | None]:
+    """Resolve CN price-limit bands, reusing the technical-patterns profile.
+
+    The lake row only carries the ticker, so ST/board detection needs the symbol
+    profile lookup TechnicalPatternService already implements; if that is
+    unavailable we fall back to the code-prefix band.
+    """
+    unique = [symbol for symbol in dict.fromkeys(str(item or "").strip().upper() for item in symbols) if symbol]
+    service = None
+    try:
+        from app.services.technical_patterns import TechnicalPatternService
+
+        service = TechnicalPatternService()
+    except Exception:
+        service = None
+    bands: dict[str, float | None] = {}
+    for symbol in unique:
+        band_pct: float | None = None
+        if service is not None:
+            try:
+                band_pct, _board_type = service._resolve_cn_limit_profile(symbol)
+            except Exception:
+                band_pct = None
+        if band_pct is None:
+            band_pct = _cn_limit_band_pct_by_code(symbol)
+        bands[symbol] = band_pct
+    return bands
+
+
+def _cn_limit_up_today(row: dict, band_pct: float | None) -> bool:
+    """True when the signal-day close rose enough to lock the CN price limit."""
+    if band_pct is None:
+        return False
+    close = _as_float(row.get("close"))
+    prev_close = _as_float(row.get("prev_close"))
+    if close is None or prev_close is None or prev_close <= 0:
+        return False
+    threshold = max(0.1, float(band_pct) - 0.2)
+    return (close / prev_close - 1.0) * 100.0 >= threshold
+
+
+def _annotate_cn_limit_up(rows: list[dict]) -> None:
+    band_map = _resolve_cn_limit_bands([str(row.get("symbol") or "") for row in rows])
+    for row in rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        band_pct = band_map.get(symbol)
+        row["limit_band_pct"] = band_pct
+        row["limit_up_today"] = _cn_limit_up_today(row, band_pct)
+
+
 def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: int = 160, min_dollar_volume: float = 1_000_000.0) -> list[dict]:
     market_code = str(market or "").strip().upper() or "US"
     parquet_files = _recent_parquet_files(market_code, limit=260)
@@ -1185,6 +1469,7 @@ def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: i
                 dollar_volume,
                 close / NULLIF(LAG(close, 5) OVER (PARTITION BY symbol ORDER BY trade_date), 0) - 1 AS momentum_5,
                 close / NULLIF(LAG(close, 20) OVER (PARTITION BY symbol ORDER BY trade_date), 0) - 1 AS momentum_20,
+                LAG(close, 1) OVER (PARTITION BY symbol ORDER BY trade_date) AS prev_close,
                 AVG(volume) OVER (
                     PARTITION BY symbol ORDER BY trade_date
                     ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
@@ -1216,6 +1501,7 @@ def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: i
             dollar_volume,
             momentum_5,
             momentum_20,
+            prev_close,
             CASE WHEN avg_volume_20 > 0 THEN volume / avg_volume_20 ELSE NULL END AS volume_ratio,
             ma20,
             ma60,
@@ -1275,7 +1561,16 @@ def screen_lake_momentum(*, market: str, trade_date: str | None = None, limit: i
         item["momentum_5"] = _fraction_to_percent(item.get("momentum_5"))
         item["momentum_20"] = _fraction_to_percent(item.get("momentum_20"))
         item["momentum_units"] = "percent"
+        # Continuous fallback score for pools without a model prediction. The
+        # coarse integer ``trend_score`` ties by design; this raw composite
+        # (percent momentum + participation - extension + trend bonus) gives
+        # Top-N sorting a continuous, reproducible basis.
+        item["model_score"] = _lake_momentum_composite(item)
+        item["score_source"] = LAKE_MOMENTUM_SCORE_SOURCE
         results.append(item)
+    apply_continuous_momentum_scores(results)
+    if market_code == "CN":
+        _annotate_cn_limit_up(results)
     return results
 
 
@@ -1319,6 +1614,83 @@ def _as_float(value) -> float | None:
 
 def _json_ready_row(row: dict) -> dict:
     return {key: value.isoformat() if hasattr(value, "isoformat") else value for key, value in row.items()}
+
+
+LAKE_MOMENTUM_SCORE_SOURCE = "lake_momentum_composite_v1:percentile_0_100"
+
+# Continuous量价 fallback score. Unlike ``_lake_trend_score`` (an integer
+# 1..99), none of the terms saturate, so the same-date ranking stays
+# continuous and the Top-N cut never falls back to ticker order except for
+# true ties (handled downstream by dollar_volume + ticker).
+LAKE_MOMENTUM_COMPOSITE_DEFINITION = (
+    "3*momentum_20_pct + 1*momentum_5_pct + 5*(volume_ratio-1) "
+    "- 0.5*pullback_depth_pct + 10*(close>ma20) + 10*(close>ma60)"
+)
+
+
+def _lake_momentum_composite(row: dict) -> float:
+    momentum_20 = float(row.get("momentum_20") or 0.0)
+    momentum_5 = float(row.get("momentum_5") or 0.0)
+    volume_ratio = float(row.get("volume_ratio") or 1.0)
+    pullback_depth_pct = float(row.get("pullback_depth_pct") or 0.0)
+    composite = momentum_20 * 3.0 + momentum_5 * 1.0 + (volume_ratio - 1.0) * 5.0 - pullback_depth_pct * 0.5
+    close = row.get("close")
+    ma20 = row.get("ma20")
+    ma60 = row.get("ma60")
+    if close is not None and ma20 is not None and float(close) > float(ma20):
+        composite += 10.0
+    if close is not None and ma60 is not None and float(close) > float(ma60):
+        composite += 10.0
+    return round(composite, 6)
+
+
+def _cross_sectional_rank_ratios(values: list[float]) -> list[float]:
+    """Average-rank percentile in [0, 1] within one same-date cross-section.
+
+    Mirrors ``factor_pipeline._percentile_ranks`` so the lake pool and the
+    model pool share one rank口径. Ties share the mean position, and a
+    single-row cross-section is the neutral 0.5.
+    """
+    count = len(values)
+    if count == 0:
+        return []
+    if count == 1:
+        return [0.5]
+    positions: dict[float, list[int]] = {}
+    for position, value in enumerate(sorted(values)):
+        positions.setdefault(value, []).append(position)
+    rank_by_value = {
+        value: (sum(value_positions) / len(value_positions)) / (count - 1)
+        for value, value_positions in positions.items()
+    }
+    return [rank_by_value[value] for value in values]
+
+
+def apply_continuous_momentum_scores(rows: list[dict]) -> None:
+    """Fill the continuous ranking basis on any row lacking a model percentile.
+
+    Pools backed by a production model prediction (e.g. ``lightgbm_top_picks``)
+    already carry ``model_score``/``model_percentile`` and are left untouched.
+    Every other pool falls back to the continuous量价 composite and a same-date
+    cross-sectional percentile, so a persisting snapshot never has to sort on
+    the coarse integer ``trend_score`` alone. In-place and idempotent.
+    """
+    pending = [row for row in rows if row.get("model_percentile") is None]
+    if not pending:
+        return
+    for row in pending:
+        if row.get("model_score") is None:
+            row["model_score"] = _lake_momentum_composite(row)
+        if not row.get("score_source"):
+            row["score_source"] = LAKE_MOMENTUM_SCORE_SOURCE
+    by_date: dict[str, list[dict]] = {}
+    for row in pending:
+        by_date.setdefault(str(row.get("date") or row.get("as_of_date") or ""), []).append(row)
+    for group in by_date.values():
+        ratios = _cross_sectional_rank_ratios([float(row.get("model_score") or 0.0) for row in group])
+        for row, ratio in zip(group, ratios, strict=False):
+            row["rank_percentile"] = round(ratio, 6)
+            row["model_percentile"] = round(ratio * 100.0, 4)
 
 
 def _lake_trend_score(row: dict) -> int:

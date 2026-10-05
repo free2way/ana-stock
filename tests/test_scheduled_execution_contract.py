@@ -60,7 +60,7 @@ class ScheduledExecutionContractTests(ApplicationPostgresTestCase):
             for row in history:
                 row.pop('open')
         service = CNMarketSchedulerService() if market == 'CN' else USMarketSchedulerService()
-        with patch('app.services.model_evaluation.load_lake_price_history', return_value=history):
+        with patch('app.services.model_evaluation.load_lake_price_history_with_provenance', return_value=history):
             service._run_structured_evaluation(source_job_id=parent_id)
         with SessionLocal() as db:
             row = db.scalar(select(ModelEvaluation).where(ModelEvaluation.model_run_id == run_id))

@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.services.statistical_inference import significance_report
+from app.services.statistical_inference import day_clustered_hit_rate_ci, significance_report
 from app.models.tables import (
     ModelEvaluation,
     ModelEvaluationMetric,
@@ -29,16 +29,21 @@ from app.models.tables import (
     Symbol,
     WorkspaceSnapshot,
 )
-from app.services.market_lake import load_lake_price_history
+from app.services.market_lake import (
+    load_lake_price_history,
+    load_lake_price_history_with_provenance,
+)
 from app.services.market_risk import market_risk_snapshot_type
 from app.services.prediction_artifacts import read_prediction_artifact_rows
 from app.services.price_basis import preferred_close
+from app.services.repositories.research import FundamentalSnapshotRepository
 from app.services.time_utils import app_now_iso
 from app.services.stock_selection.labels import ExecutableLabel
 from app.services.stock_selection.executable_outcomes import OUTCOME_VERSION, FILL_COST_OUTCOME_VERSION
 from app.services.execution_costs import FillCostModel
 from app.services.execution_reconciliation import (
-    VERSION as RECONCILED_VERSION, replay_candidate, outcome_counts, validate_contract, implementation_identity,
+    VERSION as RECONCILED_VERSION, execution_contract, replay_candidate, outcome_counts,
+    validate_contract, implementation_identity,
 )
 
 
@@ -145,9 +150,11 @@ def summarize_evaluation_samples(samples: list[dict], *, horizon_days: int, roun
                      and item.get("tradable") is not False and _number(item.get("gross_return_pct")) is not None]
     gross_returns = [float(item["gross_return_pct"]) for item in valid_samples]
     net_returns = [value - cost_pct for value in gross_returns]
+    trade_dates = [str(item.get("trade_date") or "") for item in valid_samples]
     drawdowns = [float(item["drawdown_pct"]) for item in valid_samples if _number(item.get("drawdown_pct")) is not None]
     return _summarize_return_vectors(gross_returns, net_returns, drawdowns,
-        horizon_days=horizon_days, round_trip_cost_bps=cost_bps, selected_count=len(samples))
+        horizon_days=horizon_days, round_trip_cost_bps=cost_bps, selected_count=len(samples),
+        trade_dates=trade_dates)
 
 
 DEFAULT_COST_SENSITIVITY_LADDER_BPS = (20.0, 50.0, 80.0)
@@ -209,8 +216,17 @@ def cost_sensitivity_ladder(
 
 
 def _summarize_return_vectors(gross_returns: list[float], net_returns: list[float], drawdowns: list[float],
-                              *, horizon_days: int, round_trip_cost_bps: float, selected_count: int) -> dict:
-    """Aggregate measured vectors without interpreting or reapplying costs."""
+                              *, horizon_days: int, round_trip_cost_bps: float, selected_count: int,
+                              trade_dates: list[str] | None = None) -> dict:
+    """Aggregate measured vectors without interpreting or reapplying costs.
+
+    ``confidence_low`` / ``confidence_high`` keep their historical meaning (an
+    iid normal interval around the hit rate) for schema stability, but the label
+    now says so explicitly.  ``hit_rate_ci95_clustered`` is the day-clustered
+    moving-block bootstrap interval: picks sharing a signal date share a market
+    move, so the iid interval understates uncertainty.  Promotion-style
+    thresholds must consume the clustered lower bound.
+    """
     count = len(net_returns)
     positive = [value for value in net_returns if value > 0]
     negative = [value for value in net_returns if value < 0]
@@ -222,6 +238,14 @@ def _summarize_return_vectors(gross_returns: list[float], net_returns: list[floa
         confidence_high = min(100.0, hit_rate + margin)
     else:
         confidence_low = confidence_high = None
+    clustered = None
+    if trade_dates is not None and len(trade_dates) == count:
+        clustered = day_clustered_hit_rate_ci(
+            [value > 0 for value in net_returns],
+            trade_dates,
+            block_length=max(1, int(horizon_days)),
+        )
+    clustered_ci = clustered.get("ci95") if clustered else None
     significance = significance_report(net_returns, horizon_days=horizon_days) if len(net_returns) >= 2 else None
     return {
         "horizon_days": int(horizon_days),
@@ -244,6 +268,13 @@ def _summarize_return_vectors(gross_returns: list[float], net_returns: list[floa
         "confidence_low": confidence_low,
         "confidence_high": confidence_high,
         "confidence_method": "iid_normal_diagnostic_not_promotion_evidence",
+        "hit_rate_ci95_iid": [confidence_low, confidence_high],
+        "hit_rate_ci95_clustered": list(clustered_ci) if clustered_ci else None,
+        "hit_rate_ci_lower_bound_clustered": clustered_ci[0] if clustered_ci else None,
+        "hit_rate_ci_cluster_method": (clustered or {}).get("method"),
+        "hit_rate_ci_cluster_days": (clustered or {}).get("days"),
+        "hit_rate_ci_block_length": (clustered or {}).get("block_length"),
+        "hit_rate_ci_iid_is_diagnostic_only": True,
         "drawdown_semantics": "cvar95_tail_gated_v2 (mean of worst >=5 samples; worst sample kept as record)",
         "selected_sample_count": selected_count,
         "unmeasured_sample_count": selected_count - count,
@@ -267,6 +298,7 @@ def summarize_executable_labels(labels: list[ExecutableLabel], *, horizon_days: 
         result = summarize_evaluation_samples([
             {"gross_return_pct": label.gross_return * 100 if label.gross_return is not None else None,
              "drawdown_pct": label.path_drawdown * 100 if label.path_drawdown is not None else None,
+             "trade_date": label.signal_date.isoformat() if label.signal_date else None,
              "tradable": label.tradable, "excluded_reason": label.exclusion_reason}
             for label in labels
         ], horizon_days=horizon_days, round_trip_cost_bps=cost_bps)
@@ -334,6 +366,128 @@ def _run_config(run: ModelRun) -> dict:
     except (TypeError, json.JSONDecodeError):
         config = {}
     return config if isinstance(config, dict) else {}
+
+
+def _run_prediction_horizon_days(run: ModelRun) -> int | None:
+    """Resolve the run's declared forward horizon, if any.
+
+    Reads the same ``prediction_horizon_days`` key that
+    ``stock_selection.reliability_artifacts.resolve_run_horizon`` filters on, so
+    the evaluation and the downstream reliability producer agree on the horizon
+    the run scores.  Returns ``None`` when the run does not declare
+    ``prediction_horizon_days`` (legacy runs), so the caller keeps its pure
+    default set instead of inventing a horizon; the producer's own fallback is
+    5, which the default scheduled set already contains.
+    """
+    try:
+        horizon = int(_run_config(run).get("prediction_horizon_days"))
+    except (TypeError, ValueError):
+        return None
+    return horizon if horizon >= 1 else None
+
+
+def _horizons_with_run_horizon(
+    horizons: tuple[int, ...], run: ModelRun
+) -> tuple[tuple[int, ...], int | None]:
+    """Union the caller's horizon set with the run's own prediction horizon.
+
+    The reliability producer filters CLOSED candidate outcomes by the run's
+    ``prediction_horizon_days``; if the evaluation never scored that horizon the
+    producer sees zero matured rows and silently never writes an artifact.
+    Including the run horizon keeps every existing horizon metric unchanged
+    while guaranteeing the producer/evaluation parity.
+    """
+    run_horizon = _run_prediction_horizon_days(run)
+    if run_horizon is None or run_horizon in horizons:
+        return horizons, run_horizon
+    return tuple(sorted({*horizons, run_horizon})), run_horizon
+
+
+# Target profiles whose labels are next-session-open net-return fills.  The
+# trainer only persists ``execution_contract`` for the reconciled profile, so
+# runs trained with the default executable profile carry the identical
+# execution semantics but a null contract.  These two profiles are the only
+# ones whose labels are defined *by* that contract (entry rule + FillCostModel);
+# the legacy composite profile has no execution semantics and must never be
+# auto-derived here.
+EXECUTABLE_CONTRACT_TARGET_PROFILES = frozenset(
+    {FILL_COST_OUTCOME_VERSION, RECONCILED_VERSION}
+)
+
+
+def _manifest_execution_cost(run: ModelRun) -> dict | None:
+    """Read the recorded cost tuple from the run's prediction artifact manifest.
+
+    Path contract: ``<artifacts_dir>/prediction_runs/model_run_id=<id>/manifest.json``.
+    This is the authoritative source the trainer wrote; it exists for every run
+    published with ``prediction_artifacts_enabled``.  Any missing/unreadable/
+    malformed manifest yields ``None`` so the caller stays fail-closed instead
+    of guessing a default cost.
+    """
+    try:
+        run_id = int(getattr(run, "id", None))
+    except (TypeError, ValueError):
+        return None
+    if run_id <= 0:
+        return None
+    manifest_path = (
+        get_settings().artifacts_dir
+        / "prediction_runs"
+        / f"model_run_id={run_id}"
+        / "manifest.json"
+    )
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    cost_setting = payload.get("execution_cost_bps")
+    return cost_setting if isinstance(cost_setting, dict) else None
+
+
+def resolve_execution_contract(run: ModelRun, market: str) -> dict | None:
+    """Return the frozen execution contract for ``run``/``market``, or None.
+
+    Preference order:
+    1. The contract persisted in the run config (the reconciled trainer
+       profile).  Used verbatim.
+    2. For runs whose ``target_profile`` is an executable next-open net-return
+       label family, re-derive the *identical* contract from the cost tuple the
+       run itself recorded (``execution_cost_bps``).  This is not a fabricated
+       contract: ``execution_contract`` is a pure function of market + cost, and
+       the trainer labelled those samples with exactly that entry rule and cost
+       model.  It restores the audit link the trainer omitted for the default
+       profile without changing any label.
+    3. If the config predates the fix and has no ``execution_cost_bps``, fall
+       back to the run's prediction artifact manifest, which carries the same
+       cost tuple the trainer recorded.  A missing/unreadable manifest returns
+       None rather than a guessed default.
+    4. Otherwise None.  A run with no executable label family or no recorded
+       cost is left unverified rather than silently blessed.
+    """
+    config = _run_config(run)
+    persisted = config.get("execution_contract")
+    if isinstance(persisted, dict):
+        return persisted
+    profile = str(config.get("target_profile") or "").strip().lower()
+    if profile not in EXECUTABLE_CONTRACT_TARGET_PROFILES:
+        return None
+    cost_setting = config.get("execution_cost_bps")
+    if not isinstance(cost_setting, dict):
+        # Backward compatibility for runs persisted before the config fix: the
+        # artifact manifest holds the authoritative cost tuple.
+        cost_setting = _manifest_execution_cost(run)
+    if not isinstance(cost_setting, dict):
+        return None
+    try:
+        cost = FillCostModel(
+            float(cost_setting["commission_bps_one_way"]),
+            float(cost_setting["slippage_bps_one_way"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    return execution_contract(market, cost)
 
 
 def _strict_oos_status(run: ModelRun, *, trade_date: str) -> tuple[bool, str, int | None]:
@@ -462,6 +616,196 @@ def _selected_prediction_rows(
     return selected
 
 
+STRATIFICATION_ADV_WINDOW_DAYS = 20
+INDUSTRY_UNKNOWN = "unknown"
+MARKET_CAP_BUCKET_LABELS = ("small", "mid", "large")
+LIQUIDITY_BUCKET_LABELS = ("low", "mid", "high")
+
+
+def _trailing_dollar_adv(history: list[dict], trade_date: str, *, window: int = STRATIFICATION_ADV_WINDOW_DAYS) -> float | None:
+    """Trailing dollar ADV (close x volume) up to and including ``trade_date``."""
+    values: list[float] = []
+    for bar in reversed(history):
+        bar_date = str(bar.get("date") or "")[:10]
+        if not bar_date or bar_date > trade_date:
+            continue
+        close = _number(bar.get("close"))
+        volume = _number(bar.get("volume"))
+        if close and volume:
+            values.append(close * volume)
+        if len(values) >= window:
+            break
+    return statistics.fmean(values) if values else None
+
+
+def _tercile_cuts(values: list[float]) -> tuple[float, float] | None:
+    clean = sorted(value for value in values if value is not None)
+    if len(clean) < 3:
+        return None
+    return clean[int(len(clean) * 0.3333)], clean[int(len(clean) * 0.6667)]
+
+
+def _bucket_label(value: float | None, cuts: tuple[float, float] | None, labels: tuple[str, str, str]) -> str:
+    if value is None or cuts is None:
+        return "unknown"
+    low_cut, high_cut = cuts
+    if value <= low_cut:
+        return labels[0]
+    if value >= high_cut:
+        return labels[2]
+    return labels[1]
+
+
+BENCHMARK_UNIVERSE_MAX_TICKERS = 300
+
+
+def _benchmark_universe_tickers(
+    db: Session,
+    *,
+    run: ModelRun,
+    market: str,
+    trade_dates: list[str],
+    limit: int = BENCHMARK_UNIVERSE_MAX_TICKERS,
+) -> list[str]:
+    """Tickers in the run's own prediction universe for the evaluated dates.
+
+    The equal-weight benchmark must not be built from the evaluated top-N alone
+    (that would make excess identically zero), so this reads the run's full
+    ranking for the same dates.  The set is capped by best (lowest) rank value
+    for cost control; the cap is recorded via the returned universe size.
+    """
+    if not trade_dates:
+        return []
+    rows = db.execute(
+        select(Symbol.ticker, Prediction.rank_value)
+        .join(Prediction, Prediction.symbol_id == Symbol.id)
+        .where(
+            Prediction.model_run_id == int(run.id),
+            Symbol.market == market,
+            Prediction.trade_date.in_(sorted(trade_dates)),
+        )
+    ).all()
+    best_rank: dict[str, float] = {}
+    for ticker, rank_value in rows:
+        ticker_code = str(ticker or "").upper()
+        if not ticker_code:
+            continue
+        rank = _number(rank_value)
+        rank = rank if rank is not None else float("inf")
+        if ticker_code not in best_rank or rank < best_rank[ticker_code]:
+            best_rank[ticker_code] = rank
+    ordered = sorted(best_rank.items(), key=lambda item: (item[1], item[0]))
+    return [ticker for ticker, _ in ordered[: max(1, int(limit))]]
+
+
+def _equal_weight_benchmark_by_date(
+    universe_histories: list[list[dict]],
+    *,
+    trade_dates: list[str],
+    horizon_days: int,
+) -> dict[str, float]:
+    """Same-day same-universe equal-weight return, mirroring backtesting runner.
+
+    This is the model-evaluation analogue of
+    ``BacktestRunner._benchmark_returns``: for each date, average the
+    close-to-close holding return of every universe member that has a
+    measurable path.  Crucially the universe is the run's *prediction*
+    universe, not the evaluated top-N subset, so the excess is not trivially
+    zero by construction.
+    """
+    by_date: dict[str, float] = {}
+    for trade_date in trade_dates:
+        returns: list[float] = []
+        for history in universe_histories:
+            outcome = _history_outcome(history, trade_date=trade_date, horizon_days=horizon_days)
+            value = _number((outcome or {}).get("gross_return_pct"))
+            if value is not None:
+                returns.append(value)
+        if returns:
+            by_date[trade_date] = statistics.fmean(returns)
+    return by_date
+
+
+def _benchmark_section(
+    samples: list[dict],
+    *,
+    benchmark_by_date: dict[str, float],
+    horizon_days: int,
+    index_history: list[dict] | None,
+) -> dict:
+    """Excess vs a same-day equal-weight benchmark, plus an optional index overlay."""
+
+    excess: list[float] = []
+    for sample in samples:
+        gross = _number(sample.get("gross_return_pct"))
+        base = benchmark_by_date.get(str(sample.get("trade_date") or ""))
+        if gross is None or base is None:
+            continue
+        excess.append(gross - base)
+    index_excess: list[float] = []
+    index_returns: list[float] = []
+    if index_history:
+        for sample in samples:
+            gross = _number(sample.get("gross_return_pct"))
+            index_outcome = _history_outcome(index_history, trade_date=str(sample.get("trade_date") or ""), horizon_days=horizon_days)
+            index_gross = _number((index_outcome or {}).get("gross_return_pct"))
+            if gross is None or index_gross is None:
+                continue
+            index_returns.append(index_gross)
+            index_excess.append(gross - index_gross)
+    status = "available_same_day_universe_equal_weight_v1"
+    if not samples or not benchmark_by_date:
+        status = "not_available_no_benchmark_universe"
+    elif index_history and index_returns:
+        status = "available_equal_weight_plus_index_overlay_v1"
+    return {
+        "benchmark_status": status,
+        "benchmark_kind": "same_day_prediction_universe_equal_weight",
+        "benchmark_dates": len(benchmark_by_date),
+        "benchmark_avg_return_pct": statistics.fmean(benchmark_by_date.values()) if benchmark_by_date else None,
+        "excess_avg_return_pct": statistics.fmean(excess) if excess else None,
+        "excess_positive_rate_pct": (
+            sum(1 for value in excess if value > 0) / len(excess) * 100.0 if excess else None
+        ),
+        "index_benchmark_avg_return_pct": statistics.fmean(index_returns) if index_returns else None,
+        "excess_vs_index_avg_return_pct": statistics.fmean(index_excess) if index_excess else None,
+        "index_overlay_available": bool(index_returns),
+    }
+
+
+def _stratification_groups(samples: list[dict]) -> tuple[dict[str, list[dict]], dict]:
+    """Build industry / market-cap / liquidity strata plus a shape descriptor.
+
+    Market-cap and liquidity buckets are within-evaluation terciles, so the
+    split is self-calibrating (no hard-coded currency thresholds).  A sample
+    with no value lands in the explicit ``unknown`` bucket rather than being
+    silently dropped.
+    """
+    cap_cuts = _tercile_cuts([sample.get("market_cap") for sample in samples])
+    liq_cuts = _tercile_cuts([sample.get("liquidity_adv_20d") for sample in samples])
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for sample in samples:
+        groups[f"industry:{sample.get('industry') or INDUSTRY_UNKNOWN}"].append(sample)
+        groups[
+            f"market_cap_bucket:{_bucket_label(sample.get('market_cap'), cap_cuts, MARKET_CAP_BUCKET_LABELS)}"
+        ].append(sample)
+        groups[
+            f"liquidity_bucket:{_bucket_label(sample.get('liquidity_adv_20d'), liq_cuts, LIQUIDITY_BUCKET_LABELS)}"
+        ].append(sample)
+    shape = {
+        "industry": sorted({scope.split(":", 1)[1] for scope in groups if scope.startswith("industry:")}),
+        "market_cap_bucket": sorted(
+            {scope.split(":", 1)[1] for scope in groups if scope.startswith("market_cap_bucket:")}
+        ),
+        "liquidity_bucket": sorted(
+            {scope.split(":", 1)[1] for scope in groups if scope.startswith("liquidity_bucket:")}
+        ),
+        "market_cap_cut_points": list(cap_cuts) if cap_cuts else None,
+        "liquidity_cut_points": list(liq_cuts) if liq_cuts else None,
+    }
+    return groups, shape
+
+
 def _metric_record(
     evaluation_id: int,
     *,
@@ -470,8 +814,14 @@ def _metric_record(
     state: dict[str, str] | None,
     samples: list[dict],
     round_trip_cost_bps: float,
+    benchmark: dict | None = None,
+    extra_bucket: dict[str, str] | None = None,
 ) -> ModelEvaluationMetric:
     summary = summarize_evaluation_samples(samples, horizon_days=horizon_days, round_trip_cost_bps=round_trip_cost_bps)
+    if benchmark:
+        summary.update(benchmark)
+    if extra_bucket:
+        summary.update(extra_bucket)
     state = state or {}
     return ModelEvaluationMetric(
         model_evaluation_id=evaluation_id,
@@ -524,6 +874,7 @@ def evaluate_model_runs(
     excluded_discontinuity_count = 0
 
     for run in runs:
+        run_horizons, run_horizon_days = _horizons_with_run_horizon(normalized_horizons, run)
         run_markets = target_markets if str(run.market or "").upper() in {"", "MIXED", "ALL"} else [str(run.market).upper()]
         for market in run_markets:
             if market not in target_markets:
@@ -532,7 +883,7 @@ def evaluate_model_runs(
                 db, run=run, market=market, recent_trade_dates=recent_trade_dates, top_n=top_n
             )
             if require_execution_reconciliation:
-                contract = _run_config(run).get("execution_contract")
+                contract = resolve_execution_contract(run, market)
                 candidate_outcomes = []
                 try:
                     frozen_cost = validate_contract(contract, market)
@@ -541,10 +892,10 @@ def evaluate_model_runs(
                 for prediction, symbol in selected:
                     key = (market, symbol.ticker)
                     if key not in history_cache:
-                        history_cache[key] = (load_lake_price_history(
+                        history_cache[key] = (load_lake_price_history_with_provenance(
                             market=market, ticker=symbol.ticker, limit=320) if frozen_cost else [])
                     strict, _, _ = _strict_oos_status(run, trade_date=str(prediction.trade_date))
-                    for horizon in normalized_horizons:
+                    for horizon in run_horizons:
                         outcome = replay_candidate(
                             ticker=symbol.ticker, market=market,
                             signal_date=str(prediction.trade_date), horizon_days=horizon,
@@ -568,7 +919,9 @@ def evaluate_model_runs(
                     "selected_prediction_count": len(selected),
                     "candidate_horizon_count": len(candidate_outcomes),
                     "outcome_counts": counts,
-                    "horizons": list(normalized_horizons),
+                    "horizons": list(run_horizons),
+                    "horizons_used": list(run_horizons),
+                    "run_prediction_horizon_days": run_horizon_days,
                     "block_reason": None if complete else "unresolved_candidate_outcomes",
                     "legacy_fallback_used": False,
                     "cost_contract": contract,
@@ -591,7 +944,7 @@ def evaluate_model_runs(
                 )
                 db.add(evaluation)
                 db.flush()
-                for horizon in normalized_horizons:
+                for horizon in run_horizons:
                     subset = [row for row in closed if row['horizon_days'] == horizon]
                     metrics = _summarize_return_vectors(
                         [row['gross_return'] * 100 for row in subset],
@@ -608,7 +961,18 @@ def evaluate_model_runs(
                                     "market": market, "status": evaluated_status, **summary})
                 continue
             state_by_date = _snapshot_states(db, market=market, trade_dates={str(row[0].trade_date) for row in selected})
-            samples_by_horizon: dict[int, list[dict]] = {horizon: [] for horizon in normalized_horizons}
+            # Stratification inputs: industry is the stored symbol classification
+            # (Shenwan-derived from the source feed); market cap is the latest
+            # fundamental snapshot; liquidity is a trailing dollar ADV computed
+            # from the already-loaded price history.
+            fundamentals = FundamentalSnapshotRepository(db).list_latest_for_market(
+                market, tickers=[str(symbol.ticker or "").upper() for _, symbol in selected]
+            )
+            market_cap_by_ticker = {
+                str(row.get("ticker") or "").upper(): _number(row.get("market_cap"))
+                for row in fundamentals
+            }
+            samples_by_horizon: dict[int, list[dict]] = {horizon: [] for horizon in run_horizons}
             for prediction, symbol in selected:
                 trade_date = str(prediction.trade_date)
                 ticker = str(symbol.ticker or "").upper()
@@ -619,7 +983,10 @@ def evaluate_model_runs(
                     trade_date,
                     {"market_regime": "unclassified", "risk_regime": "unclassified", "buy_gate": "UNKNOWN"},
                 )
-                for horizon in normalized_horizons:
+                industry = str(getattr(symbol, "industry", None) or INDUSTRY_UNKNOWN)
+                market_cap = market_cap_by_ticker.get(ticker)
+                liquidity_adv = _trailing_dollar_adv(history_cache[key], trade_date)
+                for horizon in run_horizons:
                     outcome = _history_outcome(history_cache[key], trade_date=trade_date, horizon_days=horizon)
                     if outcome is None:
                         continue
@@ -632,6 +999,9 @@ def evaluate_model_runs(
                             **outcome,
                             "trade_date": trade_date,
                             "ticker": ticker,
+                            "industry": industry,
+                            "market_cap": market_cap,
+                            "liquidity_adv_20d": liquidity_adv,
                             "market_regime": state["market_regime"],
                             "risk_regime": state["risk_regime"],
                             "buy_gate": state["buy_gate"],
@@ -649,11 +1019,50 @@ def evaluate_model_runs(
             sample_dates = sorted({str(sample["trade_date"]) for sample in strict_samples})
             oos_count = len(strict_samples)
             oos_coverage_days = len({str(sample["trade_date"]) for sample in strict_samples})
+            run_config = _run_config(run)
+            index_history: list[dict] | None = None
+            benchmark_symbol = str(
+                run_config.get("benchmark_symbol") or get_settings().backtest_benchmark_symbol or ""
+            ).strip().upper()
+            if benchmark_symbol:
+                index_history = load_lake_price_history(market=market, ticker=benchmark_symbol, limit=320) or None
+            benchmark_trade_dates = sorted({str(sample["trade_date"]) for sample in strict_samples})
+            universe_tickers = _benchmark_universe_tickers(
+                db, run=run, market=market, trade_dates=benchmark_trade_dates
+            )
+            universe_histories: list[list[dict]] = []
+            for universe_ticker in universe_tickers:
+                cached = history_cache.get((market, universe_ticker))
+                if cached is None:
+                    cached = load_lake_price_history(market=market, ticker=universe_ticker, limit=320)
+                    history_cache[(market, universe_ticker)] = cached
+                if cached:
+                    universe_histories.append(cached)
+            benchmark_by_horizon = {
+                horizon: _benchmark_section(
+                    samples,
+                    benchmark_by_date=_equal_weight_benchmark_by_date(
+                        universe_histories, trade_dates=benchmark_trade_dates, horizon_days=horizon
+                    ),
+                    horizon_days=horizon,
+                    index_history=index_history,
+                )
+                for horizon, samples in strict_samples_by_horizon.items()
+            }
             strict_metrics = {
                 horizon: summarize_evaluation_samples(samples, horizon_days=horizon, round_trip_cost_bps=round_trip_cost_bps)
                 for horizon, samples in strict_samples_by_horizon.items()
             }
-            run_config = _run_config(run)
+            for horizon, section in benchmark_by_horizon.items():
+                strict_metrics[horizon].update(section)
+            primary_benchmark = (
+                benchmark_by_horizon.get(5)
+                or (next(iter(benchmark_by_horizon.values())) if benchmark_by_horizon else {})
+            )
+            primary_metrics = (
+                strict_metrics.get(5)
+                or (next(iter(strict_metrics.values())) if strict_metrics else {})
+            )
             purge_gap_days = next((sample.get("purge_gap_days") for sample in strict_samples if sample.get("purge_gap_days") is not None), None)
             if purge_gap_days is None:
                 purge_gap_days = run_config.get("purge_gap_days")
@@ -683,11 +1092,33 @@ def evaluate_model_runs(
                 "oos_protocol": next((sample.get("oos_protocol") for sample in strict_samples), None)
                 or str(run_config.get("evaluation_protocol") or "legacy_train_end"),
                 "purge_gap_days": purge_gap_days,
-                "benchmark_status": "not_available_in_v1",
+                "benchmark_status": (primary_benchmark or {}).get("benchmark_status") or "not_available_no_samples",
+                "benchmark_kind": (primary_benchmark or {}).get("benchmark_kind"),
+                "benchmark_symbol": benchmark_symbol or None,
+                "benchmark_universe_size": len(universe_histories),
+                "benchmark_universe_cap": BENCHMARK_UNIVERSE_MAX_TICKERS,
+                "benchmark_avg_return_pct": (primary_benchmark or {}).get("benchmark_avg_return_pct"),
+                "excess_avg_return_pct": (primary_benchmark or {}).get("excess_avg_return_pct"),
+                "index_benchmark_avg_return_pct": (primary_benchmark or {}).get("index_benchmark_avg_return_pct"),
+                "excess_vs_index_avg_return_pct": (primary_benchmark or {}).get("excess_vs_index_avg_return_pct"),
+                "benchmark_by_horizon": benchmark_by_horizon,
+                "hit_rate_ci95_clustered": (primary_metrics or {}).get("hit_rate_ci95_clustered"),
+                "hit_rate_ci_lower_bound_clustered": (primary_metrics or {}).get("hit_rate_ci_lower_bound_clustered"),
+                "hit_rate_ci_cluster_method": (primary_metrics or {}).get("hit_rate_ci_cluster_method"),
+                "hit_rate_ci_iid_is_diagnostic_only": True,
+                "confidence_method": "iid_normal_diagnostic_not_promotion_evidence",
                 "activation_status": activation_status,
                 "excluded_corporate_action_paths": excluded_discontinuity_count,
                 "corporate_action_jump_threshold_pct": CORPORATE_ACTION_JUMP_PCT,
-                "horizons": list(normalized_horizons),
+                "horizons": list(run_horizons),
+                "horizons_used": list(run_horizons),
+                "run_prediction_horizon_days": run_horizon_days,
+                "cost_bps": float(round_trip_cost_bps),
+                "cost_basis": "round_trip",
+                "cost_source": (
+                    "evaluate_model_runs(round_trip_cost_bps=...) argument; the scheduled chain passes "
+                    "Settings.trainer_round_trip_cost_bps (canonical default 50bps)"
+                ),
                 "cost_sensitivity_ladder_bps": [float(value) for value in DEFAULT_COST_SENSITIVITY_LADDER_BPS],
                 "cost_sensitivity": {
                     horizon: cost_sensitivity_ladder(
@@ -709,7 +1140,7 @@ def evaluate_model_runs(
                 oos_sample_count=len({(sample["ticker"], sample["trade_date"]) for sample in strict_samples}),
                 oos_coverage_days=oos_coverage_days,
                 purge_gap_days=purge_gap_days,
-                benchmark_avg_return=None,
+                benchmark_avg_return=(primary_benchmark or {}).get("benchmark_avg_return_pct"),
                 universe_version=str(run_config.get("universe_version") or run.universe or "") or None,
                 activation_status=activation_status,
                 includes_costs=1,
@@ -720,7 +1151,9 @@ def evaluate_model_runs(
                     {
                         "recent_trade_dates": int(recent_trade_dates),
                         "top_n": int(top_n),
-                        "horizons": list(normalized_horizons),
+                        "horizons": list(run_horizons),
+                        "horizons_used": list(run_horizons),
+                        "run_prediction_horizon_days": run_horizon_days,
                         "round_trip_cost_bps": float(round_trip_cost_bps),
                         "strict_oos_only": True,
                     },
@@ -732,8 +1165,9 @@ def evaluate_model_runs(
             )
             db.add(evaluation)
             db.flush()
+            stratification_shape: dict[int, dict] = {}
             for horizon, samples in strict_samples_by_horizon.items():
-                db.add(_metric_record(evaluation.id, horizon_days=horizon, metric_scope="overall", state=None, samples=samples, round_trip_cost_bps=round_trip_cost_bps))
+                db.add(_metric_record(evaluation.id, horizon_days=horizon, metric_scope="overall", state=None, samples=samples, round_trip_cost_bps=round_trip_cost_bps, benchmark=benchmark_by_horizon.get(horizon)))
                 state_groups: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
                 for sample in samples:
                     state_groups[(sample["market_regime"], sample["risk_regime"], sample["buy_gate"])].append(sample)
@@ -746,6 +1180,24 @@ def evaluate_model_runs(
                             state={"market_regime": regime, "risk_regime": risk_regime, "buy_gate": buy_gate},
                             samples=grouped_samples,
                             round_trip_cost_bps=round_trip_cost_bps,
+                        )
+                    )
+                strat_groups, strat_shape = _stratification_groups(samples)
+                stratification_shape[horizon] = strat_shape
+                for scope, grouped_samples in strat_groups.items():
+                    dimension, _, value = scope.partition(":")
+                    db.add(
+                        _metric_record(
+                            evaluation.id,
+                            horizon_days=horizon,
+                            metric_scope=scope,
+                            state=None,
+                            samples=grouped_samples,
+                            round_trip_cost_bps=round_trip_cost_bps,
+                            extra_bucket={
+                                "stratification_dimension": dimension,
+                                "stratification_value": value,
+                            },
                         )
                     )
                 # Keep exploratory records auditable without mixing them into
@@ -761,6 +1213,16 @@ def evaluate_model_runs(
                             round_trip_cost_bps=round_trip_cost_bps,
                         )
                     )
+            summary["stratification"] = {
+                "dimensions": ["industry", "market_cap_bucket", "liquidity_bucket"],
+                "industry_basis": "symbols.industry (source feed industry/Shenwan classification)",
+                "market_cap_bucket_basis": "within-evaluation terciles of latest fundamental market_cap",
+                "liquidity_bucket_basis": (
+                    f"within-evaluation terciles of trailing {STRATIFICATION_ADV_WINDOW_DAYS}d close*volume ADV"
+                ),
+                "by_horizon": stratification_shape,
+            }
+            evaluation.summary_json = json.dumps(summary, ensure_ascii=False)
             evaluations.append({"id": evaluation.id, "model_run_id": run.id, "market": market, "status": evaluation.status, **summary})
     db.commit()
     successful = sum(1 for row in evaluations if row["status"] == "success")
@@ -794,6 +1256,10 @@ def list_latest_model_evaluations(db: Session, *, market: str = "ALL", limit: in
             .order_by(ModelEvaluationMetric.horizon_days.asc(), ModelEvaluationMetric.metric_scope.asc())
         ).all()
         def metric_payload(item: ModelEvaluationMetric) -> dict:
+            try:
+                extras = json.loads(item.metrics_json or "{}")
+            except (TypeError, json.JSONDecodeError):
+                extras = {}
             return {
                 "horizon_days": item.horizon_days,
                 "metric_scope": item.metric_scope,
@@ -811,6 +1277,14 @@ def list_latest_model_evaluations(db: Session, *, market: str = "ALL", limit: in
                 "turnover": item.turnover,
                 "confidence_low": item.confidence_low,
                 "confidence_high": item.confidence_high,
+                "hit_rate_ci95_clustered": extras.get("hit_rate_ci95_clustered"),
+                "hit_rate_ci_lower_bound_clustered": extras.get("hit_rate_ci_lower_bound_clustered"),
+                "hit_rate_ci_cluster_method": extras.get("hit_rate_ci_cluster_method"),
+                "benchmark_avg_return_pct": extras.get("benchmark_avg_return_pct"),
+                "excess_avg_return_pct": extras.get("excess_avg_return_pct"),
+                "benchmark_status": extras.get("benchmark_status"),
+                "stratification_dimension": extras.get("stratification_dimension"),
+                "stratification_value": extras.get("stratification_value"),
             }
         result.append(
             {
@@ -833,7 +1307,16 @@ def list_latest_model_evaluations(db: Session, *, market: str = "ALL", limit: in
                 "is_out_of_sample": bool(evaluation.is_out_of_sample),
                 "summary": json.loads(evaluation.summary_json or "{}"),
                 "metrics": [metric_payload(item) for item in metrics if item.metric_scope == "overall"],
-                "market_state_metrics": [metric_payload(item) for item in metrics if item.metric_scope != "overall"],
+                "market_state_metrics": [
+                    metric_payload(item)
+                    for item in metrics
+                    if item.metric_scope.startswith("market_state:") or item.metric_scope == "observation_all_predictions"
+                ],
+                "stratified_metrics": [
+                    metric_payload(item)
+                    for item in metrics
+                    if item.metric_scope.startswith(("industry:", "market_cap_bucket:", "liquidity_bucket:"))
+                ],
             }
         )
     return result
