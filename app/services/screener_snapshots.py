@@ -12,7 +12,12 @@ from app.models.tables import WorkspaceSnapshot
 from app.services.repository import (
     WorkspaceSnapshotRepository,
 )
-from app.services.market_lake import get_latest_lake_trade_date, screen_cn_lake_momentum, screen_us_lake_momentum
+from app.services.market_lake import (
+    apply_continuous_momentum_scores,
+    get_latest_lake_trade_date,
+    screen_cn_lake_momentum,
+    screen_us_lake_momentum,
+)
 from app.services.job_control import JobCancelled
 from app.services.market_freshness import is_snapshot_as_of_current
 from app.services.market_freshness import latest_completed_market_date
@@ -23,6 +28,10 @@ from app.services.stock_selection.multi_model_confluence import (
     aggregate_multi_model_rows,
     normalize_multi_model_templates as _normalize_multi_model_templates,
     template_action_semantic_buckets as _template_action_semantic_buckets,  # noqa: F401 - compatibility export
+)
+from app.services.stock_selection.reliability_artifacts import (
+    attach_reliability_metadata,
+    inject_calibration_defaults,
 )
 from app.services.time_utils import app_now_iso
 
@@ -163,6 +172,8 @@ SNAPSHOT_ROW_FIELDS = {
     "action_label",
     "action_summary",
     "latest_close",
+    "volume",
+    "dollar_volume",
     "momentum_5",
     "momentum_20",
     "volume_ratio",
@@ -180,6 +191,19 @@ SNAPSHOT_ROW_FIELDS = {
     "confluence_score_mean",
     "selection_reason",
     "model_score",
+    "model_percentile",
+    "rank_percentile",
+    "score_source",
+    # Reliability-weighted confluence + calibrated probability. These are the
+    # row-level outputs of ``aggregate_multi_model_rows``; without them the
+    # precompute compaction strips the fusion result before it reaches the
+    # query-time snapshot reader.
+    "weighted_score",
+    "weighted_score_normalized",
+    "expected_hit_probability",
+    "calibration_status",
+    "weight_source",
+    "model_weights",
     "model_summary",
     "model_state",
     "model_confidence",
@@ -189,7 +213,6 @@ SNAPSHOT_ROW_FIELDS = {
     "model_position_size_hint",
     "model_entry_style",
     "model_execution_tags",
-    "model_percentile",
     "model_horizon_days",
     "model_reward_risk_ratio",
     "model_expected_drawdown_20d",
@@ -218,6 +241,9 @@ SNAPSHOT_ROW_FIELDS = {
     "revenue_yoy",
     "dividend_yield",
     "debt_to_assets",
+    "market_cap",
+    "limit_up_today",
+    "limit_band_pct",
     "setup_bucket",
     "distance_to_52w_high_pct",
     "pullback_depth_pct",
@@ -444,9 +470,9 @@ def _build_multi_screen_rows_from_snapshots(params: dict) -> tuple[list[dict], d
         if rows is not None:
             template_rows[template_key] = rows
     return aggregate_multi_model_rows(
-        template_rows,
+        attach_reliability_metadata(template_rows),
         template_keys=template_keys,
-        params=params,
+        params=inject_calibration_defaults(params),
     )
 
 
@@ -515,6 +541,9 @@ def refresh_precomputed_screener_snapshots(
         try:
             rows = _screen_with_lake_preferred(params)
             persisted_rows = _compact_snapshot_rows(rows, limit=int(params.get("limit", 5000)))
+            # Pools without a production model prediction fall back to the
+            # continuous量价 score so query-time Top-N has a continuous basis.
+            apply_continuous_momentum_scores(persisted_rows)
             empty_reason = _precompute_empty_reason(params) if not persisted_rows else None
             updated_at = app_now_iso()
             input_meta = _snapshot_input_meta(params)
@@ -677,7 +706,7 @@ def _screen_with_lake_preferred(params: dict) -> list[dict]:
     ):
         rows = screen_cn_lake_momentum(limit=int(params.get("limit", 160)))
         if rows:
-            return ScreenerService().apply_candidate_governance(rows)
+            return _govern_without_continuous_scores(rows)
     if (
         str(params.get("market") or "").upper() == "US"
         and str(params.get("universe") or "") == "full_market"
@@ -685,5 +714,23 @@ def _screen_with_lake_preferred(params: dict) -> list[dict]:
     ):
         rows = screen_us_lake_momentum(limit=int(params.get("limit", 160)))
         if rows:
-            return ScreenerService().apply_candidate_governance(rows)
+            return _govern_without_continuous_scores(rows)
     return ScreenerService().screen(**params)
+
+
+RANKING_SCORE_FIELDS = ("model_score", "model_percentile", "rank_percentile", "score_source")
+
+
+def _govern_without_continuous_scores(rows: list[dict]) -> list[dict]:
+    """Run governance, then re-attach the量价 fallback score for persistence.
+
+    The continuous fallback is a ranking basis, not a calibrated model
+    conviction. Letting ``evaluate_candidate_tradability`` see it would flip
+    momentum rows from REVIEW to DEFER/READY, a semantic change outside this
+    fix's scope, so the decision is made first and the score is attached after.
+    """
+    withheld = [{key: row.pop(key) for key in RANKING_SCORE_FIELDS if key in row} for row in rows]
+    governed = ScreenerService().apply_candidate_governance(rows)
+    for row, fields in zip(governed, withheld, strict=False):
+        row.update(fields)
+    return governed

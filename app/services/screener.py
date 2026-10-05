@@ -294,6 +294,36 @@ def _normalize_action_value(value: str | None) -> str:
     return normalized
 
 
+def _safe_finite(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+def _percentile_ratio(value: object) -> float | None:
+    """Convert a 0-100 model percentile into the canonical 0-1 ratio."""
+    number = _safe_finite(value)
+    if number is None:
+        return None
+    return max(0.0, min(1.0, number / 100.0))
+
+
+def _row_rank_ratio(row: dict) -> float | None:
+    """Prefer the canonical 0-1 ratio, else the legacy 0-100 percentile."""
+    if row.get("rank_percentile") is not None:
+        number = _safe_finite(row.get("rank_percentile"))
+        if number is None:
+            return None
+        return max(0.0, min(1.0, number))
+    return _percentile_ratio(row.get("model_percentile"))
+
+
 class ScreenerService:
     # Newest successful runs inspected when picking the model-ranking champion.
     # Mirrors PredictionRepository._SERVING_RUN_WINDOW: a run the unified
@@ -673,6 +703,8 @@ class ScreenerService:
                         list(item.get("model_execution_tags") or item.get("execution_tags") or [])
                     ),
                     "model_percentile": item.get("percentile"),
+                    "rank_percentile": _percentile_ratio(item.get("percentile")),
+                    "score_source": "lightgbm_prediction_v1:percentile_0_100",
                     "model_horizon_days": 5,
                     "model_reward_risk_ratio": item.get("model_reward_risk_ratio"),
                     "model_expected_drawdown_20d": item.get("expected_drawdown_20d"),
@@ -1346,6 +1378,20 @@ class ScreenerService:
                 filtered.append(row)
         return filtered
 
+    def _ranking_tiebreak_key(self, row: dict) -> tuple:
+        """Deterministic tie-break: model percentile, dollar volume, then ticker.
+
+        The tie-break direction is fixed (higher percentile / higher dollar
+        volume / ascending ticker) and independent of the primary sort field or
+        ``sort_order``. Two-pass stable sorts in :meth:`_sort_results` keep this
+        order among equal primary values, so a Top-N cut can never be decided by
+        the input row order.
+        """
+        ratio = _row_rank_ratio(row)
+        percentile_rank = -(ratio if ratio is not None else -1.0)
+        dollar_volume = self._sortable_number(row.get("dollar_volume"))
+        return (percentile_rank, -dollar_volume, str(row.get("ticker") or ""))
+
     def _sort_results(self, results: list[dict], *, sort_by: str, sort_order: str) -> list[dict]:
         reverse = sort_order != "asc"
         if sort_by == "default":
@@ -1365,26 +1411,32 @@ class ScreenerService:
             "debt_to_assets",
             "snapshot_hits",
             "model_signal_strength",
+            "model_score",
+            "model_percentile",
+            "rank_percentile",
             "trade_readiness_score",
+            "weighted_score",
+            "weighted_score_normalized",
+            "expected_hit_probability",
         }
         if sort_by == "model_signal_strength":
             # Direction-aware: a large |score| on the short side must not rank top.
+            ordered = sorted(results, key=self._ranking_tiebreak_key)
             return sorted(
-                results,
+                ordered,
                 key=lambda row: (
                     model_direction_rank(first_present(row, "model_score", "score")),
                     self._sortable_number(row.get("model_signal_strength")),
-                    row.get("ticker", ""),
                 ),
                 reverse=reverse,
             )
         if sort_by in numeric_fields:
-            return sorted(
-                results,
-                key=lambda row: (self._sortable_number(row.get(sort_by)), row.get("ticker", "")),
-                reverse=reverse,
-            )
-        return sorted(results, key=lambda row: str(row.get(sort_by, "")).lower(), reverse=reverse)
+            # Stable pre-sort fixes the deterministic tie-break; the primary
+            # sort below only reorders rows with distinct primary values.
+            ordered = sorted(results, key=self._ranking_tiebreak_key)
+            return sorted(ordered, key=lambda row: self._sortable_number(row.get(sort_by)), reverse=reverse)
+        ordered = sorted(results, key=self._ranking_tiebreak_key)
+        return sorted(ordered, key=lambda row: str(row.get(sort_by, "")).lower(), reverse=reverse)
 
     def _apply_model_signal_filter(
         self,
@@ -1496,7 +1548,7 @@ class ScreenerService:
             primary = -(row.get("roe_avg_3y") or row.get("trend_score") or 0)
         secondary = -(row.get("net_profit_yoy") or row.get("volume_ratio") or 0)
         market_rank = MARKET_SORT_ORDER.get(str(row.get("market") or "").upper(), 9)
-        return (market_rank, readiness, primary, secondary, row.get("ticker", ""))
+        return (market_rank, readiness, primary, secondary, self._ranking_tiebreak_key(row))
 
     def _sortable_number(self, value) -> float:
         if value is None:

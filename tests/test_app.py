@@ -25,32 +25,18 @@ class AppFlowTests(unittest.TestCase):
         # tearDown restore also undoes leaks from individual test methods.
         self._environ_snapshot = dict(os.environ)
         self._set_test_environment()
-        from app.services.runtime_cache import clear_namespace
+        from app.services.runtime_cache import clear_all
 
         from app.core.config import reset_settings_cache
         from app.core import db as db_module
         from app.core.db import configure_database, init_db
         from app.models.base import Base
 
-        for namespace in (
-            "safe_symbol_analysis",
-            "market_headlines",
-            "symbol_headlines",
-            "market_snapshot",
-            "tradingview_rating",
-            "tradingview_multi_timeframe",
-            "symbol_page_bundle",
-            "dashboard_home_panels",
-            "dashboard_watchlist_map",
-            "dashboard_focus_items",
-            "dashboard_summary",
-            "dashboard_recent_jobs",
-            "ai_symbol_analysis",
-            "watchlist_items",
-            "watchlist_analysis_fragment",
-            "watchlist_table_fragment",
-        ):
-            clear_namespace(namespace)
+        # Reset every runtime-cache entry, not just a curated namespace list.
+        # Several dashboard summary/bundle caches are keyed only by
+        # lookback_runs (TTL up to 60s), so a summary built under a previous
+        # example's now-truncated DB state leaked into this example's requests.
+        clear_all()
         reset_settings_cache()
         configure_database()
         check_test_engine(db_module.engine)
@@ -68,29 +54,15 @@ class AppFlowTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.client.close()
-        from app.services.runtime_cache import clear_namespace
+        from app.services.runtime_cache import clear_all
 
         from app.core.config import reset_settings_cache
 
-        for namespace in (
-            "safe_symbol_analysis",
-            "market_headlines",
-            "symbol_headlines",
-            "market_snapshot",
-            "tradingview_rating",
-            "tradingview_multi_timeframe",
-            "symbol_page_bundle",
-            "dashboard_home_panels",
-            "dashboard_watchlist_map",
-            "dashboard_focus_items",
-            "dashboard_summary",
-            "dashboard_recent_jobs",
-            "ai_symbol_analysis",
-            "watchlist_items",
-            "watchlist_analysis_fragment",
-            "watchlist_table_fragment",
-        ):
-            clear_namespace(namespace)
+        # Reset every runtime-cache entry, not just a curated namespace list.
+        # Several dashboard summary/bundle caches are keyed only by
+        # lookback_runs (TTL up to 60s), so a summary built under a previous
+        # example's now-truncated DB state leaked into this example's requests.
+        clear_all()
         # Full restore instead of a fixed pop list: individual test methods
         # set extra PQW_* variables (notifications, provider tokens, ...) that
         # previously leaked into later test modules and flipped their settings.
@@ -2572,7 +2544,7 @@ class AppFlowTests(unittest.TestCase):
 
         seed_sample_data()
         fixture_tickers = ["AAPL", "MSFT", "ASTS", *[f"QF{index:02d}" for index in range(7)]]
-        fixture_dates = pd.bdate_range("2025-06-02", periods=180)
+        fixture_dates = pd.bdate_range("2025-06-02", periods=300)
         for ticker_index, fixture_ticker in enumerate(fixture_tickers):
             self._write_price_history(
                 fixture_ticker,

@@ -703,6 +703,9 @@ class CNMarketSchedulerService:
                     scan_limit=50,
                 )
                 result["prediction_storage_acceptance"] = storage_acceptance
+                result["reliability_artifacts"] = self._refresh_reliability_artifacts(
+                    db, markets=["CN"]
+                )
                 evaluation_status = str(result.get("status") or "partial")
                 if storage_acceptance["status"] == "fail":
                     evaluation_status = "partial"
@@ -720,6 +723,29 @@ class CNMarketSchedulerService:
         except Exception as exc:
             with SessionLocal() as db:
                 DataJobRepository(db).complete_job(job_id, status="failed", message=str(exc), result={"error": str(exc)})
+
+    def _refresh_reliability_artifacts(self, db, *, markets: list[str]) -> dict:
+        """Persist rolling OOS reliability + calibration after evaluation.
+
+        A failure here must only warn and never block the committed structured
+        evaluation (and the precompute stages that follow it).
+        """
+
+        try:
+            from app.services.stock_selection.reliability_artifacts import (
+                refresh_stock_selection_reliability_artifacts,
+            )
+
+            return refresh_stock_selection_reliability_artifacts(
+                db, markets=markets, recent_runs=1
+            )
+        except Exception as exc:  # noqa: BLE001 - artifact refresh must not break evaluation
+            logger.warning(
+                "stock-selection reliability artifact refresh failed for %s: %s",
+                markets,
+                exc,
+            )
+            return {"status": "failed", "error": str(exc), "markets": list(markets)}
 
     def _complete_precompute_job(self, *, job_id: int, result: dict, message: str, stage: str) -> dict:
         failed_count = int(result.get("failed_count", 0) or 0)

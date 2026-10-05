@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 from urllib.parse import urlencode
 
 from app.api.presentation.i18n import t
@@ -59,6 +60,7 @@ SORT_BY_OPTIONS = [
     ("trend_score", {"en": "Trend Score", "zh": "趋势分"}),
     ("latest_close", {"en": "Latest Close", "zh": "最新价"}),
     ("model_signal_strength", {"en": "Model Signal", "zh": "模型信号"}),
+    ("weighted_score", {"en": "Weighted Score", "zh": "可靠性加权分"}),
     ("kronos_score", {"en": "Kronos Score", "zh": "Kronos 分"}),
     ("trade_readiness_score", {"en": "Trade Readiness", "zh": "交易就绪度"}),
     ("watchlist_state", {"en": "Watchlist State", "zh": "自选状态"}),
@@ -1702,7 +1704,16 @@ def _model_cell(item: dict, lang: str) -> str:
     model_hit_count = item.get("model_hit_count")
     confluence_alignment_count = item.get("confluence_alignment_count")
     matched_action_buckets = list(item.get("matched_action_buckets") or [])
-    if not summary and not highlights and not state and not lightgbm_tactical_tag and readiness_score is None and not kronos_validation:
+    expected_hit_probability = item.get("expected_hit_probability")
+    if (
+        not summary
+        and not highlights
+        and not state
+        and not lightgbm_tactical_tag
+        and readiness_score is None
+        and expected_hit_probability is None
+        and not kronos_validation
+    ):
         return "-"
     display_summary = summary
     if lightgbm_tactical_tag:
@@ -1778,6 +1789,14 @@ def _model_cell(item: dict, lang: str) -> str:
         if readiness_score is not None
         else ""
     )
+    # Uncalibrated rows carry ``expected_hit_probability=None``; render blank
+    # (no chip at all) rather than a misleading "0%".
+    probability_html = (
+        f"<div style='margin-top:6px;display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px;font-weight:800;'>"
+        f"{t(lang, '命中概率', 'Hit probability')} {float(expected_hit_probability) * 100:.1f}%</div>"
+        if expected_hit_probability is not None
+        else ""
+    )
     kronos_html = ""
     if kronos_validation:
         kronos_status = str(kronos_validation.get("kronos_status") or "-").upper()
@@ -1828,16 +1847,17 @@ def _model_cell(item: dict, lang: str) -> str:
         f"{signal_html}"
         f"{kronos_html}"
         f"{readiness_html}"
+        f"{probability_html}"
         f"{block_html}"
         f"{meta_html}"
         f"{confidence_html}"
         f"<div style='margin-top:6px;font-size:12px;color:#6b7280;'>{details_label}</div>"
         "</details>"
         if highlights
-        else signal_html + readiness_html + block_html + meta_html + confidence_html
+        else signal_html + readiness_html + probability_html + block_html + meta_html + confidence_html
     )
     if kronos_html and not highlights:
-        detail_block = signal_html + kronos_html + readiness_html + block_html + meta_html + confidence_html
+        detail_block = signal_html + kronos_html + readiness_html + probability_html + block_html + meta_html + confidence_html
     return (
         f"<div style='min-width:180px;white-space:normal;'>"
         f"<div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap;'>"
@@ -1920,6 +1940,13 @@ def _preset_hidden_fields_html(params: dict) -> str:
                 fields.append(
                     f"<input type='hidden' name='{html.escape(str(key))}' value='{html.escape(str(item))}' />"
                 )
+        elif isinstance(value, dict):
+            # JSON specs (weights / calibration) must round-trip as JSON, not as
+            # a Python repr that the query whitelist would then reject.
+            fields.append(
+                f"<input type='hidden' name='{html.escape(str(key))}' "
+                f"value='{html.escape(json.dumps(value, ensure_ascii=False, sort_keys=True))}' />"
+            )
         else:
             fields.append(
                 f"<input type='hidden' name='{html.escape(str(key))}' value='{html.escape(str(value))}' />"

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+import math
+from collections.abc import Callable, Mapping
 
 from app.services.screener import MODEL_TEMPLATES, ScreenerService
 from app.services.screener_snapshots import build_base_precompute_params
 from app.services.stock_selection.multi_model_confluence import (
     aggregate_multi_model_rows,
     normalize_multi_model_templates,
+)
+from app.services.stock_selection.reliability_artifacts import (
+    attach_reliability_metadata,
+    inject_calibration_defaults,
 )
 from app.services.stock_selection.selection_policy import (
     apply_quality_confluence_profile,
@@ -27,6 +33,40 @@ def watchlist_state_rank(existing: dict | None) -> int:
     if existing.get("sync_enabled"):
         return 2
     return 1
+
+
+def _parse_optional_probability(value: object, *, name: str) -> float | None:
+    """Parse an optional [0, 1] probability; fail fast on bad input."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+        raise ValueError(f"{name} must be finite and in [0, 1]")
+    return number
+
+
+def _parse_json_object_param(value: object, *, name: str) -> dict | None:
+    """Accept a mapping or a JSON-object string; reject anything else loudly.
+
+    The screener whitelist must not silently drop these opt-in reliability /
+    calibration specs: a malformed spec is a user error, not a no-op.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{name} must be valid JSON: {exc}") from exc
+        if not isinstance(parsed, Mapping):
+            raise ValueError(f"{name} must decode to a JSON object")
+        return dict(parsed)
+    raise ValueError(f"{name} must be a JSON object string or mapping")
 
 
 def normalize_screen_params(params: dict) -> dict:
@@ -56,6 +96,10 @@ def normalize_screen_params(params: dict) -> dict:
         "max_debt_to_assets": float(params.get("max_debt_to_assets", 100.0)),
         "min_dividend_yield": float(params.get("min_dividend_yield", 0.0)),
         "exclude_bottom_market_cap_pct": float(params.get("exclude_bottom_market_cap_pct", 10.0)),
+        # Execution-readiness hard gates. "ALL"/0.0 keep the legacy behaviour
+        # (readiness stayed a sort key only); the page/presets opt in explicitly.
+        "tradability_status": str(params.get("tradability_status", "ALL")),
+        "min_trade_readiness": float(params.get("min_trade_readiness", 0.0)),
         "recent_snapshot_runs": int(float(params.get("recent_snapshot_runs", 0))),
         "min_snapshot_hits": int(float(params.get("min_snapshot_hits", 0))),
         "model_signal_filter": str(params.get("model_signal_filter", "ALL")),
@@ -64,11 +108,87 @@ def normalize_screen_params(params: dict) -> dict:
         "exclude_execution_tag_filter": str(params.get("exclude_execution_tag_filter", "ALL")),
         "sort_by": str(params.get("sort_by", "default")),
         "sort_order": str(params.get("sort_order", "desc")),
+        # Reliability weighting + calibrated-probability abstention (opt-in).
+        # Without a spec these stay ``None`` and the legacy behaviour is kept;
+        # a malformed spec raises instead of being silently discarded.
+        "min_hit_probability": _parse_optional_probability(
+            params.get("min_hit_probability"), name="min_hit_probability"
+        ),
+        "probability_calibration": _parse_json_object_param(
+            params.get("probability_calibration"), name="probability_calibration"
+        ),
+        "model_reliability_weights": _parse_json_object_param(
+            params.get("model_reliability_weights"), name="model_reliability_weights"
+        ),
         "limit": 500,
     }
     if str(params.get("strategy_profile") or "").strip() == "quality_confluence_v1":
         normalized["strategy_profile"] = "quality_confluence_v1"
     return normalized
+
+
+def _normalize_tradability_whitelist(value: object) -> set[str] | None:
+    """Parse a tradability_status whitelist; None means "no gate"."""
+    text = str(value or "").strip().upper()
+    if text in {"", "ALL"}:
+        return None
+    statuses = {item.strip().upper() for item in text.replace(";", ",").split(",") if item.strip()}
+    return statuses or None
+
+
+def _safe_number(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _market_cap_threshold(rows: list[dict], bottom_pct: float) -> float | None:
+    """Bottom-percentile market-cap cut, matching ScreenerService's口径 (S-6)."""
+    if bottom_pct <= 0:
+        return None
+    caps = sorted(cap for cap in (_safe_number(row.get("market_cap")) for row in rows) if cap is not None)
+    if not caps:
+        return None
+    index = int(len(caps) * (bottom_pct / 100.0))
+    index = max(0, min(index, len(caps) - 1))
+    return caps[index]
+
+
+CN_LIMIT_UP_OBSERVATION_TEMPLATES = {"cn_limit_up_watch"}
+
+
+def _row_is_cn_limit_up(row: dict) -> bool:
+    return str(row.get("market") or "").strip().upper() == "CN" and bool(row.get("limit_up_today"))
+
+
+def _apply_cn_limit_up_governance(rows: list[dict], params: dict) -> list[dict]:
+    """Keep same-session CN limit-up names off the top of next-session buy lists.
+
+    Those names are very likely un-buyable at the next open, so they are stably
+    demoted below every non-limit-up row and tagged with ``limit-up-today`` for
+    transparency. They are never dropped here, and the explicit limit-up
+    observation template keeps its own ordering.
+    """
+    if str(params.get("model_template") or "") in CN_LIMIT_UP_OBSERVATION_TEMPLATES:
+        return rows
+    demoted: list[dict] = []
+    kept: list[dict] = []
+    for row in rows:
+        if not _row_is_cn_limit_up(row):
+            kept.append(row)
+            continue
+        tags = list(row.get("model_execution_tags") or [])
+        if "limit-up-today" not in tags:
+            tags.append("limit-up-today")
+        row["model_execution_tags"] = tags
+        row["limit_up_demoted"] = True
+        demoted.append(row)
+    if not demoted:
+        return rows
+    return kept + demoted
 
 
 def _rank_precomputed_rows(service: ScreenerService, rows: list[dict], params: dict) -> list[dict]:
@@ -90,6 +210,10 @@ def _rank_precomputed_rows(service: ScreenerService, rows: list[dict], params: d
     min_dividend_yield = float(params.get("min_dividend_yield", 0.0))
     recent_snapshot_runs = int(params.get("recent_snapshot_runs", 0))
     min_snapshot_hits = int(params.get("min_snapshot_hits", 0))
+    tradability_whitelist = _normalize_tradability_whitelist(params.get("tradability_status"))
+    min_trade_readiness = float(params.get("min_trade_readiness", 0.0))
+    exclude_bottom_market_cap_pct = float(params.get("exclude_bottom_market_cap_pct", 0.0))
+    market_cap_threshold = _market_cap_threshold(rows, exclude_bottom_market_cap_pct)
     normalized_action_filter = normalize_action_filter(action_filter)
     filtered: list[dict] = []
 
@@ -123,6 +247,20 @@ def _rank_precomputed_rows(service: ScreenerService, rows: list[dict], params: d
         dividend_yield = row.get("dividend_yield")
         if dividend_yield is not None and float(dividend_yield) < min_dividend_yield:
             continue
+        # Execution-readiness hard gates (opt-in; ALL/0.0 preserve legacy order).
+        if tradability_whitelist is not None:
+            status = str(row.get("tradability_status") or "").strip().upper()
+            if status not in tradability_whitelist:
+                continue
+        if min_trade_readiness > 0.0:
+            readiness = _safe_number(row.get("trade_readiness_score"))
+            if readiness is None or readiness < min_trade_readiness:
+                continue
+        # Market-cap exclusion mirrors the fundamental path; rows without a cap
+        # reading (e.g. lake momentum) are never dropped by it.
+        market_cap = _safe_number(row.get("market_cap"))
+        if market_cap_threshold is not None and market_cap is not None and market_cap <= market_cap_threshold:
+            continue
         filtered.append(dict(row))
 
     filtered = service._apply_snapshot_persistence_filter(
@@ -144,11 +282,12 @@ def _rank_precomputed_rows(service: ScreenerService, rows: list[dict], params: d
         filtered,
         profile=str(params.get("strategy_profile") or ""),
     )
-    return service._sort_results(
+    ranked = service._sort_results(
         filtered,
         sort_by=str(params.get("sort_by", "default")),
         sort_order=str(params.get("sort_order", "desc")),
     )
+    return _apply_cn_limit_up_governance(ranked, params)
 
 
 def filter_precomputed_rows(service: ScreenerService, rows: list[dict], params: dict) -> list[dict]:
@@ -238,10 +377,15 @@ def run_multi_screen(
             )
         if ready and rows is not None:
             template_rows[template_key] = rows
+    # Reliability weighting + calibrated probability: inject the newest
+    # producer artifacts.  A missing artifact leaves the rows/params untouched,
+    # so the legacy equal-weight + null-probability behaviour is preserved and
+    # any explicit request value still wins.
+    enriched_template_rows = attach_reliability_metadata(template_rows)
     results, meta = aggregate_multi_model_rows(
-        template_rows,
+        enriched_template_rows,
         template_keys=template_keys,
-        params=params,
+        params=inject_calibration_defaults(params),
         apply_limit=apply_limit,
     )
     return results, bool(meta["available_templates"]), meta
@@ -313,6 +457,10 @@ def build_final_results(
             ),
             reverse=str(normalized.get("sort_order") or "desc") != "asc",
         )
+
+    # Re-assert the limit-up demotion after any downstream re-sort (and for the
+    # precomputed-combo path, which does not rank per template).
+    rows = _apply_cn_limit_up_governance(rows, normalized)
 
     limit = int(normalized.get("limit", 500))
     total_count = len(rows)

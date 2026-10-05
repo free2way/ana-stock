@@ -6,10 +6,12 @@ from unittest.mock import MagicMock, patch
 from app.api.routes import screener as screener_route
 from app.services import screener_snapshots
 from app.services.stock_selection.multi_model_confluence import aggregate_multi_model_rows
+from tests.artifact_isolation import IsolatedArtifactsTestCase
 
 
-class MultiModelConfluenceDecouplingTests(unittest.TestCase):
+class MultiModelConfluenceDecouplingTests(IsolatedArtifactsTestCase, unittest.TestCase):
     def setUp(self) -> None:
+        super().setUp()
         self.template_keys = ["lightgbm_top_picks", "technical_momentum"]
         self.template_rows = {
             "lightgbm_top_picks": [

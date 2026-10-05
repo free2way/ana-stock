@@ -238,6 +238,9 @@ def _current_params(
     min_multi_model_hits: int = 2,
     confluence_action_filter: str = "ALL",
     strategy_profile: str = "",
+    min_hit_probability: float | None = None,
+    probability_calibration: str | None = None,
+    model_reliability_weights: str | None = None,
 ) -> dict:
     params = {
         "model_template": model_template,
@@ -270,6 +273,12 @@ def _current_params(
     }
     if str(strategy_profile).strip() == "quality_confluence_v1":
         params["strategy_profile"] = "quality_confluence_v1"
+    if min_hit_probability is not None:
+        params["min_hit_probability"] = min_hit_probability
+    if probability_calibration not in (None, ""):
+        params["probability_calibration"] = probability_calibration
+    if model_reliability_weights not in (None, ""):
+        params["model_reliability_weights"] = model_reliability_weights
     return params
 
 
@@ -362,6 +371,9 @@ def _should_execute_screen(request: Request) -> bool:
         "exclude_execution_tag_filter",
         "sort_by",
         "sort_order",
+        "min_hit_probability",
+        "probability_calibration",
+        "model_reliability_weights",
     }
     return any(key in meaningful_keys for key in request.query_params.keys())
 
@@ -725,6 +737,9 @@ def screener_page(
     exclude_execution_tag_filter: str = Query("ALL"),
     sort_by: str = Query("default"),
     sort_order: str = Query("desc"),
+    min_hit_probability: float | None = Query(None),
+    probability_calibration: str | None = Query(None),
+    model_reliability_weights: str | None = Query(None),
     show_evaluation: int = Query(0),
     show_details: int = Query(0),
     db: Session = Depends(get_db_session),
@@ -767,6 +782,9 @@ def screener_page(
         exclude_execution_tag_filter=exclude_execution_tag_filter,
         sort_by=sort_by,
         sort_order=sort_order,
+        min_hit_probability=min_hit_probability,
+        probability_calibration=probability_calibration,
+        model_reliability_weights=model_reliability_weights,
     )
     should_execute = _should_execute_screen(request)
     normalized_current_params = _normalize_screen_params(current_params)
@@ -951,6 +969,9 @@ def save_screener_preset(
     exclude_execution_tag_filter: str = Form("ALL"),
     sort_by: str = Form("default"),
     sort_order: str = Form("desc"),
+    min_hit_probability: float | None = Form(None),
+    probability_calibration: str | None = Form(None),
+    model_reliability_weights: str | None = Form(None),
     db: Session = Depends(get_db_session),
 ) -> RedirectResponse:
     if not is_authenticated(request):
@@ -984,6 +1005,9 @@ def save_screener_preset(
         exclude_execution_tag_filter=exclude_execution_tag_filter,
         sort_by=sort_by,
         sort_order=sort_order,
+        min_hit_probability=min_hit_probability,
+        probability_calibration=probability_calibration,
+        model_reliability_weights=model_reliability_weights,
     )
     presets = _load_saved_presets(db)
     clean_name = preset_name.strip()
@@ -1075,6 +1099,9 @@ def export_screener_csv(
     exclude_execution_tag_filter: str = Query("ALL"),
     sort_by: str = Query("default"),
     sort_order: str = Query("desc"),
+    min_hit_probability: float | None = Query(None),
+    probability_calibration: str | None = Query(None),
+    model_reliability_weights: str | None = Query(None),
     db: Session = Depends(get_db_session),
 ) -> Response:
     if not is_authenticated(request):
@@ -1108,6 +1135,9 @@ def export_screener_csv(
         exclude_execution_tag_filter=exclude_execution_tag_filter,
         sort_by=sort_by,
         sort_order=sort_order,
+        min_hit_probability=min_hit_probability,
+        probability_calibration=probability_calibration,
+        model_reliability_weights=model_reliability_weights,
     )
     if not _screen_snapshot_ready(ScreenerService(), params):
         return RedirectResponse(
@@ -1130,6 +1160,11 @@ def export_screener_csv(
             "market",
             "model_hit_count",
             "matched_model_templates",
+            "weighted_score",
+            "weighted_score_normalized",
+            "expected_hit_probability",
+            "calibration_status",
+            "weight_source",
             "trend_score",
             "action_label",
             "latest_close",
@@ -1213,6 +1248,9 @@ def add_screener_result_to_watchlist(
     exclude_execution_tag_filter: str = Form("ALL"),
     sort_by: str = Form("default"),
     sort_order: str = Form("desc"),
+    min_hit_probability: float | None = Form(None),
+    probability_calibration: str | None = Form(None),
+    model_reliability_weights: str | None = Form(None),
     db: Session = Depends(get_db_session),
 ) -> RedirectResponse:
     if not is_authenticated(request):
@@ -1249,6 +1287,9 @@ def add_screener_result_to_watchlist(
         exclude_execution_tag_filter=exclude_execution_tag_filter,
         sort_by=sort_by,
         sort_order=sort_order,
+        min_hit_probability=min_hit_probability,
+        probability_calibration=probability_calibration,
+        model_reliability_weights=model_reliability_weights,
     )
     normalized_ticker = str(ticker).strip().upper()
     watchlist_map = watchlist_repo.list_ticker_map(watchlist.id)
@@ -1313,6 +1354,9 @@ def add_all_screener_results_to_watchlist(
     exclude_execution_tag_filter: str = Form("ALL"),
     sort_by: str = Form("default"),
     sort_order: str = Form("desc"),
+    min_hit_probability: float | None = Form(None),
+    probability_calibration: str | None = Form(None),
+    model_reliability_weights: str | None = Form(None),
     bulk_top_n: int = Form(0),
     auto_enable_sync: str | None = Form(None),
     db: Session = Depends(get_db_session),
@@ -1348,6 +1392,9 @@ def add_all_screener_results_to_watchlist(
         exclude_execution_tag_filter=exclude_execution_tag_filter,
         sort_by=sort_by,
         sort_order=sort_order,
+        min_hit_probability=min_hit_probability,
+        probability_calibration=probability_calibration,
+        model_reliability_weights=model_reliability_weights,
     )
     if not _screen_snapshot_ready(ScreenerService(), params):
         return RedirectResponse(
@@ -1408,6 +1455,9 @@ def sync_screener_symbol(
     exclude_execution_tag_filter: str = Form("ALL"),
     sort_by: str = Form("default"),
     sort_order: str = Form("desc"),
+    min_hit_probability: float | None = Form(None),
+    probability_calibration: str | None = Form(None),
+    model_reliability_weights: str | None = Form(None),
     db: Session = Depends(get_db_session),
 ) -> RedirectResponse:
     if not is_authenticated(request):
@@ -1452,6 +1502,9 @@ def sync_screener_symbol(
         exclude_execution_tag_filter=exclude_execution_tag_filter,
         sort_by=sort_by,
         sort_order=sort_order,
+        min_hit_probability=min_hit_probability,
+        probability_calibration=probability_calibration,
+        model_reliability_weights=model_reliability_weights,
     )
     return RedirectResponse(
         url=f"{_build_screen_query(params)}&message={urlencode({'m': message})[2:]}",
@@ -1490,6 +1543,9 @@ def sync_top_screener_results(
     exclude_execution_tag_filter: str = Form("ALL"),
     sort_by: str = Form("default"),
     sort_order: str = Form("desc"),
+    min_hit_probability: float | None = Form(None),
+    probability_calibration: str | None = Form(None),
+    model_reliability_weights: str | None = Form(None),
     sync_top_n: int = Form(5),
     db: Session = Depends(get_db_session),
 ) -> RedirectResponse:
@@ -1524,6 +1580,9 @@ def sync_top_screener_results(
         exclude_execution_tag_filter=exclude_execution_tag_filter,
         sort_by=sort_by,
         sort_order=sort_order,
+        min_hit_probability=min_hit_probability,
+        probability_calibration=probability_calibration,
+        model_reliability_weights=model_reliability_weights,
     )
     if not _screen_snapshot_ready(ScreenerService(), params):
         return RedirectResponse(
@@ -1583,6 +1642,9 @@ def add_all_screener_results_to_focus(
     exclude_execution_tag_filter: str = Form("ALL"),
     sort_by: str = Form("default"),
     sort_order: str = Form("desc"),
+    min_hit_probability: float | None = Form(None),
+    probability_calibration: str | None = Form(None),
+    model_reliability_weights: str | None = Form(None),
     focus_top_n: int = Form(10),
     db: Session = Depends(get_db_session),
 ) -> RedirectResponse:
@@ -1617,6 +1679,9 @@ def add_all_screener_results_to_focus(
         exclude_execution_tag_filter=exclude_execution_tag_filter,
         sort_by=sort_by,
         sort_order=sort_order,
+        min_hit_probability=min_hit_probability,
+        probability_calibration=probability_calibration,
+        model_reliability_weights=model_reliability_weights,
     )
     if not _screen_snapshot_ready(ScreenerService(), params):
         return RedirectResponse(

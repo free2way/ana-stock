@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from datetime import datetime, timedelta
 
@@ -27,6 +28,8 @@ US_MARKET_SCHEDULER_CONFIG_KEY = "us_market_scheduler_config"
 US_MARKET_REFRESH_JOB_TYPE = "us_market_close_refresh"
 US_SCREENER_PRECOMPUTE_JOB_TYPE = "us_screener_precompute"
 US_SIGNAL_TRAIN_JOB_TYPE = "us_signal_train"
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_US_MARKET_SCHEDULER_CONFIG = {
     "enabled": True,
@@ -467,6 +470,9 @@ class USMarketSchedulerService:
                     round_trip_cost_bps=20.0,
                     source_job_id=job.id,
                 )
+                result["reliability_artifacts"] = self._refresh_reliability_artifacts(
+                    db, markets=["US"]
+                )
                 job_repo.complete_job(
                     job.id,
                     status=str(result.get("status") or "partial"),
@@ -475,6 +481,29 @@ class USMarketSchedulerService:
                 )
             except Exception as exc:
                 job_repo.complete_job(job.id, status="failed", message=str(exc), result={"error": str(exc)})
+
+    def _refresh_reliability_artifacts(self, db, *, markets: list[str]) -> dict:
+        """Persist rolling OOS reliability + calibration after evaluation.
+
+        This is a downstream artifact refresh: a failure must only warn and never
+        block the structured evaluation that has already been committed.
+        """
+
+        try:
+            from app.services.stock_selection.reliability_artifacts import (
+                refresh_stock_selection_reliability_artifacts,
+            )
+
+            return refresh_stock_selection_reliability_artifacts(
+                db, markets=markets, recent_runs=1
+            )
+        except Exception as exc:  # noqa: BLE001 - artifact refresh must not break evaluation
+            logger.warning(
+                "stock-selection reliability artifact refresh failed for %s: %s",
+                markets,
+                exc,
+            )
+            return {"status": "failed", "error": str(exc), "markets": list(markets)}
 
     def _run_screener_precompute(self, *, source_job_id: int) -> None:
         with SessionLocal() as db:
