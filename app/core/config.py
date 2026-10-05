@@ -131,6 +131,59 @@ class Settings(BaseSettings):
     trainer_us_window_dates: int = Field(default=252, ge=1, le=1260)
     trainer_us_window_max_rows: int = Field(default=120_000, ge=1)
     trainer_us_window_max_estimated_fit_bytes: int = Field(default=2 * 1024**3, ge=1)
+    # ---- Training-side robustness knobs (2026-10) ----
+    # (1) Point-in-time tradable-universe filter applied to the lake rows fed
+    # into sample construction. Semantics are reused from
+    # app.services.stock_selection.universe.default_universe_rules (min_price,
+    # min_adv20=50M, min_history_sessions=120, and -- for CN -- the signal-day
+    # limit-up lock). The lake row schema does not carry ST / suspension state,
+    # so those two rules are recorded as unapplied in the run's
+    # `universe_filter_stats` rather than silently assumed to have run.
+    # Disable for a documented research rollback.
+    trainer_universe_filter_enabled: bool = Field(default=True)
+    # (2) Net-return target winsorization plus a robust regression objective.
+    # Quantiles are resolved per market so CN and US may carry different tail
+    # behaviour. `trainer_objective="huber"` is the robust default;
+    # "regression"/"l2" restores the legacy least-squares fit.
+    trainer_label_winsorize_enabled: bool = Field(default=True)
+    trainer_cn_label_winsorize_lower: float = Field(default=0.025, ge=0.0, lt=0.5)
+    trainer_cn_label_winsorize_upper: float = Field(default=0.975, gt=0.5, le=1.0)
+    trainer_us_label_winsorize_lower: float = Field(default=0.025, ge=0.0, lt=0.5)
+    trainer_us_label_winsorize_upper: float = Field(default=0.975, gt=0.5, le=1.0)
+    trainer_objective: str = Field(default="huber")
+    trainer_huber_alpha: float = Field(default=0.9, gt=0.0)
+    # (3) Drawdown penalty lambda applied to the executable label's
+    # risk_adjusted_return (net - lambda*|path_drawdown|) and reused as the OOS
+    # metric. `net_return` itself is preserved unchanged on every sample.
+    trainer_drawdown_penalty: float = Field(default=0.25, ge=0.0)
+    # Fit-target switch (2026-10). False (default) keeps the historical GBDT
+    # target -- the executable `net_return` -- so the drawdown penalty only
+    # moves the OOS metric, not the fit. True makes the penalty actually change
+    # training: the fit target becomes the same label's `risk_adjusted_return`
+    # (net - lambda*|path_drawdown|). Either way `net_return` is preserved on
+    # every sample and the OOS evidence always reports both
+    # `mean_risk_adjusted_return` and `mean_net_return`, so the two variants
+    # stay directly comparable. The run config records the effective
+    # `fit_target` (`net_return` / `risk_adjusted_return`) plus the penalty.
+    trainer_fit_on_risk_adjusted: bool = Field(default=False)
+    # Deterministic seed for the GBDT estimator. Exposed so a multi-seed
+    # ablation can separate protocol effects from estimator variance; 42 is the
+    # historical hard-coded value, so the default keeps single-seed runs
+    # byte-identical.
+    trainer_random_seed: int = Field(default=42, ge=0)
+    # (4) Embargo gap in sessions between the last training feature date and
+    # the prediction date. Unset -> `horizon_days` (purge already covers the
+    # label window; the embargo adds an equal forward gap). Set 0 to restore
+    # the legacy no-embargo protocol.
+    trainer_embargo_sessions: int | None = Field(default=None, ge=0)
+    # Per-trade-date cross-sectional feature transform: winsorize then MAD
+    # robust z-score using only the same date's cross-section (point in time).
+    # Mirrors CrossSectionalFactorPipeline; a degenerate cross-section (fewer
+    # than two values or zero MAD) is left untransformed instead of collapsed.
+    trainer_feature_transform_enabled: bool = Field(default=True)
+    trainer_feature_transform_winsor_lower: float = Field(default=0.025, ge=0.0, lt=0.5)
+    trainer_feature_transform_winsor_upper: float = Field(default=0.975, gt=0.5, le=1.0)
+    trainer_feature_transform_zscore_clip: float = Field(default=3.0, gt=0.0)
     # Executable-label execution assumptions for the CN production trainer.
     # The confirmed next-open label prices a T+1 entry at the next open and
     # excludes signal-day limit-up opens as unbuyable unless policy="keep".
@@ -211,6 +264,14 @@ class Settings(BaseSettings):
     # plus stamp/transfer load and next-open market-order slippage).  The
     # previous 20bps flat assumption flattered every headline metric.
     trainer_round_trip_cost_bps: float = Field(default=50.0, ge=0.0, le=200.0)
+    # Single canonical round-trip cost basis shared by every selection /
+    # evaluation path that previously measured gross returns at 0 cost.  The
+    # 50bps default is the existing majority convention: the P0 #3 trainer
+    # ladder nominal (`trainer_round_trip_cost_bps`) and the model-evaluation
+    # sensitivity ladder's scheduled nominal both centre on 50bps.  Every
+    # consumer must surface the value it actually used plus this source string,
+    # so a summary can never silently imply cost-free returns.
+    selection_canonical_round_trip_cost_bps: float = Field(default=50.0, ge=0.0, le=200.0)
     backtest_max_position_weight: float = Field(default=0.2)
     backtest_min_signal_score: float = Field(default=0.05)
     backtest_default_holding_days: int = Field(default=3)

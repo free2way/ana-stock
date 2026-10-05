@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from datetime import date
 from typing import Iterable, Mapping
 
+from app.services.statistical_inference import block_bootstrap_mean_ci
 from app.services.stock_selection.factor_pipeline import FactorScore
 
 
@@ -301,15 +302,31 @@ class SelectiveEvaluationReport:
     extreme_five_tickers_excluded_mean: float | None
     monthly_metrics: tuple[SelectiveMonthlyMetric, ...]
     daily_metrics: tuple[SelectiveDailyMetric, ...]
+    active_mean_ci95_iid: tuple[float, float] | None = None
+    active_mean_ci_cluster_method: str = "day_order_moving_block_bootstrap_block=horizon"
 
 
 def _mean_ci95(values: list[float]) -> tuple[float, float]:
+    """Legacy iid normal interval; kept as the diagnostic companion."""
     mean = statistics.fmean(values)
     if len(values) == 1:
         return (mean, mean)
     standard_error = statistics.stdev(values) / math.sqrt(len(values))
     radius = 1.96 * standard_error
     return (mean - radius, mean + radius)
+
+
+def _clustered_mean_ci95(values: list[float], *, horizon_days: int) -> tuple[float, float] | None:
+    """Day-ordered moving-block bootstrap interval for the active-date mean.
+
+    ``active_values`` already holds one value per active date in ascending date
+    order, so a moving-block resample over consecutive entries is exactly a
+    day-clustered bootstrap.  Block length = evaluation horizon, matching the
+    overlapping-return dependence window used elsewhere in the repo.
+    """
+    if len(values) < 2:
+        return None
+    return block_bootstrap_mean_ci(values, block_length=max(1, int(horizon_days)))
 
 
 def evaluate_selective_decisions(
@@ -438,13 +455,19 @@ def evaluate_selective_decisions(
 
     oos_dates = len(daily_metrics)
     active_dates = len(active_values)
+    horizon_days = daily_decisions[0].horizon_days
+    iid_ci = _mean_ci95(active_values)
+    clustered_ci = _clustered_mean_ci95(active_values, horizon_days=horizon_days)
+    # Promotion thresholds consume `active_mean_ci95`.  It now carries the
+    # day-clustered lower bound whenever the bootstrap is defined; the iid
+    # interval is preserved separately as a diagnostic.
     return SelectiveEvaluationReport(
         schema_version="selective_stock_evaluation_v1",
         market=config.market,
         model_key=config.model_key,
         model_versions=tuple(sorted(model_versions)),
         policy_version=daily_decisions[0].policy_version,
-        horizon_days=daily_decisions[0].horizon_days,
+        horizon_days=horizon_days,
         max_selected_per_date=daily_decisions[0].max_selected_per_date,
         round_trip_cost_bps=config.round_trip_cost_bps,
         oos_date_count=oos_dates,
@@ -458,7 +481,7 @@ def evaluate_selective_decisions(
         ),
         positive_active_date_rate=sum(value > 0 for value in active_values) / active_dates,
         positive_selected_rate=sum(value > 0 for value in selected_values) / len(selected_values),
-        active_mean_ci95=_mean_ci95(active_values),
+        active_mean_ci95=clustered_ci if clustered_ci is not None else iid_ci,
         extreme_five_dates_excluded_mean=(
             statistics.fmean(date_excluded) if date_excluded else None
         ),
@@ -467,4 +490,68 @@ def evaluate_selective_decisions(
         ),
         monthly_metrics=monthly_metrics,
         daily_metrics=tuple(daily_metrics),
+        active_mean_ci95_iid=iid_ci,
+        active_mean_ci_cluster_method=(
+            f"day_order_moving_block_bootstrap_block={max(1, int(horizon_days))}"
+            if clustered_ci is not None
+            else "iid_normal_fallback_insufficient_active_dates"
+        ),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class CoveragePrecisionPoint:
+    """One point on the abstention curve: higher threshold -> lower coverage."""
+
+    threshold: float
+    selected_count: int
+    total_count: int
+    coverage: float
+    precision: float | None
+
+
+def coverage_precision_curve(
+    rows: Iterable[Mapping],
+    *,
+    thresholds: Iterable[float],
+    probability_key: str = "expected_hit_probability",
+    outcome_key: str | None = None,
+) -> tuple[CoveragePrecisionPoint, ...]:
+    """Report the coverage/precision trade-off of a probability gate.
+
+    Coverage is the share of candidates that clear ``threshold``; it is
+    non-increasing as the threshold rises.  Precision, when matured outcomes
+    are joined in, is the realized positive rate of the retained subset -- the
+    "trade出手率 for命中率" contract.
+    """
+    resolved_rows = list(rows)
+    total = len(resolved_rows)
+    resolved_thresholds = sorted({float(item) for item in thresholds})
+    points: list[CoveragePrecisionPoint] = []
+    for threshold in resolved_thresholds:
+        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ValueError("coverage-precision thresholds must be finite and in [0, 1]")
+        selected = [
+            row
+            for row in resolved_rows
+            if row.get(probability_key) is not None and float(row[probability_key]) >= threshold
+        ]
+        precision: float | None = None
+        if outcome_key is not None and selected:
+            outcomes = [
+                float(row[outcome_key])
+                for row in selected
+                if row.get(outcome_key) is not None
+            ]
+            if outcomes:
+                precision = sum(1 for value in outcomes if value > 0) / len(outcomes)
+        points.append(
+            CoveragePrecisionPoint(
+                threshold=threshold,
+                selected_count=len(selected),
+                total_count=total,
+                coverage=(len(selected) / total) if total else 0.0,
+                precision=precision,
+            )
+        )
+    return tuple(points)

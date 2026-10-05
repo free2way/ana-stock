@@ -8,6 +8,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.services.cost_basis import CANONICAL_COST_SOURCE, canonical_round_trip_cost_bps
 from app.services.market_lake import get_latest_lake_trade_date, load_lake_price_history, load_lake_rows
 from app.services.price_basis import preferred_close
 from app.services.repository import AppSettingRepository, WorkspaceSnapshotRepository
@@ -735,6 +736,15 @@ def compute_forward_outcome(row: dict[str, Any], *, history: list[dict[str, Any]
         return {"status": "bad_signal_close", "trade_date": latest_trade_date}
     signal_raw_close = _to_float(signal_bar.get("close")) or signal_close
     outcome: dict[str, Any] = {"status": "ok", "trade_date": signal_bar.get("date"), "signal_close": signal_close}
+    # Cost basis: the close-to-close legs are gross price returns.  The net view
+    # subtracts the single canonical round trip once, so the reported hit rate
+    # cannot be an artifact of a zero-cost assumption.  `return_*_pct` stays
+    # gross (existing consumers unchanged); `net_return_*_pct` is the addition.
+    cost_bps = canonical_round_trip_cost_bps(market)
+    cost_pct = cost_bps / 100.0
+    outcome["cost_bps"] = cost_bps
+    outcome["cost_basis"] = "round_trip"
+    outcome["cost_source"] = CANONICAL_COST_SOURCE
     next_bar = history[index + 1] if index + 1 < len(history) else None
     if next_bar:
         next_open = _to_float(next_bar.get("open"))
@@ -750,6 +760,7 @@ def compute_forward_outcome(row: dict[str, Any], *, history: list[dict[str, Any]
                 outcome["next_open_to_low_pct"] = round((next_low / next_open - 1.0) * 100.0, 2)
         if next_close is not None:
             outcome["return_1d_pct"] = round((next_close / signal_close - 1.0) * 100.0, 2)
+            outcome["net_return_1d_pct"] = round(outcome["return_1d_pct"] - cost_pct, 2)
         outcome["gap_unbuyable"] = bool((outcome.get("next_open_gap_pct") or 0) >= (8.0 if market == "CN" else 6.0))
     for horizon in (3, 5):
         target_index = index + horizon
@@ -757,6 +768,7 @@ def compute_forward_outcome(row: dict[str, Any], *, history: list[dict[str, Any]
             target_close = preferred_close(history[target_index])
             if target_close is not None:
                 outcome[f"return_{horizon}d_pct"] = round((target_close / signal_close - 1.0) * 100.0, 2)
+                outcome[f"net_return_{horizon}d_pct"] = round(outcome[f"return_{horizon}d_pct"] - cost_pct, 2)
         lows: list[float] = []
         for bar in history[index + 1 : min(len(history), index + horizon + 1)]:
             low_value = _to_float(bar.get("low"))
@@ -808,17 +820,37 @@ def _history_index_for_date(history: list[dict[str, Any]], trade_date: str) -> i
 
 def summarize_factor_outcomes(rows: list[dict[str, Any]]) -> dict[str, Any]:
     metrics: dict[str, Any] = {"evaluated_count": len(rows)}
+    cost_bps = canonical_round_trip_cost_bps()
+    metrics["cost_bps"] = cost_bps
+    metrics["cost_basis"] = "round_trip"
+    metrics["cost_source"] = CANONICAL_COST_SOURCE
     for horizon in (1, 3, 5):
         key = f"return_{horizon}d_pct"
-        values = [
+        gross_values = [
             _to_float((row.get("forward_outcome") or {}).get(key))
             for row in rows
-            if _to_float((row.get("forward_outcome") or {}).get(key)) is not None
         ]
-        clean = [value for value in values if value is not None]
-        metrics[f"available_{horizon}d"] = len(clean)
-        metrics[f"avg_return_{horizon}d_pct"] = round(mean(clean), 2) if clean else None
-        metrics[f"hit_rate_{horizon}d_pct"] = round(len([value for value in clean if value > 0]) / len(clean) * 100.0, 1) if clean else None
+        gross_clean = [value for value in gross_values if value is not None]
+        # Prefer the stored net leg (already cost-adjusted at outcome time);
+        # fall back to gross minus the canonical round trip so a caller that
+        # supplied hand-built outcomes can never record a zero-cost hit rate.
+        net_values = [
+            _to_float((row.get("forward_outcome") or {}).get(f"net_return_{horizon}d_pct"))
+            for row in rows
+        ]
+        net_clean = [
+            value if value is not None else gross - cost_bps / 100.0
+            for value, gross in zip(net_values, gross_values)
+            if gross is not None
+        ]
+        metrics[f"available_{horizon}d"] = len(gross_clean)
+        metrics[f"avg_return_{horizon}d_pct"] = round(mean(gross_clean), 2) if gross_clean else None
+        metrics[f"avg_net_return_{horizon}d_pct"] = round(mean(net_clean), 2) if net_clean else None
+        metrics[f"hit_rate_{horizon}d_pct"] = (
+            round(len([value for value in net_clean if value > 0]) / len(net_clean) * 100.0, 1)
+            if net_clean
+            else None
+        )
     drawdowns = [
         _to_float((row.get("forward_outcome") or {}).get("max_drawdown_5d_pct"))
         for row in rows

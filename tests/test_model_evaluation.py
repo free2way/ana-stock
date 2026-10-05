@@ -180,6 +180,92 @@ class ModelEvaluationTests(ApplicationPostgresTestCase):
         self.assertEqual("waiting_for_oos", readiness["status"])
         self.assertEqual("strict_oos_evidence_insufficient", readiness["markets"]["CN"]["reason"])
 
+    def test_benchmark_excess_and_stratified_metric_shapes(self) -> None:
+        with SessionLocal() as db:
+            symbols = []
+            for ticker, industry in (("000001.SZ", "银行"), ("000002.SZ", "医药"), ("600000.SS", "医药")):
+                symbols.append(Symbol(
+                    ticker=ticker, name=ticker, market="CN", industry=industry,
+                    created_at="2026-07-01T00:00:00+00:00", updated_at="2026-07-01T00:00:00+00:00",
+                ))
+            run = ModelRun(
+                name="cn-benchmark",
+                model_type="lightgbm_multifactor",
+                market="CN",
+                universe="full_market",
+                train_start="2025-01-01",
+                train_end="2026-06-30",
+                test_start="2026-07-01",
+                test_end=None,
+                config_json='{"input_market_date":"2026-07-01","evaluation_protocol":"walk_forward_purged_v1","oos_start_date":"2026-07-01"}',
+                artifact_path=None,
+                status="success",
+                created_at="2026-07-01T00:00:00+00:00",
+                finished_at="2026-07-01T00:01:00+00:00",
+            )
+            db.add_all([*symbols, run])
+            db.flush()
+            for rank, symbol in enumerate(symbols, start=1):
+                db.add(Prediction(model_run_id=run.id, symbol_id=symbol.id, trade_date="2026-07-01", score=0.9, rank_value=rank, created_at="2026-07-01T00:00:00+00:00"))
+            db.commit()
+            histories = {
+                # +20% / 0% / +5% next-session close-to-close, same entry basis.
+                "000001.SZ": [
+                    {"date": "2026-07-01", "open": 100.0, "high": 100.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+                    {"date": "2026-07-02", "open": 100.0, "high": 120.0, "low": 99.0, "close": 120.0, "volume": 1000.0},
+                ],
+                "000002.SZ": [
+                    {"date": "2026-07-01", "open": 100.0, "high": 100.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+                    {"date": "2026-07-02", "open": 100.0, "high": 100.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+                ],
+                "600000.SS": [
+                    {"date": "2026-07-01", "open": 100.0, "high": 100.0, "low": 99.0, "close": 100.0, "volume": 1000.0},
+                    {"date": "2026-07-02", "open": 100.0, "high": 105.0, "low": 99.0, "close": 105.0, "volume": 1000.0},
+                ],
+            }
+
+            def fake_history(*, market, ticker, limit=320):
+                return histories.get(str(ticker).upper(), [])
+
+            with patch("app.services.model_evaluation.load_lake_price_history", side_effect=fake_history):
+                result = evaluate_model_runs(
+                    db,
+                    markets=["CN"],
+                    model_run_id=run.id,
+                    recent_trade_dates=1,
+                    top_n=1,
+                    horizons=(1,),
+                    round_trip_cost_bps=50.0,
+                )
+            api_rows = list_latest_model_evaluations(db, market="CN", limit=1)
+
+        summary = result["evaluations"][0]
+        self.assertEqual("available_same_day_universe_equal_weight_v1", summary["benchmark_status"])
+        self.assertEqual(3, summary["benchmark_universe_size"])
+        # Universe benchmark = mean(+20%, 0%, +5%) = 8.333...%; the selected
+        # (+20%) name's excess is therefore non-zero.
+        self.assertAlmostEqual(8.333333, summary["benchmark_avg_return_pct"], places=3)
+        self.assertAlmostEqual(11.666666, summary["excess_avg_return_pct"], places=3)
+        self.assertIn("stratification", summary)
+        self.assertEqual(
+            ["industry", "market_cap_bucket", "liquidity_bucket"],
+            summary["stratification"]["dimensions"],
+        )
+        shape = summary["stratification"]["by_horizon"][1]
+        self.assertIn("银行", shape["industry"])
+        self.assertIn("unknown", shape["market_cap_bucket"])
+        self.assertIn("unknown", shape["liquidity_bucket"])
+
+        row = api_rows[0]
+        scopes = {item["metric_scope"] for item in row["stratified_metrics"]}
+        self.assertIn("industry:银行", scopes)
+        self.assertIn("market_cap_bucket:unknown", scopes)
+        self.assertIn("liquidity_bucket:unknown", scopes)
+        overall = row["metrics"][0]
+        self.assertAlmostEqual(11.666666, overall["excess_avg_return_pct"], places=3)
+        self.assertTrue(row["summary"]["hit_rate_ci_iid_is_diagnostic_only"])
+        self.assertEqual("day_cluster_insufficient_days", overall["hit_rate_ci_cluster_method"])
+
     def test_full_market_template_governance_attaches_observation_status_before_risk_filter(self) -> None:
         from app.services.screener import ScreenerService
 

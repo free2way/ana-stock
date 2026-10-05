@@ -93,6 +93,77 @@ def block_bootstrap_mean_ci(
     return means[low_index], means[high_index]
 
 
+def day_clustered_hit_rate_ci(
+    flags: Sequence[bool | None],
+    dates: Sequence[str],
+    *,
+    block_length: int,
+    iterations: int = 2000,
+    seed: int = 20261003,
+    alpha: float = 0.05,
+) -> dict:
+    """Day-clustered moving-block bootstrap interval for a binary hit rate.
+
+    A plain iid interval treats every pick as independent, but picks selected on
+    the same signal date share a market move, so the effective sample is the
+    number of *dates*, not the number of picks.  Here each distinct date is one
+    cluster and a block is a run of consecutive dates of length ``block_length``
+    (the evaluation horizon).  The point estimate and the iid interval stay in
+    the payload so gate consumers can see both, but the clustered interval is
+    the one that must clear a promotion threshold.
+    """
+
+    paired = [(str(date), bool(flag)) for date, flag in zip(dates, flags, strict=False) if flag is not None]
+    if not paired:
+        return {"point_pct": None, "ci95": None, "days": 0, "block_length": None,
+                "method": "day_cluster_insufficient_days"}
+    by_day: dict[str, list[bool]] = {}
+    for date, flag in paired:
+        by_day.setdefault(date, []).append(flag)
+    ordered_days = sorted(by_day)
+    hits_by_day = [sum(by_day[day]) for day in ordered_days]
+    counts_by_day = [len(by_day[day]) for day in ordered_days]
+    total_hits = sum(hits_by_day)
+    total_count = sum(counts_by_day)
+    point = total_hits / total_count * 100.0 if total_count else None
+    if len(ordered_days) < 2:
+        return {
+            "point_pct": point,
+            "ci95": None,
+            "days": len(ordered_days),
+            "block_length": None,
+            "method": "day_cluster_insufficient_days",
+        }
+    day_count = len(ordered_days)
+    block = max(1, min(int(block_length), day_count))
+    rng = random.Random(seed)
+    starts = list(range(0, day_count - block + 1)) if day_count > block else [0]
+    rates: list[float] = []
+    for _ in range(max(50, int(iterations))):
+        selected: list[int] = []
+        while len(selected) < day_count:
+            start = rng.choice(starts)
+            selected.extend(range(start, start + block))
+        selected = selected[:day_count]
+        hits = sum(hits_by_day[index] for index in selected)
+        count = sum(counts_by_day[index] for index in selected)
+        if count:
+            rates.append(hits / count * 100.0)
+    rates.sort()
+    if len(rates) < 2:
+        return {"point_pct": point, "ci95": None, "days": day_count, "block_length": block,
+                "method": "day_cluster_insufficient_days"}
+    low_index = max(0, int((alpha / 2.0) * len(rates)) - 1)
+    high_index = min(len(rates) - 1, int((1.0 - alpha / 2.0) * len(rates)))
+    return {
+        "point_pct": point,
+        "ci95": (rates[low_index], rates[high_index]),
+        "days": day_count,
+        "block_length": block,
+        "method": f"day_cluster_moving_block_bootstrap_block={block}",
+    }
+
+
 def _z_for(alpha: float) -> float:
     # Acklam-style inverse normal approximation; accurate to ~1e-9 for 0.01<=p<=0.99.
     p = 1.0 - alpha / 2.0

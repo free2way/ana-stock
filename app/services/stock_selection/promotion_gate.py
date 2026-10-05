@@ -397,7 +397,8 @@ def assess_selective_candidate_promotion(
             ci95_lower > 0,
             ci95_lower,
             ">0 at every required cost",
-            "The active-date mean must be positive beyond a normal-approximation 95% interval.",
+            "The day-clustered 95% lower bound of the active-date mean must stay positive; "
+            "the iid interval is diagnostic only and may not be used to clear this gate.",
         ),
         _check(
             "positive_active_date_rate",

@@ -51,6 +51,7 @@ def _selective_report(
     excess: float = 0.01,
     coverage: float = 0.25,
     ci95_lower: float = 0.005,
+    iid_ci95_lower: float = 0.008,
 ) -> SelectiveEvaluationReport:
     return SelectiveEvaluationReport(
         schema_version="selective_stock_evaluation_v1",
@@ -71,6 +72,8 @@ def _selective_report(
         positive_active_date_rate=0.70,
         positive_selected_rate=0.70,
         active_mean_ci95=(ci95_lower, excess + 0.005),
+        active_mean_ci95_iid=(iid_ci95_lower, excess + 0.005),
+        active_mean_ci_cluster_method="day_order_moving_block_bootstrap_block=5",
         extreme_five_dates_excluded_mean=excess,
         extreme_five_tickers_excluded_mean=excess,
         monthly_metrics=tuple(
@@ -197,6 +200,19 @@ class PromotionGateTests(unittest.TestCase):
             config=SelectivePromotionGateConfig(),
         )
         self.assertEqual("REJECT", uncertain.decision)
+
+    def test_selective_gate_uses_clustered_lower_bound_not_iid_diagnostic(self) -> None:
+        # Clustered lower bound is negative while the iid diagnostic is positive:
+        # the gate must reject on the clustered bound the report now carries.
+        report = assess_selective_candidate_promotion(
+            [_selective_report(20.0, ci95_lower=-0.001, iid_ci95_lower=0.008)],
+            source_evidence_versions=["selective-base"],
+            config=SelectivePromotionGateConfig(),
+        )
+        self.assertEqual("REJECT", report.decision)
+        check = next(item for item in report.checks if item.key == "active_mean_ci95_lower_bound")
+        self.assertEqual("FAIL", check.status)
+        self.assertAlmostEqual(-0.001, float(check.observed))
 
 
 if __name__ == "__main__":
