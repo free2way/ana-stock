@@ -38,3 +38,7 @@ storage/
 !/README.zh-CN.md
 *.docx
 *.pdf
+
+# data domains that must never be committed (see commit policy)
+/data/corporate_actions/
+/data/experiments/

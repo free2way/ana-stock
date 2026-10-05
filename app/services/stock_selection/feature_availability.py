@@ -14,6 +14,12 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
+from app.services.stock_selection.sentiment_features import (
+    SENTIMENT_FACTOR_SET_KEY,
+    SentimentPITConfig,
+    sentiment_feature_definitions,
+)
+
 
 FUNDAMENTAL_FEATURE_NAMES = (
     "pe_ttm",
@@ -24,6 +30,88 @@ FUNDAMENTAL_FEATURE_NAMES = (
     "revenue_yoy",
     "debt_to_assets",
 )
+
+FEATURE_AVAILABILITY_MANIFEST_SCHEMA = "stock_selection_feature_availability_manifest_v1"
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureAvailabilityEntry:
+    """Registered source/availability metadata for one engineered feature."""
+
+    feature_name: str
+    source: str
+    available_time_local: str
+    timezone_name: str
+    availability_slot: str
+    availability_semantics: str
+    forward_only: bool
+    coverage_window: str
+    missing_policy: str
+    information_family: str
+    factor_set_key: str
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("feature_name", self.feature_name),
+            ("source", self.source),
+            ("timezone_name", self.timezone_name),
+            ("availability_slot", self.availability_slot),
+            ("availability_semantics", self.availability_semantics),
+            ("coverage_window", self.coverage_window),
+            ("missing_policy", self.missing_policy),
+            ("information_family", self.information_family),
+            ("factor_set_key", self.factor_set_key),
+        ):
+            if not str(value or "").strip():
+                raise ValueError(f"{name} must not be empty")
+        hours, separator, minutes = str(self.available_time_local).partition(":")
+        if (
+            not separator
+            or len(hours) != 2
+            or len(minutes) != 2
+            or not (hours + minutes).isdigit()
+            or not 0 <= int(hours) <= 23
+            or not 0 <= int(minutes) <= 59
+        ):
+            raise ValueError("available_time_local must be a valid HH:MM time of day")
+        ZoneInfo(self.timezone_name)
+        if not isinstance(self.forward_only, bool):
+            raise ValueError("forward_only must be a boolean")
+
+
+def sentiment_feature_availability_entries() -> tuple[FeatureAvailabilityEntry, ...]:
+    """Availability entries for the forward-only HiThink sentiment family."""
+
+    return tuple(
+        FeatureAvailabilityEntry(
+            feature_name=definition.name,
+            source=definition.source,
+            available_time_local=definition.available_time_local,
+            timezone_name=SentimentPITConfig().timezone_name,
+            availability_slot=definition.availability_slot,
+            availability_semantics=definition.availability_semantics,
+            forward_only=definition.forward_only,
+            coverage_window=definition.coverage_window,
+            missing_policy=definition.missing_policy,
+            information_family=definition.information_family,
+            factor_set_key=SENTIMENT_FACTOR_SET_KEY,
+        )
+        for definition in sentiment_feature_definitions().values()
+    )
+
+
+def feature_availability_manifest() -> dict[str, FeatureAvailabilityEntry]:
+    """Explicitly registered feature-availability entries, keyed by feature name.
+
+    Fundamental features remain governed by :data:`FUNDAMENTAL_FEATURE_NAMES`
+    and :class:`FeatureAvailabilityConfig`; this manifest records sources that
+    must carry an explicit availability contract, such as the bounded
+    (``trailing_one_year``), ``forward_only`` HiThink sentiment family.
+    """
+
+    return {
+        entry.feature_name: entry for entry in sentiment_feature_availability_entries()
+    }
 
 
 @dataclass(frozen=True, slots=True)

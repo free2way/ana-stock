@@ -5,6 +5,10 @@ import json
 from dataclasses import asdict, dataclass
 
 from app.services.stock_selection.factor_pipeline import FactorDirection, FactorSpec
+from app.services.stock_selection.sentiment_features import (
+    SENTIMENT_FACTOR_SET_KEY,
+    sentiment_feature_definitions,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,8 +173,65 @@ def research_factor_sets() -> dict[str, ResearchFactorSet]:
 
 def get_research_factor_set(key: str) -> ResearchFactorSet:
     normalized = str(key or "").strip()
+    registry = registered_factor_sets()
     try:
-        return research_factor_sets()[normalized]
+        return registry[normalized]
     except KeyError as exc:
-        available = ", ".join(sorted(research_factor_sets()))
+        available = ", ".join(sorted(registry))
         raise ValueError(f"unknown factor_set_key {key!r}; available: {available}") from exc
+
+
+# Lower-is-better sentiment columns.  These directions are an explicit,
+# unvalidated research hypothesis; the remaining columns default to
+# higher-is-better until a forward ablation revises them.
+_SENTIMENT_LOWER_BETTER_FEATURES = frozenset(
+    {
+        "hot_rank",
+        "dragon_tiger_hot_rank",
+        "limit_down_flag",
+        "limit_down_turnover_pct",
+        "limit_break_flag",
+        "limit_break_open_times",
+        "anomaly_limit_down_flag",
+    }
+)
+
+
+def sentiment_factor_specs() -> tuple[FactorSpec, ...]:
+    return tuple(
+        FactorSpec(
+            name=definition.name,
+            direction=(
+                FactorDirection.LOWER_BETTER
+                if definition.name in _SENTIMENT_LOWER_BETTER_FEATURES
+                else FactorDirection.HIGHER_BETTER
+            ),
+        )
+        for definition in sentiment_feature_definitions().values()
+    )
+
+
+def sentiment_factor_set() -> ResearchFactorSet:
+    """Forward-only HiThink sentiment family; excluded from the frozen candidates."""
+
+    return ResearchFactorSet(
+        key=SENTIMENT_FACTOR_SET_KEY,
+        thesis=(
+            "Research-only forward-only HiThink featured/auction sentiment family. "
+            "Source depth is bounded to roughly one trailing year, so it is "
+            "registered for research and experiment consumption but is not part of "
+            "the frozen price/P1 candidates or the production training defaults. "
+            "Directions are unvalidated placeholders pending a forward ablation."
+        ),
+        specs=sentiment_factor_specs(),
+    )
+
+
+def sentiment_factor_sets() -> dict[str, ResearchFactorSet]:
+    return {SENTIMENT_FACTOR_SET_KEY: sentiment_factor_set()}
+
+
+def registered_factor_sets() -> dict[str, ResearchFactorSet]:
+    """All factory-loadable factor sets: frozen research candidates + sentiment."""
+
+    return {**research_factor_sets(), **sentiment_factor_sets()}
