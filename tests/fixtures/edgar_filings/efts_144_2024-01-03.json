@@ -1,0 +1,609 @@
+{
+ "took": 383,
+ "timed_out": false,
+ "_shards": {
+  "total": 50,
+  "successful": 50,
+  "skipped": 0,
+  "failed": 0
+ },
+ "hits": {
+  "total": {
+   "value": 3,
+   "relation": "eq"
+  },
+  "max_score": 0,
+  "hits": [
+   {
+    "_index": "edgar_file",
+    "_id": "0001959173-24-000078:primary_doc.xml",
+    "_score": 0,
+    "_source": {
+     "ciks": [
+      "0001477449",
+      "0002001935"
+     ],
+     "period_ending": null,
+     "file_num": [
+      "001-37477"
+     ],
+     "display_names": [
+      "Teladoc Health, Inc.  (TDOC)  (CIK 0001477449)",
+      "Nanis Nikolaos P.  (CIK 0002001935)"
+     ],
+     "xsl": "xsl144X01",
+     "sequence": 1,
+     "root_forms": [
+      "144"
+     ],
+     "file_date": "2024-01-03",
+     "biz_states": [
+      "NY"
+     ],
+     "sics": [
+      "8011"
+     ],
+     "form": "144",
+     "adsh": "0001959173-24-000078",
+     "film_num": [
+      "24506031"
+     ],
+     "biz_locations": [
+      "Purchase, NY",
+      ""
+     ],
+     "file_type": "144",
+     "file_description": null,
+     "inc_states": [
+      "DE",
+      ""
+     ],
+     "items": []
+    }
+   },
+   {
+    "_index": "edgar_file",
+    "_id": "0001959173-24-000094:primary_doc.xml",
+    "_score": 0,
+    "_source": {
+     "ciks": [
+      "0001859690",
+      "0001967211"
+     ],
+     "period_ending": null,
+     "file_num": [
+      "001-40777"
+     ],
+     "display_names": [
+      "Arqit Quantum Inc.  (ARQQ, ARQQW)  (CIK 0001859690)",
+      "Willcocks Patrick  (CIK 0001967211)"
+     ],
+     "xsl": "xsl144X01",
+     "sequence": 1,
+     "root_forms": [
+      "144"
+     ],
+     "file_date": "2024-01-03",
+     "biz_states": [
+      "X0"
+     ],
+     "sics": [
+      "7372"
+     ],
+     "form": "144",
+     "adsh": "0001959173-24-000094",
+     "film_num": [
+      "24507331"
+     ],
+     "biz_locations": [
+      "London, X0",
+      ""
+     ],
+     "file_type": "144",
+     "file_description": null,
+     "inc_states": [
+      "E9",
+      ""
+     ],
+     "items": []
+    }
+   },
+   {
+    "_index": "edgar_file",
+    "_id": "0002006196-24-000003:primary_doc.xml",
+    "_score": 0,
+    "_source": {
+     "ciks": [
+      "0001401667",
+      "0001727172"
+     ],
+     "period_ending": null,
+     "file_num": [
+      "001-35703"
+     ],
+     "display_names": [
+      "PUMA BIOTECHNOLOGY, INC.  (PBYI)  (CIK 0001401667)",
+      "HUNT DOUGLAS M  (CIK 0001727172)"
+     ],
+     "xsl": "xsl144X01",
+     "sequence": 1,
+     "root_forms": [
+      "144"
+     ],
+     "file_date": "2024-01-03",
+     "biz_states": [
+      "CA"
+     ],
+     "sics": [
+      "2834"
+     ],
+     "form": "144",
+     "adsh": "0002006196-24-000003",
+     "film_num": [
+      "24509621"
+     ],
+     "biz_locations": [
+      "Los Angeles, CA",
+      ""
+     ],
+     "file_type": "144",
+     "file_description": null,
+     "inc_states": [
+      "DE",
+      ""
+     ],
+     "items": []
+    }
+   }
+  ]
+ },
+ "aggregations": {
+  "entity_filter": {
+   "doc_count_error_upper_bound": 0,
+   "sum_other_doc_count": 230,
+   "buckets": [
+    {
+     "key": "SentinelOne, Inc.  (S)  (CIK 0001583708)",
+     "doc_count": 14
+    },
+    {
+     "key": "EverCommerce Inc.  (EVCM)  (CIK 0001853145)",
+     "doc_count": 7
+    },
+    {
+     "key": "BICYCLE THERAPEUTICS plc  (BCYC)  (CIK 0001761612)",
+     "doc_count": 6
+    },
+    {
+     "key": "Sun Country Airlines Holdings, Inc.  (SNCY)  (CIK 0001743907)",
+     "doc_count": 6
+    },
+    {
+     "key": "Arqit Quantum Inc.  (ARQQ, ARQQW)  (CIK 0001859690)",
+     "doc_count": 5
+    },
+    {
+     "key": "MongoDB, Inc.  (MDB)  (CIK 0001441816)",
+     "doc_count": 5
+    },
+    {
+     "key": "PUMA BIOTECHNOLOGY, INC.  (PBYI)  (CIK 0001401667)",
+     "doc_count": 5
+    },
+    {
+     "key": "Toast, Inc.  (TOST)  (CIK 0001650164)",
+     "doc_count": 5
+    },
+    {
+     "key": "Dyne Therapeutics, Inc.  (DYN)  (CIK 0001818794)",
+     "doc_count": 4
+    },
+    {
+     "key": "Sight Sciences, Inc.  (SGHT)  (CIK 0001531177)",
+     "doc_count": 4
+    },
+    {
+     "key": "Wayfair Inc.  (W)  (CIK 0001616707)",
+     "doc_count": 4
+    },
+    {
+     "key": "Xometry, Inc.  (XMTR)  (CIK 0001657573)",
+     "doc_count": 4
+    },
+    {
+     "key": "Gaming & Leisure Properties, Inc.  (GLPI)  (CIK 0001575965)",
+     "doc_count": 3
+    },
+    {
+     "key": "Genius Sports Ltd  (GENI)  (CIK 0001834489)",
+     "doc_count": 3
+    },
+    {
+     "key": "Ginkgo Bioworks Holdings, Inc.  (DNA, DNA-WT)  (CIK 0001830214)",
+     "doc_count": 3
+    },
+    {
+     "key": "PROGRESSIVE CORP/OH/  (PGR)  (CIK 0000080661)",
+     "doc_count": 3
+    },
+    {
+     "key": "Zai Lab Ltd  (ZLAB)  (CIK 0001704292)",
+     "doc_count": 3
+    },
+    {
+     "key": "AUDIOCODES LTD  (AUDC)  (CIK 0001086434)",
+     "doc_count": 2
+    },
+    {
+     "key": "Accolade, Inc.  (ACCD)  (CIK 0001481646)",
+     "doc_count": 2
+    },
+    {
+     "key": "Alphabet Inc.  (GOOG, GOOGL)  (CIK 0001652044)",
+     "doc_count": 2
+    },
+    {
+     "key": "Arteris, Inc.  (AIP)  (CIK 0001667011)",
+     "doc_count": 2
+    },
+    {
+     "key": "CRONIN BILL  (CIK 0001259278)",
+     "doc_count": 2
+    },
+    {
+     "key": "Cardlytics, Inc.  (CDLX)  (CIK 0001666071)",
+     "doc_count": 2
+    },
+    {
+     "key": "Honest Company, Inc.  (HNST)  (CIK 0001530979)",
+     "doc_count": 2
+    },
+    {
+     "key": "Huron Consulting Group Inc.  (HURN)  (CIK 0001289848)",
+     "doc_count": 2
+    },
+    {
+     "key": "JABIL INC  (JBL)  (CIK 0000898293)",
+     "doc_count": 2
+    },
+    {
+     "key": "LAM RESEARCH CORP  (LRCX)  (CIK 0000707549)",
+     "doc_count": 2
+    },
+    {
+     "key": "Pech Cedric  (CIK 0001767034)",
+     "doc_count": 2
+    },
+    {
+     "key": "Royalty Pharma plc  (RPRX)  (CIK 0001802768)",
+     "doc_count": 2
+    },
+    {
+     "key": "SYNOPSYS INC  (SNPS)  (CIK 0000883241)",
+     "doc_count": 2
+    }
+   ]
+  },
+  "sic_filter": {
+   "doc_count_error_upper_bound": 0,
+   "sum_other_doc_count": 10,
+   "buckets": [
+    {
+     "key": "7372",
+     "doc_count": 42
+    },
+    {
+     "key": "2834",
+     "doc_count": 27
+    },
+    {
+     "key": "7389",
+     "doc_count": 10
+    },
+    {
+     "key": "2836",
+     "doc_count": 6
+    },
+    {
+     "key": "3841",
+     "doc_count": 6
+    },
+    {
+     "key": "4512",
+     "doc_count": 6
+    },
+    {
+     "key": "5961",
+     "doc_count": 6
+    },
+    {
+     "key": "7370",
+     "doc_count": 6
+    },
+    {
+     "key": "7374",
+     "doc_count": 6
+    },
+    {
+     "key": "3674",
+     "doc_count": 5
+    },
+    {
+     "key": "6331",
+     "doc_count": 4
+    },
+    {
+     "key": "3559",
+     "doc_count": 3
+    },
+    {
+     "key": "3661",
+     "doc_count": 3
+    },
+    {
+     "key": "3672",
+     "doc_count": 3
+    },
+    {
+     "key": "6798",
+     "doc_count": 3
+    },
+    {
+     "key": "7990",
+     "doc_count": 3
+    },
+    {
+     "key": "1311",
+     "doc_count": 2
+    },
+    {
+     "key": "3569",
+     "doc_count": 2
+    },
+    {
+     "key": "3690",
+     "doc_count": 2
+    },
+    {
+     "key": "6199",
+     "doc_count": 2
+    },
+    {
+     "key": "7340",
+     "doc_count": 2
+    },
+    {
+     "key": "8742",
+     "doc_count": 2
+    },
+    {
+     "key": "3440",
+     "doc_count": 1
+    },
+    {
+     "key": "3533",
+     "doc_count": 1
+    },
+    {
+     "key": "3576",
+     "doc_count": 1
+    },
+    {
+     "key": "3585",
+     "doc_count": 1
+    },
+    {
+     "key": "3651",
+     "doc_count": 1
+    },
+    {
+     "key": "3990",
+     "doc_count": 1
+    },
+    {
+     "key": "4700",
+     "doc_count": 1
+    },
+    {
+     "key": "5080",
+     "doc_count": 1
+    }
+   ]
+  },
+  "biz_states_filter": {
+   "doc_count_error_upper_bound": 0,
+   "sum_other_doc_count": 0,
+   "buckets": [
+    {
+     "key": "CA",
+     "doc_count": 57
+    },
+    {
+     "key": "MA",
+     "doc_count": 22
+    },
+    {
+     "key": "NY",
+     "doc_count": 16
+    },
+    {
+     "key": "X0",
+     "doc_count": 15
+    },
+    {
+     "key": "E9",
+     "doc_count": 10
+    },
+    {
+     "key": "CO",
+     "doc_count": 8
+    },
+    {
+     "key": "MN",
+     "doc_count": 6
+    },
+    {
+     "key": "PA",
+     "doc_count": 6
+    },
+    {
+     "key": "L3",
+     "doc_count": 5
+    },
+    {
+     "key": "MD",
+     "doc_count": 5
+    },
+    {
+     "key": "F4",
+     "doc_count": 4
+    },
+    {
+     "key": "TX",
+     "doc_count": 4
+    },
+    {
+     "key": "FL",
+     "doc_count": 3
+    },
+    {
+     "key": "N4",
+     "doc_count": 3
+    },
+    {
+     "key": "OH",
+     "doc_count": 3
+    },
+    {
+     "key": "DC",
+     "doc_count": 2
+    },
+    {
+     "key": "DE",
+     "doc_count": 2
+    },
+    {
+     "key": "GA",
+     "doc_count": 2
+    },
+    {
+     "key": "IL",
+     "doc_count": 2
+    },
+    {
+     "key": "NJ",
+     "doc_count": 2
+    },
+    {
+     "key": "WI",
+     "doc_count": 2
+    },
+    {
+     "key": "A6",
+     "doc_count": 1
+    },
+    {
+     "key": "CT",
+     "doc_count": 1
+    },
+    {
+     "key": "D0",
+     "doc_count": 1
+    },
+    {
+     "key": "D8",
+     "doc_count": 1
+    },
+    {
+     "key": "L2",
+     "doc_count": 1
+    },
+    {
+     "key": "OK",
+     "doc_count": 1
+    },
+    {
+     "key": "OR",
+     "doc_count": 1
+    },
+    {
+     "key": "UT",
+     "doc_count": 1
+    },
+    {
+     "key": "WA",
+     "doc_count": 1
+    }
+   ]
+  },
+  "form_filter": {
+   "doc_count_error_upper_bound": 0,
+   "sum_other_doc_count": 0,
+   "buckets": [
+    {
+     "key": "144",
+     "doc_count": 170
+    }
+   ]
+  }
+ },
+ "query": {
+  "_source": {
+   "exclude": [
+    "doc_text"
+   ]
+  },
+  "query": {
+   "bool": {
+    "must": [],
+    "must_not": [],
+    "should": [],
+    "filter": [
+     {
+      "terms": {
+       "root_forms": [
+        "144"
+       ]
+      }
+     },
+     {
+      "range": {
+       "file_date": {
+        "gte": "2024-01-03",
+        "lte": "2024-01-03"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "from": 0,
+  "size": 100,
+  "aggregations": {
+   "form_filter": {
+    "terms": {
+     "field": "root_forms",
+     "size": 30
+    }
+   },
+   "entity_filter": {
+    "terms": {
+     "field": "display_names.raw",
+     "size": 30
+    }
+   },
+   "sic_filter": {
+    "terms": {
+     "field": "sics",
+     "size": 30
+    }
+   },
+   "biz_states_filter": {
+    "terms": {
+     "field": "biz_states",
+     "size": 30
+    }
+   }
+  }
+ }
+}

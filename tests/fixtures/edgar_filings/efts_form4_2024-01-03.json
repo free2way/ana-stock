@@ -1,0 +1,611 @@
+{
+ "took": 375,
+ "timed_out": false,
+ "_shards": {
+  "total": 50,
+  "successful": 50,
+  "skipped": 0,
+  "failed": 0
+ },
+ "hits": {
+  "total": {
+   "value": 3,
+   "relation": "eq"
+  },
+  "max_score": 0,
+  "hits": [
+   {
+    "_index": "edgar_file",
+    "_id": "0001628280-24-000262:wk-form4_1704320134.xml",
+    "_score": 0,
+    "_source": {
+     "ciks": [
+      "0001932370",
+      "0001836981"
+     ],
+     "period_ending": "2023-12-31",
+     "file_num": [
+      "001-40031"
+     ],
+     "display_names": [
+      "Peffer Julie  (CIK 0001932370)",
+      "BigBear.ai Holdings, Inc.  (BBAI, BBAI-WT)  (CIK 0001836981)"
+     ],
+     "xsl": "xslF345X05",
+     "schema_version": "X0508",
+     "sequence": 1,
+     "root_forms": [
+      "4"
+     ],
+     "file_date": "2024-01-03",
+     "biz_states": [
+      "MD"
+     ],
+     "sics": [
+      "7372"
+     ],
+     "form": "4",
+     "adsh": "0001628280-24-000262",
+     "film_num": [
+      "24508111"
+     ],
+     "biz_locations": [
+      "",
+      "Columbia, MD"
+     ],
+     "file_type": "4",
+     "file_description": "FORM 4",
+     "inc_states": [
+      "",
+      "DE"
+     ],
+     "items": []
+    }
+   },
+   {
+    "_index": "edgar_file",
+    "_id": "0001628280-24-000288:wk-form4_1704323134.xml",
+    "_score": 0,
+    "_source": {
+     "ciks": [
+      "0001599324",
+      "0001576263"
+     ],
+     "period_ending": "2023-12-29",
+     "file_num": [
+      "001-35921"
+     ],
+     "display_names": [
+      "Christensen Jamie  (CIK 0001599324)",
+      "Mirati Therapeutics, Inc.  (CIK 0001576263)"
+     ],
+     "xsl": "xslF345X05",
+     "schema_version": "X0508",
+     "sequence": 1,
+     "root_forms": [
+      "4"
+     ],
+     "file_date": "2024-01-03",
+     "biz_states": [
+      "CA"
+     ],
+     "sics": [
+      "2834"
+     ],
+     "form": "4",
+     "adsh": "0001628280-24-000288",
+     "film_num": [
+      "24508682"
+     ],
+     "biz_locations": [
+      "",
+      "San Diego, CA"
+     ],
+     "file_type": "4",
+     "file_description": "FORM 4",
+     "inc_states": [
+      "",
+      "DE"
+     ],
+     "items": []
+    }
+   },
+   {
+    "_index": "edgar_file",
+    "_id": "0001650164-24-000012:wk-form4_1704320497.xml",
+    "_score": 0,
+    "_source": {
+     "ciks": [
+      "0002004790",
+      "0001650164"
+     ],
+     "period_ending": "2024-01-01",
+     "file_num": [
+      "001-40819"
+     ],
+     "display_names": [
+      "Vassil Jonathan  (CIK 0002004790)",
+      "Toast, Inc.  (TOST)  (CIK 0001650164)"
+     ],
+     "xsl": "xslF345X05",
+     "schema_version": "X0508",
+     "sequence": 1,
+     "root_forms": [
+      "4"
+     ],
+     "file_date": "2024-01-03",
+     "biz_states": [
+      "MA"
+     ],
+     "sics": [
+      "7374"
+     ],
+     "form": "4",
+     "adsh": "0001650164-24-000012",
+     "film_num": [
+      "24508221"
+     ],
+     "biz_locations": [
+      "",
+      "Boston, MA"
+     ],
+     "file_type": "4",
+     "file_description": "FORM 4",
+     "inc_states": [
+      ""
+     ],
+     "items": []
+    }
+   }
+  ]
+ },
+ "aggregations": {
+  "entity_filter": {
+   "doc_count_error_upper_bound": 50,
+   "sum_other_doc_count": 5911,
+   "buckets": [
+    {
+     "key": "FIRST MERCHANTS CORP  (FRME, FRMEP)  (CIK 0000712534)",
+     "doc_count": 27
+    },
+    {
+     "key": "CHOICEONE FINANCIAL SERVICES INC  (COFS)  (CIK 0000803164)",
+     "doc_count": 24
+    },
+    {
+     "key": "Dime Community Bancshares, Inc. /NY/  (DCOM, DCOMG, DCOMP)  (CIK 0000846617)",
+     "doc_count": 24
+    },
+    {
+     "key": "DISH Network CORP  (CIK 0001001082)",
+     "doc_count": 21
+    },
+    {
+     "key": "EXXON MOBIL CORP  (XOM)  (CIK 0000034088)",
+     "doc_count": 21
+    },
+    {
+     "key": "C. H. ROBINSON WORLDWIDE, INC.  (CHRW)  (CIK 0001043277)",
+     "doc_count": 20
+    },
+    {
+     "key": "Capital Bancorp Inc  (CBNK)  (CIK 0001419536)",
+     "doc_count": 19
+    },
+    {
+     "key": "EchoStar CORP  (SATS)  (CIK 0001415404)",
+     "doc_count": 18
+    },
+    {
+     "key": "APA Corp  (APA)  (CIK 0001841666)",
+     "doc_count": 16
+    },
+    {
+     "key": "Hillenbrand, Inc.  (HI)  (CIK 0001417398)",
+     "doc_count": 14
+    },
+    {
+     "key": "COLUMBIA BANKING SYSTEM, INC.  (COLB)  (CIK 0000887343)",
+     "doc_count": 13
+    },
+    {
+     "key": "FLOWERS FOODS INC  (FLO)  (CIK 0001128928)",
+     "doc_count": 13
+    },
+    {
+     "key": "Alight, Inc. / Delaware  (ALIT)  (CIK 0001809104)",
+     "doc_count": 12
+    },
+    {
+     "key": "Bank of Marin Bancorp  (BMRC)  (CIK 0001403475)",
+     "doc_count": 12
+    },
+    {
+     "key": "AMERICAN ELECTRIC POWER CO INC  (AEP)  (CIK 0000004904)",
+     "doc_count": 11
+    },
+    {
+     "key": "AVIENT CORP  (AVNT)  (CIK 0001122976)",
+     "doc_count": 11
+    },
+    {
+     "key": "BlackRock Inc.  (BLK)  (CIK 0001364742)",
+     "doc_count": 11
+    },
+    {
+     "key": "CLOROX CO /DE/  (CLX)  (CIK 0000021076)",
+     "doc_count": 11
+    },
+    {
+     "key": "ECOLAB INC.  (ECL)  (CIK 0000031462)",
+     "doc_count": 11
+    },
+    {
+     "key": "Fortress Biotech, Inc.  (FBIO, FBIOP)  (CIK 0001429260)",
+     "doc_count": 11
+    },
+    {
+     "key": "GENERAL ELECTRIC CO  (GE)  (CIK 0000040545)",
+     "doc_count": 11
+    },
+    {
+     "key": "Archer-Daniels-Midland Co  (ADM)  (CIK 0000007084)",
+     "doc_count": 10
+    },
+    {
+     "key": "BIOLARGO, INC.  (BLGO)  (CIK 0000880242)",
+     "doc_count": 10
+    },
+    {
+     "key": "BRINKS CO  (BCO)  (CIK 0000078890)",
+     "doc_count": 10
+    },
+    {
+     "key": "Bankwell Financial Group, Inc.  (BWFG)  (CIK 0001505732)",
+     "doc_count": 10
+    },
+    {
+     "key": "COMMERCE BANCSHARES INC /MO/  (CBSH)  (CIK 0000022356)",
+     "doc_count": 10
+    },
+    {
+     "key": "CapStar Financial Holdings, Inc.  (CIK 0001676479)",
+     "doc_count": 10
+    },
+    {
+     "key": "Carter Bankshares, Inc.  (CARE)  (CIK 0001829576)",
+     "doc_count": 10
+    },
+    {
+     "key": "Constellation Energy Corp  (CEG)  (CIK 0001868275)",
+     "doc_count": 10
+    },
+    {
+     "key": "FIRST FINANCIAL BANCORP /OH/  (FFBC)  (CIK 0000708955)",
+     "doc_count": 10
+    }
+   ]
+  },
+  "sic_filter": {
+   "doc_count_error_upper_bound": 0,
+   "sum_other_doc_count": 1243,
+   "buckets": [
+    {
+     "key": "6022",
+     "doc_count": 244
+    },
+    {
+     "key": "2834",
+     "doc_count": 206
+    },
+    {
+     "key": "6798",
+     "doc_count": 204
+    },
+    {
+     "key": "7372",
+     "doc_count": 128
+    },
+    {
+     "key": "6021",
+     "doc_count": 127
+    },
+    {
+     "key": "7389",
+     "doc_count": 88
+    },
+    {
+     "key": "6331",
+     "doc_count": 75
+    },
+    {
+     "key": "1311",
+     "doc_count": 65
+    },
+    {
+     "key": "6199",
+     "doc_count": 52
+    },
+    {
+     "key": "4911",
+     "doc_count": 47
+    },
+    {
+     "key": "5812",
+     "doc_count": 44
+    },
+    {
+     "key": "3711",
+     "doc_count": 39
+    },
+    {
+     "key": "4700",
+     "doc_count": 38
+    },
+    {
+     "key": "4899",
+     "doc_count": 37
+    },
+    {
+     "key": "3841",
+     "doc_count": 34
+    },
+    {
+     "key": "4841",
+     "doc_count": 32
+    },
+    {
+     "key": "6324",
+     "doc_count": 31
+    },
+    {
+     "key": "4731",
+     "doc_count": 30
+    },
+    {
+     "key": "6211",
+     "doc_count": 30
+    },
+    {
+     "key": "7370",
+     "doc_count": 30
+    },
+    {
+     "key": "2836",
+     "doc_count": 29
+    },
+    {
+     "key": "7363",
+     "doc_count": 29
+    },
+    {
+     "key": "3670",
+     "doc_count": 26
+    },
+    {
+     "key": "7374",
+     "doc_count": 26
+    },
+    {
+     "key": "3674",
+     "doc_count": 25
+    },
+    {
+     "key": "1389",
+     "doc_count": 24
+    },
+    {
+     "key": "2000",
+     "doc_count": 24
+    },
+    {
+     "key": "6500",
+     "doc_count": 24
+    },
+    {
+     "key": "2911",
+     "doc_count": 23
+    },
+    {
+     "key": "3990",
+     "doc_count": 22
+    }
+   ]
+  },
+  "biz_states_filter": {
+   "doc_count_error_upper_bound": 0,
+   "sum_other_doc_count": 216,
+   "buckets": [
+    {
+     "key": "CA",
+     "doc_count": 431
+    },
+    {
+     "key": "TX",
+     "doc_count": 283
+    },
+    {
+     "key": "NY",
+     "doc_count": 263
+    },
+    {
+     "key": "MA",
+     "doc_count": 164
+    },
+    {
+     "key": "PA",
+     "doc_count": 157
+    },
+    {
+     "key": "IL",
+     "doc_count": 150
+    },
+    {
+     "key": "FL",
+     "doc_count": 147
+    },
+    {
+     "key": "CO",
+     "doc_count": 129
+    },
+    {
+     "key": "OH",
+     "doc_count": 125
+    },
+    {
+     "key": "MD",
+     "doc_count": 100
+    },
+    {
+     "key": "VA",
+     "doc_count": 95
+    },
+    {
+     "key": "MN",
+     "doc_count": 88
+    },
+    {
+     "key": "IN",
+     "doc_count": 76
+    },
+    {
+     "key": "NJ",
+     "doc_count": 74
+    },
+    {
+     "key": "AZ",
+     "doc_count": 69
+    },
+    {
+     "key": "WA",
+     "doc_count": 68
+    },
+    {
+     "key": "CT",
+     "doc_count": 62
+    },
+    {
+     "key": "GA",
+     "doc_count": 57
+    },
+    {
+     "key": "TN",
+     "doc_count": 56
+    },
+    {
+     "key": "MI",
+     "doc_count": 51
+    },
+    {
+     "key": "MO",
+     "doc_count": 49
+    },
+    {
+     "key": "WI",
+     "doc_count": 48
+    },
+    {
+     "key": "KY",
+     "doc_count": 40
+    },
+    {
+     "key": "NC",
+     "doc_count": 29
+    },
+    {
+     "key": "A6",
+     "doc_count": 26
+    },
+    {
+     "key": "ID",
+     "doc_count": 22
+    },
+    {
+     "key": "NV",
+     "doc_count": 22
+    },
+    {
+     "key": "DC",
+     "doc_count": 21
+    },
+    {
+     "key": "UT",
+     "doc_count": 19
+    },
+    {
+     "key": "AL",
+     "doc_count": 18
+    }
+   ]
+  },
+  "form_filter": {
+   "doc_count_error_upper_bound": 0,
+   "sum_other_doc_count": 0,
+   "buckets": [
+    {
+     "key": "4",
+     "doc_count": 3092
+    }
+   ]
+  }
+ },
+ "query": {
+  "_source": {
+   "exclude": [
+    "doc_text"
+   ]
+  },
+  "query": {
+   "bool": {
+    "must": [],
+    "must_not": [],
+    "should": [],
+    "filter": [
+     {
+      "terms": {
+       "root_forms": [
+        "4"
+       ]
+      }
+     },
+     {
+      "range": {
+       "file_date": {
+        "gte": "2024-01-03",
+        "lte": "2024-01-03"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "from": 0,
+  "size": 100,
+  "aggregations": {
+   "form_filter": {
+    "terms": {
+     "field": "root_forms",
+     "size": 30
+    }
+   },
+   "entity_filter": {
+    "terms": {
+     "field": "display_names.raw",
+     "size": 30
+    }
+   },
+   "sic_filter": {
+    "terms": {
+     "field": "sics",
+     "size": 30
+    }
+   },
+   "biz_states_filter": {
+    "terms": {
+     "field": "biz_states",
+     "size": 30
+    }
+   }
+  }
+ }
+}

@@ -1,0 +1,650 @@
+{
+ "took": 480,
+ "timed_out": false,
+ "_shards": {
+  "total": 50,
+  "successful": 50,
+  "skipped": 0,
+  "failed": 0
+ },
+ "hits": {
+  "total": {
+   "value": 4,
+   "relation": "eq"
+  },
+  "max_score": 0,
+  "hits": [
+   {
+    "_index": "edgar_file",
+    "_id": "0000950170-24-000033:lbph-20240102.htm",
+    "_score": 0,
+    "_source": {
+     "ciks": [
+      "0001832168"
+     ],
+     "period_ending": "2024-01-02",
+     "file_num": [
+      "001-40192"
+     ],
+     "display_names": [
+      "Longboard Pharmaceuticals, Inc.  (LBPH)  (CIK 0001832168)"
+     ],
+     "xsl": null,
+     "sequence": 1,
+     "root_forms": [
+      "8-K"
+     ],
+     "file_date": "2024-01-02",
+     "biz_states": [
+      "CA"
+     ],
+     "sics": [
+      "2834"
+     ],
+     "form": "8-K",
+     "adsh": "0000950170-24-000033",
+     "film_num": [
+      "24500644"
+     ],
+     "biz_locations": [
+      "La Jolla, CA"
+     ],
+     "file_type": "8-K",
+     "file_description": "8-K",
+     "inc_states": [],
+     "items": [
+      "7.01",
+      "8.01",
+      "9.01"
+     ]
+    }
+   },
+   {
+    "_index": "edgar_file",
+    "_id": "0001104659-24-000390:tm2333952d5_8k.htm",
+    "_score": 0,
+    "_source": {
+     "ciks": [
+      "0001837412"
+     ],
+     "period_ending": "2024-01-02",
+     "file_num": [
+      "001-40090"
+     ],
+     "display_names": [
+      "SomaLogic, Inc.  (CIK 0001837412)"
+     ],
+     "xsl": null,
+     "sequence": 1,
+     "root_forms": [
+      "8-K"
+     ],
+     "file_date": "2024-01-02",
+     "biz_states": [
+      "CO"
+     ],
+     "sics": [
+      "8731"
+     ],
+     "form": "8-K",
+     "adsh": "0001104659-24-000390",
+     "film_num": [
+      "24503371"
+     ],
+     "biz_locations": [
+      "Boulder, CO"
+     ],
+     "file_type": "8-K",
+     "file_description": "FORM 8-K",
+     "inc_states": [
+      "DE"
+     ],
+     "items": [
+      "7.01",
+      "9.01"
+     ]
+    }
+   },
+   {
+    "_index": "edgar_file",
+    "_id": "0001193125-23-306062:d50731d8k.htm",
+    "_score": 0,
+    "_source": {
+     "ciks": [
+      "0001333835"
+     ],
+     "period_ending": "2023-12-27",
+     "file_num": [
+      "001-38324"
+     ],
+     "display_names": [
+      "Casa Systems Inc  (CIK 0001333835)"
+     ],
+     "xsl": null,
+     "sequence": 1,
+     "root_forms": [
+      "8-K"
+     ],
+     "file_date": "2024-01-02",
+     "biz_states": [
+      "MA"
+     ],
+     "sics": [
+      "3663"
+     ],
+     "form": "8-K",
+     "adsh": "0001193125-23-306062",
+     "film_num": [
+      "231529275"
+     ],
+     "biz_locations": [
+      "Andover, MA"
+     ],
+     "file_type": "8-K",
+     "file_description": "8-K",
+     "inc_states": [
+      "DE"
+     ],
+     "items": [
+      "1.01",
+      "5.02"
+     ]
+    }
+   },
+   {
+    "_index": "edgar_file",
+    "_id": "0001316944-24-000002:fhlbsf-20231227.htm",
+    "_score": 0,
+    "_source": {
+     "ciks": [
+      "0001316944"
+     ],
+     "period_ending": "2023-12-27",
+     "file_num": [
+      "000-51398"
+     ],
+     "display_names": [
+      "Federal Home Loan Bank of San Francisco  (CIK 0001316944)"
+     ],
+     "xsl": null,
+     "sequence": 1,
+     "root_forms": [
+      "8-K"
+     ],
+     "file_date": "2024-01-02",
+     "biz_states": [
+      "CA"
+     ],
+     "sics": [
+      "6111"
+     ],
+     "form": "8-K",
+     "adsh": "0001316944-24-000002",
+     "film_num": [
+      "24501713"
+     ],
+     "biz_locations": [
+      "San Francisco, CA"
+     ],
+     "file_type": "8-K",
+     "file_description": "CURRENT REPORT, ITEM 2.03",
+     "inc_states": [
+      "X1"
+     ],
+     "items": [
+      "2.03"
+     ]
+    }
+   }
+  ]
+ },
+ "aggregations": {
+  "entity_filter": {
+   "doc_count_error_upper_bound": 0,
+   "sum_other_doc_count": 311,
+   "buckets": [
+    {
+     "key": "GRIID Infrastructure Inc.  (GRDI, GRDIW)  (CIK 0001830029)",
+     "doc_count": 16
+    },
+    {
+     "key": "Iron Horse Acquisitions Corp.  (IROH, IROHR, IROHU, IROHW)  (CIK 0001901203)",
+     "doc_count": 13
+    },
+    {
+     "key": "Core Scientific, Inc./tx  (CORZ, CORZR, CORZW, CORZZ)  (CIK 0001839341)",
+     "doc_count": 12
+    },
+    {
+     "key": "EchoStar CORP  (SATS)  (CIK 0001415404)",
+     "doc_count": 11
+    },
+    {
+     "key": "Healthcare Triangle, Inc.  (HCTI)  (CIK 0001839285)",
+     "doc_count": 10
+    },
+    {
+     "key": "DISH Network CORP  (CIK 0001001082)",
+     "doc_count": 9
+    },
+    {
+     "key": "Nukkleus Inc.  (NUKK, NUKKW)  (CIK 0001787518)",
+     "doc_count": 9
+    },
+    {
+     "key": "Bluejay Diagnostics, Inc.  (BJDX)  (CIK 0001704287)",
+     "doc_count": 7
+    },
+    {
+     "key": "CARRIER GLOBAL Corp  (CARR)  (CIK 0001783180)",
+     "doc_count": 7
+    },
+    {
+     "key": "Electronic Servitor Publication Network, Inc.  (XESP)  (CIK 0001709542)",
+     "doc_count": 7
+    },
+    {
+     "key": "Vertex Energy Inc.  (VTNR)  (CIK 0000890447)",
+     "doc_count": 7
+    },
+    {
+     "key": "Israel Acquisitions Corp  (ISRL, ISRLU, ISRLW)  (CIK 0001915328)",
+     "doc_count": 6
+    },
+    {
+     "key": "NORTHRIM BANCORP INC  (NRIM)  (CIK 0001163370)",
+     "doc_count": 6
+    },
+    {
+     "key": "PISMO COAST VILLAGE INC  (CIK 0000216877)",
+     "doc_count": 6
+    },
+    {
+     "key": "Aditxt, Inc.  (ADTX)  (CIK 0001726711)",
+     "doc_count": 5
+    },
+    {
+     "key": "Blue World Acquisition Corp  (CIK 0001878074)",
+     "doc_count": 5
+    },
+    {
+     "key": "CIVITAS RESOURCES, INC.  (CIVI, CIVII, CIVIW)  (CIK 0001509589)",
+     "doc_count": 5
+    },
+    {
+     "key": "FREYR Battery  (CIK 0001844224)",
+     "doc_count": 5
+    },
+    {
+     "key": "Lazard, Inc.  (LAZ)  (CIK 0001311370)",
+     "doc_count": 5
+    },
+    {
+     "key": "Longboard Pharmaceuticals, Inc.  (LBPH)  (CIK 0001832168)",
+     "doc_count": 5
+    },
+    {
+     "key": "Microbot Medical Inc.  (MBOT)  (CIK 0000883975)",
+     "doc_count": 5
+    },
+    {
+     "key": "Pasithea Therapeutics Corp.  (KTTA, KTTAW)  (CIK 0001841330)",
+     "doc_count": 5
+    },
+    {
+     "key": "Trio Petroleum Corp.  (TPET)  (CIK 0001898766)",
+     "doc_count": 5
+    },
+    {
+     "key": "fuboTV Inc. /FL  (FUBO)  (CIK 0001484769)",
+     "doc_count": 5
+    },
+    {
+     "key": "AKUMIN INC.  (CIK 0001776197)",
+     "doc_count": 4
+    },
+    {
+     "key": "MYERS INDUSTRIES INC  (MYE)  (CIK 0000069488)",
+     "doc_count": 4
+    },
+    {
+     "key": "Primo Water Corp /CN/  (PRMW)  (CIK 0000884713)",
+     "doc_count": 4
+    },
+    {
+     "key": "TELLURIAN INC. /DE/  (TELL, TELZ)  (CIK 0000061398)",
+     "doc_count": 4
+    },
+    {
+     "key": "AI Transportation Acquisition Corp  (AITR, AITRR, AITRU)  (CIK 0001966734)",
+     "doc_count": 3
+    },
+    {
+     "key": "ASA Gold & Precious Metals Ltd  (ASA)  (CIK 0001230869)",
+     "doc_count": 3
+    }
+   ]
+  },
+  "sic_filter": {
+   "doc_count_error_upper_bound": 0,
+   "sum_other_doc_count": 127,
+   "buckets": [
+    {
+     "key": "2834",
+     "doc_count": 58
+    },
+    {
+     "key": "6770",
+     "doc_count": 40
+    },
+    {
+     "key": "6199",
+     "doc_count": 24
+    },
+    {
+     "key": "7374",
+     "doc_count": 24
+    },
+    {
+     "key": "1311",
+     "doc_count": 22
+    },
+    {
+     "key": "3841",
+     "doc_count": 18
+    },
+    {
+     "key": "4841",
+     "doc_count": 11
+    },
+    {
+     "key": "4899",
+     "doc_count": 11
+    },
+    {
+     "key": "7373",
+     "doc_count": 11
+    },
+    {
+     "key": "8742",
+     "doc_count": 11
+    },
+    {
+     "key": "2836",
+     "doc_count": 10
+    },
+    {
+     "key": "2911",
+     "doc_count": 10
+    },
+    {
+     "key": "6798",
+     "doc_count": 10
+    },
+    {
+     "key": "4931",
+     "doc_count": 9
+    },
+    {
+     "key": "6111",
+     "doc_count": 9
+    },
+    {
+     "key": "4911",
+     "doc_count": 8
+    },
+    {
+     "key": "6035",
+     "doc_count": 8
+    },
+    {
+     "key": "3585",
+     "doc_count": 7
+    },
+    {
+     "key": "3690",
+     "doc_count": 7
+    },
+    {
+     "key": "6022",
+     "doc_count": 7
+    },
+    {
+     "key": "6282",
+     "doc_count": 7
+    },
+    {
+     "key": "7372",
+     "doc_count": 7
+    },
+    {
+     "key": "6211",
+     "doc_count": 6
+    },
+    {
+     "key": "7000",
+     "doc_count": 6
+    },
+    {
+     "key": "8071",
+     "doc_count": 6
+    },
+    {
+     "key": "3442",
+     "doc_count": 5
+    },
+    {
+     "key": "5812",
+     "doc_count": 5
+    },
+    {
+     "key": "7812",
+     "doc_count": 5
+    },
+    {
+     "key": "0100",
+     "doc_count": 4
+    },
+    {
+     "key": "2086",
+     "doc_count": 4
+    }
+   ]
+  },
+  "biz_states_filter": {
+   "doc_count_error_upper_bound": 0,
+   "sum_other_doc_count": 27,
+   "buckets": [
+    {
+     "key": "CA",
+     "doc_count": 90
+    },
+    {
+     "key": "TX",
+     "doc_count": 56
+    },
+    {
+     "key": "NY",
+     "doc_count": 49
+    },
+    {
+     "key": "FL",
+     "doc_count": 38
+    },
+    {
+     "key": "CO",
+     "doc_count": 35
+    },
+    {
+     "key": "MA",
+     "doc_count": 28
+    },
+    {
+     "key": "OH",
+     "doc_count": 27
+    },
+    {
+     "key": "NJ",
+     "doc_count": 18
+    },
+    {
+     "key": "MN",
+     "doc_count": 13
+    },
+    {
+     "key": "PA",
+     "doc_count": 13
+    },
+    {
+     "key": "CT",
+     "doc_count": 10
+    },
+    {
+     "key": "GA",
+     "doc_count": 10
+    },
+    {
+     "key": "AZ",
+     "doc_count": 9
+    },
+    {
+     "key": "F4",
+     "doc_count": 9
+    },
+    {
+     "key": "IN",
+     "doc_count": 9
+    },
+    {
+     "key": "NV",
+     "doc_count": 7
+    },
+    {
+     "key": "AK",
+     "doc_count": 6
+    },
+    {
+     "key": "E9",
+     "doc_count": 6
+    },
+    {
+     "key": "IL",
+     "doc_count": 6
+    },
+    {
+     "key": "VA",
+     "doc_count": 6
+    },
+    {
+     "key": "D0",
+     "doc_count": 5
+    },
+    {
+     "key": "MD",
+     "doc_count": 5
+    },
+    {
+     "key": "N4",
+     "doc_count": 5
+    },
+    {
+     "key": "X0",
+     "doc_count": 4
+    },
+    {
+     "key": "L2",
+     "doc_count": 3
+    },
+    {
+     "key": "ME",
+     "doc_count": 3
+    },
+    {
+     "key": "NC",
+     "doc_count": 3
+    },
+    {
+     "key": "NE",
+     "doc_count": 3
+    },
+    {
+     "key": "NM",
+     "doc_count": 3
+    },
+    {
+     "key": "SD",
+     "doc_count": 3
+    }
+   ]
+  },
+  "form_filter": {
+   "doc_count_error_upper_bound": 0,
+   "sum_other_doc_count": 0,
+   "buckets": [
+    {
+     "key": "8-K",
+     "doc_count": 509
+    }
+   ]
+  }
+ },
+ "query": {
+  "_source": {
+   "exclude": [
+    "doc_text"
+   ]
+  },
+  "query": {
+   "bool": {
+    "must": [],
+    "must_not": [],
+    "should": [],
+    "filter": [
+     {
+      "terms": {
+       "root_forms": [
+        "8-K"
+       ]
+      }
+     },
+     {
+      "range": {
+       "file_date": {
+        "gte": "2024-01-02",
+        "lte": "2024-01-02"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "from": 0,
+  "size": 100,
+  "aggregations": {
+   "form_filter": {
+    "terms": {
+     "field": "root_forms",
+     "size": 30
+    }
+   },
+   "entity_filter": {
+    "terms": {
+     "field": "display_names.raw",
+     "size": 30
+    }
+   },
+   "sic_filter": {
+    "terms": {
+     "field": "sics",
+     "size": 30
+    }
+   },
+   "biz_states_filter": {
+    "terms": {
+     "field": "biz_states",
+     "size": 30
+    }
+   }
+  }
+ }
+}

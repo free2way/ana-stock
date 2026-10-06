@@ -224,6 +224,20 @@ class Settings(BaseSettings):
     sec_data_endpoint: str = Field(default="https://data.sec.gov")
     sec_company_tickers_endpoint: str = Field(default="https://www.sec.gov/files/company_tickers.json")
     sec_timeout_seconds: float = Field(default=15.0)
+    # Read-only EDGAR daily-filings (US event ledger) source.  SEC allows at
+    # most 10 requests/second across all clients; the default interval is a
+    # deliberately conservative ~5 req/s so a busy day stays well inside it.
+    sec_efts_endpoint: str = Field(default="https://efts.sec.gov/LATEST/search-index")
+    sec_filings_archive_endpoint: str = Field(default="https://www.sec.gov/Archives/edgar/data")
+    sec_min_request_interval_seconds: float = Field(default=0.2)
+    # Hard cap on EFTS result pages per (date, form) query; 1 page = 100 hits.
+    # EDGAR only serves a 10,000-hit window (~100 pages), so this doubles as a
+    # runaway guard and as the window ceiling for a single form on one day.
+    sec_filings_max_pages: int = Field(default=100)
+    # EDGAR's full-text search occasionally answers HTTP 5xx under sustained
+    # pagination; retry those (and 429) a few times before failing closed.
+    sec_filings_max_retries: int = Field(default=3)
+    sec_filings_retry_backoff_seconds: float = Field(default=0.75)
     a_stock_data_max_symbols: int = Field(default=50)
     us_trade_universe_min_price: float = Field(default=3.0)
     us_trade_universe_min_avg_dollar_volume: float = Field(default=2_000_000.0)
