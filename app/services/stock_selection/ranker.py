@@ -10,7 +10,13 @@ from typing import Iterable, Mapping
 
 from lightgbm import LGBMRanker
 
-from app.services.stock_selection.factor_pipeline import FactorScore, _percentile_ranks
+from app.services.stock_selection.factor_pipeline import (
+    FactorScore,
+    MissingFactorPolicy,
+    _percentile_ranks,
+    model_feature_row,
+    resolve_model_missing_policy,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +99,9 @@ class CrossSectionalRankerModel:
     estimator: LGBMRanker
     audit: RankerTrainingAudit
     model_version: str
+    # Explicit record of the cross-sectional missing contract the matrix was fit
+    # under; defaults to the legacy neutral-zero contract for direct constructors.
+    missing_policy: str = MissingFactorPolicy.NEUTRAL_ZERO.value
 
     def predict(self, scores: Iterable[FactorScore]) -> tuple[RankerPrediction, ...]:
         rows = list(scores)
@@ -103,6 +112,10 @@ class CrossSectionalRankerModel:
             )
         if not rows:
             return ()
+        if resolve_model_missing_policy(rows) != MissingFactorPolicy(self.missing_policy):
+            raise ValueError(
+                "prediction scores do not share the model's fitted missing-factor policy"
+            )
         _require_unique_sample_ids(rows)
         grouped: dict[date, list[FactorScore]] = defaultdict(list)
         for item in rows:
@@ -130,17 +143,9 @@ class CrossSectionalRankerModel:
 
 
 def _feature_row(score: FactorScore, feature_names: tuple[str, ...]) -> list[float]:
-    row: list[float] = []
-    for name in feature_names:
-        raw_value = score.factor_values.get(name, 0.0)
-        try:
-            value = float(raw_value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"factor {name!r} is not numeric for {score.sample_id}") from exc
-        if not math.isfinite(value):
-            raise ValueError(f"factor {name!r} is not finite for {score.sample_id}")
-        row.append(value)
-    return row
+    # ``EXCLUDE`` panels carry NaN for genuinely unknown cells (LightGBM splits
+    # on them natively); the legacy ``NEUTRAL_ZERO`` panel still zero-fills.
+    return model_feature_row(score, feature_names)
 
 
 def _require_unique_sample_ids(scores: list[FactorScore]) -> None:
@@ -236,6 +241,7 @@ def fit_cross_sectional_ranker(
     if not training_rows:
         raise ValueError("ranker training has no usable date groups")
 
+    missing_policy = resolve_model_missing_policy(training_rows)
     matrix = [_feature_row(item, config.feature_names) for item in training_rows]
     training_weights = [all_sample_weights[item.sample_id] for item in training_rows]
     estimator = LGBMRanker(
@@ -265,18 +271,23 @@ def fit_cross_sectional_ranker(
         sample_weight=training_weights,
     )
     booster = estimator.booster_
+    version_payload_fields: dict[str, object] = {
+        "config": asdict(config),
+        "sampling_config_version": sampling_config_version,
+        "sample_weights": [
+            [item.sample_id, weight]
+            for item, weight in sorted(
+                zip(training_rows, training_weights, strict=True),
+                key=lambda value: value[0].sample_id,
+            )
+        ],
+    }
+    if missing_policy != MissingFactorPolicy.NEUTRAL_ZERO:
+        # Only the EXCLUDE contract changes the matrix; the legacy digest is kept
+        # byte-identical so unchanged price/P1 panels are not re-versioned.
+        version_payload_fields["missing_policy"] = missing_policy.value
     version_payload = json.dumps(
-        {
-            "config": asdict(config),
-            "sampling_config_version": sampling_config_version,
-            "sample_weights": [
-                [item.sample_id, weight]
-                for item, weight in sorted(
-                    zip(training_rows, training_weights, strict=True),
-                    key=lambda value: value[0].sample_id,
-                )
-            ],
-        },
+        version_payload_fields,
         sort_keys=True,
         separators=(",", ":"),
     ) + booster.model_to_string()
@@ -307,4 +318,5 @@ def fit_cross_sectional_ranker(
         estimator=estimator,
         audit=audit,
         model_version=f"lightgbm_lambdarank_v1:{config.horizon_days}d:{model_digest}",
+        missing_policy=missing_policy.value,
     )

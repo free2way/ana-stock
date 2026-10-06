@@ -10,7 +10,13 @@ from typing import Iterable, Mapping
 
 from lightgbm import LGBMClassifier
 
-from app.services.stock_selection.factor_pipeline import FactorScore, _percentile_ranks
+from app.services.stock_selection.factor_pipeline import (
+    FactorScore,
+    MissingFactorPolicy,
+    _percentile_ranks,
+    model_feature_row,
+    resolve_model_missing_policy,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +81,9 @@ class TopTailClassifierModel:
     estimator: LGBMClassifier
     audit: TopTailTrainingAudit
     model_version: str
+    # Explicit record of the cross-sectional missing contract the matrix was fit
+    # under; defaults to the legacy neutral-zero contract for direct constructors.
+    missing_policy: str = MissingFactorPolicy.NEUTRAL_ZERO.value
 
     def predict(self, scores: Iterable[FactorScore]) -> tuple[TopTailPrediction, ...]:
         rows = list(scores)
@@ -82,6 +91,10 @@ class TopTailClassifierModel:
             raise ValueError("prediction scores must match top-tail model horizon")
         if not rows:
             return ()
+        if resolve_model_missing_policy(rows) != MissingFactorPolicy(self.missing_policy):
+            raise ValueError(
+                "prediction scores do not share the model's fitted missing-factor policy"
+            )
         _require_unique_sample_ids(rows)
         grouped: dict[date, list[FactorScore]] = defaultdict(list)
         for item in rows:
@@ -108,16 +121,9 @@ class TopTailClassifierModel:
 
 
 def _feature_row(score: FactorScore, feature_names: tuple[str, ...]) -> list[float]:
-    row: list[float] = []
-    for name in feature_names:
-        try:
-            value = float(score.factor_values.get(name, 0.0))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"factor {name!r} is not numeric for {score.sample_id}") from exc
-        if not math.isfinite(value):
-            raise ValueError(f"factor {name!r} is not finite for {score.sample_id}")
-        row.append(value)
-    return row
+    # ``EXCLUDE`` panels carry NaN for genuinely unknown cells (LightGBM splits
+    # on them natively); the legacy ``NEUTRAL_ZERO`` panel still zero-fills.
+    return model_feature_row(score, feature_names)
 
 
 def _require_unique_sample_ids(scores: list[FactorScore]) -> None:
@@ -199,6 +205,7 @@ def fit_top_tail_classifier(
     positive_label_count = sum(targets)
     if not training_rows or positive_label_count == 0:
         raise ValueError("top-tail training has no positive head labels")
+    missing_policy = resolve_model_missing_policy(training_rows)
     matrix = [_feature_row(item, config.feature_names) for item in training_rows]
     estimator = LGBMClassifier(
         objective="binary",
@@ -224,7 +231,16 @@ def fit_top_tail_classifier(
         feature_name=list(config.feature_names),
     )
     booster = estimator.booster_
-    version_payload = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
+    if missing_policy == MissingFactorPolicy.NEUTRAL_ZERO:
+        # Byte-identical to the pre-EXCLUDE payload so unchanged price/P1 panels
+        # are not re-versioned.
+        version_payload = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
+    else:
+        version_payload = json.dumps(
+            {"config": asdict(config), "missing_policy": missing_policy.value},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     version_payload += booster.model_to_string()
     model_digest = hashlib.sha256(version_payload.encode("utf-8")).hexdigest()[:16]
     importance = booster.feature_importance(importance_type="gain")
@@ -246,4 +262,5 @@ def fit_top_tail_classifier(
         estimator=estimator,
         audit=audit,
         model_version=f"lightgbm_top_tail_v1:{config.horizon_days}d:{model_digest}",
+        missing_policy=missing_policy.value,
     )

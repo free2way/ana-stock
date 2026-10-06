@@ -32,6 +32,69 @@ class MissingFactorPolicy(StrEnum):
     EXCLUDE = "exclude"
 
 
+def resolve_model_missing_policy(scores: Iterable[FactorScore]) -> MissingFactorPolicy:
+    """Resolve the single model-matrix missing policy carried by a score panel.
+
+    A model matrix is built once from a panel that was produced by exactly one
+    pipeline, so every score must record the same missing-factor policy. Mixing
+    policies (for example concatenating an ``EXCLUDE`` sentiment panel with a
+    legacy ``NEUTRAL_ZERO`` price panel) would silently apply the wrong contract
+    to half the matrix, so it fails closed here.
+    """
+
+    rows = tuple(scores)
+    policies = {str(item.missing_policy) for item in rows}
+    if len(policies) != 1:
+        raise ValueError(
+            "model matrix requires a single missing-factor policy; got: "
+            + ", ".join(sorted(policies) or ["<empty>"])
+        )
+    try:
+        return MissingFactorPolicy(next(iter(policies)))
+    except ValueError as exc:
+        raise ValueError(
+            f"unsupported missing-factor policy in model panel: {next(iter(policies))!r}"
+        ) from exc
+
+
+def model_feature_row(
+    score: FactorScore,
+    feature_names: Iterable[str],
+) -> list[float]:
+    """Build one model feature row that honours the sample's missing policy.
+
+    A present cell must be finite and is copied unchanged. An absent cell is the
+    neutral ``0.0`` under the legacy ``NEUTRAL_ZERO`` contract, but under
+    ``EXCLUDE`` it becomes ``NaN`` so a tree learner (LightGBM) can route it
+    through its native missing-value split instead of reading a fabricated zero.
+    Linear models pair this row with an explicit missing-indicator column.
+    """
+
+    missing_value = (
+        math.nan
+        if MissingFactorPolicy(score.missing_policy) == MissingFactorPolicy.EXCLUDE
+        else 0.0
+    )
+    row: list[float] = []
+    for name in feature_names:
+        if name in score.factor_values:
+            raw_value = score.factor_values[name]
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"factor {name!r} is not numeric for {score.sample_id}"
+                ) from exc
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"factor {name!r} is not finite for {score.sample_id}"
+                )
+        else:
+            value = missing_value
+        row.append(value)
+    return row
+
+
 @dataclass(frozen=True, slots=True)
 class FactorSpec:
     name: str

@@ -37,6 +37,7 @@ from app.services.stock_selection.sample_builder import (
     SampleBuildResult,
     build_training_samples,
 )
+from app.services.stock_selection.schemas import LabeledSample
 from app.services.stock_selection.universe import (
     SecurityMetadata,
     UniverseBuildResult,
@@ -117,9 +118,88 @@ class ProductionResearchDataset:
     def sentiment_metadata(self) -> Mapping[str, object]:
         """Recorded sentiment coverage/cutoff metadata (empty when disabled)."""
 
-        if self.sentiment_feature_result is None:
-            return {}
-        return dict(self.sentiment_feature_result.metadata())
+        metadata: dict[str, object] = {}
+        if self.sentiment_feature_result is not None:
+            metadata.update(self.sentiment_feature_result.metadata())
+        # Coverage-filter statistics are written into the sample label contract
+        # when a panel is restricted to the sentiment window at the model
+        # assembly step; surface them alongside the join metadata.
+        metadata.update(
+            {
+                key: value
+                for key, value in self.sample_result.label_contract.items()
+                if str(key).startswith("sentiment_")
+            }
+        )
+        return metadata
+
+
+SENTIMENT_COVERAGE_FILTER_SCHEMA = "stock_selection_sentiment_coverage_filter_v1"
+
+
+@dataclass(frozen=True, slots=True)
+class SentimentCoverageFilterResult:
+    """Audit of restricting a model panel to the sentiment coverage window."""
+
+    coverage_start: date | None
+    coverage_end: date | None
+    input_sample_count: int
+    retained_sample_count: int
+    filtered_sample_count: int
+
+    def __post_init__(self) -> None:
+        if self.retained_sample_count + self.filtered_sample_count != self.input_sample_count:
+            raise ValueError("sentiment coverage filter counts do not sum to the input count")
+        if self.retained_sample_count < 0 or self.filtered_sample_count < 0:
+            raise ValueError("sentiment coverage filter counts must not be negative")
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            "sentiment_coverage_filter_schema": SENTIMENT_COVERAGE_FILTER_SCHEMA,
+            "sentiment_coverage_filter_applied": True,
+            "sentiment_coverage_start": (
+                self.coverage_start.isoformat() if self.coverage_start else None
+            ),
+            "sentiment_coverage_end": (
+                self.coverage_end.isoformat() if self.coverage_end else None
+            ),
+            "sentiment_input_sample_count": self.input_sample_count,
+            "sentiment_retained_sample_count": self.retained_sample_count,
+            "sentiment_filtered_sample_count": self.filtered_sample_count,
+        }
+
+
+def filter_samples_to_sentiment_coverage(
+    samples: Iterable[LabeledSample],
+    sentiment_result: SentimentResearchJoinResult | None,
+) -> tuple[tuple[LabeledSample, ...], SentimentCoverageFilterResult | None]:
+    """Restrict a model panel to the recorded sentiment coverage window.
+
+    Every out-of-coverage row carries ``None`` for all sentiment columns, so it
+    would enter the model matrix as an all-unknown row.  Dropping those rows
+    (rather than feeding them to the model as fabricated values) is the panel
+    hard filter for the forward-only ``sentiment_v1`` family.  A dataset without
+    a sentiment join is returned untouched, so price/P1 panels are unchanged.
+    """
+
+    rows = tuple(samples)
+    if sentiment_result is None:
+        return rows, None
+    if sentiment_result.coverage_start is None or sentiment_result.coverage_end is None:
+        raise ValueError(
+            "sentiment coverage window is empty; cannot assemble a sentiment model panel"
+        )
+    start = sentiment_result.coverage_start
+    end = sentiment_result.coverage_end
+    retained = tuple(item for item in rows if start <= item.feature_date <= end)
+    result = SentimentCoverageFilterResult(
+        coverage_start=start,
+        coverage_end=end,
+        input_sample_count=len(rows),
+        retained_sample_count=len(retained),
+        filtered_sample_count=len(rows) - len(retained),
+    )
+    return retained, result
 
 
 def default_price_factor_specs() -> tuple[FactorSpec, ...]:

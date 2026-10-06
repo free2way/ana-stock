@@ -44,6 +44,7 @@ from app.services.stock_selection.production_data import (
     ProductionResearchDataset,
     build_production_research_dataset,
     default_price_factor_specs,
+    filter_samples_to_sentiment_coverage,
 )
 from app.services.stock_selection.p1_factors import (
     P1PriceVolumeFeatureConfig,
@@ -524,6 +525,27 @@ def run_production_research_challenger(
             **dataset.sample_result.label_contract, "execution_evidence_artifact": reference,
             "execution_evidence_artifact_root": "execution_evidence",
         }))
+    if factor_set.key == SENTIMENT_FACTOR_SET_KEY:
+        # The forward-only sentiment family can only be modelled inside its
+        # observed coverage window; out-of-coverage rows are all-unknown and
+        # would otherwise reach the model matrix. Drop them here and record the
+        # count so the evidence reports how much of the panel was removed.
+        retained_samples, coverage_filter = filter_samples_to_sentiment_coverage(
+            dataset.sample_result.samples,
+            dataset.sentiment_feature_result,
+        )
+        if coverage_filter is not None:
+            dataset = replace(
+                dataset,
+                sample_result=replace(
+                    dataset.sample_result,
+                    samples=retained_samples,
+                    label_contract={
+                        **dataset.sample_result.label_contract,
+                        **coverage_filter.metadata(),
+                    },
+                ),
+            )
     universe_artifact = persist_universe_artifact(dataset.universe_result, root=root / "universes")
     sample_artifact = persist_sample_artifact(dataset.sample_result, root=root / "datasets")
     factor_pipeline = factor_pipeline_for_factor_set(factor_set)

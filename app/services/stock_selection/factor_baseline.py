@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import statistics
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
@@ -10,7 +11,11 @@ from typing import Iterable, Mapping
 
 from sklearn.linear_model import Ridge
 
-from app.services.stock_selection.factor_pipeline import FactorScore
+from app.services.stock_selection.factor_pipeline import (
+    FactorScore,
+    MissingFactorPolicy,
+    resolve_model_missing_policy,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +27,81 @@ class BaselinePrediction:
     raw_score: float
     cross_sectional_rank: float
     model_version: str
+
+
+MISSING_INDICATOR_SUFFIX = "__missing"
+
+
+def _finite_or_nan(raw_value: object) -> float:
+    """Coerce a factor cell to a float, mapping unknown/non-finite to ``NaN``."""
+
+    if raw_value is None:
+        return math.nan
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return math.nan
+    return value if math.isfinite(value) else math.nan
+
+
+def _legacy_feature_row(score: FactorScore, factor_names: tuple[str, ...]) -> list[float]:
+    """Legacy ``NEUTRAL_ZERO`` row: an absent cell enters as ``0.0``."""
+
+    return [float(score.factor_values.get(name, 0.0)) for name in factor_names]
+
+
+def _training_medians(
+    rows: list[FactorScore], factor_names: tuple[str, ...]
+) -> tuple[float, ...]:
+    """Training-window median per factor, computed only from present cells.
+
+    The median is fit on the training rows handed to ``fit_ridge_factor_baseline``
+    (already purged/point-in-time safe) and stored on the model, so scoring uses
+    the training-window statistic rather than any inference-time value.
+    """
+
+    medians: list[float] = []
+    for name in factor_names:
+        present = [
+            value
+            for value in (
+                _finite_or_nan(item.factor_values.get(name)) for item in rows
+            )
+            if math.isfinite(value)
+        ]
+        medians.append(float(statistics.median(present)) if present else 0.0)
+    return tuple(medians)
+
+
+def _exclude_feature_row(
+    score: FactorScore,
+    factor_names: tuple[str, ...],
+    medians: tuple[float, ...],
+) -> list[float]:
+    """``EXCLUDE`` design row: median-impute unknown cells + explicit indicators.
+
+    An unknown cell never becomes a fabricated cross-sectional ``0.0``; it is
+    replaced by the training-window median and flagged with a trailing ``1.0``
+    indicator, so the linear model can separate "unknown" from "real zero".
+    """
+
+    row: list[float] = []
+    indicators: list[float] = []
+    for index, name in enumerate(factor_names):
+        value = _finite_or_nan(score.factor_values.get(name))
+        if math.isfinite(value):
+            row.append(value)
+            indicators.append(0.0)
+        else:
+            row.append(medians[index] if index < len(medians) else 0.0)
+            indicators.append(1.0)
+    return row + indicators
+
+
+def indicator_feature_names(factor_names: tuple[str, ...]) -> tuple[str, ...]:
+    """Names of the trailing missing-indicator columns for an ``EXCLUDE`` model."""
+
+    return tuple(f"{name}{MISSING_INDICATOR_SUFFIX}" for name in factor_names)
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,16 +116,33 @@ class RidgeFactorModel:
     training_effective_sample_count: float
     sampling_config_version: str
     model_version: str
+    # Explicit record of the cross-sectional missing contract the design matrix
+    # was fit under; defaults to the legacy neutral-zero contract.
+    missing_policy: str = MissingFactorPolicy.NEUTRAL_ZERO.value
+    # Training-window medians used to impute unknown cells under ``EXCLUDE``;
+    # empty for the legacy ``NEUTRAL_ZERO`` contract.
+    feature_medians: tuple[float, ...] = ()
 
     def predict(self, scores: Iterable[FactorScore]) -> tuple[BaselinePrediction, ...]:
         rows = list(scores)
         if any(item.horizon_days != self.horizon_days for item in rows):
             raise ValueError("prediction scores must match model horizon")
+        if not rows:
+            return ()
+        policy = MissingFactorPolicy(self.missing_policy)
+        if resolve_model_missing_policy(rows) != policy:
+            raise ValueError(
+                "prediction scores do not share the model's fitted missing-factor policy"
+            )
         grouped: dict[date, list[tuple[FactorScore, float]]] = defaultdict(list)
         for item in rows:
+            if policy == MissingFactorPolicy.EXCLUDE:
+                features = _exclude_feature_row(item, self.factor_names, self.feature_medians)
+            else:
+                features = _legacy_feature_row(item, self.factor_names)
             raw_score = self.intercept + sum(
-                coefficient * float(item.factor_values.get(name, 0.0))
-                for name, coefficient in zip(self.factor_names, self.coefficients, strict=True)
+                coefficient * value
+                for coefficient, value in zip(self.coefficients, features, strict=True)
             )
             grouped[item.feature_date].append((item, raw_score))
         predictions: list[BaselinePrediction] = []
@@ -156,10 +253,17 @@ def fit_ridge_factor_baseline(
             + ", ".join(unavailable[:5])
         )
     target_by_id = _rank_targets(rows)
-    x_train = [
-        [float(item.factor_values.get(name, 0.0)) for name in factor_names]
-        for item in rows
-    ]
+    missing_policy = resolve_model_missing_policy(rows)
+    if missing_policy == MissingFactorPolicy.EXCLUDE:
+        # Unknown cells are median-imputed from the training window and flagged
+        # with an explicit missing-indicator column; sample count is unchanged.
+        feature_medians = _training_medians(rows, factor_names)
+        x_train = [
+            _exclude_feature_row(item, factor_names, feature_medians) for item in rows
+        ]
+    else:
+        feature_medians = ()
+        x_train = [_legacy_feature_row(item, factor_names) for item in rows]
     y_train = [target_by_id[item.sample_id] for item in rows]
     if sample_weight_by_id is None:
         sample_weights = [1.0] * len(rows)
@@ -175,7 +279,7 @@ def fit_ridge_factor_baseline(
     coefficients = tuple(float(value) for value in estimator.coef_)
     intercept = float(estimator.intercept_)
     training_end_date = max(item.feature_date for item in rows)
-    version_payload = {
+    version_payload: dict[str, object] = {
         "family": "factor_ridge_v1",
         "factor_names": factor_names,
         "coefficients": coefficients,
@@ -192,6 +296,11 @@ def fit_ridge_factor_baseline(
             )
         ],
     }
+    if missing_policy != MissingFactorPolicy.NEUTRAL_ZERO:
+        # Only the EXCLUDE contract changes the design matrix; the legacy digest
+        # is kept byte-identical so unchanged price/P1 panels are not re-versioned.
+        version_payload["missing_policy"] = missing_policy.value
+        version_payload["feature_medians"] = list(feature_medians)
     digest = hashlib.sha256(
         json.dumps(version_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:16]
@@ -208,4 +317,6 @@ def fit_ridge_factor_baseline(
         ),
         sampling_config_version=sampling_config_version,
         model_version=f"factor_ridge_v1:{horizon_days}d:{digest}",
+        missing_policy=missing_policy.value,
+        feature_medians=feature_medians,
     )
