@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from unittest import TestCase
 
+from app.services.providers.fundamental import GlobalStockDataSECFundamentalProvider
+from app.services.stock_selection.feature_availability import adapt_fundamental_snapshots
 from app.services.trainer import SignalTrainer, group_point_in_time_fundamental_history
 
 
@@ -102,3 +104,65 @@ class FundamentalAvailabilityTests(TestCase):
         cursor, active = trainer._advance_fundamental_cursor(history=history, cursor=0, trade_date="2026-09-01")
         self.assertEqual(2, cursor)
         self.assertAlmostEqual(2.0, active["roe_avg_3y"])
+
+    def test_sec_filing_date_bounds_training_sample_availability(self) -> None:
+        facts = {
+            "facts": {
+                "us-gaap": {
+                    "Revenues": {"units": {"USD": [
+                        {"form": "10-K", "fp": "FY", "end": "2025-12-31", "filed": "2026-02-01", "val": 120},
+                        {"form": "10-K", "fp": "FY", "end": "2024-12-31", "filed": "2025-02-01", "val": 100},
+                    ]}},
+                    "NetIncomeLoss": {"units": {"USD": [
+                        {"form": "10-K", "fp": "FY", "end": "2025-12-31", "filed": "2026-02-01", "val": 24},
+                        {"form": "10-K", "fp": "FY", "end": "2024-12-31", "filed": "2025-02-01", "val": 20},
+                    ]}},
+                    "Assets": {"units": {"USD": [{"form": "10-K", "fp": "FY", "end": "2025-12-31", "filed": "2026-02-01", "val": 200}]}},
+                    "Liabilities": {"units": {"USD": [{"form": "10-K", "fp": "FY", "end": "2025-12-31", "filed": "2026-02-01", "val": 80}]}},
+                }
+            }
+        }
+        snapshot = GlobalStockDataSECFundamentalProvider.__new__(GlobalStockDataSECFundamentalProvider)._facts_to_snapshot(
+            ticker="ACME", cik=7, company_name="Acme Inc.", facts=facts
+        )
+        adapted = adapt_fundamental_snapshots(
+            (
+                {
+                    **snapshot,
+                    "source": "global_stock_data_sec_edgar",
+                    "created_at": "2026-06-01T00:00:00+00:00",
+                    "updated_at": "2026-06-01T00:00:00+00:00",
+                },
+            ),
+            market="US",
+        )
+        history = group_point_in_time_fundamental_history(
+            [
+                {
+                    "ticker": record.ticker,
+                    "feature_name": record.feature_name,
+                    "feature_value": record.value,
+                    "available_time": record.available_time.isoformat(),
+                    "ingested_time": record.ingested_time.isoformat(),
+                    "source": record.source,
+                    "payload_json": json.dumps({"report_date": snapshot["report_date"]}),
+                }
+                for record in adapted.records
+            ]
+        )["ACME"]
+        trainer = SignalTrainer()
+
+        # Decision before the filing date: the report is not usable yet.
+        cursor, active = trainer._advance_fundamental_cursor(
+            history=history, cursor=0, trade_date="2026-01-31"
+        )
+        self.assertEqual(0, cursor)
+        self.assertIsNone(active)
+
+        # On the filing date the report becomes usable.
+        cursor, active = trainer._advance_fundamental_cursor(
+            history=history, cursor=0, trade_date="2026-02-01"
+        )
+        self.assertEqual(1, cursor)
+        self.assertAlmostEqual(20.0, active["revenue_yoy"])
+

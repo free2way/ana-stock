@@ -20,6 +20,11 @@ class GlobalFundamentalRow:
     market: str
     report_date: str
     source: str = "openbb_fundamentals"
+    # Provider-supplied point-in-time availability for this snapshot.  SEC
+    # EDGAR fills these from the filing date; providers without a publication
+    # timestamp leave them empty so the adapter falls back to ingestion time.
+    available_time: str | None = None
+    feature_times: dict | None = None
     name: str | None = None
     exchange: str | None = None
     listing_date: str | None = None
@@ -86,6 +91,8 @@ def sync_global_fundamentals(tickers: list[str] | None = None, *, provider_name:
                 market=_infer_market(ticker),
                 report_date=snapshot["report_date"],
                 source=getattr(provider, "last_source_used", "openbb_fundamentals") or "openbb_fundamentals",
+                available_time=snapshot.get("available_time"),
+                feature_times=snapshot.get("feature_times"),
                 name=snapshot.get("name"),
                 exchange=snapshot.get("exchange"),
                 listing_date=snapshot.get("listing_date"),

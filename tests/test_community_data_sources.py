@@ -4,6 +4,7 @@ from datetime import date, datetime
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from app.services.openbb_client import HistoricalPriceRequest
 from app.services.providers.fundamental import (
@@ -236,3 +237,56 @@ class CommunityDataSourceTests(unittest.TestCase):
         self.assertAlmostEqual(20.0, snapshot["net_profit_yoy"])
         self.assertEqual(40.0, snapshot["debt_to_assets"])
         self.assertEqual("0000000123", snapshot["raw_data"]["cik"])
+
+    def test_sec_company_facts_exposes_filing_date_as_feature_availability(self):
+        facts = {
+            "facts": {
+                "us-gaap": {
+                    "Revenues": {"units": {"USD": [
+                        {"form": "10-K", "fp": "FY", "end": "2025-12-31", "filed": "2026-02-01", "val": 120},
+                        {"form": "10-K", "fp": "FY", "end": "2024-12-31", "filed": "2025-02-01", "val": 100},
+                    ]}},
+                    "NetIncomeLoss": {"units": {"USD": [
+                        {"form": "10-K", "fp": "FY", "end": "2025-12-31", "filed": "2026-02-01", "val": 24},
+                        {"form": "10-K", "fp": "FY", "end": "2024-12-31", "filed": "2025-02-01", "val": 20},
+                    ]}},
+                    "Assets": {"units": {"USD": [{"form": "10-K", "fp": "FY", "end": "2025-12-31", "filed": "2026-02-01", "val": 200}]}},
+                    "Liabilities": {"units": {"USD": [{"form": "10-K", "fp": "FY", "end": "2025-12-31", "filed": "2026-02-01", "val": 80}]}},
+                }
+            }
+        }
+        snapshot = GlobalStockDataSECFundamentalProvider.__new__(GlobalStockDataSECFundamentalProvider)._facts_to_snapshot(
+            ticker="ACME", cik=123, company_name="Acme Inc.", facts=facts
+        )
+        # EDGAR ``filed`` is a U.S. Eastern calendar date; availability is the
+        # *end* of that day so a filing is never consumable before it exists.
+        expected = datetime(2026, 2, 1, 23, 59, 59, 999999, tzinfo=ZoneInfo("America/New_York"))
+        self.assertEqual(expected.isoformat(), snapshot["available_time"])
+        self.assertEqual(
+            {"net_profit_yoy", "revenue_yoy", "debt_to_assets"},
+            set(snapshot["feature_times"]),
+        )
+        for timing in snapshot["feature_times"].values():
+            self.assertEqual(expected.isoformat(), timing["available_time"])
+            self.assertEqual("2025-12-31T00:00:00-05:00", timing["event_time"])
+
+    def test_sec_company_facts_without_filed_defers_to_sync_time(self):
+        facts = {
+            "facts": {
+                "us-gaap": {
+                    "Revenues": {"units": {"USD": [
+                        {"form": "10-K", "fp": "FY", "end": "2025-12-31", "val": 120},
+                        {"form": "10-K", "fp": "FY", "end": "2024-12-31", "val": 100},
+                    ]}},
+                    "Assets": {"units": {"USD": [{"form": "10-K", "fp": "FY", "end": "2025-12-31", "val": 200}]}},
+                }
+            }
+        }
+        snapshot = GlobalStockDataSECFundamentalProvider.__new__(GlobalStockDataSECFundamentalProvider)._facts_to_snapshot(
+            ticker="ACME", cik=123, company_name="Acme Inc.", facts=facts
+        )
+        # No filing date: leave availability unset so the adapter keeps the
+        # previous behaviour of falling back to the local ingestion time.
+        self.assertIsNone(snapshot["available_time"])
+        self.assertEqual({}, snapshot["feature_times"])
+

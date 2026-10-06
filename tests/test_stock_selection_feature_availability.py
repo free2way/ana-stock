@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 import json
+from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from zoneinfo import ZoneInfo
 
+from app.services.global_fundamentals import GlobalFundamentalRow
+from app.services.providers.fundamental import GlobalStockDataSECFundamentalProvider
 from app.services.stock_selection.feature_availability import (
     FeatureAvailabilityConfig,
     PointInTimeFeatureRecord,
@@ -16,6 +20,33 @@ from app.services.stock_selection.feature_availability import (
     select_feature_records_as_of,
 )
 from app.services.repository import PointInTimeFeatureSnapshotRepository
+
+
+def _sec_company_facts(*, filed: str | None) -> dict:
+    """Minimal two-year EDGAR companyfacts payload for the SEC provider."""
+
+    def annual(end: str, value: float, item_filed: str | None) -> dict:
+        item: dict = {"form": "10-K", "fp": "FY", "end": end, "val": value}
+        if item_filed is not None:
+            item["filed"] = item_filed
+        return item
+
+    return {
+        "facts": {
+            "us-gaap": {
+                "Revenues": {"units": {"USD": [
+                    annual("2025-12-31", 120, filed),
+                    annual("2024-12-31", 100, filed or "2025-02-01"),
+                ]}},
+                "NetIncomeLoss": {"units": {"USD": [
+                    annual("2025-12-31", 24, filed),
+                    annual("2024-12-31", 20, filed or "2025-02-01"),
+                ]}},
+                "Assets": {"units": {"USD": [annual("2025-12-31", 200, filed)]}},
+                "Liabilities": {"units": {"USD": [annual("2025-12-31", 80, filed)]}},
+            }
+        }
+    }
 
 
 class StockSelectionFeatureAvailabilityTests(TestCase):
@@ -270,3 +301,136 @@ class StockSelectionFeatureAvailabilityTests(TestCase):
                 revision_id="revision-1",
                 commit=False,
             )
+
+    def test_sec_edgar_filing_date_sets_available_time(self) -> None:
+        provider = GlobalStockDataSECFundamentalProvider.__new__(GlobalStockDataSECFundamentalProvider)
+        snapshot = provider._facts_to_snapshot(
+            ticker="ACME",
+            cik=7,
+            company_name="Acme Inc.",
+            facts=_sec_company_facts(filed="2026-02-01"),
+        )
+        result = adapt_fundamental_snapshots(
+            (
+                {
+                    **snapshot,
+                    "source": "global_stock_data_sec_edgar",
+                    "created_at": "2026-06-01T00:00:00+00:00",
+                    "updated_at": "2026-06-01T00:00:00+00:00",
+                },
+            ),
+            market="US",
+        )
+
+        by_name = {record.feature_name: record for record in result.records}
+        self.assertEqual({"net_profit_yoy", "revenue_yoy", "debt_to_assets"}, set(by_name))
+        expected_available = datetime(
+            2026, 2, 1, 23, 59, 59, 999999, tzinfo=ZoneInfo("America/New_York")
+        )
+        for record in by_name.values():
+            # Availability is the filing date (end of the U.S. Eastern day),
+            # not the local sync time.
+            self.assertEqual(expected_available, record.available_time)
+            self.assertNotEqual(datetime(2026, 6, 1, tzinfo=timezone.utc), record.available_time)
+            # Ingestion is never backdated onto the historical filing date.
+            self.assertEqual(datetime(2026, 6, 1, tzinfo=timezone.utc), record.ingested_time)
+
+    def test_sec_edgar_without_filing_date_falls_back_to_sync_time(self) -> None:
+        provider = GlobalStockDataSECFundamentalProvider.__new__(GlobalStockDataSECFundamentalProvider)
+        snapshot = provider._facts_to_snapshot(
+            ticker="ACME",
+            cik=7,
+            company_name="Acme Inc.",
+            facts=_sec_company_facts(filed=None),
+        )
+        result = adapt_fundamental_snapshots(
+            (
+                {
+                    **snapshot,
+                    "source": "global_stock_data_sec_edgar",
+                    "created_at": "2026-06-01T00:00:00+00:00",
+                    "updated_at": "2026-06-02T00:00:00+00:00",
+                },
+            ),
+            market="US",
+        )
+
+        record = {item.feature_name: item for item in result.records}["revenue_yoy"]
+        # Without a filing date the record keeps the legacy conservative
+        # fallback: availability is the latest local ingestion timestamp.
+        self.assertEqual(datetime(2026, 6, 2, tzinfo=timezone.utc), record.available_time)
+        self.assertEqual(datetime(2026, 6, 2, tzinfo=timezone.utc), record.ingested_time)
+
+    def test_filing_date_point_in_time_boundary(self) -> None:
+        filed_eod = datetime(
+            2026, 2, 1, 23, 59, 59, 999999, tzinfo=ZoneInfo("America/New_York")
+        )
+        record = PointInTimeFeatureRecord(
+            record_id="fundamental:US:ACME:global_stock_data_sec_edgar:2025-12-31:revenue_yoy:rev",
+            market="US",
+            ticker="ACME",
+            feature_name="revenue_yoy",
+            value=20.0,
+            event_time=datetime(2025, 12, 31, tzinfo=ZoneInfo("America/New_York")),
+            available_time=filed_eod,
+            ingested_time=filed_eod,
+            source="global_stock_data_sec_edgar",
+            revision_id="rev",
+        )
+
+        # A decision earlier on the filing day cannot see the filing yet.
+        before_filing = select_feature_records_as_of(
+            (record,),
+            cutoff=datetime(2026, 2, 1, 12, 0, tzinfo=ZoneInfo("America/New_York")),
+        )
+        after_filing = select_feature_records_as_of(
+            (record,),
+            cutoff=datetime(2026, 2, 2, 0, 0, tzinfo=ZoneInfo("America/New_York")),
+        )
+
+        self.assertEqual({}, before_filing)
+        self.assertEqual(20.0, after_filing[("ACME", "revenue_yoy")].value)
+
+    def test_sec_feature_times_survive_global_row_transmission(self) -> None:
+        provider = GlobalStockDataSECFundamentalProvider.__new__(GlobalStockDataSECFundamentalProvider)
+        snapshot = provider._facts_to_snapshot(
+            ticker="ACME",
+            cik=7,
+            company_name="Acme Inc.",
+            facts=_sec_company_facts(filed="2026-02-01"),
+        )
+        # Mirror ``sync_global_fundamentals``: the snapshot is narrowed onto the
+        # wide row before it reaches the point-in-time adapter.  This is the
+        # exact hop that previously dropped ``feature_times``.
+        row = GlobalFundamentalRow(
+            ticker="ACME",
+            market="US",
+            report_date=snapshot["report_date"],
+            source="global_stock_data_sec_edgar",
+            available_time=snapshot.get("available_time"),
+            feature_times=snapshot.get("feature_times"),
+            name=snapshot.get("name"),
+            net_profit_yoy=snapshot.get("net_profit_yoy"),
+            revenue_yoy=snapshot.get("revenue_yoy"),
+            debt_to_assets=snapshot.get("debt_to_assets"),
+        )
+        result = adapt_fundamental_snapshots(
+            (
+                {
+                    **asdict(row),
+                    "created_at": "2026-06-01T00:00:00+00:00",
+                    "updated_at": "2026-06-01T00:00:00+00:00",
+                },
+            ),
+            market="US",
+        )
+
+        by_name = {record.feature_name: record for record in result.records}
+        expected_available = datetime(
+            2026, 2, 1, 23, 59, 59, 999999, tzinfo=ZoneInfo("America/New_York")
+        )
+        self.assertEqual(expected_available, by_name["revenue_yoy"].available_time)
+        self.assertEqual(expected_available, by_name["net_profit_yoy"].available_time)
+        self.assertEqual(expected_available, by_name["debt_to_assets"].available_time)
+
+

@@ -897,6 +897,9 @@ class GlobalStockDataSECFundamentalProvider(BaseFundamentalProvider):
     _request_lock = threading.Lock()
     _last_request_at = 0.0
     _min_request_interval_seconds = 0.125  # Stay below SEC's 10 req/s ceiling.
+    # EDGAR dates (``end`` / ``filed``) are plain calendar dates in U.S.
+    # Eastern time; U.S. equities trade on the same clock.
+    _filed_timezone = ZoneInfo("America/New_York")
 
     def __init__(self) -> None:
         super().__init__()
@@ -986,6 +989,18 @@ class GlobalStockDataSECFundamentalProvider(BaseFundamentalProvider):
         return []
 
     @staticmethod
+    def _parse_filed_date(value: object) -> date | None:
+        """Parse an EDGAR calendar date (``end`` / ``filed``), tolerating a timestamp."""
+
+        text = str(value or "").strip()[:10]
+        if not text:
+            return None
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            return None
+
+    @staticmethod
     def _value(values: list[dict], index: int = 0) -> float | None:
         try:
             return float(values[index].get("val"))
@@ -1011,9 +1026,75 @@ class GlobalStockDataSECFundamentalProvider(BaseFundamentalProvider):
         asset_value = self._value(assets)
         liability_value = self._value(liabilities)
         report_date = str(anchor[0].get("end"))
+        debt_to_assets = (
+            (liability_value / asset_value) * 100.0
+            if asset_value and liability_value is not None
+            else None
+        )
+        net_profit_yoy = self._yoy(net_income)
+        revenue_yoy = self._yoy(revenue)
+        # EDGAR's ``filed`` is the date the 10-K/20-F was accepted, in U.S.
+        # Eastern time.  A report is only safe to consume once that whole day
+        # has elapsed on the exchange clock, so availability is the *end* of
+        # the filed day in America/New_York (an absolute instant once the
+        # tz-aware datetime is stored; the repository normalizes it to UTC).
+        # Using the filing date instead of the local sync time recovers the
+        # historical window between filing and ingestion without leaking a
+        # filing that had not happened yet.
+        #
+        # When EDGAR omits ``filed`` we leave the timestamps unset on purpose:
+        # the consumer then falls back to the local ingestion time, keeping the
+        # previous conservative behaviour rather than inventing a date.
+        filed_date = self._parse_filed_date(anchor[0].get("filed"))
+        event_date = self._parse_filed_date(report_date)
+        feature_times: dict[str, dict] = {}
+        available_time: str | None = None
+        if filed_date is not None and event_date is not None:
+            available_dt = datetime.combine(
+                filed_date, datetime_time.max, tzinfo=self._filed_timezone
+            )
+            event_dt = datetime.combine(
+                event_date, datetime_time.min, tzinfo=self._filed_timezone
+            )
+            feature_values = {
+                "net_profit_yoy": net_profit_yoy,
+                "revenue_yoy": revenue_yoy,
+                "debt_to_assets": debt_to_assets,
+            }
+            revision_id = hashlib.sha256(
+                json.dumps(
+                    {
+                        "ticker": ticker,
+                        "report_date": report_date,
+                        "filed": filed_date.isoformat(),
+                        "values": {
+                            name: value
+                            for name, value in feature_values.items()
+                            if value is not None
+                        },
+                    },
+                    sort_keys=True,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()[:20]
+            available_time = available_dt.isoformat()
+            # ``ingested_time`` is intentionally left unset: it is stamped by
+            # the caller (the sync run), so a backfill never pretends the
+            # filing was observed on its historical filing date.
+            feature_times = {
+                name: {
+                    "event_time": event_dt.isoformat(),
+                    "available_time": available_dt.isoformat(),
+                    "revision_id": revision_id,
+                }
+                for name, value in feature_values.items()
+                if value is not None
+            }
         return {
             "ticker": ticker,
             "report_date": report_date,
+            "available_time": available_time,
+            "feature_times": feature_times,
             "name": company_name,
             "exchange": None,
             "listing_date": None,
@@ -1021,9 +1102,9 @@ class GlobalStockDataSECFundamentalProvider(BaseFundamentalProvider):
             "dividend_yield": None,
             "market_cap": None,
             "roe_avg_3y": None,
-            "net_profit_yoy": self._yoy(net_income),
-            "revenue_yoy": self._yoy(revenue),
-            "debt_to_assets": ((liability_value / asset_value) * 100.0 if asset_value and liability_value is not None else None),
+            "net_profit_yoy": net_profit_yoy,
+            "revenue_yoy": revenue_yoy,
+            "debt_to_assets": debt_to_assets,
             "raw_data": {
                 "provider": self.name,
                 "source_url": f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json",
