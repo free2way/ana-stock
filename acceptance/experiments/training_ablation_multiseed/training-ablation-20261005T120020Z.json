@@ -1,0 +1,1626 @@
+{
+  "schema_version": "training_ablation_v1",
+  "generated_at": "20261005T120020Z",
+  "market": "CN",
+  "scope": {
+    "mode": "engineering_pilot_not_for_model_selection",
+    "disclaimer": "latest-liquidity pilot universe (survivor/look-ahead biased) and a shortened training window; results are directional ablation evidence, not a model-selection decision",
+    "dropped_tickers_not_in_symbols": 0
+  },
+  "cost": {
+    "canonical_round_trip_cost_bps": 50.0,
+    "commission_bps_one_way": 2.5,
+    "slippage_bps_one_way": 22.5,
+    "nominal_round_trip_bps": 50.0,
+    "derivation": "slippage_bps_one_way = canonical_round_trip_bps / 2 - commission_bps_one_way; the trainer's executable label builds FillCostModel(commission, slippage)",
+    "note": "differs from the shipped per-fill default (2.5/15 -> 35bps nominal); the override aligns every variant to the repository canonical cost"
+  },
+  "panel": {
+    "dataset_hash": "selection_dataset_v1:CN:30b74fde532511c5e723",
+    "source_version": "market_lake_v1:CN:4c4d8a9a151f03e8ee31",
+    "components": {
+      "market": "CN",
+      "source_version": "market_lake_v1:CN:4c4d8a9a151f03e8ee31",
+      "factor_set_key": "trainer_lightgbm_momentum_v1",
+      "label_version": "executable_net_return_v1",
+      "universe_version": "training_ablation_cn_pilot:120"
+    },
+    "panel_hash": "710aba515c61ee4241450c5242612b17e7539ee379a4511d2d8e7b77484959be",
+    "tickers": [
+      "688256.SS",
+      "300308.SZ",
+      "688008.SS",
+      "300502.SZ",
+      "603986.SS",
+      "688981.SS",
+      "688525.SS",
+      "688041.SS",
+      "688012.SS",
+      "002384.SZ",
+      "300394.SZ",
+      "300750.SZ",
+      "600487.SS",
+      "300476.SZ",
+      "688498.SS",
+      "601138.SS",
+      "688521.SS",
+      "601899.SS",
+      "000725.SZ",
+      "600584.SS",
+      "688048.SS",
+      "300274.SZ",
+      "002475.SZ",
+      "000988.SZ",
+      "600522.SS",
+      "688347.SS",
+      "688017.SS",
+      "002281.SZ",
+      "688126.SS",
+      "002463.SZ",
+      "002156.SZ",
+      "300058.SZ",
+      "300136.SZ",
+      "301308.SZ",
+      "600183.SS",
+      "001309.SZ",
+      "688766.SS",
+      "600176.SS",
+      "688313.SS",
+      "002371.SZ",
+      "300475.SZ",
+      "300059.SZ",
+      "688110.SS",
+      "688120.SS",
+      "688629.SS",
+      "600105.SS",
+      "603259.SS",
+      "600519.SS",
+      "000938.SZ",
+      "002428.SZ",
+      "688146.SS",
+      "300604.SZ",
+      "600498.SS",
+      "603993.SS",
+      "002050.SZ",
+      "000977.SZ",
+      "601869.SS",
+      "000657.SZ",
+      "300408.SZ",
+      "002202.SZ",
+      "002185.SZ",
+      "600111.SS",
+      "601318.SS",
+      "000063.SZ",
+      "600089.SS",
+      "300223.SZ",
+      "000636.SZ",
+      "688702.SS",
+      "000021.SZ",
+      "688361.SS",
+      "300857.SZ",
+      "603019.SS",
+      "002008.SZ",
+      "300285.SZ",
+      "600118.SS",
+      "300433.SZ",
+      "603083.SS",
+      "002407.SZ",
+      "002837.SZ",
+      "688037.SS",
+      "002436.SZ",
+      "600879.SS",
+      "000547.SZ",
+      "002594.SZ",
+      "301526.SZ",
+      "688362.SS",
+      "688019.SS",
+      "600549.SS",
+      "300442.SZ",
+      "688396.SS",
+      "600030.SS",
+      "688183.SS",
+      "688082.SS",
+      "688503.SS",
+      "688627.SS",
+      "300620.SZ",
+      "600667.SS",
+      "002709.SZ",
+      "002131.SZ",
+      "600276.SS",
+      "300548.SZ",
+      "688123.SS",
+      "300418.SZ",
+      "300017.SZ",
+      "300570.SZ",
+      "688072.SS",
+      "300757.SZ",
+      "002916.SZ",
+      "002460.SZ",
+      "300014.SZ",
+      "600150.SS",
+      "688549.SS",
+      "688596.SS",
+      "688167.SS",
+      "300033.SZ",
+      "603629.SS",
+      "688234.SS",
+      "600703.SS",
+      "688403.SS",
+      "300395.SZ"
+    ],
+    "ticker_count": 120,
+    "row_count": 47994,
+    "session_count": 424,
+    "date_min": "2025-01-02",
+    "date_max": "2026-09-30"
+  },
+  "protocol": {
+    "model_family": "lightgbm",
+    "lookback_days": 3,
+    "horizon_days": 6,
+    "window_dates": 228,
+    "history_sessions": 560,
+    "prediction_dates": 60,
+    "top_n": 5,
+    "label_version": "executable_net_return_v1",
+    "seeds": [
+      42,
+      43,
+      44
+    ],
+    "seed_count": 3,
+    "variants": [
+      "canonical",
+      "winsor_off",
+      "drawdown_off",
+      "fit_risk_adjusted",
+      "all_off"
+    ]
+  },
+  "variants": [
+    {
+      "key": "canonical",
+      "label": "all four changes on (shipped defaults)",
+      "seed": 42,
+      "run_name": "training_ablation_20261005T120020Z_canonical_s42",
+      "settings_overrides": {
+        "trainer_cn_execution_commission_bps": 2.5,
+        "trainer_cn_execution_slippage_bps": 22.5,
+        "trainer_cn_window_mode": "complete_dates_v1",
+        "trainer_cn_window_dates": 228,
+        "trainer_random_seed": 42
+      },
+      "elapsed_seconds": 44.629,
+      "prediction_row_count": 6100,
+      "error": null,
+      "captured": {
+        "captured_sample_count": 270,
+        "net_sample_count": 270,
+        "net_hit_rate": 0.3851851851851852,
+        "risk_adjusted_sample_hit_rate": 0.34814814814814815,
+        "net_positive_date_rate": 0.42592592592592593,
+        "evaluated_date_count_captured": 54,
+        "label_cost": {
+          "commission_bps_one_way": 2.5,
+          "slippage_bps_one_way": 22.5,
+          "nominal_round_trip_bps": 50.0,
+          "cost_model_hash": "1521199f34132d45baa9e531f1dd82361df5555ede7885242181e4a88e804d0c"
+        }
+      },
+      "run": {
+        "run_id": 376,
+        "status": "success",
+        "training_sample_count": 26345,
+        "knobs": {
+          "label_winsorize": {
+            "enabled": true,
+            "lower_quantile": 0.025,
+            "upper_quantile": 0.975
+          },
+          "objective": {
+            "alpha": 0.9,
+            "objective": "huber"
+          },
+          "drawdown_penalty": 0.25,
+          "fit_target": "net_return",
+          "random_seed": 42,
+          "embargo_sessions": 6,
+          "purge_gap_days": 6,
+          "feature_transform": {
+            "enabled": true,
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": 0.025,
+            "winsor_upper": 0.975,
+            "zscore_clip": 3.0
+          }
+        },
+        "execution_cost": null,
+        "metrics": {
+          "mean_risk_adjusted_return": -0.05766938,
+          "mean_net_return": -0.03047267,
+          "positive_date_rate": 0.37037,
+          "evaluated_sample_count": 270,
+          "evaluated_date_count": 54,
+          "date_min": "2026-07-08",
+          "date_max": "2026-09-21"
+        }
+      }
+    },
+    {
+      "key": "winsor_off",
+      "label": "label winsorization off (Huber kept)",
+      "seed": 42,
+      "run_name": "training_ablation_20261005T120020Z_winsor_off_s42",
+      "settings_overrides": {
+        "trainer_cn_execution_commission_bps": 2.5,
+        "trainer_cn_execution_slippage_bps": 22.5,
+        "trainer_cn_window_mode": "complete_dates_v1",
+        "trainer_cn_window_dates": 228,
+        "trainer_label_winsorize_enabled": false,
+        "trainer_random_seed": 42
+      },
+      "elapsed_seconds": 44.237,
+      "prediction_row_count": 6100,
+      "error": null,
+      "captured": {
+        "captured_sample_count": 270,
+        "net_sample_count": 270,
+        "net_hit_rate": 0.4185185185185185,
+        "risk_adjusted_sample_hit_rate": 0.37777777777777777,
+        "net_positive_date_rate": 0.42592592592592593,
+        "evaluated_date_count_captured": 54,
+        "label_cost": {
+          "commission_bps_one_way": 2.5,
+          "slippage_bps_one_way": 22.5,
+          "nominal_round_trip_bps": 50.0,
+          "cost_model_hash": "1521199f34132d45baa9e531f1dd82361df5555ede7885242181e4a88e804d0c"
+        }
+      },
+      "run": {
+        "run_id": 377,
+        "status": "success",
+        "training_sample_count": 26345,
+        "knobs": {
+          "label_winsorize": {
+            "enabled": false,
+            "lower_quantile": 0.025,
+            "upper_quantile": 0.975
+          },
+          "objective": {
+            "alpha": 0.9,
+            "objective": "huber"
+          },
+          "drawdown_penalty": 0.25,
+          "fit_target": "net_return",
+          "random_seed": 42,
+          "embargo_sessions": 6,
+          "purge_gap_days": 6,
+          "feature_transform": {
+            "enabled": true,
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": 0.025,
+            "winsor_upper": 0.975,
+            "zscore_clip": 3.0
+          }
+        },
+        "execution_cost": null,
+        "metrics": {
+          "mean_risk_adjusted_return": -0.05768167,
+          "mean_net_return": -0.03005226,
+          "positive_date_rate": 0.351852,
+          "evaluated_sample_count": 270,
+          "evaluated_date_count": 54,
+          "date_min": "2026-07-08",
+          "date_max": "2026-09-21"
+        }
+      }
+    },
+    {
+      "key": "drawdown_off",
+      "label": "change 2 off: drawdown penalty 0.0",
+      "seed": 42,
+      "run_name": "training_ablation_20261005T120020Z_drawdown_off_s42",
+      "settings_overrides": {
+        "trainer_cn_execution_commission_bps": 2.5,
+        "trainer_cn_execution_slippage_bps": 22.5,
+        "trainer_cn_window_mode": "complete_dates_v1",
+        "trainer_cn_window_dates": 228,
+        "trainer_drawdown_penalty": 0.0,
+        "trainer_random_seed": 42
+      },
+      "elapsed_seconds": 43.688,
+      "prediction_row_count": 6100,
+      "error": null,
+      "captured": {
+        "captured_sample_count": 270,
+        "net_sample_count": 270,
+        "net_hit_rate": 0.3851851851851852,
+        "risk_adjusted_sample_hit_rate": 0.3851851851851852,
+        "net_positive_date_rate": 0.42592592592592593,
+        "evaluated_date_count_captured": 54,
+        "label_cost": {
+          "commission_bps_one_way": 2.5,
+          "slippage_bps_one_way": 22.5,
+          "nominal_round_trip_bps": 50.0,
+          "cost_model_hash": "1521199f34132d45baa9e531f1dd82361df5555ede7885242181e4a88e804d0c"
+        }
+      },
+      "run": {
+        "run_id": 378,
+        "status": "success",
+        "training_sample_count": 26345,
+        "knobs": {
+          "label_winsorize": {
+            "enabled": true,
+            "lower_quantile": 0.025,
+            "upper_quantile": 0.975
+          },
+          "objective": {
+            "alpha": 0.9,
+            "objective": "huber"
+          },
+          "drawdown_penalty": 0.0,
+          "fit_target": "net_return",
+          "random_seed": 42,
+          "embargo_sessions": 6,
+          "purge_gap_days": 6,
+          "feature_transform": {
+            "enabled": true,
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": 0.025,
+            "winsor_upper": 0.975,
+            "zscore_clip": 3.0
+          }
+        },
+        "execution_cost": null,
+        "metrics": {
+          "mean_risk_adjusted_return": -0.03047267,
+          "mean_net_return": -0.03047267,
+          "positive_date_rate": 0.425926,
+          "evaluated_sample_count": 270,
+          "evaluated_date_count": 54,
+          "date_min": "2026-07-08",
+          "date_max": "2026-09-21"
+        }
+      }
+    },
+    {
+      "key": "fit_risk_adjusted",
+      "label": "penalty on the fit target: fit on risk_adjusted_return",
+      "seed": 42,
+      "run_name": "training_ablation_20261005T120020Z_fit_risk_adjusted_s42",
+      "settings_overrides": {
+        "trainer_cn_execution_commission_bps": 2.5,
+        "trainer_cn_execution_slippage_bps": 22.5,
+        "trainer_cn_window_mode": "complete_dates_v1",
+        "trainer_cn_window_dates": 228,
+        "trainer_fit_on_risk_adjusted": true,
+        "trainer_random_seed": 42
+      },
+      "elapsed_seconds": 44.407,
+      "prediction_row_count": 6100,
+      "error": null,
+      "captured": {
+        "captured_sample_count": 270,
+        "net_sample_count": 270,
+        "net_hit_rate": 0.3888888888888889,
+        "risk_adjusted_sample_hit_rate": 0.362962962962963,
+        "net_positive_date_rate": 0.4444444444444444,
+        "evaluated_date_count_captured": 54,
+        "label_cost": {
+          "commission_bps_one_way": 2.5,
+          "slippage_bps_one_way": 22.5,
+          "nominal_round_trip_bps": 50.0,
+          "cost_model_hash": "1521199f34132d45baa9e531f1dd82361df5555ede7885242181e4a88e804d0c"
+        }
+      },
+      "run": {
+        "run_id": 379,
+        "status": "success",
+        "training_sample_count": 26345,
+        "knobs": {
+          "label_winsorize": {
+            "enabled": true,
+            "lower_quantile": 0.025,
+            "upper_quantile": 0.975
+          },
+          "objective": {
+            "alpha": 0.9,
+            "objective": "huber"
+          },
+          "drawdown_penalty": 0.25,
+          "fit_target": "risk_adjusted_return",
+          "random_seed": 42,
+          "embargo_sessions": 6,
+          "purge_gap_days": 6,
+          "feature_transform": {
+            "enabled": true,
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": 0.025,
+            "winsor_upper": 0.975,
+            "zscore_clip": 3.0
+          }
+        },
+        "execution_cost": null,
+        "metrics": {
+          "mean_risk_adjusted_return": -0.05542779,
+          "mean_net_return": -0.02805525,
+          "positive_date_rate": 0.351852,
+          "evaluated_sample_count": 270,
+          "evaluated_date_count": 54,
+          "date_min": "2026-07-08",
+          "date_max": "2026-09-21"
+        }
+      }
+    },
+    {
+      "key": "all_off",
+      "label": "all four changes off",
+      "seed": 42,
+      "run_name": "training_ablation_20261005T120020Z_all_off_s42",
+      "settings_overrides": {
+        "trainer_cn_execution_commission_bps": 2.5,
+        "trainer_cn_execution_slippage_bps": 22.5,
+        "trainer_cn_window_mode": "complete_dates_v1",
+        "trainer_cn_window_dates": 228,
+        "trainer_label_winsorize_enabled": false,
+        "trainer_objective": "l2",
+        "trainer_drawdown_penalty": 0.0,
+        "trainer_embargo_sessions": 0,
+        "trainer_feature_transform_enabled": false,
+        "trainer_fit_on_risk_adjusted": false,
+        "trainer_random_seed": 42
+      },
+      "elapsed_seconds": 41.487,
+      "prediction_row_count": 6100,
+      "error": null,
+      "captured": {
+        "captured_sample_count": 270,
+        "net_sample_count": 270,
+        "net_hit_rate": 0.3851851851851852,
+        "risk_adjusted_sample_hit_rate": 0.3851851851851852,
+        "net_positive_date_rate": 0.4444444444444444,
+        "evaluated_date_count_captured": 54,
+        "label_cost": {
+          "commission_bps_one_way": 2.5,
+          "slippage_bps_one_way": 22.5,
+          "nominal_round_trip_bps": 50.0,
+          "cost_model_hash": "1521199f34132d45baa9e531f1dd82361df5555ede7885242181e4a88e804d0c"
+        }
+      },
+      "run": {
+        "run_id": 380,
+        "status": "success",
+        "training_sample_count": 26372,
+        "knobs": {
+          "label_winsorize": {
+            "enabled": false,
+            "lower_quantile": 0.025,
+            "upper_quantile": 0.975
+          },
+          "objective": {
+            "alpha": 0.9,
+            "objective": "l2"
+          },
+          "drawdown_penalty": 0.0,
+          "fit_target": "net_return",
+          "random_seed": 42,
+          "embargo_sessions": 0,
+          "purge_gap_days": 6,
+          "feature_transform": {
+            "enabled": false,
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": 0.025,
+            "winsor_upper": 0.975,
+            "zscore_clip": 3.0
+          }
+        },
+        "execution_cost": null,
+        "metrics": {
+          "mean_risk_adjusted_return": -0.02595201,
+          "mean_net_return": -0.02595201,
+          "positive_date_rate": 0.444444,
+          "evaluated_sample_count": 270,
+          "evaluated_date_count": 54,
+          "date_min": "2026-07-08",
+          "date_max": "2026-09-21"
+        }
+      }
+    },
+    {
+      "key": "canonical",
+      "label": "all four changes on (shipped defaults)",
+      "seed": 43,
+      "run_name": "training_ablation_20261005T120020Z_canonical_s43",
+      "settings_overrides": {
+        "trainer_cn_execution_commission_bps": 2.5,
+        "trainer_cn_execution_slippage_bps": 22.5,
+        "trainer_cn_window_mode": "complete_dates_v1",
+        "trainer_cn_window_dates": 228,
+        "trainer_random_seed": 43
+      },
+      "elapsed_seconds": 43.688,
+      "prediction_row_count": 6100,
+      "error": null,
+      "captured": {
+        "captured_sample_count": 270,
+        "net_sample_count": 270,
+        "net_hit_rate": 0.4074074074074074,
+        "risk_adjusted_sample_hit_rate": 0.36666666666666664,
+        "net_positive_date_rate": 0.4074074074074074,
+        "evaluated_date_count_captured": 54,
+        "label_cost": {
+          "commission_bps_one_way": 2.5,
+          "slippage_bps_one_way": 22.5,
+          "nominal_round_trip_bps": 50.0,
+          "cost_model_hash": "1521199f34132d45baa9e531f1dd82361df5555ede7885242181e4a88e804d0c"
+        }
+      },
+      "run": {
+        "run_id": 381,
+        "status": "success",
+        "training_sample_count": 26345,
+        "knobs": {
+          "label_winsorize": {
+            "enabled": true,
+            "lower_quantile": 0.025,
+            "upper_quantile": 0.975
+          },
+          "objective": {
+            "alpha": 0.9,
+            "objective": "huber"
+          },
+          "drawdown_penalty": 0.25,
+          "fit_target": "net_return",
+          "random_seed": 43,
+          "embargo_sessions": 6,
+          "purge_gap_days": 6,
+          "feature_transform": {
+            "enabled": true,
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": 0.025,
+            "winsor_upper": 0.975,
+            "zscore_clip": 3.0
+          }
+        },
+        "execution_cost": null,
+        "metrics": {
+          "mean_risk_adjusted_return": -0.05416057,
+          "mean_net_return": -0.02653969,
+          "positive_date_rate": 0.37037,
+          "evaluated_sample_count": 270,
+          "evaluated_date_count": 54,
+          "date_min": "2026-07-08",
+          "date_max": "2026-09-21"
+        }
+      }
+    },
+    {
+      "key": "winsor_off",
+      "label": "label winsorization off (Huber kept)",
+      "seed": 43,
+      "run_name": "training_ablation_20261005T120020Z_winsor_off_s43",
+      "settings_overrides": {
+        "trainer_cn_execution_commission_bps": 2.5,
+        "trainer_cn_execution_slippage_bps": 22.5,
+        "trainer_cn_window_mode": "complete_dates_v1",
+        "trainer_cn_window_dates": 228,
+        "trainer_label_winsorize_enabled": false,
+        "trainer_random_seed": 43
+      },
+      "elapsed_seconds": 43.575,
+      "prediction_row_count": 6100,
+      "error": null,
+      "captured": {
+        "captured_sample_count": 270,
+        "net_sample_count": 270,
+        "net_hit_rate": 0.37037037037037035,
+        "risk_adjusted_sample_hit_rate": 0.3333333333333333,
+        "net_positive_date_rate": 0.4074074074074074,
+        "evaluated_date_count_captured": 54,
+        "label_cost": {
+          "commission_bps_one_way": 2.5,
+          "slippage_bps_one_way": 22.5,
+          "nominal_round_trip_bps": 50.0,
+          "cost_model_hash": "1521199f34132d45baa9e531f1dd82361df5555ede7885242181e4a88e804d0c"
+        }
+      },
+      "run": {
+        "run_id": 382,
+        "status": "success",
+        "training_sample_count": 26345,
+        "knobs": {
+          "label_winsorize": {
+            "enabled": false,
+            "lower_quantile": 0.025,
+            "upper_quantile": 0.975
+          },
+          "objective": {
+            "alpha": 0.9,
+            "objective": "huber"
+          },
+          "drawdown_penalty": 0.25,
+          "fit_target": "net_return",
+          "random_seed": 43,
+          "embargo_sessions": 6,
+          "purge_gap_days": 6,
+          "feature_transform": {
+            "enabled": true,
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": 0.025,
+            "winsor_upper": 0.975,
+            "zscore_clip": 3.0
+          }
+        },
+        "execution_cost": null,
+        "metrics": {
+          "mean_risk_adjusted_return": -0.06839835,
+          "mean_net_return": -0.0399713,
+          "positive_date_rate": 0.296296,
+          "evaluated_sample_count": 270,
+          "evaluated_date_count": 54,
+          "date_min": "2026-07-08",
+          "date_max": "2026-09-21"
+        }
+      }
+    },
+    {
+      "key": "drawdown_off",
+      "label": "change 2 off: drawdown penalty 0.0",
+      "seed": 43,
+      "run_name": "training_ablation_20261005T120020Z_drawdown_off_s43",
+      "settings_overrides": {
+        "trainer_cn_execution_commission_bps": 2.5,
+        "trainer_cn_execution_slippage_bps": 22.5,
+        "trainer_cn_window_mode": "complete_dates_v1",
+        "trainer_cn_window_dates": 228,
+        "trainer_drawdown_penalty": 0.0,
+        "trainer_random_seed": 43
+      },
+      "elapsed_seconds": 43.316,
+      "prediction_row_count": 6100,
+      "error": null,
+      "captured": {
+        "captured_sample_count": 270,
+        "net_sample_count": 270,
+        "net_hit_rate": 0.4074074074074074,
+        "risk_adjusted_sample_hit_rate": 0.4074074074074074,
+        "net_positive_date_rate": 0.4074074074074074,
+        "evaluated_date_count_captured": 54,
+        "label_cost": {
+          "commission_bps_one_way": 2.5,
+          "slippage_bps_one_way": 22.5,
+          "nominal_round_trip_bps": 50.0,
+          "cost_model_hash": "1521199f34132d45baa9e531f1dd82361df5555ede7885242181e4a88e804d0c"
+        }
+      },
+      "run": {
+        "run_id": 383,
+        "status": "success",
+        "training_sample_count": 26345,
+        "knobs": {
+          "label_winsorize": {
+            "enabled": true,
+            "lower_quantile": 0.025,
+            "upper_quantile": 0.975
+          },
+          "objective": {
+            "alpha": 0.9,
+            "objective": "huber"
+          },
+          "drawdown_penalty": 0.0,
+          "fit_target": "net_return",
+          "random_seed": 43,
+          "embargo_sessions": 6,
+          "purge_gap_days": 6,
+          "feature_transform": {
+            "enabled": true,
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": 0.025,
+            "winsor_upper": 0.975,
+            "zscore_clip": 3.0
+          }
+        },
+        "execution_cost": null,
+        "metrics": {
+          "mean_risk_adjusted_return": -0.02653969,
+          "mean_net_return": -0.02653969,
+          "positive_date_rate": 0.407407,
+          "evaluated_sample_count": 270,
+          "evaluated_date_count": 54,
+          "date_min": "2026-07-08",
+          "date_max": "2026-09-21"
+        }
+      }
+    },
+    {
+      "key": "fit_risk_adjusted",
+      "label": "penalty on the fit target: fit on risk_adjusted_return",
+      "seed": 43,
+      "run_name": "training_ablation_20261005T120020Z_fit_risk_adjusted_s43",
+      "settings_overrides": {
+        "trainer_cn_execution_commission_bps": 2.5,
+        "trainer_cn_execution_slippage_bps": 22.5,
+        "trainer_cn_window_mode": "complete_dates_v1",
+        "trainer_cn_window_dates": 228,
+        "trainer_fit_on_risk_adjusted": true,
+        "trainer_random_seed": 43
+      },
+      "elapsed_seconds": 43.667,
+      "prediction_row_count": 6100,
+      "error": null,
+      "captured": {
+        "captured_sample_count": 270,
+        "net_sample_count": 270,
+        "net_hit_rate": 0.4222222222222222,
+        "risk_adjusted_sample_hit_rate": 0.37777777777777777,
+        "net_positive_date_rate": 0.4444444444444444,
+        "evaluated_date_count_captured": 54,
+        "label_cost": {
+          "commission_bps_one_way": 2.5,
+          "slippage_bps_one_way": 22.5,
+          "nominal_round_trip_bps": 50.0,
+          "cost_model_hash": "1521199f34132d45baa9e531f1dd82361df5555ede7885242181e4a88e804d0c"
+        }
+      },
+      "run": {
+        "run_id": 384,
+        "status": "success",
+        "training_sample_count": 26345,
+        "knobs": {
+          "label_winsorize": {
+            "enabled": true,
+            "lower_quantile": 0.025,
+            "upper_quantile": 0.975
+          },
+          "objective": {
+            "alpha": 0.9,
+            "objective": "huber"
+          },
+          "drawdown_penalty": 0.25,
+          "fit_target": "risk_adjusted_return",
+          "random_seed": 43,
+          "embargo_sessions": 6,
+          "purge_gap_days": 6,
+          "feature_transform": {
+            "enabled": true,
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": 0.025,
+            "winsor_upper": 0.975,
+            "zscore_clip": 3.0
+          }
+        },
+        "execution_cost": null,
+        "metrics": {
+          "mean_risk_adjusted_return": -0.05315692,
+          "mean_net_return": -0.02650593,
+          "positive_date_rate": 0.37037,
+          "evaluated_sample_count": 270,
+          "evaluated_date_count": 54,
+          "date_min": "2026-07-08",
+          "date_max": "2026-09-21"
+        }
+      }
+    },
+    {
+      "key": "all_off",
+      "label": "all four changes off",
+      "seed": 43,
+      "run_name": "training_ablation_20261005T120020Z_all_off_s43",
+      "settings_overrides": {
+        "trainer_cn_execution_commission_bps": 2.5,
+        "trainer_cn_execution_slippage_bps": 22.5,
+        "trainer_cn_window_mode": "complete_dates_v1",
+        "trainer_cn_window_dates": 228,
+        "trainer_label_winsorize_enabled": false,
+        "trainer_objective": "l2",
+        "trainer_drawdown_penalty": 0.0,
+        "trainer_embargo_sessions": 0,
+        "trainer_feature_transform_enabled": false,
+        "trainer_fit_on_risk_adjusted": false,
+        "trainer_random_seed": 43
+      },
+      "elapsed_seconds": 41.236,
+      "prediction_row_count": 6100,
+      "error": null,
+      "captured": {
+        "captured_sample_count": 270,
+        "net_sample_count": 270,
+        "net_hit_rate": 0.4,
+        "risk_adjusted_sample_hit_rate": 0.4,
+        "net_positive_date_rate": 0.4444444444444444,
+        "evaluated_date_count_captured": 54,
+        "label_cost": {
+          "commission_bps_one_way": 2.5,
+          "slippage_bps_one_way": 22.5,
+          "nominal_round_trip_bps": 50.0,
+          "cost_model_hash": "1521199f34132d45baa9e531f1dd82361df5555ede7885242181e4a88e804d0c"
+        }
+      },
+      "run": {
+        "run_id": 385,
+        "status": "success",
+        "training_sample_count": 26372,
+        "knobs": {
+          "label_winsorize": {
+            "enabled": false,
+            "lower_quantile": 0.025,
+            "upper_quantile": 0.975
+          },
+          "objective": {
+            "alpha": 0.9,
+            "objective": "l2"
+          },
+          "drawdown_penalty": 0.0,
+          "fit_target": "net_return",
+          "random_seed": 43,
+          "embargo_sessions": 0,
+          "purge_gap_days": 6,
+          "feature_transform": {
+            "enabled": false,
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": 0.025,
+            "winsor_upper": 0.975,
+            "zscore_clip": 3.0
+          }
+        },
+        "execution_cost": null,
+        "metrics": {
+          "mean_risk_adjusted_return": -0.02385616,
+          "mean_net_return": -0.02385616,
+          "positive_date_rate": 0.444444,
+          "evaluated_sample_count": 270,
+          "evaluated_date_count": 54,
+          "date_min": "2026-07-08",
+          "date_max": "2026-09-21"
+        }
+      }
+    },
+    {
+      "key": "canonical",
+      "label": "all four changes on (shipped defaults)",
+      "seed": 44,
+      "run_name": "training_ablation_20261005T120020Z_canonical_s44",
+      "settings_overrides": {
+        "trainer_cn_execution_commission_bps": 2.5,
+        "trainer_cn_execution_slippage_bps": 22.5,
+        "trainer_cn_window_mode": "complete_dates_v1",
+        "trainer_cn_window_dates": 228,
+        "trainer_random_seed": 44
+      },
+      "elapsed_seconds": 43.576,
+      "prediction_row_count": 6100,
+      "error": null,
+      "captured": {
+        "captured_sample_count": 270,
+        "net_sample_count": 270,
+        "net_hit_rate": 0.37777777777777777,
+        "risk_adjusted_sample_hit_rate": 0.34444444444444444,
+        "net_positive_date_rate": 0.37037037037037035,
+        "evaluated_date_count_captured": 54,
+        "label_cost": {
+          "commission_bps_one_way": 2.5,
+          "slippage_bps_one_way": 22.5,
+          "nominal_round_trip_bps": 50.0,
+          "cost_model_hash": "1521199f34132d45baa9e531f1dd82361df5555ede7885242181e4a88e804d0c"
+        }
+      },
+      "run": {
+        "run_id": 386,
+        "status": "success",
+        "training_sample_count": 26345,
+        "knobs": {
+          "label_winsorize": {
+            "enabled": true,
+            "lower_quantile": 0.025,
+            "upper_quantile": 0.975
+          },
+          "objective": {
+            "alpha": 0.9,
+            "objective": "huber"
+          },
+          "drawdown_penalty": 0.25,
+          "fit_target": "net_return",
+          "random_seed": 44,
+          "embargo_sessions": 6,
+          "purge_gap_days": 6,
+          "feature_transform": {
+            "enabled": true,
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": 0.025,
+            "winsor_upper": 0.975,
+            "zscore_clip": 3.0
+          }
+        },
+        "execution_cost": null,
+        "metrics": {
+          "mean_risk_adjusted_return": -0.0606215,
+          "mean_net_return": -0.03288313,
+          "positive_date_rate": 0.351852,
+          "evaluated_sample_count": 270,
+          "evaluated_date_count": 54,
+          "date_min": "2026-07-08",
+          "date_max": "2026-09-21"
+        }
+      }
+    },
+    {
+      "key": "winsor_off",
+      "label": "label winsorization off (Huber kept)",
+      "seed": 44,
+      "run_name": "training_ablation_20261005T120020Z_winsor_off_s44",
+      "settings_overrides": {
+        "trainer_cn_execution_commission_bps": 2.5,
+        "trainer_cn_execution_slippage_bps": 22.5,
+        "trainer_cn_window_mode": "complete_dates_v1",
+        "trainer_cn_window_dates": 228,
+        "trainer_label_winsorize_enabled": false,
+        "trainer_random_seed": 44
+      },
+      "elapsed_seconds": 43.938,
+      "prediction_row_count": 6100,
+      "error": null,
+      "captured": {
+        "captured_sample_count": 270,
+        "net_sample_count": 270,
+        "net_hit_rate": 0.3925925925925926,
+        "risk_adjusted_sample_hit_rate": 0.35555555555555557,
+        "net_positive_date_rate": 0.4074074074074074,
+        "evaluated_date_count_captured": 54,
+        "label_cost": {
+          "commission_bps_one_way": 2.5,
+          "slippage_bps_one_way": 22.5,
+          "nominal_round_trip_bps": 50.0,
+          "cost_model_hash": "1521199f34132d45baa9e531f1dd82361df5555ede7885242181e4a88e804d0c"
+        }
+      },
+      "run": {
+        "run_id": 387,
+        "status": "success",
+        "training_sample_count": 26345,
+        "knobs": {
+          "label_winsorize": {
+            "enabled": false,
+            "lower_quantile": 0.025,
+            "upper_quantile": 0.975
+          },
+          "objective": {
+            "alpha": 0.9,
+            "objective": "huber"
+          },
+          "drawdown_penalty": 0.25,
+          "fit_target": "net_return",
+          "random_seed": 44,
+          "embargo_sessions": 6,
+          "purge_gap_days": 6,
+          "feature_transform": {
+            "enabled": true,
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": 0.025,
+            "winsor_upper": 0.975,
+            "zscore_clip": 3.0
+          }
+        },
+        "execution_cost": null,
+        "metrics": {
+          "mean_risk_adjusted_return": -0.06335719,
+          "mean_net_return": -0.03555234,
+          "positive_date_rate": 0.277778,
+          "evaluated_sample_count": 270,
+          "evaluated_date_count": 54,
+          "date_min": "2026-07-08",
+          "date_max": "2026-09-21"
+        }
+      }
+    },
+    {
+      "key": "drawdown_off",
+      "label": "change 2 off: drawdown penalty 0.0",
+      "seed": 44,
+      "run_name": "training_ablation_20261005T120020Z_drawdown_off_s44",
+      "settings_overrides": {
+        "trainer_cn_execution_commission_bps": 2.5,
+        "trainer_cn_execution_slippage_bps": 22.5,
+        "trainer_cn_window_mode": "complete_dates_v1",
+        "trainer_cn_window_dates": 228,
+        "trainer_drawdown_penalty": 0.0,
+        "trainer_random_seed": 44
+      },
+      "elapsed_seconds": 43.529,
+      "prediction_row_count": 6100,
+      "error": null,
+      "captured": {
+        "captured_sample_count": 270,
+        "net_sample_count": 270,
+        "net_hit_rate": 0.37777777777777777,
+        "risk_adjusted_sample_hit_rate": 0.37777777777777777,
+        "net_positive_date_rate": 0.37037037037037035,
+        "evaluated_date_count_captured": 54,
+        "label_cost": {
+          "commission_bps_one_way": 2.5,
+          "slippage_bps_one_way": 22.5,
+          "nominal_round_trip_bps": 50.0,
+          "cost_model_hash": "1521199f34132d45baa9e531f1dd82361df5555ede7885242181e4a88e804d0c"
+        }
+      },
+      "run": {
+        "run_id": 388,
+        "status": "success",
+        "training_sample_count": 26345,
+        "knobs": {
+          "label_winsorize": {
+            "enabled": true,
+            "lower_quantile": 0.025,
+            "upper_quantile": 0.975
+          },
+          "objective": {
+            "alpha": 0.9,
+            "objective": "huber"
+          },
+          "drawdown_penalty": 0.0,
+          "fit_target": "net_return",
+          "random_seed": 44,
+          "embargo_sessions": 6,
+          "purge_gap_days": 6,
+          "feature_transform": {
+            "enabled": true,
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": 0.025,
+            "winsor_upper": 0.975,
+            "zscore_clip": 3.0
+          }
+        },
+        "execution_cost": null,
+        "metrics": {
+          "mean_risk_adjusted_return": -0.03288313,
+          "mean_net_return": -0.03288313,
+          "positive_date_rate": 0.37037,
+          "evaluated_sample_count": 270,
+          "evaluated_date_count": 54,
+          "date_min": "2026-07-08",
+          "date_max": "2026-09-21"
+        }
+      }
+    },
+    {
+      "key": "fit_risk_adjusted",
+      "label": "penalty on the fit target: fit on risk_adjusted_return",
+      "seed": 44,
+      "run_name": "training_ablation_20261005T120020Z_fit_risk_adjusted_s44",
+      "settings_overrides": {
+        "trainer_cn_execution_commission_bps": 2.5,
+        "trainer_cn_execution_slippage_bps": 22.5,
+        "trainer_cn_window_mode": "complete_dates_v1",
+        "trainer_cn_window_dates": 228,
+        "trainer_fit_on_risk_adjusted": true,
+        "trainer_random_seed": 44
+      },
+      "elapsed_seconds": 43.718,
+      "prediction_row_count": 6100,
+      "error": null,
+      "captured": {
+        "captured_sample_count": 270,
+        "net_sample_count": 270,
+        "net_hit_rate": 0.3925925925925926,
+        "risk_adjusted_sample_hit_rate": 0.3592592592592593,
+        "net_positive_date_rate": 0.4444444444444444,
+        "evaluated_date_count_captured": 54,
+        "label_cost": {
+          "commission_bps_one_way": 2.5,
+          "slippage_bps_one_way": 22.5,
+          "nominal_round_trip_bps": 50.0,
+          "cost_model_hash": "1521199f34132d45baa9e531f1dd82361df5555ede7885242181e4a88e804d0c"
+        }
+      },
+      "run": {
+        "run_id": 389,
+        "status": "success",
+        "training_sample_count": 26345,
+        "knobs": {
+          "label_winsorize": {
+            "enabled": true,
+            "lower_quantile": 0.025,
+            "upper_quantile": 0.975
+          },
+          "objective": {
+            "alpha": 0.9,
+            "objective": "huber"
+          },
+          "drawdown_penalty": 0.25,
+          "fit_target": "risk_adjusted_return",
+          "random_seed": 44,
+          "embargo_sessions": 6,
+          "purge_gap_days": 6,
+          "feature_transform": {
+            "enabled": true,
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": 0.025,
+            "winsor_upper": 0.975,
+            "zscore_clip": 3.0
+          }
+        },
+        "execution_cost": null,
+        "metrics": {
+          "mean_risk_adjusted_return": -0.06011749,
+          "mean_net_return": -0.03246686,
+          "positive_date_rate": 0.407407,
+          "evaluated_sample_count": 270,
+          "evaluated_date_count": 54,
+          "date_min": "2026-07-08",
+          "date_max": "2026-09-21"
+        }
+      }
+    },
+    {
+      "key": "all_off",
+      "label": "all four changes off",
+      "seed": 44,
+      "run_name": "training_ablation_20261005T120020Z_all_off_s44",
+      "settings_overrides": {
+        "trainer_cn_execution_commission_bps": 2.5,
+        "trainer_cn_execution_slippage_bps": 22.5,
+        "trainer_cn_window_mode": "complete_dates_v1",
+        "trainer_cn_window_dates": 228,
+        "trainer_label_winsorize_enabled": false,
+        "trainer_objective": "l2",
+        "trainer_drawdown_penalty": 0.0,
+        "trainer_embargo_sessions": 0,
+        "trainer_feature_transform_enabled": false,
+        "trainer_fit_on_risk_adjusted": false,
+        "trainer_random_seed": 44
+      },
+      "elapsed_seconds": 41.159,
+      "prediction_row_count": 6100,
+      "error": null,
+      "captured": {
+        "captured_sample_count": 270,
+        "net_sample_count": 270,
+        "net_hit_rate": 0.4222222222222222,
+        "risk_adjusted_sample_hit_rate": 0.4222222222222222,
+        "net_positive_date_rate": 0.4444444444444444,
+        "evaluated_date_count_captured": 54,
+        "label_cost": {
+          "commission_bps_one_way": 2.5,
+          "slippage_bps_one_way": 22.5,
+          "nominal_round_trip_bps": 50.0,
+          "cost_model_hash": "1521199f34132d45baa9e531f1dd82361df5555ede7885242181e4a88e804d0c"
+        }
+      },
+      "run": {
+        "run_id": 390,
+        "status": "success",
+        "training_sample_count": 26372,
+        "knobs": {
+          "label_winsorize": {
+            "enabled": false,
+            "lower_quantile": 0.025,
+            "upper_quantile": 0.975
+          },
+          "objective": {
+            "alpha": 0.9,
+            "objective": "l2"
+          },
+          "drawdown_penalty": 0.0,
+          "fit_target": "net_return",
+          "random_seed": 44,
+          "embargo_sessions": 0,
+          "purge_gap_days": 6,
+          "feature_transform": {
+            "enabled": false,
+            "method": "cross_sectional_winsor_mad_zscore",
+            "scope": "per_trade_date",
+            "winsor_lower": 0.025,
+            "winsor_upper": 0.975,
+            "zscore_clip": 3.0
+          }
+        },
+        "execution_cost": null,
+        "metrics": {
+          "mean_risk_adjusted_return": -0.02001884,
+          "mean_net_return": -0.02001884,
+          "positive_date_rate": 0.444444,
+          "evaluated_sample_count": 270,
+          "evaluated_date_count": 54,
+          "date_min": "2026-07-08",
+          "date_max": "2026-09-21"
+        }
+      }
+    }
+  ],
+  "variant_summary": [
+    {
+      "key": "canonical",
+      "label": "all four changes on (shipped defaults)",
+      "seed_count": 3,
+      "seeds": [
+        42,
+        43,
+        44
+      ],
+      "metrics": {
+        "mean_net_return": {
+          "n": 3,
+          "mean": -0.02996516,
+          "std": 0.00320203,
+          "min": -0.03288313,
+          "max": -0.02653969
+        },
+        "mean_risk_adjusted_return": {
+          "n": 3,
+          "mean": -0.05748382,
+          "std": 0.00323446,
+          "min": -0.0606215,
+          "max": -0.05416057
+        },
+        "positive_date_rate": {
+          "n": 3,
+          "mean": 0.36419733,
+          "std": 0.01069137,
+          "min": 0.351852,
+          "max": 0.37037
+        },
+        "evaluated_sample_count": {
+          "n": 3,
+          "mean": 270.0,
+          "std": 0.0,
+          "min": 270.0,
+          "max": 270.0
+        },
+        "evaluated_date_count": {
+          "n": 3,
+          "mean": 54.0,
+          "std": 0.0,
+          "min": 54.0,
+          "max": 54.0
+        }
+      }
+    },
+    {
+      "key": "winsor_off",
+      "label": "label winsorization off (Huber kept)",
+      "seed_count": 3,
+      "seeds": [
+        42,
+        43,
+        44
+      ],
+      "metrics": {
+        "mean_net_return": {
+          "n": 3,
+          "mean": -0.03519197,
+          "std": 0.00496933,
+          "min": -0.0399713,
+          "max": -0.03005226
+        },
+        "mean_risk_adjusted_return": {
+          "n": 3,
+          "mean": -0.06314574,
+          "std": 0.00536147,
+          "min": -0.06839835,
+          "max": -0.05768167
+        },
+        "positive_date_rate": {
+          "n": 3,
+          "mean": 0.308642,
+          "std": 0.03854941,
+          "min": 0.277778,
+          "max": 0.351852
+        },
+        "evaluated_sample_count": {
+          "n": 3,
+          "mean": 270.0,
+          "std": 0.0,
+          "min": 270.0,
+          "max": 270.0
+        },
+        "evaluated_date_count": {
+          "n": 3,
+          "mean": 54.0,
+          "std": 0.0,
+          "min": 54.0,
+          "max": 54.0
+        }
+      }
+    },
+    {
+      "key": "drawdown_off",
+      "label": "change 2 off: drawdown penalty 0.0",
+      "seed_count": 3,
+      "seeds": [
+        42,
+        43,
+        44
+      ],
+      "metrics": {
+        "mean_net_return": {
+          "n": 3,
+          "mean": -0.02996516,
+          "std": 0.00320203,
+          "min": -0.03288313,
+          "max": -0.02653969
+        },
+        "mean_risk_adjusted_return": {
+          "n": 3,
+          "mean": -0.02996516,
+          "std": 0.00320203,
+          "min": -0.03288313,
+          "max": -0.02653969
+        },
+        "positive_date_rate": {
+          "n": 3,
+          "mean": 0.40123433,
+          "std": 0.02828769,
+          "min": 0.37037,
+          "max": 0.425926
+        },
+        "evaluated_sample_count": {
+          "n": 3,
+          "mean": 270.0,
+          "std": 0.0,
+          "min": 270.0,
+          "max": 270.0
+        },
+        "evaluated_date_count": {
+          "n": 3,
+          "mean": 54.0,
+          "std": 0.0,
+          "min": 54.0,
+          "max": 54.0
+        }
+      }
+    },
+    {
+      "key": "fit_risk_adjusted",
+      "label": "penalty on the fit target: fit on risk_adjusted_return",
+      "seed_count": 3,
+      "seeds": [
+        42,
+        43,
+        44
+      ],
+      "metrics": {
+        "mean_net_return": {
+          "n": 3,
+          "mean": -0.02900935,
+          "std": 0.00309288,
+          "min": -0.03246686,
+          "max": -0.02650593
+        },
+        "mean_risk_adjusted_return": {
+          "n": 3,
+          "mean": -0.05623407,
+          "std": 0.00354964,
+          "min": -0.06011749,
+          "max": -0.05315692
+        },
+        "positive_date_rate": {
+          "n": 3,
+          "mean": 0.376543,
+          "std": 0.02828726,
+          "min": 0.351852,
+          "max": 0.407407
+        },
+        "evaluated_sample_count": {
+          "n": 3,
+          "mean": 270.0,
+          "std": 0.0,
+          "min": 270.0,
+          "max": 270.0
+        },
+        "evaluated_date_count": {
+          "n": 3,
+          "mean": 54.0,
+          "std": 0.0,
+          "min": 54.0,
+          "max": 54.0
+        }
+      }
+    },
+    {
+      "key": "all_off",
+      "label": "all four changes off",
+      "seed_count": 3,
+      "seeds": [
+        42,
+        43,
+        44
+      ],
+      "metrics": {
+        "mean_net_return": {
+          "n": 3,
+          "mean": -0.02327567,
+          "std": 0.00300888,
+          "min": -0.02595201,
+          "max": -0.02001884
+        },
+        "mean_risk_adjusted_return": {
+          "n": 3,
+          "mean": -0.02327567,
+          "std": 0.00300888,
+          "min": -0.02595201,
+          "max": -0.02001884
+        },
+        "positive_date_rate": {
+          "n": 3,
+          "mean": 0.444444,
+          "std": 0.0,
+          "min": 0.444444,
+          "max": 0.444444
+        },
+        "evaluated_sample_count": {
+          "n": 3,
+          "mean": 270.0,
+          "std": 0.0,
+          "min": 270.0,
+          "max": 270.0
+        },
+        "evaluated_date_count": {
+          "n": 3,
+          "mean": 54.0,
+          "std": 0.0,
+          "min": 54.0,
+          "max": 54.0
+        }
+      }
+    }
+  ],
+  "comparisons": [
+    {
+      "metric": "mean_risk_adjusted_return",
+      "baseline_key": "canonical",
+      "variant_key": "winsor_off",
+      "shared_seed_count": 3,
+      "variant_gt_baseline": 0,
+      "variant_lt_baseline": 3,
+      "ties": 0,
+      "direction": "lower",
+      "support_threshold": 2,
+      "supported": true,
+      "per_seed_delta": {
+        "42": -1.229e-05,
+        "43": -0.01423778,
+        "44": -0.00273569
+      }
+    },
+    {
+      "metric": "mean_risk_adjusted_return",
+      "baseline_key": "canonical",
+      "variant_key": "drawdown_off",
+      "shared_seed_count": 3,
+      "variant_gt_baseline": 3,
+      "variant_lt_baseline": 0,
+      "ties": 0,
+      "direction": "higher",
+      "support_threshold": 2,
+      "supported": true,
+      "per_seed_delta": {
+        "42": 0.02719671,
+        "43": 0.02762088,
+        "44": 0.02773837
+      }
+    },
+    {
+      "metric": "mean_risk_adjusted_return",
+      "baseline_key": "canonical",
+      "variant_key": "fit_risk_adjusted",
+      "shared_seed_count": 3,
+      "variant_gt_baseline": 3,
+      "variant_lt_baseline": 0,
+      "ties": 0,
+      "direction": "higher",
+      "support_threshold": 2,
+      "supported": true,
+      "per_seed_delta": {
+        "42": 0.00224159,
+        "43": 0.00100365,
+        "44": 0.00050401
+      }
+    },
+    {
+      "metric": "mean_risk_adjusted_return",
+      "baseline_key": "canonical",
+      "variant_key": "all_off",
+      "shared_seed_count": 3,
+      "variant_gt_baseline": 3,
+      "variant_lt_baseline": 0,
+      "ties": 0,
+      "direction": "higher",
+      "support_threshold": 2,
+      "supported": true,
+      "per_seed_delta": {
+        "42": 0.03171737,
+        "43": 0.03030441,
+        "44": 0.04060266
+      }
+    },
+    {
+      "metric": "mean_net_return",
+      "baseline_key": "canonical",
+      "variant_key": "winsor_off",
+      "shared_seed_count": 3,
+      "variant_gt_baseline": 1,
+      "variant_lt_baseline": 2,
+      "ties": 0,
+      "direction": "lower",
+      "support_threshold": 2,
+      "supported": true,
+      "per_seed_delta": {
+        "42": 0.00042041,
+        "43": -0.01343161,
+        "44": -0.00266921
+      }
+    },
+    {
+      "metric": "mean_net_return",
+      "baseline_key": "canonical",
+      "variant_key": "drawdown_off",
+      "shared_seed_count": 3,
+      "variant_gt_baseline": 0,
+      "variant_lt_baseline": 0,
+      "ties": 3,
+      "direction": "mixed",
+      "support_threshold": 2,
+      "supported": false,
+      "per_seed_delta": {
+        "42": 0.0,
+        "43": 0.0,
+        "44": 0.0
+      }
+    },
+    {
+      "metric": "mean_net_return",
+      "baseline_key": "canonical",
+      "variant_key": "fit_risk_adjusted",
+      "shared_seed_count": 3,
+      "variant_gt_baseline": 3,
+      "variant_lt_baseline": 0,
+      "ties": 0,
+      "direction": "higher",
+      "support_threshold": 2,
+      "supported": true,
+      "per_seed_delta": {
+        "42": 0.00241742,
+        "43": 3.376e-05,
+        "44": 0.00041627
+      }
+    },
+    {
+      "metric": "mean_net_return",
+      "baseline_key": "canonical",
+      "variant_key": "all_off",
+      "shared_seed_count": 3,
+      "variant_gt_baseline": 3,
+      "variant_lt_baseline": 0,
+      "ties": 0,
+      "direction": "higher",
+      "support_threshold": 2,
+      "supported": true,
+      "per_seed_delta": {
+        "42": 0.00452066,
+        "43": 0.00268353,
+        "44": 0.01286429
+      }
+    }
+  ],
+  "limitations": [
+    "pilot universe is a latest-liquidity subset, not a point-in-time tradable universe",
+    "training window shortened via trainer_*_window_dates for cost; not the 252-session production window",
+    "drawdown_off keeps the default fit target (net_return): it changes only mean_risk_adjusted_return mechanically and leaves mean_net_return untouched by construction; use fit_risk_adjusted to test the penalty as a fit target",
+    "net hit rate is computed from the matured top-N OOS samples captured around the trainer's OOS metric accessor",
+    "multi-seed dispersion makes estimator variance visible, but a single pilot panel is reused across seeds, so panel-level (universe/session) uncertainty is not estimated; the 2/3-seed direction threshold is a weak screen, not a significance test"
+  ]
+}

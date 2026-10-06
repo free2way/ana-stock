@@ -1,0 +1,10 @@
+{
+  "factor_set_key": "sentiment_v1",
+  "source_version": "hithink_sentiment_features_v1:REPLACE_WITH_REAL_DIGEST",
+  "coverage_start": "2025-10-09",
+  "coverage_end": "2026-10-09",
+  "missing_policy": "none_outside_coverage_never_zero",
+  "decision_cutoff": "eod",
+  "cutoff_time_local": "16:00",
+  "auction_path_enabled": false
+}

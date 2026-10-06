@@ -1,0 +1,29 @@
+experiment_id: sentiment-v1-eod-cutoff-example
+market: CN
+hypothesis: sentiment_v1 情绪族（同花顺公开特色/集合竞价数据）在 EOD 16:00 决定 cutoff 下对 CN 全池 Top-5 的 OOS 净收益命中率有正向边际；覆盖窗口与 cutoff 语义必须与冻结 dataset_hash 一致，覆盖外样本不进面板
+change:
+  kind: factor_set_swap
+  patch:
+    factor_set_key: sentiment_v1
+    decision_cutoff: eod
+    cutoff_time_local: "16:00"
+    auction_path_enabled: false
+panel:
+  oos_start: 2026-08-27
+  oos_end: 2026-09-22
+  universe_version: pit_universe_v1:CN:25815a348bebba7f
+  label_version: stock_selection_dataset_v2:CN:75c6200e1385afb8
+  cost_bps: 50.0
+  horizons: [5]
+  top_n: 5
+strata:
+  - regime
+  - liquidity_bucket
+decision:
+  primary_metric: net_return
+  min_effect_pp: 0.2
+  alpha: 0.05
+  fdr: 0.05
+  min_independent_dates: 3
+  strict_t_threshold: 3.5
+  bootstrap_iterations: 1000

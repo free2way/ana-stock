@@ -1,0 +1,4 @@
+# 本目录是面向交付的验收证据归档。
+# 根 .gitignore 的 `*.md` 规则会忽略本目录下的 Markdown；此处在子树内放行，
+# 避免改动根 .gitignore（保持 docs/、data/ 的忽略规则原样）。
+!*.md

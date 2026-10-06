@@ -1,0 +1,47 @@
+{
+  "acceptance": {
+    "alpha": 0.05,
+    "bootstrap_iterations": 1000,
+    "fdr": 0.05,
+    "min_effect_pp": 0.0,
+    "min_independent_dates": 20,
+    "min_matured_dates": 60,
+    "min_net_hit_rate": 0.55,
+    "primary_metric": "post_cost_net_hit_rate",
+    "primary_metric_semantics": "fraction_of_matured_top_n_signals_with_positive_net_return_after_cost",
+    "random_control_seeds": 5,
+    "strict_t_threshold": 3.5
+  },
+  "batch_id": "sentiment_v1_forward_2026-10-08",
+  "cost_bps": 50.0,
+  "coverage": {
+    "end_date": null,
+    "forward_only": true,
+    "start_date": "2026-10-08",
+    "window": "trailing_one_year"
+  },
+  "created_at": "2026-10-06T00:03:23+08:00",
+  "cutoff": {
+    "auction_local_time": "09:25",
+    "auction_path_included": false,
+    "auction_semantics": "same_trade_date_call_auction_close",
+    "local_time": "16:00",
+    "main_path": "eod",
+    "semantics": "same_trade_date_post_close_featured_data",
+    "timezone": "Asia/Shanghai"
+  },
+  "dataset_hash": "sentiment_forward_batch_v1:CN:f31ebe289588e2243433",
+  "factor_set": "sentiment_v1",
+  "factor_set_version": "stock_selection_factor_set_v1:sentiment_v1:33f230ab30cde464",
+  "horizon_days": 5,
+  "label_version": "label_net_return_v1",
+  "min_present_features": 1,
+  "missing_policy": "exclude",
+  "operator": "unknown",
+  "schema_version": "sentiment_v1_forward_batch_v1",
+  "scope": "sentiment_v1_forward_only",
+  "source_version": null,
+  "start_date": "2026-10-08",
+  "top_n": 20,
+  "universe_version": "pit_universe_v1:CN:25815a348bebba7f"
+}
