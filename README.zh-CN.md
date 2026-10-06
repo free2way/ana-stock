@@ -132,6 +132,10 @@ ANA 是研究工具。排名分数不等于胜率；即便是经过校准的估�
 
 已支持的来源包括 Tushare、同花顺 Financial API、Alpaca、Polygon 和部分备用源；接入能力不等于当前账户拥有所有历史字段或完整市场覆盖。
 
+## 许可证
+
+本项目采用 [Apache License 2.0](LICENSE) 许可证。
+
 ## 公开仓库范围
 
 可从[应用源码](app/)、[测试](tests/)和[脚本](scripts/)了解项目。
