@@ -1148,7 +1148,7 @@ def _render_dashboard_workspace(
             f"{t(lang, '进入模型选股', 'Open screeners')}",
             f'{lang}',
             f'{lookback_runs}',
-            f"{t(lang, '连续强势', 'Continuous leaders')}",
+            f"{t(lang, '连续强势股', 'Continuous Leaders')}",
             f'{lang}',
             f"{t(lang, '模型评测总览', 'Model Evaluation Overview')}",
             f"{t(lang, '减风险队列', 'Risk Reduction Queue')}",
