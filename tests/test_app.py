@@ -849,20 +849,35 @@ class AppFlowTests(unittest.TestCase):
         self.assertNotIn("强势观察池", message)
 
     def test_send_ai_daily_report_endpoint_uses_notifier(self) -> None:
+        import os as _os
+
+        from app.core.config import reset_settings_cache
         from app.services.ai_daily_report import save_ai_daily_report
 
+        # The publication path only dispatches to configured channels, so the
+        # fixture configures one webhook channel (the transport itself is
+        # patched below). The cached report carries the ready market-recommendation
+        # contract so the endpoint resends it instead of rebuilding from the
+        # (empty) market lake.
+        _os.environ["PQW_FEISHU_WEBHOOK_URL"] = "https://example.test/feishu"
+        reset_settings_cache()
         save_ai_daily_report(
             {
                 "status": "success",
+                "report_date": "2026-08-21",
                 "mood": "偏进攻",
                 "headline": "今日 AI 决策面板偏进攻",
                 "rows": [],
+                "market_recommendations": [],
+                "market_recommendations_meta": {"status": "ready", "target_snapshot_date": "2026-08-21"},
+                "market_watch_recommendations": [{"ticker": "600000.SS", "name": "观察股"}],
+                "decision_cutoff_at": "2026-08-21T08:00:00+08:00",
             }
         )
 
         with patch(
             "app.api.routes.jobs.PushNotificationService.send_text",
-            return_value={"status": "success", "sent": ["wechat"], "failed": []},
+            return_value={"status": "success", "sent": ["feishu"], "failed": []},
         ):
             response = self.client.post(
                 "/jobs/send-ai-daily-report",
@@ -1166,6 +1181,10 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual("premarket", boards[0]["mode"])
 
     def test_market_snapshot_page_renders_boards(self) -> None:
+        from app.core.db import SessionLocal
+        from app.services.repository import WorkspaceSnapshotRepository
+        from app.services.stock_selection.market_snapshot_view import market_snapshot_type
+
         boards = [
             {
                 "key": "leaders",
@@ -1213,8 +1232,17 @@ class AppFlowTests(unittest.TestCase):
             },
         ]
 
-        with patch("app.api.routes.screener.ScreenerService.build_market_snapshot", return_value=boards):
-            response = self.client.get("/screeners/market-snapshot?lang=zh&mode=postmarket")
+        with SessionLocal() as db:
+            # The page renders the precomputed workspace snapshot (the live
+            # ScreenerService build runs in the background job), so the fixture
+            # seeds one. Boards carry their market so the CN scope filter keeps
+            # them.
+            WorkspaceSnapshotRepository(db).create_snapshot(
+                snapshot_type=market_snapshot_type("postmarket"),
+                snapshot_date="2026-04-03",
+                payload={"boards": [{**board, "market": "CN"} for board in boards]},
+            )
+        response = self.client.get("/screeners/market-snapshot?lang=zh&mode=postmarket")
 
         self.assertEqual(200, response.status_code)
         self.assertIn("市场快照榜单", response.text)
@@ -1957,18 +1985,27 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual(["600004.SS"], sync_mock.call_args.kwargs["tickers"])
 
     def test_refresh_cn_market_data_incremental_uses_last_synced_date_window(self) -> None:
+        from datetime import date, timedelta
+
         from app.core.db import SessionLocal
         from app.services.cn_market_universe import refresh_cn_market_data
         from app.services.repository import PriceSyncStateRepository, SymbolRepository
 
         self._seed_symbol("600004.SS", "刷新缓存股", "CN", "SSE")
 
+        # The incremental window is anchored on the last synced date (minus the
+        # overlap) and capped at ``days_back + overlap`` ago; keep the fixture
+        # anchor recent so the assertion exercises the last-synced-date branch
+        # rather than the lookback cap, independent of the wall clock.
+        last_synced_date = date.today() - timedelta(days=5)
+        expected_start = (last_synced_date - timedelta(days=3)).isoformat()
+
         with SessionLocal() as db:
             symbol = SymbolRepository(db).get_by_ticker("600004.SS")
             PriceSyncStateRepository(db).upsert_state(
                 symbol_id=symbol.id,
                 provider="eastmoney",
-                last_synced_date="2026-04-03",
+                last_synced_date=last_synced_date.isoformat(),
                 status="success",
                 message="already synced",
             )
@@ -1984,7 +2021,7 @@ class AppFlowTests(unittest.TestCase):
 
         self.assertEqual("success", result["status"])
         self.assertTrue(result["incremental"])
-        self.assertEqual({"600004.SS": "2026-03-31"}, sync_mock.call_args.kwargs["start_dates_by_ticker"])
+        self.assertEqual({"600004.SS": expected_start}, sync_mock.call_args.kwargs["start_dates_by_ticker"])
 
     def test_sync_cn_symbol_universe_falls_back_to_akshare_when_tushare_fails(self) -> None:
         from app.core.db import SessionLocal
@@ -6242,38 +6279,18 @@ class AppFlowTests(unittest.TestCase):
 
     def test_run_pipeline_redirects_back_to_dashboard(self) -> None:
         from app.services.openbb_client import OpenBBClient
+        from app.services.sample_data import extend_sample_rows
+
+        # The trainer's point-in-time universe filter requires >=120 liquid
+        # sessions before a name is tradable, only sessions *after* that warmup
+        # survive it, and the first prediction date then needs >=1000 labelled
+        # samples. With two tickers that needs a multi-year calendar-valid
+        # history, so the provider fixture serves one.
+        base_history = extend_sample_rows("AAPL", days=900)
 
         def fake_fetch(self, request) -> list[dict]:
             symbol = request.ticker
-            return [
-                {
-                    "date": "2026-04-01",
-                    "symbol": symbol,
-                    "open": 50.0,
-                    "high": 51.0,
-                    "low": 49.5,
-                    "close": 50.5,
-                    "volume": 500000,
-                },
-                {
-                    "date": "2026-04-02",
-                    "symbol": symbol,
-                    "open": 50.5,
-                    "high": 52.0,
-                    "low": 50.0,
-                    "close": 51.4,
-                    "volume": 520000,
-                },
-                {
-                    "date": "2026-04-03",
-                    "symbol": symbol,
-                    "open": 51.4,
-                    "high": 53.0,
-                    "low": 51.0,
-                    "close": 52.1,
-                    "volume": 540000,
-                },
-            ]
+            return [{**row, "symbol": symbol} for row in base_history]
 
         with patch.object(OpenBBClient, "fetch_historical_prices", new=fake_fetch):
             response = self.client.post(
@@ -6282,7 +6299,7 @@ class AppFlowTests(unittest.TestCase):
                     "tickers": "CRM,SHOP",
                     "provider": "yfinance",
                     "run_name": "pipeline_redirect",
-                    "signal_type": "reversal",
+                    "signal_type": "momentum",
                     "lookback_days": "3",
                     "top_n": "2",
                     "redirect_to": "/dashboard",

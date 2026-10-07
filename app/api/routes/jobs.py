@@ -957,12 +957,17 @@ async def send_ai_daily_report(request: Request, db: Session = Depends(get_db_se
             report = build_ai_daily_report(limit=8)
             rebuilt_report = True
         from app.services.stock_selection.publication_guard import (
-            load_trusted_model_qualifications, prepare_report_for_publication,
+            load_trusted_model_qualifications, load_trusted_regime_snapshots,
+            prepare_report_for_publication,
         )
         from app.services.stock_selection.decision_ledger import dispatch_publication_message
 
         report.update(prepare_report_for_publication(
             report, approved_qualifications=load_trusted_model_qualifications(db=db),
+            # Must mirror save_ai_daily_report's re-prepare exactly, otherwise the
+            # regime policy it attaches would differ between render and freeze and
+            # the publication guard would reject its own save.
+            trusted_regime_snapshots=load_trusted_regime_snapshots(db=db),
         ))
         market_meta = report.get("market_recommendations_meta") or {}
         market_status = str(market_meta.get("status") or "").strip().lower()

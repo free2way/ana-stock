@@ -99,11 +99,19 @@ def _symbol_page_bundle(overview: dict, latest_signal: dict | None, *, headline_
             decision_brief=decision_brief,
             combined_analysis=combined,
         )
+        try:
+            news_feed = MarketNewsService().fetch_symbol_headlines(
+                ticker=overview["ticker"],
+                name=overview.get("name"),
+                limit=headline_limit,
+            )
+        except Exception:
+            news_feed = []
         return {
             "combined": combined,
             "decision_brief": decision_brief,
             "news_brief": news_brief,
-            "news_feed": [],
+            "news_feed": news_feed,
         }
 
     return get_or_set("symbol_page_bundle", cache_key, ttl_seconds=90.0, loader=_load)

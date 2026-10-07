@@ -285,7 +285,12 @@ class PredictionRepository:
             )
         )
         if normalized_market and normalized_market != "ALL":
-            candidate_run_stmt = candidate_run_stmt.where(ModelRun.market == normalized_market)
+            # A multi-market run (``market == 'ALL'``) publishes predictions for
+            # every market, so it must stay a candidate for a market-scoped read;
+            # only single-market runs for other markets are excluded.
+            candidate_run_stmt = candidate_run_stmt.where(
+                ModelRun.market.in_([normalized_market, "ALL"])
+            )
         candidate_run_ids = self.db.scalars(
             candidate_run_stmt.order_by(ModelRun.id.desc()).limit(self._SERVING_RUN_WINDOW)
         ).all()
@@ -295,9 +300,17 @@ class PredictionRepository:
         if latest_model_run_id is None:
             return []
 
+        # Latest trade date is resolved per market: a multi-market run can carry
+        # a newer date for one market than another, so scoping the max date to
+        # the requested market keeps that market's newest rows instead of
+        # returning nothing when the run-wide max date belongs to another market.
         latest_date_stmt = select(func.max(Prediction.trade_date)).where(
             Prediction.model_run_id == latest_model_run_id
         )
+        if normalized_market and normalized_market != "ALL":
+            latest_date_stmt = latest_date_stmt.join(
+                Symbol, Symbol.id == Prediction.symbol_id
+            ).where(Symbol.market == normalized_market)
         latest_date = self.db.scalar(latest_date_stmt)
         if latest_date is None:
             return []

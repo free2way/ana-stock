@@ -71,9 +71,20 @@ def _classify_market(market: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
             "regime": "unknown",
             "buy_gate": "REVIEW",
             "risk_level": 50,
+            "max_position_scale": 0.0,
             "headline": "缺少行情数据，禁止盲目进攻。",
             "playbook": "先补齐行情刷新，再评估模型候选。",
             "flags": ["missing-market-data"],
+            "latest": None,
+            "previous": None,
+            "recent_crash_days": 0,
+            "diagnostics": {
+                "latest_risk_score": None,
+                "latest_avg_ret_pct": None,
+                "latest_median_ret_pct": None,
+                "latest_up_pct": None,
+                "avg_minus_median_pct": None,
+            },
         }
 
     latest = rows[0]
@@ -203,7 +214,13 @@ def analyze_market_regime(market: str, *, lookback_days: int = 12) -> dict[str, 
     market_code = str(market or "").strip().upper()
     if market_code not in {"CN", "US"}:
         raise ValueError("market must be CN or US")
-    path = str(market_lake_root() / f"{market_code.lower()}_daily" / "date=*" / "*.parquet")
+    market_dir = market_lake_root() / f"{market_code.lower()}_daily"
+    if not any(market_dir.glob("date=*/*.parquet")):
+        # No lake partitions yet (fresh workspace / temp-lake fixtures): return a
+        # missing-data regime instead of letting DuckDB raise an IO Error on an
+        # empty glob. _classify_market already maps empty rows to a REVIEW gate.
+        return _no_data_regime_payload(market_code, lookback_days=lookback_days)
+    path = str(market_dir / "date=*" / "*.parquet")
     sql = """
         WITH base AS (
           SELECT
@@ -257,6 +274,10 @@ def analyze_market_regime(market: str, *, lookback_days: int = 12) -> dict[str, 
         columns = [item[0] for item in result.description]
         rows = [dict(zip(columns, row, strict=False)) for row in result.fetchall()]
     rows = [{key: (_round(value, 2) if isinstance(value, float) else value) for key, value in row.items()} for row in rows]
+    return _build_regime_payload(market_code, rows, lookback_days=lookback_days)
+
+
+def _build_regime_payload(market_code: str, rows: list[dict[str, Any]], *, lookback_days: int) -> dict[str, Any]:
     classification = _classify_market(market_code, rows)
     latest_date = str(rows[0].get("date")) if rows else None
     return {
@@ -279,6 +300,10 @@ def analyze_market_regime(market: str, *, lookback_days: int = 12) -> dict[str, 
         "recent_crash_days": classification["recent_crash_days"],
         "diagnostics": classification["diagnostics"],
     }
+
+
+def _no_data_regime_payload(market_code: str, *, lookback_days: int) -> dict[str, Any]:
+    return _build_regime_payload(market_code, [], lookback_days=lookback_days)
 
 
 def save_market_risk_snapshots(

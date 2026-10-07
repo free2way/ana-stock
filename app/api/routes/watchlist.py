@@ -971,7 +971,13 @@ def _render_watchlist_table_fragment(
             f"<td class='sticky-col sticky-col-2'><div>{item['name'] or item['ticker']}</div>"
             + (f"<div class='muted' style='margin-top:4px;font-weight:800;color:#f59e0b;'>{html.escape(_watchlist_attention_hint(item, lang=lang))}</div>" if _watchlist_attention_hint(item, lang=lang) else "")
             + "</td>"
-            f"<td>{item['market'] or '-'}</td>"
+            f"<td>{item['market'] or '-'}"
+            + (
+                f"<div class='muted' style='margin-top:2px;font-size:11px;'>{html.escape(str(item.get('exchange')))}</div>"
+                if item.get("exchange") and str(item.get("exchange")).upper() != str(item.get("market") or "").upper()
+                else ""
+            )
+            + "</td>"
             f"<td>{_format_watchlist_close(item.get('latest_close'))}</td>"
             f"<td>{_render_daily_change_chip(item.get('daily_change_pct'))}</td>"
             f"<td>{_decision_chip((item.get('combined_analysis') or {}).get('decision') or 'HOLD', lang=lang)}</td>"
