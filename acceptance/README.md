@@ -102,3 +102,12 @@ acceptance/
 - 本目录的 `acceptance/.gitignore` 用 `!*.md` **在本子树内放行** `*.md`，因此**无需改动根 `.gitignore`**
   （`docs/`、`data/` 忽略规则保持原样）。
 - `data/experiments/` 被根 `.gitignore` 忽略，故 `experiments/` 下的 JSON/YAML 采用**复制**而非软链/引用。
+
+## 8. 债务登记表权威版（以本目录 `signoff/` 为准）
+
+- **入库权威版**：`acceptance/signoff/acceptance-debt-registry-zh.md`。它是随仓库交付、供外部复核的版本，**签署链引用、版本判定与提交一律以此为准**。
+- **本地工作副本**：`docs/acceptance-debt-registry-zh.md`。根 `.gitignore` 含 `/docs/`（不随仓库交付），故该副本只作本地编辑/查阅用；**两版内容应保持一致**（当前一致，可用
+  `diff -u docs/acceptance-debt-registry-zh.md acceptance/signoff/acceptance-debt-registry-zh.md` 核对，无输出即一致）。
+- **刷新顺序**：先在 `docs/acceptance-debt-registry-zh.md` 改写/重算（写作在本机 docs 侧进行），再 `cp docs/acceptance-debt-registry-zh.md acceptance/signoff/acceptance-debt-registry-zh.md` 覆盖权威版，
+  最后按 `git add acceptance/signoff/acceptance-debt-registry-zh.md` 提交。
+- 原因：`docs/` 被忽略，若只改 docs 而不回填 `acceptance/`，外部拿到仓库时看不到最新债务表，判定链会断在这里。
