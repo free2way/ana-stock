@@ -1212,7 +1212,7 @@ def dashboard_market_heatmap_page(
     ) or "-"
     nav_html = render_workspace_nav_html(lang=lang, active_key="market", lookback_runs=lookback_runs)
     loading_hint = (
-        f"<div class='card'><div class='eyebrow'>{t(lang, '后台预计算', 'Background Precompute')}</div><p class='muted'>{t(lang, '板块热力图仍在后台生成，稍后刷新即可。', 'Sector heatmap is still being generated in the background. Refresh shortly.')}</p></div>"
+        f"<div class='card'><div class='eyebrow'>{t(lang, '板块热力图', 'Sector Heatmap')}</div><p class='muted'>{t(lang, '暂无概念热力图', 'No concept heatmap yet')}</p></div>"
         if not heatmap_ready
         else ""
     )

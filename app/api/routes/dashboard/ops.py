@@ -571,13 +571,20 @@ def _render_task_center_redesign(*, request: Request, lang: str, lookback_runs: 
       </div>
     </section>
     """
+    ops_entry_nav_html = (
+        "<nav class='ops-entry-nav' style='display:flex;gap:8px;flex-wrap:wrap;margin:0 0 12px;'>"
+        f"<a class='outline' href='/dashboard/ops/sync?lang={lang}&lookback_runs={lookback_runs}'>{t(lang, '同步中心', 'Sync Center')}</a>"
+        f"<a class='outline' href='/dashboard/ops/models?lang={lang}&lookback_runs={lookback_runs}'>{t(lang, '模型运行', 'Model Runs')}</a>"
+        f"<a class='outline' href='/dashboard/ops/jobs?lang={lang}&lookback_runs={lookback_runs}'>{t(lang, '任务记录', 'Job History')}</a>"
+        "</nav>"
+    )
     return render_dashboard_legacy_page(
         "dashboard/legacy/ops__render_task_center_redesign.html",
         fragments=[
             f'{lang}',
-            f"{t(lang, '任务中心', 'Task Center')}",
+            f"{t(lang, '运维操作台', 'Operations')}",
             f'{RISK_CARD_STYLE}',
-            f"{t(lang, '任务中心', 'Task Center')}",
+            f"{t(lang, '运维操作台', 'Operations')}",
             f"{t(lang, '每日运行、维护和历史记录按用途分开。', 'Daily runs, maintenance, and history are separated by purpose.')}",
             f'{nav_html}',
             f"{t(lang, '今日运行台', 'Today’s runbook')}",
@@ -591,7 +598,7 @@ def _render_task_center_redesign(*, request: Request, lang: str, lookback_runs: 
             f'{lookback_runs}',
             f'{banner_html}',
             f'{today_module_html}',
-            f'{risk_overview_html}',
+            f'{ops_entry_nav_html}{risk_overview_html}',
             f"{t(lang, '每日必跑', 'Daily required')}",
             f"{t(lang, '从行情到日报的必要链路', 'Required path from prices to report')}",
             f"{t(lang, '每行可手动触发，并保留本次运行明细。', 'Run each step manually and retain its execution details.')}",

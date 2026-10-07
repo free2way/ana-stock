@@ -1089,7 +1089,7 @@ def watchlist_page(
                   <div class="muted">{f'已就绪同步 {synced_ready_count} / {total_watchlist_names}' if lang == 'zh' else f'Sync ready {synced_ready_count} / {total_watchlist_names}'}</div>
                 </article>
                 <article style="border:1px solid var(--line);border-radius:16px;padding:14px 15px;background:rgba(15,24,35,0.58);">
-                  <div class="eyebrow">{'风险标记' if lang == 'zh' else 'Risk Tags'}</div>
+                  <div class="eyebrow">{'风险概览' if lang == 'zh' else 'Risk Overview'}</div>
                   <div style="margin-top:6px;font-size:22px;font-weight:900;">{risk_tagged_count}</div>
                   <div class="muted">{'带执行提醒的自选股票' if lang == 'zh' else 'Names carrying execution warnings'}</div>
                 </article>

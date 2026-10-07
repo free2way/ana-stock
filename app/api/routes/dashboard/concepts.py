@@ -438,7 +438,12 @@ def dashboard_concept_detail(
     if not is_authenticated(request):
         return login_redirect(f"/dashboard/concepts/{concept_slug}")
     lookback_runs = _clamp_lookback_runs(lookback_runs)
-    summary = _load_home_summary(db, lookback_runs=lookback_runs)
+    # Concept detail needs the full market context (concept_tracker). The home
+    # summary deliberately uses the lightweight loader with an empty tracker,
+    # so reusing it here made every concept page 404 whenever the full summary
+    # was not already cached by a preceding POST. The POST handlers on this page
+    # already use _load_summary; keep the GET consistent with them.
+    summary = _load_summary(db, lookback_runs=lookback_runs)
     concept = _get_concept_for_detail(db, summary, concept_slug, lang=lang)
     if concept is None:
         return HTMLResponse("<h1>Concept not found</h1>", status_code=404)

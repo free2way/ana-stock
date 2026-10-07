@@ -55,7 +55,7 @@ def render_dashboard_market_page(view: dict[str, Any]) -> str:
         )
         secondary_open = "打开连续强势" if lang == "zh" else "Open continuous leaders"
     else:
-        secondary_title = "概念活跃追踪" if lang == "zh" else "Concept Activity Tracker"
+        secondary_title = "概念异动追踪" if lang == "zh" else "Concept Activity Tracker"
         secondary_preview_html = view["concept_preview_html"]
         secondary_href = "/dashboard/market/concepts?" + urlencode(
             {
@@ -96,9 +96,9 @@ def render_dashboard_market_page(view: dict[str, Any]) -> str:
         "step_1": t(lang, "第一步", "Step 1"),
         "step_2": t(lang, "第二步", "Step 2"),
         "step_3": t(lang, "第三步", "Step 3"),
-        "heatmap_title": "美股热力图" if lang == "zh" and market_filter == "US" else t(lang, "行业热力图", "Sector Heatmap"),
+        "heatmap_title": "美股热力图" if lang == "zh" and market_filter == "US" else t(lang, "板块热力图", "Sector Heatmap"),
         "heatmap_help": t(lang, "看资金和模型信号集中在哪些行业/主题，先确认当前市场主线。", "See where model signals cluster by sector/theme and confirm the current market leadership first."),
-        "open_heatmap": t(lang, "打开热力图", "Open heatmap"),
+        "open_heatmap": t(lang, "打开板块热力图", "Open heatmap"),
         "secondary_title": secondary_title,
         "secondary_help": t(lang, "美股先看连续命中和强势延续，A股继续看概念的命中变化、连续性和扩散广度。", "For U.S. names, track persistence and repeated hits; for A-shares, keep using concept delta, streak, and breadth."),
         "secondary_open": secondary_open,
@@ -115,7 +115,7 @@ def render_dashboard_market_page(view: dict[str, Any]) -> str:
         "signal_focus": "信号聚焦" if lang == "zh" else "Signal Focus",
         "execution_tag": "执行提醒标签" if lang == "zh" else "Execution Tag",
         "exclude_tag": "排除标签" if lang == "zh" else "Exclude Tag",
-        "min_buy_hits": "窗口内最少 BUY 命中次数" if lang == "zh" else "Min BUY Hits In Window",
+        "min_buy_hits": "最少买点数" if lang == "zh" else "Min BUY Hits In Window",
         "min_strength": "最低强度" if lang == "zh" else "Min Strength",
         "filter_help": "这个字段会按当前快照窗口内，这只股票最近被标记为 BUY 的次数来过滤首页候选。" if lang == "zh" else "This field filters homepage candidates by how many recent snapshots tagged the stock as BUY inside the current window.",
         "apply": t(lang, "应用筛选", "Apply Filters"),
