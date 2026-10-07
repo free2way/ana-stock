@@ -614,11 +614,18 @@ def build_continuous_leaders_snapshot(db: Session, *, lang: str = "zh") -> dict:
             latest_signal_map[ticker] = item
     tickers = list(ticker_hit_counts.keys())
     latest_outputs = signal_repo.get_latest_model_outputs_for_tickers(tickers)
+    trade_plan_repo = PredictionTradePlanRepository(db)
+    trade_plans = trade_plan_repo.get_latest_for_tickers(tickers)
     rows: list[dict] = []
     for ticker, hits in ticker_hit_counts.items():
         latest_output = signal_repo._build_signal_decision(latest_outputs.get(ticker) or {})
         symbol = symbol_repo.get_by_ticker(ticker)
         latest_signal = latest_signal_map.get(ticker, {})
+        # Execution tags live on the model trade plan, not the signal decision
+        # payload; without this merge the leader table loses its risk tags.
+        execution_tags = list(latest_output.get("execution_tags") or []) or list(
+            (trade_plans.get(ticker) or {}).get("execution_tags") or []
+        )
         rows.append(
             {
                 "ticker": ticker,
@@ -637,7 +644,7 @@ def build_continuous_leaders_snapshot(db: Session, *, lang: str = "zh") -> dict:
                 "entry_style": latest_output.get("entry_style"),
                 "percentile": latest_output.get("percentile"),
                 "model_reward_risk_ratio": latest_output.get("model_reward_risk_ratio"),
-                "execution_tags": list(latest_output.get("execution_tags") or []),
+                "execution_tags": execution_tags,
             }
         )
     rows.sort(key=lambda item: (-item["hits"], -item["score"], item["ticker"]))

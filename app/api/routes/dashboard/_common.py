@@ -34,6 +34,8 @@ from app.services.repository import (
 from app.services.runtime_cache import get_or_set
 from app.services.market_lake import load_lake_rows  # noqa: F401 - patch target guarded by model-performance tests
 
+from app.services.workspace_snapshots import build_continuous_leaders_snapshot
+
 
 
 from app.services.dashboard_market_context import (
@@ -613,7 +615,20 @@ def _load_summary(db: Session, *, lookback_runs: int = 5) -> dict:
 
 
 
-def _lightweight_market_context(latest_signals: list[dict]) -> dict:
+def _continuous_leaders_for_summary(db: Session) -> list[dict]:
+    """Continuous-leader rows built on demand from the shared snapshot source.
+
+    The continuous-leaders page/export prefer the workspace snapshot; when it is
+    absent they fall back to ``market_context["continuous_leaders"]``. Reusing
+    the exact builder behind ``SNAPSHOT_CONTINUOUS_LEADERS`` keeps that fallback
+    faithful (instead of always empty) without a second selection codepath.
+    """
+    payload = build_continuous_leaders_snapshot(db)
+    rows = payload.get("rows") if isinstance(payload, dict) else None
+    return list(rows) if isinstance(rows, list) else []
+
+
+def _lightweight_market_context(db: Session, latest_signals: list[dict]) -> dict:
     risk_counts: dict[str, int] = {}
     tagged_examples: list[dict] = []
     for item in latest_signals:
@@ -635,7 +650,7 @@ def _lightweight_market_context(latest_signals: list[dict]) -> dict:
         "top_concepts": [],
         "sector_heatmap": [],
         "concept_tracker": [],
-        "continuous_leaders": [],
+        "continuous_leaders": _continuous_leaders_for_summary(db),
         "risk_overview": {
             "tagged_names": len(tagged_examples),
             "top_tags": [
@@ -658,7 +673,7 @@ def _load_home_summary(db: Session, *, lookback_runs: int = 5) -> dict:
         return load_dashboard_summary(
             db,
             lookback_runs=lookback_runs,
-            market_context_loader=_lightweight_market_context,
+            market_context_loader=lambda latest_signals: _lightweight_market_context(db, latest_signals),
         )
 
     return get_or_set("dashboard_home_summary_bundle", cache_key, ttl_seconds=60.0, loader=_load)
