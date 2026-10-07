@@ -68,6 +68,7 @@ from app.api.routes.dashboard._common import (
     _clamp_lookback_runs,
     _compact_label,
     _concept_slug,
+    _concept_tracker_for_summary,
     _concept_tr,
     _dashboard_home_signal,
     _dt,
@@ -182,7 +183,10 @@ def _load_concept_tracker_rows(db: Session, *, lookback_runs: int) -> list[dict]
     if rows:
         return rows
     summary = _load_summary(db, lookback_runs=lookback_runs)
-    return list((summary.get("market_context") or {}).get("concept_tracker") or [])
+    rows = list((summary.get("market_context") or {}).get("concept_tracker") or [])
+    if rows:
+        return rows
+    return _concept_tracker_for_summary(db, lookback_runs=lookback_runs)
 
 
 

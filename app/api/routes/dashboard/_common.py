@@ -27,6 +27,7 @@ from app.services.dashboard_summary import load_dashboard_summary
 from app.services.model_signal_summary import build_signal_label
 
 from app.services.repository import (
+    PredictionRepository,
     SymbolRepository,
     WatchlistRepository,
 )
@@ -626,6 +627,37 @@ def _continuous_leaders_for_summary(db: Session) -> list[dict]:
     payload = build_continuous_leaders_snapshot(db)
     rows = payload.get("rows") if isinstance(payload, dict) else None
     return list(rows) if isinstance(rows, list) else []
+
+
+def _concept_tracker_for_summary(db: Session, *, lookback_runs: int = 5) -> list[dict]:
+    """Concept-tracker rows built on demand from the shared recent-run source.
+
+    The concept page/export prefer the workspace snapshot; when it is absent
+    they fall back to ``market_context["concept_tracker"]``, which the surfaced
+    summary only fills from serving-gated signals (``list_latest_signal_decisions``).
+    A workspace whose newest run is a non-production import (a native/qlib
+    artifact, for example) therefore collapses to an empty tracker even though
+    the run's concepts and execution tags exist. Feed the same
+    ``_build_market_context`` builder the latest successful runs instead --
+    mirroring ``_continuous_leaders_for_summary`` and the non-production
+    fallback already used by ``list_recent_prediction_snapshots`` -- so the
+    page/export/snapshot stay consistent instead of blank.
+    """
+    snapshots = PredictionRepository(db).list_recent_prediction_snapshots(top_n=10, limit_runs=1)
+    latest = snapshots[0] if snapshots else {}
+    signals = [
+        {
+            "ticker": item.get("ticker"),
+            "trade_date": latest.get("trade_date"),
+            "score": item.get("score"),
+        }
+        for item in (latest.get("items") or [])
+        if item.get("ticker")
+    ]
+    if not signals:
+        return []
+    context = _build_market_context(db, signals, lookback_runs=lookback_runs)
+    return list(context.get("concept_tracker") or [])
 
 
 def _lightweight_market_context(db: Session, latest_signals: list[dict]) -> dict:
