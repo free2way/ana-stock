@@ -351,7 +351,8 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual(200, data_sources_response.status_code)
         self.assertIn("text/html", data_sources_response.headers.get("content-type", ""))
         self.assertIn("Where This App Gets Data", data_sources_response.text)
-        self.assertIn("Per Symbol Sync Source", data_sources_response.text)
+        # 契约以 golden 为准（见 tests/test_dashboard_data_sources_route.py）
+        self.assertIn("Recent Per-Symbol Sync State", data_sources_response.text)
 
         self.assertIn("CN Concepts", data_sources_response.text)
 
