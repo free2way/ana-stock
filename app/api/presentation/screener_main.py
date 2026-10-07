@@ -34,6 +34,7 @@ from app.api.presentation.screener_components import (
     _preset_summary,
     _price_badge,
     _pseudo_strong_signal_html,
+    _row_technical_rating_html,
     _snapshot_pending_message,
     _sync_status_badge,
     _technical_momentum_evaluation_card,
@@ -806,6 +807,14 @@ def render_main_screener_view(
             f"<td colspan='18'>{_detail_panel(item, watchlist_map, current_params, lang)}</td>"
             "</tr>"
             )
+        else:
+            rating_html = _row_technical_rating_html(item, lang)
+            if rating_html:
+                row_chunks.append(
+                    "<tr class='detail-row'>"
+                    f"<td colspan='18'>{rating_html}</td>"
+                    "</tr>"
+                )
     empty_state = (
         "先选择一个模板或调整参数后再执行筛选，首屏默认不自动跑重计算。"
         if lang == "zh"

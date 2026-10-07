@@ -1113,7 +1113,13 @@ class AppFlowTests(unittest.TestCase):
 
     def test_screener_can_add_current_results_to_today_focus_pool(self) -> None:
         self._seed_symbol("600001.SS", "测试科技", "CN", "SSE")
-        self._write_price_history("600001.SS", self._build_bullish_cn_history())
+        # The focus-pool readiness gate (readiness >= 60) is intentionally kept
+        # as-is. Feed the fixture a fully-formed breakout session — the final
+        # bar trades on ~5x the 20-day average volume — so the candidate reaches
+        # the gate on its own market data instead of landing at readiness 57.
+        history = self._build_bullish_cn_history()
+        history[-1] = {**history[-1], "volume": history[-1]["volume"] * 5}
+        self._write_price_history("600001.SS", history)
 
         response = self.client.post(
             "/screeners/add-to-focus",

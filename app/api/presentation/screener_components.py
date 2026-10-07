@@ -1528,6 +1528,26 @@ def _tradingview_rating_cell(ratings: dict | None, lang: str) -> str:
     return "<div class='detail-chip-row'>" + "".join(chips) + "</div>"
 
 
+def _row_technical_rating_html(item: dict, lang: str) -> str:
+    """Default per-row TradingView multi-timeframe rating block.
+
+    Every screener row used to emit the ``技术评级`` block (see ddf3553). A
+    later ``show_details`` optimisation moved it into the collapsed row-detail
+    panel, which hid it from the default result page. Restore the default
+    rendering for rows that actually carry ratings, without expanding the full
+    row-detail panel or changing any column semantics.
+    """
+    ratings = item.get("tradingview_ratings")
+    if not ratings:
+        return ""
+    return (
+        "<div class='detail-card' style='max-width:340px;'>"
+        f"<div class='detail-label'>{_lang_text(lang, 'technical_rating')}</div>"
+        f"{_tradingview_rating_cell(ratings, lang)}"
+        "</div>"
+    )
+
+
 def _pattern_hits_inline(patterns: list[str] | None) -> str:
     values = [str(item).strip() for item in (patterns or []) if str(item).strip()]
     if not values:
