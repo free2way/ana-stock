@@ -6,6 +6,8 @@ from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
+from app.services.ai_analysis import AIAnalysisService
+from app.services.analysis_fusion import safe_symbol_analysis
 from app.services.execution_tag_filters import (
     matches_execution_tag_filter as _matches_execution_tag_filter,
     excludes_execution_tag_filter as _excludes_execution_tag_filter,
@@ -16,6 +18,7 @@ from app.services.auth import is_authenticated, login_redirect
 from app.services.market_sync import sync_market_data
 from app.services.price_snapshot import load_daily_change_pct as _load_watchlist_daily_change_pct
 from app.services.market_freshness import summarize_market_freshness
+from app.services.market_intelligence import build_symbol_decision_brief
 from app.services.price_snapshot import load_latest_closes
 from app.services.repository import PredictionRepository, PredictionTradePlanRepository, SymbolRepository, WatchlistRepository
 from app.services.model_signal_summary import build_signal_label, model_confidence, signal_strength
@@ -693,6 +696,64 @@ def _watchlist_queue_bucket(item: dict) -> str:
     return "observe"
 
 
+def _watchlist_overview_from_item(item: dict) -> dict:
+    return {
+        "ticker": str(item.get("ticker") or "").strip().upper(),
+        "name": item.get("name"),
+        "market": item.get("market"),
+        "exchange": item.get("exchange"),
+    }
+
+
+def _full_watchlist_analysis(item: dict) -> tuple[dict | None, dict | None]:
+    """Read the shared analysis-fusion chain for one watchlist candidate.
+
+    Returns ``(combined_analysis, decision_brief)`` and falls back to
+    ``(None, None)`` when the external analysis chain is unavailable, so the
+    decision console never takes the whole page down; callers then keep the
+    local lightweight stub for that name.
+    """
+    overview = _watchlist_overview_from_item(item)
+    if not overview["ticker"]:
+        return None, None
+    latest_signal = item.get("model_output") or None
+    try:
+        combined = safe_symbol_analysis(overview, latest_signal)
+    except Exception:
+        return None, None
+    if not isinstance(combined, dict) or not combined:
+        return None, None
+    try:
+        brief = build_symbol_decision_brief(
+            ticker=overview["ticker"],
+            combined_analysis=combined,
+            latest_signal=latest_signal,
+        )
+    except Exception:
+        brief = None
+    return combined, brief if isinstance(brief, dict) else None
+
+
+def _watchlist_ai_headline(item: dict, combined_analysis: dict, lang: str) -> str | None:
+    overview = _watchlist_overview_from_item(item)
+    if not overview["ticker"]:
+        return None
+    try:
+        payload = AIAnalysisService().analyze_symbol(
+            overview=overview,
+            latest_signal=item.get("model_output") or None,
+            combined_analysis=combined_analysis,
+            lang=lang,
+        )
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        headline = payload.get("headline") or payload.get("summary")
+        if headline:
+            return str(headline)
+    return None
+
+
 def _render_watchlist_analysis_fragment(
     *,
     items: list[dict],
@@ -703,10 +764,13 @@ def _render_watchlist_analysis_fragment(
 ) -> str:
     pre_ranked_items = sorted(items, key=_watchlist_pre_rank)
     detailed_items: list[dict] = []
-    for item in pre_ranked_items[:analysis_limit]:
+    for index, item in enumerate(pre_ranked_items[:analysis_limit]):
         model_output = item.get("model_output")
-        combined = _lightweight_watchlist_analysis(model_output)
-        decision_brief = _lightweight_watchlist_brief(item["ticker"], model_output, combined)
+        combined, decision_brief = _full_watchlist_analysis(item)
+        if combined is None:
+            combined = _lightweight_watchlist_analysis(model_output)
+        if not decision_brief:
+            decision_brief = _lightweight_watchlist_brief(item["ticker"], model_output, combined)
         enriched = dict(item)
         enriched["combined_analysis"] = combined
         enriched["decision_brief"] = decision_brief
@@ -714,6 +778,8 @@ def _render_watchlist_analysis_fragment(
         action_hint, action_reason = _watchlist_action_hint(enriched, lang=lang)
         enriched["action_hint"] = action_hint
         enriched["action_reason"] = action_reason
+        ai_headline = _watchlist_ai_headline(item, combined, lang) if index < ai_analysis_limit else None
+        enriched["ai_headline"] = ai_headline
         execution_tags = [str(tag).strip() for tag in (item.get("execution_tags") or []) if str(tag).strip()]
         if execution_tags:
             enriched["ai_brief"] = (
@@ -721,6 +787,8 @@ def _render_watchlist_analysis_fragment(
                 if lang == "zh"
                 else "Resolve execution risk tags before promoting this name."
             )
+        elif ai_headline:
+            enriched["ai_brief"] = ai_headline
         elif str(combined.get("decision") or "").upper() == "BUY":
             enriched["ai_brief"] = (
                 "模型偏多，可优先检查触发位是否接近。"
@@ -804,7 +872,57 @@ def _render_watchlist_analysis_fragment(
         )
 
     queue_html = "".join(_queue_rows(bucket) for bucket in ("risk", "primary", "observe", "archive"))
+    high_priority_count = sum(
+        1
+        for item in ranked_items
+        if str((item.get("combined_analysis") or {}).get("decision") or "").upper() in {"BUY", "STRONG BUY"}
+    )
+    caution_count = sum(
+        1
+        for item in ranked_items
+        if str((item.get("combined_analysis") or {}).get("decision") or "").upper() in {"SELL", "STRONG SELL"}
+    )
+    top_briefs_html = "".join(
+        "<div>"
+        f"{html.escape(str(item.get('ticker') or '-'))}: "
+        f"{html.escape(str((item.get('decision_brief') or {}).get('headline') or '-'))}"
+        "</div>"
+        for item in ranked_items[:3]
+    ) or f"<div class='muted'>{'暂无' if lang == 'zh' else 'No names'}</div>"
+    ai_brief_items = [item for item in ranked_items if item.get("ai_headline")][:3]
+    ai_briefs_html = "".join(
+        "<div>"
+        f"{html.escape(str(item.get('ticker') or '-'))}: "
+        f"{html.escape(str(item.get('ai_headline') or '-'))}"
+        "</div>"
+        for item in ai_brief_items
+    ) or f"<div class='muted'>{'暂无' if lang == 'zh' else 'No names'}</div>"
     return f"""
+      <section class="card" style="margin-bottom:16px;">
+        <div class="eyebrow">{'决策面板' if lang == 'zh' else 'Decision Console'}</div>
+        <div class="muted" style="margin-bottom:10px;">{'查看模式' if lang == 'zh' else 'View Mode'}: {view_mode}</div>
+        <div style="display:grid;gap:16px;grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));">
+          <article class="card" style="margin:0;">
+            <div class="eyebrow">{'高优先级' if lang == 'zh' else 'High Priority'}</div>
+            <div style="font-size:28px;font-weight:800;margin:6px 0;">{high_priority_count}</div>
+            <div class="muted">{'模型判定为偏多（BUY / STRONG BUY）的名字数量。' if lang == 'zh' else 'Watchlist names currently rated BUY or STRONG BUY.'}</div>
+          </article>
+          <article class="card" style="margin:0;">
+            <div class="eyebrow">{'谨慎' if lang == 'zh' else 'Caution'}</div>
+            <div style="font-size:28px;font-weight:800;margin:6px 0;">{caution_count}</div>
+            <div class="muted">{'模型判定为偏弱（SELL / STRONG SELL）的名字数量。' if lang == 'zh' else 'Names where the blended decision is SELL or STRONG SELL.'}</div>
+          </article>
+          <article class="card" style="margin:0;">
+            <div class="eyebrow">{'重点简报' if lang == 'zh' else 'Top Briefs'}</div>
+            <div class="muted">{top_briefs_html}</div>
+          </article>
+          <article class="card" style="margin:0;">
+            <div class="eyebrow">{'AI 简报' if lang == 'zh' else 'AI Briefs'}</div>
+            <div class="muted">{ai_briefs_html}</div>
+          </article>
+        </div>
+      </section>
+
       <section class="card" style="margin-bottom:16px;">
         <div class="eyebrow">{'行动队列' if lang == 'zh' else 'Action Queue'}</div>
         <h2 style="margin:0 0 6px;font-size:20px;">{'先处理风险，再推进主攻候选' if lang == 'zh' else 'Resolve risk first, then advance primary candidates'}</h2>
