@@ -32,7 +32,7 @@ US event ledger can consume ``EdgarFilingEvent.to_record()`` unchanged.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time as datetime_time, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 import gzip
 import hashlib
 import json
@@ -55,6 +55,8 @@ from app.services.ticker_format import normalize_ticker_for_market
 EDGAR_PROVIDER = "sec_edgar"
 EDGAR_FILINGS_SCHEMA_VERSION = "edgar_daily_filings_v1"
 EDGAR_EVENT_SCHEMA_VERSION = "edgar_filing_event_v1"
+EDGAR_DAILY_INDEX_SCHEMA_VERSION = "edgar_daily_index_v1"
+EDGAR_RECONCILIATION_SCHEMA_VERSION = "edgar_filings_reconciliation_v1"
 EDGAR_FILINGS_SUBDIR = "edgar_filings"
 
 #: Form types the daily flow is scoped to.  Callers may pass any subset.
@@ -63,6 +65,20 @@ DAILY_FILING_FORMS: tuple[str, ...] = ("8-K", "4", "144")
 # EDGAR dates (``file_date`` / ``period_ending``) are plain calendar dates in
 # U.S. Eastern time; U.S. equities trade on the same clock.
 _EDGAR_TZ = ZoneInfo("America/New_York")
+
+#: EDGAR settles a filing day's daily index at roughly 22:00 ET.  Operations
+#: treat 23:00 ET as the safe "this day's index is final" boundary:  the daily
+#: fetch is scheduled after it and the CLI's default date never moves on to a
+#: day that is still being written.
+EDGAR_DAILY_INDEX_FINAL_HOUR_ET = 23
+
+# Daily-index data rows are fixed-width: a 12-char form column, the issuer name,
+# then the CIK, an 8-digit ``YYYYMMDD`` filed date and the file path.  The parse
+# below is whitespace-tolerant rather than column-indexed so a padding change on
+# EDGAR's side cannot silently shift every count.
+_DAILY_INDEX_ROW = re.compile(
+    r"^(?P<company>.*?)\s+(?P<cik>\d{1,10})\s+(?P<date>\d{8})\s+(?P<file>\S+)\s*$"
+)
 
 # Event-ledger type keyed by the *root* form so ``4/A`` collapses onto ``Form4``.
 _EVENT_TYPE_BY_ROOT_FORM = {
@@ -172,6 +188,258 @@ def normalize_form_types(form_types: Iterable[str] | str | None) -> tuple[str, .
     return tuple(normalized)
 
 
+def edgar_index_final_at(filed_date: date | str) -> datetime:
+    """Instant (America/New_York) after which ``filed_date``'s index is final."""
+
+    day = _coerce_date(filed_date, field="filed_date")
+    return datetime.combine(
+        day, datetime_time(hour=EDGAR_DAILY_INDEX_FINAL_HOUR_ET), tzinfo=_EDGAR_TZ
+    )
+
+
+def edgar_index_is_final(filed_date: date | str, *, now: datetime | None = None) -> bool:
+    """Whether EDGAR has settled ``filed_date``'s daily index by ``now`` (ET)."""
+
+    moment = (now or datetime.now(tz=timezone.utc)).astimezone(_EDGAR_TZ)
+    return moment >= edgar_index_final_at(filed_date)
+
+
+def edgar_default_filed_date(now: datetime | None = None) -> date:
+    """Latest ET day whose EDGAR daily index is final (conservative default).
+
+    EDGAR settles a filing day's index at roughly 22:00 ET, so the default only
+    moves on to a new day after 23:00 ET.  An early-morning or same-evening run
+    therefore never picks a day that is still being written -- unlike a plain
+    "yesterday UTC" default, which can resolve to the *current, incomplete* ET
+    day in the 20:00-24:00 ET window.
+    """
+
+    moment = (now or datetime.now(tz=timezone.utc)).astimezone(_EDGAR_TZ)
+    if moment.hour < EDGAR_DAILY_INDEX_FINAL_HOUR_ET:
+        return moment.date() - timedelta(days=1)
+    return moment.date()
+
+
+@dataclass(frozen=True, slots=True)
+class EdgarDailyIndexSnapshot:
+    """Parsed ``form.YYYYMMDD.idx`` counts, keyed by amendment-normalized form."""
+
+    filed_date: date
+    url: str
+    counts_by_root_form: Mapping[str, int]
+    row_count: int
+    schema_version: str = EDGAR_DAILY_INDEX_SCHEMA_VERSION
+
+    def to_dict(self) -> dict:
+        return {
+            "schema_version": self.schema_version,
+            "filed_date": self.filed_date.isoformat(),
+            "url": self.url,
+            "row_count": self.row_count,
+            "counts_by_root_form": dict(sorted(self.counts_by_root_form.items())),
+        }
+
+
+def parse_edgar_daily_index(
+    text: str, *, filed_date: date | str, url: str
+) -> EdgarDailyIndexSnapshot:
+    """Parse an official EDGAR daily index (``form.YYYYMMDD.idx``) into counts.
+
+    Header/blank/separator lines are skipped; a period-suffixed amendment
+    (``8-K/A``) is folded onto its root form so the count is directly comparable
+    with the full-text fetch, which keeps amendments for a requested form.
+    """
+
+    day = _coerce_date(filed_date, field="filed_date")
+    counts: dict[str, int] = {}
+    row_count = 0
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("-"):
+            continue
+        form = line[:12].strip().upper()
+        if not form:
+            continue
+        if not _DAILY_INDEX_ROW.match(line[12:]):
+            continue
+        row_count += 1
+        root = form.split("/")[0]
+        counts[root] = counts.get(root, 0) + 1
+    return EdgarDailyIndexSnapshot(
+        filed_date=day,
+        url=url,
+        counts_by_root_form=counts,
+        row_count=row_count,
+    )
+
+
+def _root_form_of_row(row: Mapping) -> str:
+    # ``form_type`` is the authoritative column; amendments fold onto the root.
+    return (
+        str(row.get("form_type") or row.get("root_form") or "")
+        .split("/")[0]
+        .strip()
+        .upper()
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class EdgarFilingsReconciliation:
+    """Completeness cross-check of a fetched day against EDGAR's daily index.
+
+    Advisory by contract: ``status`` is ``match``/``mismatch``/``index_unavailable``
+    and ``blocking`` is always ``False``.  A mismatch is surfaced to the operator
+    (log line + sidecar artifact carrying both counts) but never fails the run.
+    """
+
+    filed_date: date
+    forms: tuple[str, ...]
+    status: str
+    matched: bool
+    blocking: bool
+    observed_total: int
+    expected_total: int | None
+    observed_by_form: Mapping[str, int]
+    expected_by_form: Mapping[str, int]
+    delta_by_form: Mapping[str, int]
+    notes: tuple[str, ...]
+    index_url: str | None = None
+    schema_version: str = EDGAR_RECONCILIATION_SCHEMA_VERSION
+
+    def advisory(self) -> str | None:
+        """One-line WARN text for a non-match; ``None`` when the counts match."""
+
+        if self.matched:
+            return None
+        if self.status == "index_unavailable":
+            return (
+                f"EDGAR daily-index reconciliation UNAVAILABLE for {self.filed_date.isoformat()}: "
+                f"fetched={self.observed_total} (index not read); advisory only, not blocking. "
+                + "; ".join(self.notes)
+            )
+        return (
+            f"EDGAR daily-index reconciliation MISMATCH for {self.filed_date.isoformat()}: "
+            f"index={self.expected_total} fetched={self.observed_total}; advisory only, not blocking. "
+            + "; ".join(self.notes)
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "schema_version": self.schema_version,
+            "provider": EDGAR_PROVIDER,
+            "filed_date": self.filed_date.isoformat(),
+            "forms": list(self.forms),
+            "status": self.status,
+            "matched": self.matched,
+            "blocking": self.blocking,
+            "observed_total": self.observed_total,
+            "expected_total": self.expected_total,
+            "observed_by_form": dict(sorted(self.observed_by_form.items())),
+            "expected_by_form": dict(sorted(self.expected_by_form.items())),
+            "delta_by_form": dict(sorted(self.delta_by_form.items())),
+            "index_url": self.index_url,
+            "notes": list(self.notes),
+        }
+
+
+def build_edgar_reconciliation(
+    filed_date: date | str,
+    rows: Sequence[Mapping],
+    *,
+    forms: Sequence[str] | str | None = None,
+    index: EdgarDailyIndexSnapshot | None = None,
+    index_unavailable_reason: str | None = None,
+) -> EdgarFilingsReconciliation:
+    """Compare fetched filing rows with the official daily-index counts.
+
+    ``index=None`` (e.g. the daily index could not be read) yields an
+    ``index_unavailable`` result instead of an error, so the caller's successful
+    fetch is never turned into a failure by this advisory check.
+    """
+
+    day = _coerce_date(filed_date, field="filed_date")
+    requested = normalize_form_types(forms)
+    requested_set = set(requested)
+
+    observed: dict[str, int] = {}
+    for row in rows:
+        root = _root_form_of_row(row)
+        if root in requested_set:
+            observed[root] = observed.get(root, 0) + 1
+    observed_by_form = {form: observed.get(form, 0) for form in requested}
+    observed_total = len(rows)
+
+    if index is None:
+        return EdgarFilingsReconciliation(
+            filed_date=day,
+            forms=requested,
+            status="index_unavailable",
+            matched=False,
+            blocking=False,
+            observed_total=observed_total,
+            expected_total=None,
+            observed_by_form=observed_by_form,
+            expected_by_form={},
+            delta_by_form={},
+            notes=(index_unavailable_reason or "EDGAR daily index was not read",),
+        )
+
+    expected_by_form = {
+        form: int(index.counts_by_root_form.get(form, 0)) for form in requested
+    }
+    expected_total = sum(expected_by_form.values())
+    delta_by_form = {
+        form: observed_by_form[form] - expected_by_form[form] for form in requested
+    }
+
+    notes: list[str] = []
+    outside_scope = observed_total - sum(observed_by_form.values())
+    if outside_scope:
+        notes.append(
+            f"{outside_scope} fetched row(s) fall outside the requested form scope"
+        )
+    total_delta = observed_total - expected_total
+    if total_delta or any(delta_by_form.values()) or outside_scope:
+        breakdown = ", ".join(
+            f"{form}: index={expected_by_form[form]} fetched={observed_by_form[form]}"
+            for form in requested
+        )
+        notes.insert(
+            0,
+            f"index={expected_total} fetched={observed_total} delta={total_delta:+d} "
+            f"[{breakdown}]",
+        )
+        return EdgarFilingsReconciliation(
+            filed_date=day,
+            forms=requested,
+            status="mismatch",
+            matched=False,
+            blocking=False,
+            observed_total=observed_total,
+            expected_total=expected_total,
+            observed_by_form=observed_by_form,
+            expected_by_form=expected_by_form,
+            delta_by_form=delta_by_form,
+            notes=tuple(notes),
+            index_url=index.url,
+        )
+
+    notes.append(f"index={expected_total} fetched={observed_total} delta=+0")
+    return EdgarFilingsReconciliation(
+        filed_date=day,
+        forms=requested,
+        status="match",
+        matched=True,
+        blocking=False,
+        observed_total=observed_total,
+        expected_total=expected_total,
+        observed_by_form=observed_by_form,
+        expected_by_form=expected_by_form,
+        delta_by_form=delta_by_form,
+        notes=tuple(notes),
+        index_url=index.url,
+    )
+
+
 def _throttle(min_interval_seconds: float) -> None:
     global _LAST_REQUEST_AT
     interval = max(0.0, float(min_interval_seconds or 0.0))
@@ -220,6 +488,7 @@ class EdgarDailyFilingsClient:
         user_agent: str | None = None,
         efts_endpoint: str | None = None,
         archive_endpoint: str | None = None,
+        daily_index_endpoint: str | None = None,
         min_request_interval_seconds: float | None = None,
         timeout_seconds: float | None = None,
         max_pages: int | None = None,
@@ -239,6 +508,9 @@ class EdgarDailyFilingsClient:
         self.efts_endpoint = str(efts_endpoint or self.settings.sec_efts_endpoint).rstrip("?")
         self.archive_endpoint = str(
             archive_endpoint or self.settings.sec_filings_archive_endpoint
+        ).rstrip("/")
+        self.daily_index_endpoint = str(
+            daily_index_endpoint or self.settings.sec_daily_index_endpoint
         ).rstrip("/")
         self.min_request_interval_seconds = float(
             self.settings.sec_min_request_interval_seconds
@@ -314,6 +586,32 @@ class EdgarDailyFilingsClient:
                 raise last_error
             time.sleep(max(0.0, self.retry_backoff_seconds) * (2**attempt))
         raise last_error  # pragma: no cover - loop always returns or raises
+
+    def _request_text(self, url: str) -> str:
+        if not self.user_agent:
+            raise EdgarFilingsConfigError(
+                "SEC User-Agent is required (e.g. `Your Org admin@example.com`); "
+                "set PQW_SEC_USER_AGENT before enabling the EDGAR filings source"
+            )
+        return self._read_with_retries(url).decode("utf-8", errors="replace")
+
+    # -- Daily index (advisory completeness cross-check) ----------------------
+    def daily_index_url(self, filed_date: date | str) -> str:
+        day = _coerce_date(filed_date, field="filed_date")
+        quarter = (day.month - 1) // 3 + 1
+        return f"{self.daily_index_endpoint}/{day.year}/QTR{quarter}/form.{day.strftime('%Y%m%d')}.idx"
+
+    def fetch_daily_index(self, filed_date: date | str) -> EdgarDailyIndexSnapshot:
+        """Read the official daily index for ``filed_date`` (fail-closed on error).
+
+        The caller decides whether an unavailable index is fatal: the CLI treats
+        it as an advisory warning so a successful fetch is never blocked by this
+        cross-check.
+        """
+
+        day = _coerce_date(filed_date, field="filed_date")
+        url = self.daily_index_url(day)
+        return parse_edgar_daily_index(self._request_text(url), filed_date=day, url=url)
 
     def _ticker_lookup(self) -> dict[str, str]:
         if self._ticker_map is not None:
@@ -542,6 +840,24 @@ class EdgarFilingsStore:
     def daily_parquet_path(self, filed_date: date | str) -> Path:
         day = _coerce_date(filed_date, field="filed_date")
         return self.root / f"{day.isoformat()}.parquet"
+
+    def reconciliation_path(self, filed_date: date | str) -> Path:
+        day = _coerce_date(filed_date, field="filed_date")
+        return self.root / f"{day.isoformat()}.reconciliation.json"
+
+    def write_reconciliation(self, reconciliation: EdgarFilingsReconciliation) -> Path:
+        """Persist the advisory daily-index cross-check beside the day's artifact.
+
+        Deliberately a *separate* sidecar: the main artifact's ``content_sha256``
+        identifies filing content only, so a reconciliation verdict (which can
+        change between runs) must not alter it.  Content is deterministic, so
+        re-running the same check rewrites identical bytes.
+        """
+
+        target = self.reconciliation_path(reconciliation.filed_date)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write(target, canonical_json_bytes(reconciliation.to_dict()))
+        return target
 
     def build_document(self, filed_date: date | str, rows: Sequence[dict], *, query: Mapping) -> dict:
         day = _coerce_date(filed_date, field="filed_date")
@@ -796,6 +1112,9 @@ __all__ = [
     "EDGAR_PROVIDER",
     "EDGAR_FILINGS_SCHEMA_VERSION",
     "EDGAR_EVENT_SCHEMA_VERSION",
+    "EDGAR_DAILY_INDEX_SCHEMA_VERSION",
+    "EDGAR_RECONCILIATION_SCHEMA_VERSION",
+    "EDGAR_DAILY_INDEX_FINAL_HOUR_ET",
     "EDGAR_FILINGS_SUBDIR",
     "DAILY_FILING_FORMS",
     "EDGAR_FILINGS_SCHEMA",
@@ -807,7 +1126,14 @@ __all__ = [
     "EdgarDailyFilingsClient",
     "EdgarFilingsStore",
     "EdgarFilingEvent",
+    "EdgarDailyIndexSnapshot",
+    "EdgarFilingsReconciliation",
     "build_events",
+    "build_edgar_reconciliation",
+    "parse_edgar_daily_index",
+    "edgar_default_filed_date",
+    "edgar_index_final_at",
+    "edgar_index_is_final",
     "event_type_for_form",
     "normalize_form_types",
     "canonical_json_bytes",

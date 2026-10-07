@@ -6,28 +6,39 @@ smoke test (``ANA_EDGAR_LIVE_SMOKE=1``) exercises the real endpoint.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
-from datetime import date
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import date, datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import TestCase, skipUnless
+from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 
 from app.services.providers.edgar_filings import (
     DAILY_FILING_FORMS,
     EDGAR_PROVIDER,
+    EDGAR_RECONCILIATION_SCHEMA_VERSION,
     EdgarDailyFilingsClient,
+    EdgarDailyIndexSnapshot,
     EdgarFilingsConflictError,
     EdgarFilingsConfigError,
     EdgarFilingsError,
     EdgarFilingsFetchError,
     EdgarFilingsParseError,
     EdgarFilingsStore,
+    build_edgar_reconciliation,
     build_events,
+    edgar_default_filed_date,
+    edgar_index_is_final,
     event_type_for_form,
     normalize_form_types,
+    parse_edgar_daily_index,
 )
+from scripts import fetch_edgar_filings as cli
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "edgar_filings"
@@ -96,6 +107,24 @@ def make_client(opener, **overrides) -> EdgarDailyFilingsClient:
     }
     kwargs.update(overrides)
     return EdgarDailyFilingsClient(**kwargs)
+
+
+def load_8k_rows() -> list[dict]:
+    """The four recorded 8-K filings for 2024-01-02 (shared by the check tests)."""
+
+    opener = _RecordingOpener([load_fixture("efts_8k_2024-01-02.json")])
+    return make_client(opener).fetch_daily_filings("2024-01-02", form_types=["8-K"])
+
+
+def load_daily_index(name: str) -> EdgarDailyIndexSnapshot:
+    """Parse a recorded ``form.YYYYMMDD.idx`` fixture for 2024-01-02."""
+
+    text = (FIXTURES / name).read_text(encoding="utf-8")
+    return parse_edgar_daily_index(
+        text,
+        filed_date="2024-01-02",
+        url="https://www.sec.gov/Archives/edgar/daily-index/2024/QTR1/form.20240102.idx",
+    )
 
 
 class EndpointAndParamsTests(TestCase):
@@ -440,6 +469,187 @@ class EventModelTests(TestCase):
             build_events([{"filed_date": "2024-01-02", "form_type": "8-K", "source_reference": ""}])
 
 
+class DailyIndexTests(TestCase):
+    """The advisory cross-check reads EDGAR's official ``form.YYYYMMDD.idx``."""
+
+    def test_parses_fixed_width_index_and_ignores_header(self) -> None:
+        snapshot = load_daily_index("daily_index_8k_2024-01-02.idx")
+        self.assertEqual(date(2024, 1, 2), snapshot.filed_date)
+        # 4x 8-K + 1x 4 + 1x 10-K: header/blank/separator lines are skipped.
+        self.assertEqual(6, snapshot.row_count)
+        self.assertEqual({"8-K": 4, "4": 1, "10-K": 1}, dict(snapshot.counts_by_root_form))
+
+    def test_amendments_fold_onto_their_root_form(self) -> None:
+        snapshot = load_daily_index("daily_index_8k_2024-01-02_mismatch.idx")
+        # 5x 8-K + 1x 8-K/A -> 6 root-form 8-K rows, comparable to the fetch,
+        # which also keeps an amendment of a requested form.
+        self.assertEqual(6, snapshot.counts_by_root_form["8-K"])
+        self.assertEqual(8, snapshot.row_count)
+
+    def test_client_reads_index_text_and_builds_quarter_scoped_url(self) -> None:
+        body = (FIXTURES / "daily_index_8k_2024-01-02.idx").read_bytes()
+        opener = _RecordingOpener([body])
+        client = make_client(opener, daily_index_endpoint="https://www.sec.gov/Archives/edgar/daily-index")
+        snapshot = client.fetch_daily_index("2024-01-02")
+        self.assertEqual(4, snapshot.counts_by_root_form["8-K"])
+        self.assertEqual(
+            "https://www.sec.gov/Archives/edgar/daily-index/2024/QTR1/form.20240102.idx",
+            opener.urls[0],
+        )
+        self.assertTrue(client.daily_index_url("2024-12-31").endswith("/2024/QTR4/form.20241231.idx"))
+
+    def test_unreadable_index_fails_closed_at_the_client_layer(self) -> None:
+        missing = HTTPError("https://www.sec.gov/x.idx", 404, "Not Found", {}, None)
+        client = make_client(_RecordingOpener([missing]))
+        with self.assertRaises(EdgarFilingsFetchError):
+            client.fetch_daily_index("2024-01-02")
+
+    def test_index_read_requires_user_agent(self) -> None:
+        client = EdgarDailyFilingsClient(
+            user_agent="",
+            efts_endpoint=EFTS,
+            archive_endpoint=ARCHIVE,
+            opener=_RecordingOpener([]),
+        )
+        with self.assertRaises(EdgarFilingsConfigError):
+            client.fetch_daily_index("2024-01-02")
+
+
+class ReconciliationTests(TestCase):
+    def test_matching_index_is_not_a_warning(self) -> None:
+        result = build_edgar_reconciliation(
+            "2024-01-02",
+            load_8k_rows(),
+            forms=["8-K"],
+            index=load_daily_index("daily_index_8k_2024-01-02.idx"),
+        )
+        self.assertEqual("match", result.status)
+        self.assertTrue(result.matched)
+        self.assertFalse(result.blocking)
+        self.assertEqual(4, result.expected_total)
+        self.assertEqual(4, result.observed_total)
+        self.assertEqual(0, result.delta_by_form["8-K"])
+        self.assertIsNone(result.advisory())
+        payload = result.to_dict()
+        self.assertEqual(EDGAR_RECONCILIATION_SCHEMA_VERSION, payload["schema_version"])
+        self.assertEqual(4, payload["expected_total"])
+        self.assertEqual(4, payload["observed_total"])
+
+    def test_mismatch_warns_with_both_counts_but_never_blocks(self) -> None:
+        result = build_edgar_reconciliation(
+            "2024-01-02",
+            load_8k_rows(),
+            forms=["8-K"],
+            index=load_daily_index("daily_index_8k_2024-01-02_mismatch.idx"),
+        )
+        self.assertEqual("mismatch", result.status)
+        self.assertFalse(result.matched)
+        # Advisory by contract: the verdict never blocks the caller.
+        self.assertFalse(result.blocking)
+        self.assertEqual(6, result.expected_total)
+        self.assertEqual(4, result.observed_total)
+        self.assertEqual(-2, result.delta_by_form["8-K"])
+        advisory = result.advisory()
+        self.assertIsNotNone(advisory)
+        self.assertIn("index=6", advisory)
+        self.assertIn("fetched=4", advisory)
+        self.assertIn("not blocking", advisory)
+        payload = result.to_dict()
+        self.assertEqual(6, payload["expected_total"])
+        self.assertEqual(4, payload["observed_total"])
+        self.assertTrue(payload["notes"])
+
+    def test_unavailable_index_keeps_fetched_counts_and_is_advisory(self) -> None:
+        result = build_edgar_reconciliation(
+            "2024-01-02",
+            load_8k_rows(),
+            forms=["8-K"],
+            index_unavailable_reason="EDGAR HTTP 503",
+        )
+        self.assertEqual("index_unavailable", result.status)
+        self.assertFalse(result.matched)
+        self.assertFalse(result.blocking)
+        self.assertIsNone(result.expected_total)
+        self.assertEqual(4, result.observed_total)
+        advisory = result.advisory()
+        self.assertIsNotNone(advisory)
+        self.assertIn("EDGAR HTTP 503", advisory)
+
+    def test_only_requested_forms_are_compared(self) -> None:
+        result = build_edgar_reconciliation(
+            "2024-01-02",
+            load_8k_rows(),
+            forms=["8-K"],
+            index=load_daily_index("daily_index_8k_2024-01-02.idx"),
+        )
+        self.assertEqual(("8-K",), result.forms)
+        self.assertEqual({"8-K": 4}, dict(result.expected_by_form))
+        self.assertEqual({"8-K": 0}, dict(result.delta_by_form))
+
+    def test_reconciliation_sidecar_leaves_artifact_identity_alone(self) -> None:
+        with TemporaryDirectory() as name:
+            store = EdgarFilingsStore(Path(name) / "edgar_filings")
+            rows = load_8k_rows()
+            query = {
+                "q": '""',
+                "dateRange": "custom",
+                "startdt": "2024-01-02",
+                "enddt": "2024-01-02",
+                "forms": "8-K",
+                "from": "0",
+            }
+            reference = store.write_daily("2024-01-02", rows, query=query)
+            result = build_edgar_reconciliation(
+                "2024-01-02",
+                rows,
+                forms=["8-K"],
+                index=load_daily_index("daily_index_8k_2024-01-02_mismatch.idx"),
+            )
+            path = store.write_reconciliation(result)
+            self.assertEqual(store.reconciliation_path("2024-01-02"), path)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(6, payload["expected_total"])
+            self.assertEqual(4, payload["observed_total"])
+            self.assertFalse(payload["blocking"])
+            # Re-running the same check rewrites identical bytes.
+            first = path.read_bytes()
+            store.write_reconciliation(result)
+            self.assertEqual(first, path.read_bytes())
+            # The advisory sidecar must not be part of the filing artifact.
+            document = json.loads(store.daily_path("2024-01-02").read_text(encoding="utf-8"))
+            self.assertNotIn("reconciliation", document)
+            self.assertEqual(reference["content_sha256"], document["content_sha256"])
+
+
+class ConservativeDefaultDateTests(TestCase):
+    def test_default_never_picks_an_unfinished_et_day(self) -> None:
+        # 20:00 ET on Jan 2 == 01:00 UTC Jan 3.  A naive "yesterday UTC" default
+        # would select the *current, still-being-written* ET day; the
+        # conservative rule steps back to Jan 1.
+        self.assertEqual(
+            date(2024, 1, 1),
+            edgar_default_filed_date(datetime(2024, 1, 3, 1, 0, tzinfo=timezone.utc)),
+        )
+        # 23:30 ET on Jan 2 (index final) -> Jan 2.
+        self.assertEqual(
+            date(2024, 1, 2),
+            edgar_default_filed_date(datetime(2024, 1, 3, 4, 30, tzinfo=timezone.utc)),
+        )
+        # 08:00 ET on Jan 2 -> Jan 1 (Jan 2's index is not final yet).
+        self.assertEqual(
+            date(2024, 1, 1),
+            edgar_default_filed_date(datetime(2024, 1, 2, 13, 0, tzinfo=timezone.utc)),
+        )
+
+    def test_index_finality_boundary_is_2300_et(self) -> None:
+        self.assertFalse(
+            edgar_index_is_final("2024-01-02", now=datetime(2024, 1, 3, 1, 0, tzinfo=timezone.utc))
+        )
+        self.assertTrue(
+            edgar_index_is_final("2024-01-02", now=datetime(2024, 1, 3, 4, 30, tzinfo=timezone.utc))
+        )
+
+
 @skipUnless(os.environ.get("ANA_EDGAR_LIVE_SMOKE") == "1", "set ANA_EDGAR_LIVE_SMOKE=1 to hit the real SEC endpoint")
 class LiveSmokeTests(TestCase):
     def test_real_edgar_fetch(self) -> None:
@@ -452,3 +662,76 @@ class LiveSmokeTests(TestCase):
         rows = client.fetch_daily_filings("2024-01-02", form_types=["8-K", "4", "144"])
         self.assertTrue(rows)
         self.assertTrue(all(row["provider"] == EDGAR_PROVIDER for row in rows))
+
+
+class _StubEdgarClient:
+    """CLI stub: replays recorded rows and one daily-index snapshot."""
+
+    def __init__(self, rows: list[dict], index: EdgarDailyIndexSnapshot | None, error: str | None = None) -> None:
+        self._rows = rows
+        self._index = index
+        self._error = error
+
+    def fetch_daily_filings(self, filed_date, *, form_types=None, max_pages=None):  # noqa: ARG002
+        return [dict(row) for row in self._rows]
+
+    def fetch_daily_index(self, filed_date):  # noqa: ARG002
+        if self._error:
+            raise EdgarFilingsFetchError(self._error)
+        return self._index
+
+    def build_query(self, filed_date, form_types, offset):  # noqa: ARG002
+        return {"startdt": "2024-01-02", "enddt": "2024-01-02", "forms": ",".join(form_types)}
+
+
+class CliReconciliationTests(TestCase):
+    """The CLI prints both counts, writes the sidecar, and always exits 0."""
+
+    def _run(
+        self, index: EdgarDailyIndexSnapshot | None = None, error: str | None = None
+    ) -> tuple[int, str, str, dict]:
+        rows = load_8k_rows()
+        with TemporaryDirectory() as temp:
+            with (
+                patch.object(cli, "EdgarDailyFilingsClient", lambda **kwargs: _StubEdgarClient(rows, index, error)),
+                patch.object(cli, "get_settings", lambda: object()),
+            ):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    code = cli.main(
+                        ["--date", "2024-01-02", "--forms", "8-K", "--out-root", temp, "--sample-events", "0"]
+                    )
+            sidecar = Path(temp) / "2024-01-02.reconciliation.json"
+            payload = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else {}
+        return code, out.getvalue(), err.getvalue(), payload
+
+    def test_match_prints_counts_and_reports_no_warning(self) -> None:
+        code, out, err, payload = self._run(load_daily_index("daily_index_8k_2024-01-02.idx"))
+        self.assertEqual(0, code)
+        self.assertIn("reconcile       : MATCH (index=4 fetched=4)", out)
+        self.assertEqual("", err)
+        self.assertEqual("match", payload["status"])
+        self.assertTrue(payload["matched"])
+
+    def test_mismatch_warns_but_still_exits_zero(self) -> None:
+        code, out, err, payload = self._run(load_daily_index("daily_index_8k_2024-01-02_mismatch.idx"))
+        self.assertEqual(0, code)  # advisory only: a mismatch never blocks
+        self.assertIn("MISMATCH (index=6 fetched=4)", out)
+        self.assertIn("index=6 fetched=4 delta=-2", out)
+        self.assertIn("WARN(advisory)", err)
+        self.assertIn("not blocking", err)
+        self.assertEqual("mismatch", payload["status"])
+        self.assertEqual(6, payload["expected_total"])
+        self.assertEqual(4, payload["observed_total"])
+        self.assertFalse(payload["blocking"])
+
+    def test_unreadable_index_is_reported_without_failing_the_run(self) -> None:
+        code, out, err, payload = self._run(error="EDGAR HTTP 403 for the daily index")
+        self.assertEqual(0, code)
+        self.assertIn("INDEX_UNAVAILABLE (index=n/a fetched=4)", out)
+        self.assertIn("WARN(advisory)", err)
+        self.assertIn("EDGAR HTTP 403", err)
+        self.assertEqual("index_unavailable", payload["status"])
+        self.assertIsNone(payload["expected_total"])
+        self.assertEqual(4, payload["observed_total"])
+        self.assertFalse(payload["blocking"])

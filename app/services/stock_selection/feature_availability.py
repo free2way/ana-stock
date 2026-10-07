@@ -152,6 +152,13 @@ class PointInTimeFeatureRecord:
 
     @property
     def knowledge_time(self) -> datetime:
+        # Conservative by contract: a backfilled record (e.g. EDGAR fundamentals
+        # whose ``available_time`` is the historical ``filed`` day-end) is only
+        # usable once *this repository* has ingested it, so the effective
+        # availability is the later of the two.  See
+        # docs/data-contract-knowledge-time-zh.md before "fixing" this to
+        # ``available_time``: backfill-as-filed needs an explicit provenance
+        # marker plus a consumer opt-in, which is deliberately not implemented.
         return max(self.available_time, self.ingested_time)
 
 

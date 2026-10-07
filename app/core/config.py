@@ -245,6 +245,12 @@ class Settings(BaseSettings):
     # deliberately conservative ~5 req/s so a busy day stays well inside it.
     sec_efts_endpoint: str = Field(default="https://efts.sec.gov/LATEST/search-index")
     sec_filings_archive_endpoint: str = Field(default="https://www.sec.gov/Archives/edgar/data")
+    # Official EDGAR daily index (``form.YYYYMMDD.idx``), used only as a
+    # read-only completeness cross-check against the full-text fetch.  Schedule
+    # the daily fetch after 23:00 ET, when this index has settled.
+    sec_daily_index_endpoint: str = Field(
+        default="https://www.sec.gov/Archives/edgar/daily-index"
+    )
     sec_min_request_interval_seconds: float = Field(default=0.2)
     # Hard cap on EFTS result pages per (date, form) query; 1 page = 100 hits.
     # EDGAR only serves a 10,000-hit window (~100 pages), so this doubles as a

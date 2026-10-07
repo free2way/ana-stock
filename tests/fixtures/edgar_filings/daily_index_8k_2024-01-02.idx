@@ -1,0 +1,17 @@
+Description:           Daily Index of EDGAR Dissemination Feed by Form Type
+Last Data Received:    Jan  2, 2024
+Comments:              webmaster@sec.gov
+Anonymous FTP:         ftp://ftp.sec.gov/edgar/
+ 
+ 
+ 
+ 
+Form Type   Company Name                                                  CIK
+      Date Filed  File Name
+---------------------------------------------------------------------------------------------------------------------------------------------
+8-K         Longboard Pharmaceuticals, Inc.                               1832168     20240102    edgar/data/1832168/000095017024000033/lbph-20240102.htm
+8-K         SomaLogic, Inc.                                               1837412     20240102    edgar/data/1837412/000110465924000390/tm2333952d5_8k.htm
+8-K         Casa Systems Inc                                              1333835     20240102    edgar/data/1333835/000119312523306062/d50731d8k.htm 
+8-K         Federal Home Loan Bank of San Francisco                       1316944     20240102    edgar/data/1316944/000131694424000002/fhlbsf-20231227.htm
+4           Peffer Julie                                                  1932370     20240102    edgar/data/1932370/000162828024000262/wk-form4_1704320134.xml
+10-K        Synthetic Annual Filer, Inc.                                  1234567     20240102    edgar/data/1234567/000123456724000007/synth-10k.htm 
