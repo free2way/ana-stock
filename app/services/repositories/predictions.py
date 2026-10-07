@@ -793,29 +793,77 @@ class PredictionRepository:
             reverse=True,
         )[: max(1, int(limit))]
 
-    def get_latest_model_output_for_ticker(self, ticker: str) -> dict | None:
-        stmt = (
-            select(Prediction, Symbol, ModelRun, PredictionDetail)
-            .join(Symbol, Symbol.id == Prediction.symbol_id)
-            .join(ModelRun, ModelRun.id == Prediction.model_run_id)
-            .outerjoin(PredictionDetail, PredictionDetail.prediction_id == Prediction.id)
+    def get_latest_model_output_for_ticker(
+        self, ticker: str, *, production_only: bool = True
+    ) -> dict | None:
+        """Latest successful model output for one ticker.
+
+        ``production_only`` keeps the champion-only semantics used by operational
+        candidate views. Per-ticker display surfaces (insight detail pages) pass
+        ``production_only=False`` so imported/native model artifacts stay
+        readable without being promoted to the production champion.
+
+        Reads follow the same market-scoped layering as the explanation and
+        trade-plan repositories: the physical hot table for CN/HK/US first, then
+        the legacy shared ``predictions`` mirror kept during the migration.
+        """
+        model_type_conditions = (
+            [ModelRun.model_type.in_(PRODUCTION_SIGNAL_MODEL_TYPES)]
+            if production_only
+            else []
+        )
+        prediction_table = Prediction
+        detail_table = PredictionDetail
+        row = None
+        symbol = self.db.scalar(
+            select(Symbol)
             .where(Symbol.ticker.in_(ticker_query_candidates(ticker)))
-            .where(
-                ModelRun.status == "success",
-                ModelRun.model_type.in_(PRODUCTION_SIGNAL_MODEL_TYPES),
-            )
-            .order_by(Prediction.trade_date.desc(), Prediction.model_run_id.desc())
+            .order_by(Symbol.ticker.asc())
             .limit(1)
         )
-        row = self.db.execute(stmt).first()
+        if symbol is not None and isinstance(self.db, Session):
+            market = str(symbol.market or "").strip().upper()
+            if market in physical_fact_write_markets():
+                prediction_table, detail_table, _ = physical_hot_prediction_models(market)
+                row = self.db.execute(
+                    select(prediction_table, Symbol, ModelRun, detail_table)
+                    .join(Symbol, Symbol.id == prediction_table.symbol_id)
+                    .join(ModelRun, ModelRun.id == prediction_table.model_run_id)
+                    .outerjoin(
+                        detail_table,
+                        detail_table.prediction_id == prediction_table.id,
+                    )
+                    .where(prediction_table.symbol_id == int(symbol.id))
+                    .where(Symbol.market == market)
+                    .where(ModelRun.status == "success", *model_type_conditions)
+                    .order_by(
+                        prediction_table.trade_date.desc(),
+                        prediction_table.model_run_id.desc(),
+                    )
+                    .limit(1)
+                ).first()
+        if row is None:
+            prediction_table = Prediction
+            detail_table = PredictionDetail
+            stmt = (
+                select(Prediction, Symbol, ModelRun, PredictionDetail)
+                .join(Symbol, Symbol.id == Prediction.symbol_id)
+                .join(ModelRun, ModelRun.id == Prediction.model_run_id)
+                .outerjoin(PredictionDetail, PredictionDetail.prediction_id == Prediction.id)
+                .where(Symbol.ticker.in_(ticker_query_candidates(ticker)))
+                .where(ModelRun.status == "success", *model_type_conditions)
+                .order_by(Prediction.trade_date.desc(), Prediction.model_run_id.desc())
+                .limit(1)
+            )
+            row = self.db.execute(stmt).first()
         if row is None:
             return None
 
         prediction, symbol, model_run, prediction_detail = row
         peer_count = self.db.scalar(
-            select(func.count(Prediction.id))
-            .where(Prediction.model_run_id == prediction.model_run_id)
-            .where(Prediction.trade_date == prediction.trade_date)
+            select(func.count(prediction_table.id))
+            .where(prediction_table.model_run_id == prediction.model_run_id)
+            .where(prediction_table.trade_date == prediction.trade_date)
         ) or 0
 
         rank_value = prediction.rank_value
@@ -827,7 +875,7 @@ class PredictionRepository:
             "prediction_id": prediction.id,
             "ticker": symbol.ticker,
             "name": symbol.name,
-            "trade_date": prediction.trade_date,
+            "trade_date": str(prediction.trade_date)[:10],
             "score": prediction.score,
             "rank_value": prediction.rank_value,
             "universe_size": peer_count,
@@ -867,11 +915,14 @@ class PredictionRepository:
             )
         return payload
 
-    def get_latest_model_outputs_for_tickers(self, tickers: list[str]) -> dict[str, dict]:
-        normalized = list(dict.fromkeys(ticker.strip().upper() for ticker in tickers if ticker and ticker.strip()))
-        if not normalized:
-            return {}
-
+    def _latest_model_outputs_for_tickers(
+        self, normalized: list[str], *, production_only: bool
+    ) -> dict[str, dict]:
+        model_type_conditions = (
+            [ModelRun.model_type.in_(PRODUCTION_SIGNAL_MODEL_TYPES)]
+            if production_only
+            else []
+        )
         ranked_predictions = (
             select(
                 Prediction.id.label("prediction_id"),
@@ -883,10 +934,7 @@ class PredictionRepository:
             .join(Symbol, Symbol.id == Prediction.symbol_id)
             .join(ModelRun, ModelRun.id == Prediction.model_run_id)
             .where(Symbol.ticker.in_(normalized))
-            .where(
-                ModelRun.status == "success",
-                ModelRun.model_type.in_(PRODUCTION_SIGNAL_MODEL_TYPES),
-            )
+            .where(ModelRun.status == "success", *model_type_conditions)
             .subquery()
         )
 
@@ -970,26 +1018,52 @@ class PredictionRepository:
             payloads[symbol.ticker] = payload
         return payloads
 
+    def get_latest_model_outputs_for_tickers(self, tickers: list[str]) -> dict[str, dict]:
+        """Latest successful model output per ticker, champion first.
+
+        Tickers without a production champion fall back to the latest imported
+        or research artifact so ingested model runs stay visible on display
+        surfaces (insight, screener, dashboard, watchlist) without ever
+        shadowing the production champion.
+        """
+        normalized = list(dict.fromkeys(ticker.strip().upper() for ticker in tickers if ticker and ticker.strip()))
+        if not normalized:
+            return {}
+        payloads = self._latest_model_outputs_for_tickers(normalized, production_only=True)
+        missing = [ticker for ticker in normalized if ticker not in payloads]
+        if missing:
+            for ticker, payload in self._latest_model_outputs_for_tickers(
+                missing, production_only=False
+            ).items():
+                payloads.setdefault(ticker, payload)
+        return payloads
+
     def list_recent_prediction_snapshots(self, *, top_n: int = 10, limit_runs: int = 4) -> list[dict]:
-        pair_stmt = (
-            select(Prediction.model_run_id, Prediction.trade_date)
-            .join(ModelRun, ModelRun.id == Prediction.model_run_id)
-            .where(
-                ModelRun.status == "success",
-                ModelRun.model_type.in_(PRODUCTION_SIGNAL_MODEL_TYPES),
+        def _load_pairs(*, production_only: bool) -> list[tuple[int, str]]:
+            stmt = (
+                select(Prediction.model_run_id, Prediction.trade_date)
+                .join(ModelRun, ModelRun.id == Prediction.model_run_id)
+                .where(ModelRun.status == "success")
+                .order_by(desc(Prediction.model_run_id), desc(Prediction.trade_date))
             )
-            .order_by(desc(Prediction.model_run_id), desc(Prediction.trade_date))
-        )
-        seen: set[tuple[int, str]] = set()
-        pairs: list[tuple[int, str]] = []
-        for model_run_id, trade_date in self.db.execute(pair_stmt):
-            key = (int(model_run_id), str(trade_date))
-            if key in seen:
-                continue
-            seen.add(key)
-            pairs.append(key)
-            if len(pairs) >= limit_runs:
-                break
+            if production_only:
+                stmt = stmt.where(ModelRun.model_type.in_(PRODUCTION_SIGNAL_MODEL_TYPES))
+            seen: set[tuple[int, str]] = set()
+            pairs: list[tuple[int, str]] = []
+            for model_run_id, trade_date in self.db.execute(stmt):
+                key = (int(model_run_id), str(trade_date))
+                if key in seen:
+                    continue
+                seen.add(key)
+                pairs.append(key)
+                if len(pairs) >= limit_runs:
+                    break
+            return pairs
+
+        # Prefer production champion runs; when the workspace has none yet (a
+        # fresh external/native import, for example) fall back to the latest
+        # successful run of any type so leaderboard surfaces stay populated.
+        pairs = _load_pairs(production_only=True) or _load_pairs(production_only=False)
 
         snapshots: list[dict] = []
         for model_run_id, trade_date in pairs:

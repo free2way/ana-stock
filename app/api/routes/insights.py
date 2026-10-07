@@ -85,6 +85,7 @@ TEXT = {
         "model_run": "Model Run",
         "model_summary": "Model Summary",
         "model_summary_empty": "No trained model output is available for this stock yet.",
+        "no_history_note": "No price history is available for this stock yet.",
         "model_score_help": "Higher means the latest trained model ranks this stock more favorably inside its universe.",
         "market_rank_help": "Position inside the latest model run on the same trade date.",
         "model_run_help": "The most recent training run that produced a prediction for this stock.",
@@ -184,6 +185,7 @@ TEXT = {
         "model_run": "模型运行",
         "model_summary": "模型结论",
         "model_summary_empty": "这只股票暂时还没有可展示的训练模型输出。",
+        "no_history_note": "这只股票暂时还没有可用的行情历史。",
         "model_score_help": "分数越高，表示最新模型在当前股票池里越看好这只股票。",
         "market_rank_help": "基于同一次模型运行、同一个交易日的排名位置。",
         "model_run_help": "最近一次为这只股票生成预测的训练运行。",
@@ -477,7 +479,11 @@ def _interactive_chart_html(*, chart_id: str, payload: dict, lang: str) -> str:
 
 
 def _model_output_summary(model_output: dict | None, *, lang: str) -> str:
-    if model_output and model_output.get("summary_text"):
+    if not model_output:
+        # Explicit empty state rather than a vague "no summary yet": the page can
+        # render for a known symbol with no model output at all.
+        return tr(lang, "model_summary_empty")
+    if model_output.get("summary_text"):
         return str(model_output["summary_text"])
     summary = summarize_model_output(model_output, lang=lang)
     if summary:
@@ -750,10 +756,16 @@ def _build_model_context(*, ticker: str, lang: str, db: Session) -> dict:
         fundamentals_repo = FundamentalSnapshotRepository(db)
         explanation_repo = PredictionExplanationRepository(db)
         trade_plan_repo = PredictionTradePlanRepository(db)
-        model_output = enrich_model_output(
-            PredictionRepository(db).get_latest_model_output_for_ticker(ticker),
-            lang=lang,
-        )
+        prediction_repo = PredictionRepository(db)
+        # The insight view is a per-symbol detail surface: prefer the production
+        # champion, then fall back to the latest imported/native model artifact so
+        # an ingested Qlib run stays readable without being promoted.
+        model_output = prediction_repo.get_latest_model_output_for_ticker(ticker)
+        if model_output is None:
+            model_output = prediction_repo.get_latest_model_output_for_ticker(
+                ticker, production_only=False
+            )
+        model_output = enrich_model_output(model_output, lang=lang)
         insight = InsightEngine().get_insight(ticker, lang=lang)
         trade_plan = trade_plan_repo.get_latest_for_ticker(ticker)
         if insight is not None and trade_plan:
@@ -1005,6 +1017,48 @@ def insight_chart_data(request: Request, ticker: str, lang: str = Query("en"), d
     )
 
 
+def _empty_insight(*, ticker: str, overview: dict, lang: str) -> dict:
+    """Neutral placeholder so the insight page renders an empty state.
+
+    A symbol can exist (and carry imported model output) before any price
+    history is synced. Rendering an explicit empty state is more useful than a
+    404 for the model-output / driver sections.
+    """
+    flat_zone = {"low": 0.0, "high": 0.0}
+    return {
+        "ticker": overview.get("ticker") or ticker.strip().upper(),
+        "lang": lang,
+        "as_of_date": "-",
+        "trend_score": 0,
+        "trend_label": "-",
+        "setup_label": "-",
+        "confidence": 0.0,
+        "expected_horizon": "-",
+        "recommendation": tr(lang, "no_history_note"),
+        "action_label": "-",
+        "action_summary": "",
+        "entry_zone": dict(flat_zone),
+        "breakout_level": 0.0,
+        "take_profit_zone": dict(flat_zone),
+        "risk_level": 0.0,
+        "support_level": 0.0,
+        "resistance_level": 0.0,
+        "latest_close": 0.0,
+        "distance_to_entry_pct": None,
+        "distance_to_breakout_pct": None,
+        "reward_risk_ratio": None,
+        "volume_ratio": None,
+        "ma5": None,
+        "ma20": None,
+        "ma60": None,
+        "momentum_5": None,
+        "momentum_20": None,
+        "momentum_units": "percent",
+        "history": [],
+        "explanation": [],
+    }
+
+
 @router.get("/{ticker}", response_class=HTMLResponse)
 def insight_page(
     request: Request,
@@ -1018,12 +1072,22 @@ def insight_page(
         return login_redirect(target)
     context = _build_model_context(ticker=ticker, lang=lang, db=db)
     insight = context["insight"]
-    if insight is None:
-        raise HTTPException(status_code=404, detail="Ticker not found in local dataset.")
 
     symbol_repo = SymbolRepository(db)
     sync_repo = PriceSyncStateRepository(db)
-    overview = symbol_repo.get_overview(ticker) or {"ticker": insight["ticker"], "name": insight["ticker"], "market": "US"}
+    if insight is None:
+        # No price history yet: render the model-output empty state instead of
+        # a 404 as long as the symbol itself is known.
+        overview = symbol_repo.get_overview(ticker)
+        if overview is None:
+            raise HTTPException(status_code=404, detail="Ticker not found in local dataset.")
+        insight = _empty_insight(ticker=ticker, overview=overview, lang=lang)
+    else:
+        overview = symbol_repo.get_overview(ticker) or {
+            "ticker": insight["ticker"],
+            "name": insight["ticker"],
+            "market": "US",
+        }
     sync_state = sync_repo.get_state_for_ticker(ticker)
     model_output = context["model_output"]
     feature_contributions = context["feature_contributions"]
