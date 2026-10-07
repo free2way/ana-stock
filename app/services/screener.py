@@ -1656,13 +1656,21 @@ class ScreenerService:
         index = max(0, min(index, len(caps) - 1))
         return caps[index]
 
-    def _listing_days(self, listing_date: str | None) -> int | None:
+    def _listing_days(self, listing_date: str | date | None) -> int | None:
         if not listing_date:
             return None
-        try:
-            listed = datetime.strptime(listing_date, "%Y-%m-%d").date()
-        except ValueError:
-            return None
+        # Fundamental snapshots are read back from a ``Date`` column, so the live
+        # fundamental templates receive ``date``/``datetime`` here while lake and
+        # fixture callers pass strings; both are physical listing dates.
+        if isinstance(listing_date, datetime):
+            listed = listing_date.date()
+        elif isinstance(listing_date, date):
+            listed = listing_date
+        else:
+            try:
+                listed = datetime.strptime(str(listing_date)[:10], "%Y-%m-%d").date()
+            except ValueError:
+                return None
         return (date.today() - listed).days
 
     def _build_result_from_insight(self, insight: dict, model_context: dict | None = None) -> dict:

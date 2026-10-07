@@ -1,5 +1,7 @@
 import json
 import csv
+import threading
+from collections.abc import Callable
 from io import StringIO
 from urllib.parse import urlencode
 from datetime import datetime, timedelta
@@ -64,7 +66,9 @@ from app.services.selection_quality import (
 from app.services.screener import MODEL_TEMPLATES, ScreenerService
 from app.services.screener_snapshots import (
     _action_semantic_buckets,  # noqa: F401 - re-export identity asserted by tests/test_cleanup_shared_helpers.py
+    _compact_snapshot_rows,
     _normalize_multi_model_templates,
+    _snapshot_input_meta,
     _template_action_semantic_buckets,  # noqa: F401 - compatibility export
     build_base_precompute_params,
     exact_screener_snapshot_exists,
@@ -112,6 +116,7 @@ from app.services.stock_selection.multi_model_confluence import (
 from app.services.stock_selection.screener_query import (
     build_final_results as _build_final_results_service,
     filter_precomputed_rows as _filter_precomputed_rows_service,
+    live_screen_rows as _live_screen_rows_service,
     load_precomputed_screener_rows as _load_precomputed_screener_rows_service,
     load_screen_rows_from_snapshot as _load_screen_rows_from_snapshot_service,
     normalize_screen_params as _normalize_screen_params,
@@ -291,16 +296,137 @@ def _template_default_min_trend_score(template_key: str, fallback: int = 60) -> 
         return fallback
 
 
+_LIVE_SCREEN_CACHE_NAMESPACE = "screener_results"
+
+
+def _persist_live_screen_snapshot(params: dict, rows: list[dict]) -> None:
+    """Store a live fallback result as this parameter set's exact snapshot.
+
+    The payload mirrors the producer shape (``key``/``rows``/``input``), so the
+    next request for the same parameters is served by the exact-snapshot loader
+    instead of screening the lake again.  Persistence is an optimisation on top
+    of an already successful screen, so a write failure must not turn a rendered
+    page into an error: it is swallowed here and the caller still returns the
+    live rows.
+    """
+    payload = {
+        "key": screener_snapshot_key(params),
+        "rows": _compact_snapshot_rows(rows, limit=int(params.get("limit", 500))),
+        "updated_at": app_now_iso(),
+        "model_template": params.get("model_template"),
+        "market": params.get("market"),
+        "universe": params.get("universe"),
+        "input": _snapshot_input_meta(params),
+        "source": "live_fallback",
+    }
+    try:
+        with SessionLocal() as db:
+            WorkspaceSnapshotRepository(db).create_snapshot(
+                snapshot_type=screener_snapshot_type(params),
+                snapshot_date=app_now_iso(),
+                payload=payload,
+            )
+    except Exception:
+        return
+
+
+def _live_screen_rows_with_timeout(
+    service: ScreenerService,
+    params: dict,
+    *,
+    timeout_seconds: float,
+) -> list[dict] | None:
+    """Run the live screen, optionally abandoning a slow computation.
+
+    ``timeout_seconds <= 0`` keeps the historic blocking behaviour.  With a
+    positive budget the screen runs on a daemon worker thread: when it does not
+    finish in time the caller treats the fallback as unavailable and the page
+    keeps its snapshot-pending rendering instead of holding the request open.
+    The abandoned worker's result is discarded, and the TTL memo bounds how
+    often a slow parameter set can start a fresh attempt.
+    """
+    if timeout_seconds <= 0:
+        return _live_screen_rows_service(service, params)
+    outcome: dict[str, object] = {}
+
+    def _run() -> None:
+        try:
+            outcome["rows"] = _live_screen_rows_service(service, params)
+        except BaseException as exc:  # re-raised on the request thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=_run, name="screener-live-fallback", daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive():
+        return None
+    error = outcome.get("error")
+    if isinstance(error, BaseException):
+        raise error
+    rows = outcome.get("rows")
+    return rows if isinstance(rows, list) else None
+
+
+def _live_screen_fallback_loader() -> Callable[[ScreenerService, dict], list[dict] | None] | None:
+    """Build the live-screener fallback used when both snapshots miss.
+
+    ``None`` (``PQW_SCREENER_LIVE_FALLBACK_ENABLED=false``) restores the
+    snapshot-only behaviour: an empty page plus the "snapshot still being
+    prepared" notice.  When enabled, a miss runs ``ScreenerService.screen`` for
+    this exact parameter set (one lake pass per parameter set, memoised for
+    ``screener_live_fallback_ttl_seconds`` so concurrent readers share it) and
+    persists the outcome as the exact snapshot, so later requests are served on
+    the snapshot path again.
+    """
+    settings = get_settings()
+    if not bool(settings.screener_live_fallback_enabled):
+        return None
+    ttl_seconds = max(0.0, float(settings.screener_live_fallback_ttl_seconds))
+    timeout_seconds = max(0.0, float(settings.screener_live_fallback_timeout_seconds))
+
+    def _load_live_rows(service: ScreenerService, params: dict) -> list[dict] | None:
+        def _compute() -> list[dict] | None:
+            computed = _live_screen_rows_with_timeout(
+                service, params, timeout_seconds=timeout_seconds
+            )
+            if computed is None:
+                return None
+            # Persist once per cache miss (``get_or_set`` runs the loader on the
+            # single-flight leader only), so repeating a request inside the TTL
+            # window neither re-screens the lake nor writes a duplicate snapshot.
+            _persist_live_screen_snapshot(params, computed)
+            return computed
+
+        rows = get_or_set(
+            _LIVE_SCREEN_CACHE_NAMESPACE,
+            json.dumps(params, sort_keys=True, ensure_ascii=False),
+            ttl_seconds=ttl_seconds,
+            loader=_compute,
+        )
+        if not isinstance(rows, list):
+            return None
+        # Hand every caller its own copy: the memoised value is shared.
+        return [dict(row) for row in rows]
+
+    return _load_live_rows
+
+
 def _load_screen_rows_from_snapshot(service: ScreenerService, normalized: dict) -> tuple[list[dict] | None, bool]:
     return _load_screen_rows_from_snapshot_service(
         service,
         normalized,
         snapshot_loader=_load_screener_snapshot,
+        live_screen_loader=_live_screen_fallback_loader(),
     )
 
 
 def _run_screen(service: ScreenerService, params: dict) -> list[dict]:
-    return _run_screen_service(service, params, snapshot_loader=_load_screener_snapshot)
+    return _run_screen_service(
+        service,
+        params,
+        snapshot_loader=_load_screener_snapshot,
+        live_screen_loader=_live_screen_fallback_loader(),
+    )
 
 
 def _build_final_results(
@@ -313,12 +439,18 @@ def _build_final_results(
         service,
         params,
         snapshot_loader=_load_screener_snapshot,
+        live_screen_loader=_live_screen_fallback_loader(),
         watchlist_state_map=watchlist_state_map,
     )
 
 
 def _screen_snapshot_ready(service: ScreenerService, params: dict) -> bool:
-    return _screen_snapshot_ready_service(service, params, snapshot_loader=_load_screener_snapshot)
+    return _screen_snapshot_ready_service(
+        service,
+        params,
+        snapshot_loader=_load_screener_snapshot,
+        live_screen_loader=_live_screen_fallback_loader(),
+    )
 
 
 def _run_multi_screen(service: ScreenerService, params: dict) -> tuple[list[dict], bool, dict]:
@@ -1300,7 +1432,11 @@ def add_screener_result_to_watchlist(
     )
     if final_meta["snapshot_ready"]:
         allowed = {str(item.get("ticker") or "").strip().upper() for item in results}
-        if normalized_ticker not in allowed:
+        # An empty result set carries no membership evidence: the page renders
+        # no rows either, so refusing the explicit action would block a ticker
+        # the user picked from another view.  This also keeps the behaviour of a
+        # parameter set that has no prepared snapshot at all.
+        if allowed and normalized_ticker not in allowed:
             return RedirectResponse(
                 url=(
                     f"{_build_screen_query(params)}&message="

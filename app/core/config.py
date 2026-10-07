@@ -204,6 +204,22 @@ class Settings(BaseSettings):
     job_inline_result_max_bytes: int = Field(default=64 * 1024)
     json_payload_artifact_schema_version: str = Field(default="json-payload-artifact-v1")
     app_setting_inline_value_max_bytes: int = Field(default=32 * 1024)
+    # Screener query fallback: when both the wide precompute snapshot and the
+    # exact-parameter snapshot are missing (e.g. the background precompute job
+    # has not run yet for this parameter set), the page/CSV/bulk paths run the
+    # live ``ScreenerService.screen`` synchronously instead of rendering an empty
+    # result set.  Live screening touches the market lake and can take seconds on
+    # a full-market universe, so it is memoised for a short TTL and its result is
+    # persisted as the exact-parameter snapshot for later requests.  Set
+    # PQW_SCREENER_LIVE_FALLBACK_ENABLED=false to restore the snapshot-only
+    # behaviour (empty page + "snapshot still being prepared" notice).
+    screener_live_fallback_enabled: bool = Field(default=True)
+    screener_live_fallback_ttl_seconds: float = Field(default=90.0, gt=0.0)
+    # Upper bound (seconds) on a single synchronous live-fallback computation.
+    # 0 keeps the historic blocking behaviour; a positive budget lets a slow
+    # full-market screen fall back to the snapshot-pending rendering instead of
+    # holding the request open.
+    screener_live_fallback_timeout_seconds: float = Field(default=0.0, ge=0.0)
     tushare_token: str | None = Field(default=None)
     hithink_finance_api_key: str | None = Field(default=None)
     hithink_finance_base_url: str = Field(default="https://fuyao.aicubes.cn")

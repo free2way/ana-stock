@@ -22,6 +22,49 @@ from app.services.stock_selection.selection_policy import (
 
 SnapshotLoader = Callable[[dict], list[dict] | None]
 ScreenRowsLoader = Callable[[ScreenerService, dict], tuple[list[dict] | None, bool]]
+LiveScreenLoader = Callable[[ScreenerService, dict], list[dict] | None]
+
+# Keyword names accepted by ``ScreenerService.screen``.  ``normalize_screen_params``
+# deliberately carries a wider superset (multi-model confluence, reliability /
+# calibration specs, ``lang``) that only the query layer consumes, so the live
+# fallback must project the normalized params onto this explicit whitelist —
+# the historical implementation did the same instead of splatting the dict.
+_SCREEN_KEYWORDS: tuple[str, ...] = (
+    "model_template",
+    "universe",
+    "market",
+    "min_trend_score",
+    "action_filter",
+    "min_volume_ratio",
+    "min_listing_days",
+    "pe_min",
+    "pe_max",
+    "min_roe_avg_3y",
+    "min_net_profit_yoy",
+    "min_revenue_yoy",
+    "max_debt_to_assets",
+    "min_dividend_yield",
+    "exclude_bottom_market_cap_pct",
+    "recent_snapshot_runs",
+    "min_snapshot_hits",
+    "model_signal_filter",
+    "min_model_signal_strength",
+    "execution_tag_filter",
+    "exclude_execution_tag_filter",
+    "sort_by",
+    "sort_order",
+    "limit",
+)
+
+
+def screen_kwargs(params: dict) -> dict:
+    """Project normalized query params onto ``ScreenerService.screen`` kwargs."""
+    return {key: params[key] for key in _SCREEN_KEYWORDS if key in params}
+
+
+def live_screen_rows(service: ScreenerService, params: dict) -> list[dict]:
+    """Run the live screener for one normalized query (the pre-snapshot path)."""
+    return [dict(row) for row in service.screen(**screen_kwargs(params))]
 
 
 def watchlist_state_rank(existing: dict | None) -> int:
@@ -316,11 +359,47 @@ def load_precomputed_screener_rows(
     return ranked
 
 
+def _apply_live_result_parity(rows: list[dict], params: dict) -> list[dict]:
+    """Give live rows the same query-layer semantics as precomputed rows.
+
+    ``ScreenerService.screen`` already applies the financial/threshold filters,
+    the snapshot-persistence/model-signal/execution-tag filters, trade-readiness
+    annotation and its own sort, so the live path only needs the transforms that
+    live in the query layer: the execution-readiness hard gates (``screen``
+    exposes those as annotations, not filters), the quality-confluence profile
+    gate and the CN limit-up demotion that ``_rank_precomputed_rows`` also
+    applies.  Keeping them here (rather than in the caller) means every live
+    loader — page, CSV export, bulk actions — is compared on one口径.
+    """
+    gated = [dict(row) for row in rows]
+    tradability_whitelist = _normalize_tradability_whitelist(params.get("tradability_status"))
+    min_trade_readiness = float(params.get("min_trade_readiness", 0.0))
+    if tradability_whitelist is not None or min_trade_readiness > 0.0:
+        keepers: list[dict] = []
+        for row in gated:
+            if tradability_whitelist is not None:
+                status = str(row.get("tradability_status") or "").strip().upper()
+                if status not in tradability_whitelist:
+                    continue
+            if min_trade_readiness > 0.0:
+                readiness = _safe_number(row.get("trade_readiness_score"))
+                if readiness is None or readiness < min_trade_readiness:
+                    continue
+            keepers.append(row)
+        gated = keepers
+    profiled = apply_quality_confluence_profile(
+        gated,
+        profile=str(params.get("strategy_profile") or ""),
+    )
+    return _apply_cn_limit_up_governance(profiled, params)
+
+
 def load_screen_rows_from_snapshot(
     service: ScreenerService,
     normalized: dict,
     *,
     snapshot_loader: SnapshotLoader,
+    live_screen_loader: LiveScreenLoader | None = None,
     apply_limit: bool = True,
 ) -> tuple[list[dict] | None, bool]:
     snapshot_rows = load_precomputed_screener_rows(
@@ -338,7 +417,15 @@ def load_screen_rows_from_snapshot(
             profile=str(normalized.get("strategy_profile") or ""),
         )
         return profiled, True
-    return None, False
+    # Both precomputed snapshots missed: fall back to a live computation instead
+    # of returning an empty page.  Callers may pass ``None`` (e.g. the live path
+    # is disabled) to restore the snapshot-only behaviour.
+    if live_screen_loader is None:
+        return None, False
+    live_rows = live_screen_loader(service, normalized)
+    if live_rows is None:
+        return None, False
+    return _apply_live_result_parity(live_rows, normalized), True
 
 
 def run_multi_screen(
@@ -347,6 +434,7 @@ def run_multi_screen(
     *,
     snapshot_loader: SnapshotLoader,
     screen_rows_loader: ScreenRowsLoader | None = None,
+    live_screen_loader: LiveScreenLoader | None = None,
     apply_limit: bool = True,
 ) -> tuple[list[dict], bool, dict]:
     combo_snapshot_rows = snapshot_loader(params)
@@ -373,6 +461,7 @@ def run_multi_screen(
                 service,
                 normalized_local_params,
                 snapshot_loader=snapshot_loader,
+                live_screen_loader=live_screen_loader,
                 apply_limit=apply_limit,
             )
         if ready and rows is not None:
@@ -396,6 +485,7 @@ def run_screen(
     params: dict,
     *,
     snapshot_loader: SnapshotLoader,
+    live_screen_loader: LiveScreenLoader | None = None,
 ) -> list[dict]:
     normalized = normalize_screen_params(params)
     if len(normalized.get("multi_model_templates") or []) >= 2:
@@ -403,12 +493,14 @@ def run_screen(
             service,
             normalized,
             snapshot_loader=snapshot_loader,
+            live_screen_loader=live_screen_loader,
         )
         return rows
     rows, ready = load_screen_rows_from_snapshot(
         service,
         normalized,
         snapshot_loader=snapshot_loader,
+        live_screen_loader=live_screen_loader,
     )
     if ready:
         return rows or []
@@ -420,14 +512,17 @@ def build_final_results(
     params: dict,
     *,
     snapshot_loader: SnapshotLoader,
+    live_screen_loader: LiveScreenLoader | None = None,
     watchlist_state_map: dict | None = None,
 ) -> tuple[list[dict], dict]:
     """Build the one canonical result set shared by page, export and bulk actions.
 
-    The pipeline is normalize -> snapshot -> filters -> profile -> sort -> limit.
-    It returns the truncated rows plus metadata carrying the pre-truncation
-    total so callers can render an honest truncation notice (S-8) and sort the
-    full set before cutting it (S-2).
+    The pipeline is normalize -> snapshot (or live fallback) -> filters ->
+    profile -> sort -> limit.  It returns the truncated rows plus metadata
+    carrying the pre-truncation total so callers can render an honest
+    truncation notice (S-8) and sort the full set before cutting it (S-2).
+    ``snapshot_ready`` reports whether the pipeline produced results from a
+    precomputed snapshot *or* the live fallback.
     """
     normalized = normalize_screen_params(params)
     multi_screen_meta: dict = {"available_templates": [], "missing_templates": []}
@@ -436,6 +531,7 @@ def build_final_results(
             service,
             normalized,
             snapshot_loader=snapshot_loader,
+            live_screen_loader=live_screen_loader,
             apply_limit=False,
         )
     else:
@@ -443,6 +539,7 @@ def build_final_results(
             service,
             normalized,
             snapshot_loader=snapshot_loader,
+            live_screen_loader=live_screen_loader,
             apply_limit=False,
         )
         rows = collected or []
@@ -479,6 +576,7 @@ def screen_snapshot_ready(
     params: dict,
     *,
     snapshot_loader: SnapshotLoader,
+    live_screen_loader: LiveScreenLoader | None = None,
 ) -> bool:
     normalized = normalize_screen_params(params)
     if len(normalized.get("multi_model_templates") or []) >= 2:
@@ -486,11 +584,13 @@ def screen_snapshot_ready(
             service,
             normalized,
             snapshot_loader=snapshot_loader,
+            live_screen_loader=live_screen_loader,
         )
         return ready
     _, ready = load_screen_rows_from_snapshot(
         service,
         normalized,
         snapshot_loader=snapshot_loader,
+        live_screen_loader=live_screen_loader,
     )
     return ready
