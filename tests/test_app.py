@@ -6435,7 +6435,7 @@ class AppFlowTests(unittest.TestCase):
         )
         fake_ai_service = SimpleNamespace(
             insight_engine=SimpleNamespace(
-                get_insight=lambda ticker, **kwargs: {"trend_score": 72, "trend_label": "bullish", "setup_label": "pullback_buy", "confidence": 0.72, "explanation": ["ok"]}
+                get_insight=lambda ticker, **kwargs: {"trend_score": 72, "trend_label": "bullish", "setup_label": "pullback_buy", "confidence": 0.72, "explanation": ["ok"], "latest_close": 12.5, "momentum_5": 2.0, "distance_to_breakout_pct": 1.5}
                 if ticker.endswith((".SS", ".SZ"))
                 else None
             ),
@@ -6450,6 +6450,49 @@ class AppFlowTests(unittest.TestCase):
                 "summary": "ok",
             },
         )
+        # The default CN scope is the full-market snapshot pool
+        # (`prefer_snapshot=True`), not the prediction-fallback loader, so the
+        # ready snapshot pool is stubbed here the same shape the real loader
+        # returns (rows + meta) to lock the scope label contract.
+        snapshot_pool_row = {
+            "ticker": "600330.SS",
+            "name": "天通股份",
+            "market": "CN",
+            "score": 0.12,
+            "signal_strength": 82,
+            "confidence": 0.76,
+            "latest_close": 12.5,
+            "momentum_5": 2.0,
+            "distance_to_breakout_pct": 1.5,
+            "trade_readiness_score": 70.0,
+            "readiness_bucket": "READY",
+            "tradability_status": "READY",
+            "risk_flags": [],
+            "full_market_rank_score": 88.0,
+            "full_market_template": "momentum_breakout",
+            "report_source_kind": "screener",
+            "report_source_label": "CN momentum",
+        }
+
+        def fake_full_market_loader(*, db, market, excluded_tickers, limit, with_meta=False):
+            rows = [dict(snapshot_pool_row)]
+            if with_meta:
+                return rows, {
+                    "market": market,
+                    "source": "fresh_snapshot",
+                    "status": "ready",
+                    "ready": True,
+                    "used_today_snapshot": True,
+                    "target_snapshot_date": "2026-10-07",
+                    "snapshot_templates_considered": 1,
+                    "snapshot_templates_ready": 1,
+                    "snapshot_rows": 1,
+                    "unique_candidates_scored": 1,
+                    "deep_review_candidate_count": 1,
+                    "blocked_candidates": 0,
+                    "note": "",
+                }
+            return rows
 
         with patch("app.services.ai_daily_report.SymbolRepository",
             return_value=fake_symbol_repo,
@@ -6459,12 +6502,16 @@ class AppFlowTests(unittest.TestCase):
         ), patch(
             "app.services.ai_daily_report.AIAnalysisService",
             return_value=fake_ai_service,
+        ), patch(
+            "app.services.ai_daily_report._load_full_market_report_candidates",
+            side_effect=fake_full_market_loader,
         ):
             report = build_ai_daily_report(limit=8)
 
         self.assertTrue(report["rows"])
         self.assertEqual({"CN"}, {row.get("market") for row in report["rows"]})
-        self.assertEqual("cn_full_market_top_picks", report["scope"])
+        self.assertEqual("portfolio_plus_cn_full_market_top5", report["scope"])
+        self.assertEqual("fresh_snapshot", report["market_recommendations_meta"]["source"])
         self.assertTrue(report["buy_the_dip_rows"])
         self.assertEqual("pullback_buy", report["buy_the_dip_rows"][0]["setup_label"])
 
