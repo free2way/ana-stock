@@ -581,7 +581,15 @@ class AppFlowTests(unittest.TestCase):
 
         response = self.client.get("/dashboard?lookback_runs=3")
         self.assertEqual(200, response.status_code)
-        self.assertIn("Snapshot Window", response.text)
+        # CAT-1: the home page is now the four-step workbench
+        # (`_render_dashboard_workspace`); the old "Snapshot Window" board was
+        # removed by the product redesign, so the assertion targets the live
+        # contract instead. `lookback_runs` must still flow into the workflow
+        # links, including the continuous-leaders entry point.
+        self.assertIn("Today’s market permission", response.text)
+        self.assertIn("Complete today’s selection and review in four steps.", response.text)
+        self.assertIn("Data and model status", response.text)
+        self.assertIn("/dashboard/continuous-leaders?lang=en&lookback_runs=3", response.text)
         self.assertIn("Continuous Leaders", response.text)
 
     def test_dashboard_page_supports_chinese_language(self) -> None:
@@ -598,23 +606,23 @@ class AppFlowTests(unittest.TestCase):
             response = self.client.get("/dashboard?lang=zh&lookback_runs=3&mode=postmarket")
 
         self.assertEqual(200, response.status_code)
-        self.assertIn("个人量化工作台", response.text)
-        self.assertIn("风险概览", response.text)
+        # CAT-1: brand and panels now follow the four-step workbench contract
+        # (`_render_dashboard_workspace` + the new home template fragments);
+        # the previous all-in-one dashboard copy was removed in the redesign.
+        self.assertIn("量化工作台", response.text)
+        self.assertIn("按四步完成今天的选股与复盘。", response.text)
+        self.assertIn("今日市场许可", response.text)
+        self.assertIn("第一次使用：每天只做这四件事", response.text)
+        self.assertIn("数据与模型状态", response.text)
+        self.assertIn("今日首页", response.text)
+        self.assertIn("自选股票", response.text)
+        self.assertIn("持仓总览", response.text)
+        self.assertIn("模型机会", response.text)
         self.assertIn("连续强势股", response.text)
-        self.assertIn("市场脉冲", response.text)
-        self.assertIn("运维操作台", response.text)
-        self.assertIn("打开市场脉冲页", response.text)
-        self.assertIn("会话模式", response.text)
-        self.assertIn("盘后复盘", response.text)
-        self.assertIn("打开市场快照榜单", response.text)
-        self.assertIn("今日行动板", response.text)
-        self.assertIn("今日投研流程", response.text)
-        self.assertIn("市场叙事", response.text)
-        self.assertIn("持仓账本", response.text)
-        self.assertIn("3 次", response.text)
+        self.assertIn("新闻与任务状态", response.text)
+        self.assertIn("模式", response.text)
+        self.assertIn("postmarket", response.text)
         self.assertIn("lookback_runs=3", response.text)
-        self.assertIn("dashboard-home-panels", response.text)
-        self.assertIn("dashboard-top-panels", response.text)
 
     def test_dashboard_home_panels_fragment_renders_market_headlines(self) -> None:
         from app.services.sample_data import seed_sample_data
@@ -692,24 +700,48 @@ class AppFlowTests(unittest.TestCase):
     def test_dashboard_watchlist_derived_context_is_cached_between_requests(self) -> None:
         from app.services.sample_data import seed_sample_data
         from app.services.trainer import SignalTrainer
+        from app.core.db import SessionLocal
+        from app.services.repository import WorkspaceSnapshotRepository
+        from app.services.workspace_snapshots import SNAPSHOT_HOME_WATCHLIST
 
         seed_sample_data(days=600)
         SignalTrainer().train(run_name="dashboard_watchlist_cache_demo", signal_type="momentum", lookback_days=3)
 
+        # CAT-1: the home page no longer derives the watchlist rows through
+        # ``WatchlistRepository.list_ticker_map``; the derived context is
+        # precomputed into the ``home_watchlist`` workspace snapshot and reused
+        # across requests. Seed one and prove the on-the-fly derivation (which
+        # would run twice without the persisted cache) never executes.
+        with SessionLocal() as db:
+            WorkspaceSnapshotRepository(db).create_snapshot(
+                snapshot_type=SNAPSHOT_HOME_WATCHLIST,
+                snapshot_date="2026-04-03",
+                payload={
+                    "rows": [
+                        {
+                            "ticker": "ASTS",
+                            "name": "Derived Context Cached Name",
+                            "market": "US",
+                            "signal_label": "Watch",
+                            "signal_tone": "watch",
+                            "confidence": 55,
+                        }
+                    ]
+                },
+            )
+
         with patch(
-            "app.api.routes.dashboard.WatchlistRepository.list_ticker_map",
-            return_value={},
-        ) as map_mock, patch(
-            "app.api.routes.dashboard.home.load_today_focus_pool",
+            "app.api.routes.dashboard.home._dashboard_home_watchlist_rows",
             return_value=[],
-        ) as focus_mock:
+        ) as rows_mock:
             first = self.client.get("/dashboard?lang=zh&lookback_runs=3&mode=monitor")
             second = self.client.get("/dashboard?lang=zh&lookback_runs=3&mode=monitor")
 
         self.assertEqual(200, first.status_code)
         self.assertEqual(200, second.status_code)
-        self.assertEqual(1, map_mock.call_count)
-        self.assertEqual(1, focus_mock.call_count)
+        self.assertEqual(0, rows_mock.call_count)
+        self.assertIn("Derived Context Cached Name", first.text)
+        self.assertIn("Derived Context Cached Name", second.text)
 
     def test_dashboard_ai_daily_report_page_renders(self) -> None:
         from app.services.ai_daily_report import save_ai_daily_report

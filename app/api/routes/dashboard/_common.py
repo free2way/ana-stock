@@ -279,8 +279,6 @@ def _concept_tr(lang: str, key: str) -> str:
 
 DASHBOARD_TEXT = {
     "en": {
-        "title": "Personal Quant Workbench",
-        "hero": "Personal Quant Workbench",
         "lead": "A local research cockpit for watchlists, screeners, model signals, concept resonance, and replay-friendly stock analysis.",
         "open_watchlist": "Open Watchlist",
         "open_screener": "Open Screener",
@@ -418,8 +416,6 @@ DASHBOARD_TEXT = {
         "concept_data_note": "CN concepts: {freshness} · {as_of}",
     },
     "zh": {
-        "title": "个人量化工作台",
-        "hero": "个人量化工作台",
         "lead": "一个本地研究控制台，用来管理自选、选股器、模型信号、概念共振和适合复盘的个股分析。",
         "open_watchlist": "打开自选股",
         "open_screener": "打开选股器",
