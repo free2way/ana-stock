@@ -5442,7 +5442,22 @@ class AppFlowTests(unittest.TestCase):
         client = OpenBBClient()
         request = HistoricalPriceRequest(ticker="600000.SS", start_date="2026-04-01", provider="yfinance")
 
-        with patch.object(OpenBBClient, "_load_openbb", return_value=None), patch.object(
+        with patch.object(OpenBBClient, "_load_openbb", return_value=None), patch(
+            "app.services.openbb_client.TushareClient.fetch_cn_daily_history",
+            return_value=[],
+        ), patch.object(
+            OpenBBClient,
+            "_fetch_with_eastmoney_cn",
+            return_value=[],
+        ), patch.object(
+            OpenBBClient,
+            "_fetch_with_akshare",
+            return_value=[],
+        ), patch.object(
+            OpenBBClient,
+            "_fetch_with_baostock",
+            return_value=[],
+        ), patch.object(
             OpenBBClient,
             "_fetch_with_yfinance",
             return_value=[
@@ -5472,7 +5487,14 @@ class AppFlowTests(unittest.TestCase):
         client = OpenBBClient()
         request = HistoricalPriceRequest(ticker="600000.SS", start_date="2026-04-01", provider="yfinance")
 
-        with patch.object(
+        with patch(
+            "app.services.openbb_client.TushareClient.fetch_cn_daily_history",
+            return_value=[],
+        ), patch.object(
+            OpenBBClient,
+            "_fetch_with_eastmoney_cn",
+            return_value=[],
+        ), patch.object(
             OpenBBClient,
             "_fetch_with_akshare",
             return_value=[
@@ -5548,6 +5570,10 @@ class AppFlowTests(unittest.TestCase):
 
         with patch(
             "app.services.openbb_client.TushareClient.fetch_cn_daily_history",
+            return_value=[],
+        ), patch.object(
+            OpenBBClient,
+            "_fetch_with_eastmoney_cn",
             return_value=[],
         ), patch.object(
             OpenBBClient,
@@ -6212,38 +6238,18 @@ class AppFlowTests(unittest.TestCase):
         from app.core.db import SessionLocal
         from app.services.openbb_client import OpenBBClient
         from app.services.repository import BacktestRepository, DataJobRepository, ModelRunRepository
+        from app.services.sample_data import extend_sample_rows
+
+        # The trainer's point-in-time universe filter requires >=120 liquid
+        # sessions before a name is tradable and the first prediction date then
+        # needs >=1000 labelled samples, so a three-day provider fixture can
+        # never train. Serve a multi-year calendar-valid history instead (same
+        # contract as test_run_pipeline_redirects_back_to_dashboard).
+        base_history = extend_sample_rows("AAPL", days=900)
 
         def fake_fetch(self, request) -> list[dict]:
             symbol = request.ticker
-            return [
-                {
-                    "date": "2026-04-01",
-                    "symbol": symbol,
-                    "open": 100.0,
-                    "high": 101.0,
-                    "low": 99.5,
-                    "close": 100.5,
-                    "volume": 1000000,
-                },
-                {
-                    "date": "2026-04-02",
-                    "symbol": symbol,
-                    "open": 100.5,
-                    "high": 102.0,
-                    "low": 100.0,
-                    "close": 101.8,
-                    "volume": 1100000,
-                },
-                {
-                    "date": "2026-04-03",
-                    "symbol": symbol,
-                    "open": 101.8,
-                    "high": 103.0,
-                    "low": 101.0,
-                    "close": 102.6,
-                    "volume": 1200000,
-                },
-            ]
+            return [{**row, "symbol": symbol} for row in base_history]
 
         with patch.object(OpenBBClient, "fetch_historical_prices", new=fake_fetch):
             response = self.client.post(
@@ -6275,7 +6281,11 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual("run_pipeline", latest_job["job_type"])
         self.assertEqual("success", latest_job["status"])
         self.assertEqual("pipeline_demo", latest_model["name"])
-        self.assertEqual("top_n_pipeline_demo", latest_backtest["name"])
+        # The pipeline runs the event-driven engine, whose strategy-run name
+        # carries the engine prefix (`event_v2_`, added in c948f53; the costed
+        # prefix `top_n_costed_` predates it in 9c0d487). Pin the full name so
+        # the engine provenance stays asserted.
+        self.assertEqual("event_v2_top_n_pipeline_demo", latest_backtest["name"])
 
     def test_run_pipeline_redirects_back_to_dashboard(self) -> None:
         from app.services.openbb_client import OpenBBClient
@@ -6349,37 +6359,17 @@ class AppFlowTests(unittest.TestCase):
         self.assertTrue(config_response.json()["config"]["enabled"])
         self.assertTrue(config_response.json()["config"]["sync_cn_concepts"])
 
+        from app.services.sample_data import extend_sample_rows
+
+        # The trainer's point-in-time universe filter needs >=120 liquid
+        # sessions and >=1000 labelled samples before the first prediction date;
+        # this test watches a single CN name, so it needs a longer synthetic
+        # history than the two-ticker run-pipeline fixtures.
+        base_history = extend_sample_rows("AAPL", days=1500, market="CN")
+
         def fake_fetch(self, request) -> list[dict]:
             symbol = request.ticker
-            return [
-                {
-                    "date": "2026-04-01",
-                    "symbol": symbol,
-                    "open": 80.0,
-                    "high": 81.0,
-                    "low": 79.5,
-                    "close": 80.5,
-                    "volume": 300000,
-                },
-                {
-                    "date": "2026-04-02",
-                    "symbol": symbol,
-                    "open": 80.5,
-                    "high": 82.0,
-                    "low": 80.0,
-                    "close": 81.6,
-                    "volume": 320000,
-                },
-                {
-                    "date": "2026-04-03",
-                    "symbol": symbol,
-                    "open": 81.6,
-                    "high": 83.0,
-                    "low": 81.0,
-                    "close": 82.4,
-                    "volume": 340000,
-                },
-            ]
+            return [{**row, "symbol": symbol} for row in base_history]
 
         with patch.object(OpenBBClient, "fetch_historical_prices", new=fake_fetch), patch(
             "app.services.auto_analysis.PushNotificationService.available_channels",
