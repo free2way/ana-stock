@@ -540,6 +540,7 @@ def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, m
         prediction_repo = PredictionRepository(db)
         effective_markets = markets if markets is not None else DEFAULT_AI_DAILY_REPORT_MARKETS
         normalized_markets = {str(item).strip().upper() for item in (effective_markets or []) if str(item).strip()}
+        normalized_tickers = {str(item).strip().upper() for item in (tickers or []) if str(item).strip()}
         include_cn = "CN" in normalized_markets
         include_us = "US" in normalized_markets
         portfolio_rows, portfolio_summary = _build_portfolio_report_rows(
@@ -561,7 +562,29 @@ def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, m
         recommendation_limit = 5
         evaluation_limit = max(recommendation_limit * 4, 20)
         excluded_tickers = _load_owned_or_watched_tickers(watchlist_repo)
-        if include_cn:
+        if normalized_tickers:
+            # An explicit caller-supplied scope (the auto analysis job forwards
+            # the enabled watchlist tickers it just trained on) must keep the
+            # report limited to those names instead of the full-market pool.
+            rows = _build_explicit_ticker_report_rows(
+                watchlist_repo=watchlist_repo,
+                symbol_repo=symbol_repo,
+                prediction_repo=prediction_repo,
+                tickers=normalized_tickers,
+                markets=normalized_markets,
+                limit=limit,
+            )
+            market_recommendation_meta = {
+                "market": market,
+                "source": "custom_tickers",
+                "status": "ready",
+                "ready": True,
+                "used_today_snapshot": False,
+                "target_snapshot_date": None,
+                "candidate_count": len(rows),
+                "note": "",
+            }
+        elif include_cn:
             rows, market_recommendation_meta = _build_market_recommendation_rows(
                 db=db, symbol_repo=symbol_repo, prediction_repo=prediction_repo,
                 market="CN", excluded_tickers=excluded_tickers,
@@ -700,7 +723,7 @@ def build_ai_daily_report(*, limit: int = 8, tickers: list[str] | None = None, m
             if not include_us
             else "今日 AI 日报：先复核持仓库，再从主市场与美股模型里筛出可验证候选。"
         ),
-        "scope": "portfolio_plus_cn_full_market_top5",
+        "scope": "custom_tickers" if normalized_tickers else "portfolio_plus_cn_full_market_top5",
         "strategy": strategy,
         "portfolio_summary": portfolio_summary,
         "portfolio_rows": portfolio_rows,
@@ -969,6 +992,80 @@ def _apply_selection_quality_policy(row: dict, policy: dict | None) -> dict:
     }
     row["selection_quality_reason"] = "；".join(str(item) for item in (source_policy.get("reasons") or []) if str(item).strip())
     return row
+
+
+def _build_explicit_ticker_report_rows(
+    *,
+    watchlist_repo: WatchlistRepository,
+    symbol_repo: SymbolRepository,
+    prediction_repo: PredictionRepository,
+    tickers: set[str],
+    markets: set[str],
+    limit: int,
+) -> list[dict]:
+    """Build report rows for an explicit caller-supplied ticker scope.
+
+    Mirrors the watchlist-scoped report contract: requested tickers are
+    resolved from the watchlist (optionally narrowed by market) and each name
+    is analysed through the shared AI stack so the report stays attributable
+    to the caller's scope instead of the full-market pool.
+    """
+    service = AIAnalysisService()
+    watchlist = watchlist_repo.get_or_create_default()
+    items = list(watchlist_repo.list_items(watchlist.id) or [])
+    selected = [
+        item
+        for item in items
+        if str(item.get("ticker") or "").strip().upper() in tickers
+        and (not markets or str(item.get("market") or "").strip().upper() in markets)
+    ]
+    rows: list[dict] = []
+    for item in selected[:limit]:
+        ticker = str(item.get("ticker") or "").strip().upper()
+        overview = item.get("overview") or symbol_repo.get_overview(ticker)
+        if overview is None:
+            continue
+        latest_signal = item.get("latest_signal")
+        if latest_signal is None:
+            predictions = prediction_repo.list_symbol_predictions(ticker, limit=1, latest_run_only=True)
+            latest_signal = predictions[0] if predictions else None
+        combined = service.insight_engine.get_insight(ticker, lang="zh")
+        analysis = service.analyze_symbol(
+            overview=overview,
+            latest_signal=latest_signal,
+            combined_analysis={
+                "decision": "WATCH" if combined is None else "BUY" if combined.get("trend_label") == "bullish" else "HOLD",
+                "confidence": 55 if combined is None else int(round(float(combined.get("confidence") or 0.55) * 100)),
+                "score": 0 if combined is None else int(round(((combined.get("trend_score") or 50) - 50) / 10)),
+                "reasons": list((combined or {}).get("explanation") or [])[:3],
+                "technical_rating": {},
+                "multi_timeframe": {},
+                "bollinger_band": {},
+                "candlestick_patterns": {},
+            },
+            lang="zh",
+        )
+        rows.append(
+            {
+                "ticker": ticker,
+                "name": item.get("name") or ticker,
+                "market": item.get("market"),
+                "headline": analysis.get("headline"),
+                "verdict": analysis.get("verdict"),
+                "confidence": analysis.get("confidence"),
+                "strategy": analysis.get("strategy"),
+                "quant_rank": round(float(_candidate_quant_score(latest_signal or {}, combined or {})), 1),
+                "model_score": (None if latest_signal is None else latest_signal.get("score")),
+                "model_signal_strength": (None if latest_signal is None else latest_signal.get("signal_strength")),
+                "trend_score": (None if combined is None else combined.get("trend_score")),
+                "setup_label": (None if combined is None else combined.get("setup_label")),
+                "buy_zone": analysis.get("buy_zone"),
+                "stop_loss": analysis.get("stop_loss"),
+                "take_profit": analysis.get("take_profit"),
+                "summary": analysis.get("summary"),
+            }
+        )
+    return rows
 
 
 def _build_market_recommendation_rows(
