@@ -1344,7 +1344,6 @@ def insight_page(
             <form class="search" action="/insights/open" method="get">
               <input type="hidden" name="lang" value="{lang}" />
               <input type="text" name="ticker" value="{insight['ticker']}" placeholder="{tr(lang, 'search_placeholder')}" />
-              <button type="submit">{tr(lang, 'analyze')}</button>
             </form>
             <span class="muted">{lang_switch}</span>
           </div>
