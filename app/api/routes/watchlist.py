@@ -1604,7 +1604,7 @@ def watchlist_page(
           <section class="hero">
             <article class="card">
               <div class="eyebrow">{'第 3 步 · 自选与执行' if lang == 'zh' else 'Step 3 · Watch & Execute'}</div>
-              <h1>{'把候选变成有条件的观察计划' if lang == 'zh' else 'Turn candidates into conditional watch plans'}</h1>
+              <h1>{'跨市场跟踪股票' if lang == 'zh' else 'Follow Stocks Across Markets'}</h1>
               <p class="muted">{'只保留需要持续跟踪的股票；进入详情确认触发、失效条件和最新风险后再执行。A 股与美股会保留各自的市场标记。' if lang == 'zh' else 'Keep only names that need ongoing attention. Confirm triggers, invalidation, and fresh risk in the detail view before acting. Market labels remain explicit.'}</p>
             </article>
             <article class="card">
