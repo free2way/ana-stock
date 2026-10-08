@@ -2343,7 +2343,25 @@ class AppFlowTests(unittest.TestCase):
                 },
             ]
 
-        with patch.object(OpenBBClient, "fetch_historical_prices", new=fake_fetch):
+        class _StubUsPriceProvider:
+            # D: `sync_market_data(provider="auto")` resolves US symbols to the
+            # Alpaca provider (which falls back to yfinance without API keys).
+            # Every US trading session it therefore returns the current,
+            # still-open session bar, and the lake refuses to store it
+            # ("Refusing to write future US market row for <today>") — making
+            # this example fail only while the US market is open. Stub the
+            # resolved provider so the assertion no longer depends on the wall
+            # clock.
+            name = "fixture"
+            last_source_used = "fixture"
+
+            def fetch_historical_prices(self, request) -> list[dict]:
+                return fake_fetch(self, request)
+
+        with patch.object(OpenBBClient, "fetch_historical_prices", new=fake_fetch), patch(
+            "app.services.market_sync.resolve_price_provider",
+            return_value=_StubUsPriceProvider(),
+        ):
             response = self.client.post(
                 "/dashboard/concepts/consumer-electronics/watchlist",
                 data={
@@ -2467,7 +2485,21 @@ class AppFlowTests(unittest.TestCase):
                 },
             ]
 
-        with patch.object(OpenBBClient, "fetch_historical_prices", new=fake_fetch):
+        class _StubUsPriceProvider:
+            # D: same wall-clock dependency as
+            # `test_dashboard_concept_detail_adds_tickers_to_watchlist_and_syncs`
+            # (auto provider resolves to Alpaca/yfinance for US symbols and
+            # returns the still-open session bar).
+            name = "fixture"
+            last_source_used = "fixture"
+
+            def fetch_historical_prices(self, request) -> list[dict]:
+                return fake_fetch(self, request)
+
+        with patch.object(OpenBBClient, "fetch_historical_prices", new=fake_fetch), patch(
+            "app.services.market_sync.resolve_price_provider",
+            return_value=_StubUsPriceProvider(),
+        ):
             response = self.client.post(
                 "/dashboard/concepts/consumer-electronics/watchlist-top",
                 data={
