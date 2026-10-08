@@ -728,7 +728,7 @@ class SignalTrainer:
     ) -> tuple[list[dict], dict]:
         """Filter lake rows through the point-in-time tradable-universe rules.
 
-        Thresholds are reused verbatim from
+        Thresholds are reused from
         ``stock_selection.universe.default_universe_rules``. Every decision for
         a symbol on date D reads only that symbol's rows up to and including D,
         so the filter borrows no future liquidity or history. The signal-day
@@ -737,6 +737,11 @@ class SignalTrainer:
         be entered the next session), while the existing executable-label path
         keeps its own next-open unbuyable check, so the two never double-count
         the same exclusion.
+
+        The history rule is overridden by
+        ``trainer_universe_min_history_sessions`` (0 = trainer ignores it),
+        because the lake slice fed to training is much shorter than the shared
+        universe warm-up; the effective value is recorded in ``stats``.
         """
 
         enabled = bool(getattr(self.settings, "trainer_universe_filter_enabled", True))
@@ -766,15 +771,28 @@ class SignalTrainer:
             stats["skipped_reason"] = f"unsupported_market:{market_code or 'unknown'}"
             return list(rows), stats
         rules = default_universe_rules(market_code)
+        # 1a (2026-10-08): the training-side history rule is switchable. The
+        # lake slice fed to the trainer is short (CN full-market coverage starts
+        # 2025-02-14), so the shared 120-session warm-up prunes the head of the
+        # window and starves the mature-feature-date gate. The liquidity and
+        # signal-day limit-up rules stay in force either way.
+        effective_min_history = max(
+            0, int(getattr(self.settings, "trainer_universe_min_history_sessions", 0) or 0)
+        )
         stats["rule_market"] = market_code
         stats["rules"] = {
             "min_price": rules.min_price,
             "min_adv20": rules.min_adv20,
-            "min_history_sessions": rules.min_history_sessions,
+            "min_history_sessions": effective_min_history,
             "adv_lookback_sessions": rules.adv_lookback_sessions,
             "exclude_st": rules.exclude_st,
             "exclude_suspended": rules.exclude_suspended,
             "exclude_signal_day_limit_up": rules.exclude_signal_day_limit_up,
+        }
+        stats["history_rule"] = {
+            "enabled": effective_min_history > 0,
+            "effective_min_history_sessions": effective_min_history,
+            "universe_default_min_history_sessions": rules.min_history_sessions,
         }
         # The lake row schema carries no ST / suspension state; record the two
         # rules that therefore could not be evaluated instead of implying they
@@ -828,7 +846,7 @@ class SignalTrainer:
                 if raw_volume in (None, ""):
                     reasons.append("invalid_volume")
                 history_sessions = bisect_right(valid_positions, index)
-                if history_sessions < rules.min_history_sessions:
+                if effective_min_history > 0 and history_sessions < effective_min_history:
                     reasons.append("insufficient_history")
                 lookback = valid_dollar[
                     max(0, history_sessions - rules.adv_lookback_sessions):history_sessions

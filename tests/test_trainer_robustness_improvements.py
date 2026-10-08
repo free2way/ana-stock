@@ -57,6 +57,9 @@ class UniverseFilterTests(TestCase):
             row["volume"] = 6_000_000.0
 
         trainer = SignalTrainer()
+        trainer.settings = trainer.settings.model_copy(
+            update={"trainer_universe_min_history_sessions": 120}
+        )
         kept, stats = trainer._apply_pit_universe_filter(rows, market="CN")
 
         self.assertTrue(stats["applied"])
@@ -85,6 +88,9 @@ class UniverseFilterTests(TestCase):
             row["volume"] = 6_000_000.0
 
         trainer = SignalTrainer()
+        trainer.settings = trainer.settings.model_copy(
+            update={"trainer_universe_min_history_sessions": 120}
+        )
         base_kept, _ = trainer._apply_pit_universe_filter(rows, market="CN")
         extended_kept, _ = trainer._apply_pit_universe_filter(rows + future, market="CN")
 
@@ -137,6 +143,9 @@ class UniverseFilterTests(TestCase):
     def test_load_rows_applies_filter_and_records_stats(self) -> None:
         rows = _session_rows("600020.SS", 130)
         trainer = SignalTrainer()
+        trainer.settings = trainer.settings.model_copy(
+            update={"trainer_universe_min_history_sessions": 120}
+        )
         with patch("app.services.trainer.load_lake_rows", return_value=list(rows)), patch.object(
             trainer, "_attach_adjusted_basis", return_value=0
         ):
@@ -149,6 +158,34 @@ class UniverseFilterTests(TestCase):
             119, stats["exclusion_counts"]["insufficient_history"]
         )
         self.assertEqual(130, stats["input_rows"])
+        self.assertTrue(stats["history_rule"]["enabled"])
+        self.assertEqual(120, stats["history_rule"]["effective_min_history_sessions"])
+
+    def test_history_rule_defaults_to_disabled_for_trainer(self) -> None:
+        # 1a: the lake slice handed to training is shorter than the shared
+        # universe warm-up, so the trainer's history rule is off by default
+        # while the liquidity rule still applies.
+        rows = _session_rows("600021.SS", 130)
+
+        trainer = SignalTrainer()
+        self.assertEqual(0, trainer.settings.trainer_universe_min_history_sessions)
+        kept, stats = trainer._apply_pit_universe_filter(rows, market="CN")
+
+        self.assertTrue(stats["applied"])
+        self.assertFalse(stats["history_rule"]["enabled"])
+        self.assertEqual(0, stats["rules"]["min_history_sessions"])
+        self.assertEqual(120, stats["history_rule"]["universe_default_min_history_sessions"])
+        self.assertNotIn("insufficient_history", stats["exclusion_counts"])
+        # Every row survives: liquidity passes and history is not enforced.
+        self.assertEqual(130, stats["output_rows"])
+        self.assertEqual(130, len(kept))
+
+        trainer.settings = trainer.settings.model_copy(
+            update={"trainer_universe_min_history_sessions": 120}
+        )
+        kept_enabled, enabled_stats = trainer._apply_pit_universe_filter(rows, market="CN")
+        self.assertEqual(119, enabled_stats["exclusion_counts"]["insufficient_history"])
+        self.assertEqual(11, len(kept_enabled))
 
 
 class WinsorizeAndObjectiveTests(TestCase):

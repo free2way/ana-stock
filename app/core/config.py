@@ -141,6 +141,16 @@ class Settings(BaseSettings):
     # `universe_filter_stats` rather than silently assumed to have run.
     # Disable for a documented research rollback.
     trainer_universe_filter_enabled: bool = Field(default=True)
+    # (1a) Minimum point-in-time history (sessions) enforced by the *training-side*
+    # PIT universe filter. 0 (default) disables ONLY the insufficient-history
+    # rule for the trainer while keeping the liquidity and CN signal-day
+    # limit-up rules active. Rationale (2026-10-08): the lake row slice handed
+    # to the trainer is a short window (CN: ~425 trade dates, full-market
+    # coverage only from 2025-02-14), so the 120-session warm-up prunes the head
+    # of the window and starves the mature-feature-date gate with the observed
+    # `insufficient_mature_feature_dates; dates=233/252`. The effective value is
+    # recorded in the run's `universe_filter_stats` for auditability.
+    trainer_universe_min_history_sessions: int = Field(default=0, ge=0)
     # (2) Net-return target winsorization plus a robust regression objective.
     # Quantiles are resolved per market so CN and US may carry different tail
     # behaviour. `trainer_objective="huber"` is the robust default;
