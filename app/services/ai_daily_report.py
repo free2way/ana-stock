@@ -2215,14 +2215,34 @@ def save_ai_daily_report(
     publication_input = dict(payload or {})
     publication_input.setdefault("decision_cutoff_at", app_now_iso())
     declared_run_id = publication_input.get("model_run_id")
-    promotion_report = _resolve_cn_serving_promotion_report(db, declared_run_id)
-    enriched_payload = prepare_report_for_publication(
-        publication_input, approved_qualifications=load_trusted_model_qualifications(db=db),
-        trusted_regime_snapshots=load_trusted_regime_snapshots(db=db),
-        model_run_id=declared_run_id,
-        promotion_report=promotion_report,
-        promotion_evidence_provenance=None if promotion_report is not None else "unresolved",
+    # A legacy report shape (`rows` without an explicit CN candidate list) is
+    # never a formal publication: the decision freeze deliberately refuses it
+    # (E-1). Keep that shape saveable as a read-only snapshot instead of failing
+    # the whole save, and mark it explicitly so it cannot be mistaken for a
+    # frozen decision. Any report carrying the explicit candidate contract, and
+    # every publication attempt, still goes through the guarded path below.
+    legacy_readonly = (
+        not isinstance(publication_input.get("market_recommendations"), list)
+        and bool(publication_input.get("rows"))
     )
+    if legacy_readonly and publication_messages:
+        if hasattr(db, "rollback"):
+            db.rollback()
+        raise RuntimeError(
+            "legacy report cannot be published; render an explicit CN candidate list first"
+        )
+    if legacy_readonly:
+        enriched_payload = publication_input
+        enriched_payload["publication_state"] = "legacy_unverified"
+    else:
+        promotion_report = _resolve_cn_serving_promotion_report(db, declared_run_id)
+        enriched_payload = prepare_report_for_publication(
+            publication_input, approved_qualifications=load_trusted_model_qualifications(db=db),
+            trusted_regime_snapshots=load_trusted_regime_snapshots(db=db),
+            model_run_id=declared_run_id,
+            promotion_report=promotion_report,
+            promotion_evidence_provenance=None if promotion_report is not None else "unresolved",
+        )
     if publication_messages:
         # A qualification can be revoked between rendering a message and this
         # final save. Never freeze an old actionable text beside a new blocked
@@ -2263,12 +2283,16 @@ def save_ai_daily_report(
     from app.services.stock_selection.decision_ledger import freeze_final_decisions
 
     try:
-        receipt = freeze_final_decisions(
-            enriched_payload, db=db, commit=False,
-            publication_messages=publication_messages,
-            publication_channels=publication_channels,
-        )
-        enriched_payload["final_decision_receipt"] = receipt
+        if legacy_readonly:
+            # Read-only legacy snapshot: no decision receipt is frozen.
+            receipt = None
+        else:
+            receipt = freeze_final_decisions(
+                enriched_payload, db=db, commit=False,
+                publication_messages=publication_messages,
+                publication_channels=publication_channels,
+            )
+            enriched_payload["final_decision_receipt"] = receipt
         AppSettingRepository(db).set(
             AI_DAILY_REPORT_KEY, json.dumps(enriched_payload, ensure_ascii=False), commit=False,
         )
