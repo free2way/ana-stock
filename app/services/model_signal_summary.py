@@ -21,6 +21,23 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
+def _safe_percentile(percentile: object) -> float | None:
+    """Coerce a stored cross-sectional percentile (0-100) to a float.
+
+    Anything unparseable or out of range is treated as "not provided" so the
+    badge falls back to the absolute score thresholds instead of guessing.
+    """
+    if percentile is None or isinstance(percentile, bool):
+        return None
+    try:
+        value = float(percentile)
+    except (TypeError, ValueError):
+        return None
+    if value != value or value < 0.0 or value > 100.0:  # NaN / out of contract
+        return None
+    return value
+
+
 def model_confidence(score: float | None) -> int | None:
     # A raw regression score carries no calibrated probability or confidence.
     return None
@@ -247,7 +264,9 @@ def enrich_model_output(model_output: dict | None, *, lang: str) -> dict | None:
         return model_output
 
     if model_output.get("confidence") is not None:
-        model_output["state"] = build_model_state(score, lang=lang)
+        model_output["state"] = build_model_state(
+            score, lang=lang, percentile=model_output.get("percentile")
+        )
         if model_output.get("target_horizon_days") is None:
             model_output["target_horizon_days"] = _derive_target_horizon_days(
                 score,
@@ -308,7 +327,9 @@ def enrich_model_output(model_output: dict | None, *, lang: str) -> dict | None:
             model_output.get("expected_return_20d"),
             model_output.get("expected_drawdown_20d"),
         )
-    model_output["state"] = build_model_state(score, lang=lang)
+    model_output["state"] = build_model_state(
+        score, lang=lang, percentile=model_output.get("percentile")
+    )
     if model_output.get("signal_label") is None:
         model_output["signal_label"] = build_signal_label(score, lang=lang)
     if model_output.get("signal_strength") is None:
@@ -335,8 +356,55 @@ def enrich_model_output(model_output: dict | None, *, lang: str) -> dict | None:
     return model_output
 
 
-def build_model_state(score: float | None, *, lang: str) -> dict:
+def build_model_state(score: float | None, *, lang: str, percentile: float | None = None) -> dict:
+    """Render the model badge for one row.
+
+    ``score`` is a cross-sectional ranking signal on the ``score_semantics`` /
+    ``score_contract_version`` contract (``executable_next_open_net_return``),
+    not a probability or a percent return. The absolute score thresholds below
+    were calibrated against an older, wider score scale; once the trainer
+    compressed scores to the net-return scale they pinned nearly every row to
+    Neutral (and the top-N rows a dashboard shows are exactly the compressed
+    ones). When the payload carries a cross-sectional ``percentile``
+    (``score_source: lightgbm_prediction_v1:percentile_0_100``) the badge is
+    normalized on that ranking in quintiles instead, so the badge keeps
+    discriminating between rows. Percentile-less callers keep the previous
+    absolute-threshold behaviour.
+    """
     if score is None:
+        label = "Neutral" if lang == "en" else "中性"
+        return {"key": "neutral", "label": label, "bg": "#f3f4f6", "fg": "#374151"}
+
+    rank_percentile = _safe_percentile(percentile)
+    if rank_percentile is not None:
+        if rank_percentile >= 80.0:
+            return {
+                "key": "strong",
+                "label": "Strong" if lang == "en" else "强",
+                "bg": "#dcfce7",
+                "fg": "#166534",
+            }
+        if rank_percentile >= 60.0:
+            return {
+                "key": "positive",
+                "label": "Positive" if lang == "en" else "偏强",
+                "bg": "#ecfccb",
+                "fg": "#3f6212",
+            }
+        if rank_percentile <= 20.0:
+            return {
+                "key": "weak",
+                "label": "Weak" if lang == "en" else "偏弱",
+                "bg": "#fee2e2",
+                "fg": "#991b1b",
+            }
+        if rank_percentile <= 40.0:
+            return {
+                "key": "cautious",
+                "label": "Cautious" if lang == "en" else "谨慎",
+                "bg": "#fef3c7",
+                "fg": "#92400e",
+            }
         label = "Neutral" if lang == "en" else "中性"
         return {"key": "neutral", "label": label, "bg": "#f3f4f6", "fg": "#374151"}
 

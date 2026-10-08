@@ -491,7 +491,7 @@ def _render_dashboard_top_fragment(
         f"<div class='signal-top'><a class='signal-ticker' href='/insights/{item['ticker']}?lang={lang}'>{item['ticker']}</a><span class='signal-rank'>#{int(item['rank_value'])}</span></div>"
         f"<div class='signal-date'>{item.get('name') or item['ticker']}</div>"
         f"<div class='signal-date'>{item['trade_date']}</div>"
-        f"<div style='margin-bottom:8px;'><span style='display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;background:{build_model_state(item.get('score'), lang=lang)['bg']};color:{build_model_state(item.get('score'), lang=lang)['fg']};font-weight:800;font-size:12px;'>{build_model_state(item.get('score'), lang=lang)['label']}</span></div>"
+        f"<div style='margin-bottom:8px;'><span style='display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;background:{build_model_state(item.get('score'), lang=lang, percentile=item.get('percentile'))['bg']};color:{build_model_state(item.get('score'), lang=lang, percentile=item.get('percentile'))['fg']};font-weight:800;font-size:12px;'>{build_model_state(item.get('score'), lang=lang, percentile=item.get('percentile'))['label']}</span></div>"
         f"<div class='signal-score'>{item['score']:.6f}</div>"
         f"<div style='margin-top:6px;'>{_signal_pill(item.get('score'), lang=lang, compact=True)}</div>"
         f"<div class='signal-foot' title='{latest_model['name'] if latest_model else (t(lang, '最新模型', 'Latest model'))}'>{_compact_run_name(latest_model['name'], 24) if latest_model else (t(lang, '最新模型', 'Latest model'))}"
