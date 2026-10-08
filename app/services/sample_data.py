@@ -50,7 +50,7 @@ def _trading_days_before(end_date: _date, count: int, *, market: str = "US") -> 
     return days
 
 
-def extend_sample_rows(ticker: str, *, days: int) -> list[dict]:
+def extend_sample_rows(ticker: str, *, days: int, market: str = "US") -> list[dict]:
     """Return the sample rows grown to ``days`` trading days.
 
     History is synthesized *before* the curated window so the existing dates
@@ -65,12 +65,16 @@ def extend_sample_rows(ticker: str, *, days: int) -> list[dict]:
     signals on dates outside the explicit market calendar, and the curated
     tail would otherwise leak such a date into the prediction window. The
     default ``seed_sample_data()`` path is unaffected.
+
+    ``market`` selects the explicit market calendar used both to keep the
+    curated tail and to synthesize the leading sessions, so a fixture can serve
+    a non-US ticker without feeding it sessions its backtest calendar rejects.
     """
 
     from app.services.market_calendar import is_market_open_date
 
     base_rows = [
-        row for row in SAMPLE_DATA[ticker] if is_market_open_date("US", str(row["date"]))
+        row for row in SAMPLE_DATA[ticker] if is_market_open_date(market, str(row["date"]))
     ]
     missing = int(days) - len(base_rows)
     if missing <= 0:
@@ -78,7 +82,7 @@ def extend_sample_rows(ticker: str, *, days: int) -> list[dict]:
 
     first_date = _date.fromisoformat(str(base_rows[0]["date"]))
     anchor = float(base_rows[0]["close"])
-    dates = _trading_days_before(first_date, missing, market="US")
+    dates = _trading_days_before(first_date, missing, market=market)
     total = len(dates)
     synthetic: list[dict] = []
     previous_close = anchor * 0.6
