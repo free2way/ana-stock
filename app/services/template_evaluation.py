@@ -115,6 +115,10 @@ def aggregate_lightgbm_score_calibration(records: list[dict], *, bucket_count: i
                     "next_5d_max_return_avg": avg("max_3d_high_return_pct") or avg("return_3d"),
                     "next_3d_max_drawdown_avg": avg("max_3d_drawdown_pct"),
                     "next_5d_max_drawdown_avg": avg("max_3d_drawdown_pct"),
+                    # Additive 20-day horizon: produced from the same matured
+                    # history, never aliased from the 1/3/5-day keys.
+                    "next_20d_close_return_avg": avg("return_20d"),
+                    "next_20d_max_drawdown_avg": avg("drawdown_20d_pct"),
                     "next_open_to_high_avg": avg("next_open_to_high_pct"),
                     "next_open_to_close_avg": avg("next_open_to_close_pct"),
                     "tradable_next_day_rate": round(
@@ -142,6 +146,39 @@ def template_forward_return_from_history(history: list[dict], *, trade_date: str
         return None
     try:
         return round(((float(end_close) / float(start_close)) - 1.0) * 100.0, 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def template_forward_drawdown_from_history(
+    history: list[dict], *, trade_date: str, sessions: int
+) -> float | None:
+    """Worst path drawdown over the next ``sessions`` bars, in percent.
+
+    The entry is the close of the bar at ``trade_date`` (the same bar
+    :func:`template_forward_return_from_history` anchors on) and the window is
+    the following ``sessions`` bars, so a ``sessions=20`` drawdown covers
+    exactly the same window as a ``sessions=20`` forward return. Returns
+    ``None`` while the full path is not yet available: a partial window must
+    not be reported as a 20-day estimate.
+    """
+    if not history:
+        return None
+    start_index = next((index for index, row in enumerate(history) if str(row.get("date") or "") >= str(trade_date)), None)
+    if start_index is None:
+        return None
+    sessions = int(sessions)
+    end_index = start_index + sessions
+    if end_index >= len(history):
+        return None
+    entry_close = history[start_index].get("close")
+    window = history[start_index + 1 : end_index + 1]
+    lows = [row.get("low") for row in window]
+    if entry_close in (None, 0) or any(low is None for low in lows) or not lows:
+        return None
+    try:
+        worst_low = min(float(low) for low in lows)
+        return round(((worst_low / float(entry_close)) - 1.0) * 100.0, 2)
     except (TypeError, ValueError, ZeroDivisionError):
         return None
 
@@ -1226,6 +1263,7 @@ def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, t
                     "return_1d": template_forward_return_from_history(history, trade_date=str(prediction.trade_date), sessions=1),
                     "return_3d": template_forward_return_from_history(history, trade_date=str(prediction.trade_date), sessions=3),
                     "return_5d": template_forward_return_from_history(history, trade_date=str(prediction.trade_date), sessions=5),
+                    "return_20d": template_forward_return_from_history(history, trade_date=str(prediction.trade_date), sessions=20),
                 }
                 execution_profile = template_execution_profile_from_history(
                     history,
@@ -1242,6 +1280,10 @@ def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, t
                         "score": float(prediction.score or 0.0),
                         "return_3d": sample.get("return_3d"),
                         "return_5d": sample.get("return_5d"),
+                        "return_20d": sample.get("return_20d"),
+                        "drawdown_20d_pct": template_forward_drawdown_from_history(
+                            history, trade_date=str(prediction.trade_date), sessions=20
+                        ),
                         **(execution_profile or {}),
                     }
                 )

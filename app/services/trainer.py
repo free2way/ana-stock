@@ -1201,6 +1201,29 @@ class SignalTrainer:
             return None
         return (future_price / anchor_price) - 1.0
 
+    def _future_path_metrics_20d(
+        self, *, future_rows: list[dict], anchor_close: float
+    ) -> dict[str, float | None]:
+        """Additive twenty-session horizon labels, in percent.
+
+        Anchored on the signal-day close (``anchor_close``) so the keys line up
+        with the percent-scaled calibration metrics consumed by
+        ``_build_detail_row``. The 20-day horizon is never derived from (nor fed
+        into) the 1/3/5-day keys, and a path shorter than twenty sessions stays
+        ``None`` so a short window cannot masquerade as a 20-day estimate.
+        """
+        window = future_rows[:20]
+        if len(window) < 20 or anchor_close is None or anchor_close <= 0:
+            return {"next_20d_close_return": None, "next_20d_max_drawdown": None}
+        close_20d = self._label_price(window[-1], "close")
+        lows = [value for value in (self._label_price(row, "low") for row in window) if value is not None]
+        close_return = self._future_return(close_20d, anchor_close) if close_20d is not None else None
+        drawdown = self._future_return(min(lows), anchor_close) if lows else None
+        return {
+            "next_20d_close_return": round(close_return * 100.0, 2) if close_return is not None else None,
+            "next_20d_max_drawdown": round(drawdown * 100.0, 2) if drawdown is not None else None,
+        }
+
     def _parse_iso_date(self, value: object) -> date | None:
         text = str(value or "").strip()
         if not text:
@@ -1418,6 +1441,11 @@ class SignalTrainer:
         next_5d_close_return = (
             self._future_return(self._label_price(future_5d[-1], "close"), anchor_close) if len(future_5d) >= 5 else None
         )
+        twenty_day_metrics = self._future_path_metrics_20d(
+            future_rows=future_rows, anchor_close=anchor_close
+        )
+        next_20d_close_return = twenty_day_metrics["next_20d_close_return"]
+        next_20d_max_drawdown = twenty_day_metrics["next_20d_max_drawdown"]
 
         failed_after_gap_up = 0.0
         if (
@@ -1459,6 +1487,8 @@ class SignalTrainer:
             "next_5d_max_return": round((next_5d_max_return or 0.0) * 100.0, 2),
             "next_5d_max_drawdown": round((next_5d_max_drawdown or 0.0) * 100.0, 2),
             "next_5d_close_return": round((next_5d_close_return or 0.0) * 100.0, 2),
+            "next_20d_close_return": next_20d_close_return,
+            "next_20d_max_drawdown": next_20d_max_drawdown,
             "failed_after_gap_up": failed_after_gap_up,
             "tradable_next_day": tradable_next_day,
             "next_day_limit_band_pct": round(limit_band_pct or 0.0, 2),
@@ -1529,6 +1559,13 @@ class SignalTrainer:
             "slippage_bps_one_way": slippage_bps,
             "cost_model_hash": cost_model.model_hash,
             "drawdown_penalty": drawdown_penalty,
+            # Additive 20-session horizon (percent) for the published
+            # expected_return_20d / expected_drawdown_20d estimates. This is
+            # independent of the label's own fixed-horizon net return.
+            **self._future_path_metrics_20d(
+                future_rows=symbol_rows[index + 1 : index + 21],
+                anchor_close=self._label_price(symbol_rows[index], "close") or 0.0,
+            ),
         }
         previous_close = bars[0].close
         next_open = bars[1].open
@@ -2275,6 +2312,8 @@ class SignalTrainer:
             "next_5d_max_return",
             "next_5d_max_drawdown",
             "next_5d_close_return",
+            "next_20d_close_return",
+            "next_20d_max_drawdown",
             "failed_after_gap_up",
             "tradable_next_day",
             "composite_target",
@@ -2984,12 +3023,21 @@ class SignalTrainer:
                         }
                     )
                     if trade_date == latest_prediction_date:
+                        # Expected-return/drawdown fields are published from the
+                        # out-of-sample calibration snapshot when one exists.
+                        # This repo has no producer for
+                        # ``model_calibration_snapshot`` yet, so fall back to the
+                        # run's own matured train-window calibration buckets
+                        # (20-day keys included) instead of publishing nulls.
+                        detail_calibration_buckets = (
+                            oos_calibration_buckets or calibration_buckets
+                        )
                         calibrated_metrics = (
                             self._lookup_calibrated_metrics(
                                 score=score,
-                                calibration_buckets=oos_calibration_buckets,
+                                calibration_buckets=detail_calibration_buckets,
                             )
-                            if oos_calibration_buckets
+                            if detail_calibration_buckets
                             else None
                         )
                         detail_rows.append(
@@ -3102,6 +3150,13 @@ class SignalTrainer:
                         "calibration_buckets": oos_calibration_buckets,
                         "train_window_calibration_buckets": calibration_buckets,
                         "calibration_source": "model_calibration_snapshot" if oos_calibration_buckets else "disabled_without_oos",
+                        "detail_estimate_calibration_source": (
+                            "model_calibration_snapshot"
+                            if oos_calibration_buckets
+                            else "train_window_calibration"
+                            if calibration_buckets
+                            else "none"
+                        ),
                         "oos_calibration_meta": oos_calibration_meta,
                         "oos_calibration_bucket_count": len(oos_calibration_buckets),
                         "feature_names": feature_names,
