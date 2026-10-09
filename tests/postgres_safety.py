@@ -1,5 +1,6 @@
 """Fail-closed guards for destructive local PostgreSQL test fixtures."""
 import os
+import time
 from unittest import TestCase
 
 from sqlalchemy import create_engine, make_url, text
@@ -53,6 +54,40 @@ def truncate_test_tables(connection, metadata) -> None:
         connection.execute(text(f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE"))
 
 
+# PostgreSQL SQLSTATEs that abort the current transaction but are transient and
+# therefore safe to retry: 40P01 deadlock_detected, 40001 serialization_failure.
+TRUNCATE_RETRY_ATTEMPTS = 3
+TRUNCATE_RETRY_BASE_DELAY_SECONDS = 0.25
+_RETRYABLE_LOCK_SQLSTATES = frozenset({"40P01", "40001"})
+
+
+def _is_retryable_lock_error(error: BaseException) -> bool:
+    original = getattr(error, "orig", None)
+    sqlstate = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    return sqlstate in _RETRYABLE_LOCK_SQLSTATES
+
+
+def truncate_test_tables_with_retry(engine, metadata) -> None:
+    """Truncate ``metadata``'s tables, retrying transient lock contention.
+
+    ``truncate_test_tables`` runs inside the caller's transaction, and a
+    deadlock aborts that whole transaction, so a retry has to open a fresh one
+    (retrying on the aborted connection cannot succeed). Only deadlock and
+    serialization failures are retried, with exponential backoff; anything else
+    -- including a deadlock that keeps recurring past the attempt budget --
+    is re-raised so a real failure is never hidden.
+    """
+    for attempt in range(TRUNCATE_RETRY_ATTEMPTS):
+        try:
+            with engine.begin() as connection:
+                truncate_test_tables(connection, metadata)
+            return
+        except Exception as error:  # noqa: BLE001 - retried only when transient
+            if attempt + 1 >= TRUNCATE_RETRY_ATTEMPTS or not _is_retryable_lock_error(error):
+                raise
+            time.sleep(TRUNCATE_RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
+
+
 class ApplicationPostgresTestCase(TestCase):
     """Shared application binding and per-example reset for explicit test DBs."""
 
@@ -78,8 +113,6 @@ class ApplicationPostgresTestCase(TestCase):
         database.init_db()
 
     def setUp(self):
-        from app.core.db import SessionLocal
+        from app.core import db as database
         from app.models.base import Base
-        with SessionLocal() as db:
-            truncate_test_tables(db.connection(), Base.metadata)
-            db.commit()
+        truncate_test_tables_with_retry(database.engine, Base.metadata)

@@ -1,5 +1,9 @@
 import os
-from tests.postgres_safety import require_test_database_url, check_test_engine, truncate_test_tables
+from tests.postgres_safety import (
+    require_test_database_url,
+    check_test_engine,
+    truncate_test_tables_with_retry,
+)
 import tempfile
 import unittest
 import json
@@ -22,8 +26,14 @@ class AppFlowTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.temp_path = Path(self.temp_dir.name)
         # Snapshot the process environment before any test mutates it, so the
-        # tearDown restore also undoes leaks from individual test methods.
+        # restore also undoes leaks from individual test methods.
         self._environ_snapshot = dict(os.environ)
+        # Register the restore via addCleanup *before* any step that can fail.
+        # unittest always runs addCleanup callbacks, even when setUp raises,
+        # whereas tearDown is skipped in that case. Without this, a deadlocked
+        # truncate below leaked PQW_* variables into later test modules.
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(self._restore_process_environment)
         self._set_test_environment()
         from app.services.runtime_cache import clear_all
 
@@ -43,17 +53,16 @@ class AppFlowTests(unittest.TestCase):
         init_db()
         # The application is PostgreSQL-only. Keep the suite isolated by
         # truncating the dedicated test database between examples instead of
-        # relying on the removed SQLite fallback.
-        with db_module.engine.begin() as connection:
-            truncate_test_tables(connection, Base.metadata)
+        # relying on the removed SQLite fallback. A deadlock aborts the
+        # transaction, so the retry helper reopens it (see postgres_safety).
+        truncate_test_tables_with_retry(db_module.engine, Base.metadata)
 
         from app.api.main import app
 
         self.client = TestClient(app)
         self._login()
 
-    def tearDown(self) -> None:
-        self.client.close()
+    def _restore_process_environment(self) -> None:
         from app.services.runtime_cache import clear_all
 
         from app.core.config import reset_settings_cache
@@ -68,9 +77,10 @@ class AppFlowTests(unittest.TestCase):
         # previously leaked into later test modules and flipped their settings.
         os.environ.clear()
         os.environ.update(self._environ_snapshot)
-
         reset_settings_cache()
-        self.temp_dir.cleanup()
+
+    def tearDown(self) -> None:
+        self.client.close()
 
     def _set_test_environment(self) -> None:
         storage_dir = self.temp_path / "storage"
