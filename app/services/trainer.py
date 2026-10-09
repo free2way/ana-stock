@@ -1238,6 +1238,28 @@ class SignalTrainer:
             return None
         return (future_price / anchor_price) - 1.0
 
+    def _future_path_metrics_5d(
+        self, *, future_rows: list[dict], anchor_close: float
+    ) -> dict[str, float | None]:
+        """Additive five-session horizon label, in percent.
+
+        Mirrors ``_future_path_metrics_20d``: anchored on the signal-day close
+        so ``next_5d_close_return_avg`` lines up with the percent-scaled
+        calibration metrics consumed by ``_build_detail_row`` (the insight
+        page's expected 5-day return). The window is never derived from (nor
+        fed into) the 1/3/20-day keys or the label's own fixed-horizon net
+        return, and a path shorter than five sessions stays ``None`` so a short
+        window cannot masquerade as a five-day estimate.
+        """
+        window = future_rows[:5]
+        if len(window) < 5 or anchor_close is None or anchor_close <= 0:
+            return {"next_5d_close_return": None}
+        close_5d = self._label_price(window[-1], "close")
+        close_return = self._future_return(close_5d, anchor_close) if close_5d is not None else None
+        return {
+            "next_5d_close_return": round(close_return * 100.0, 2) if close_return is not None else None,
+        }
+
     def _future_path_metrics_20d(
         self, *, future_rows: list[dict], anchor_close: float
     ) -> dict[str, float | None]:
@@ -1596,6 +1618,13 @@ class SignalTrainer:
             "slippage_bps_one_way": slippage_bps,
             "cost_model_hash": cost_model.model_hash,
             "drawdown_penalty": drawdown_penalty,
+            # Additive 5-session horizon (percent) for the published
+            # expected_return_5d estimate. This is independent of the label's
+            # own fixed-horizon net return.
+            **self._future_path_metrics_5d(
+                future_rows=symbol_rows[index + 1 : index + 6],
+                anchor_close=self._label_price(symbol_rows[index], "close") or 0.0,
+            ),
             # Additive 20-session horizon (percent) for the published
             # expected_return_20d / expected_drawdown_20d estimates. This is
             # independent of the label's own fixed-horizon net return.
