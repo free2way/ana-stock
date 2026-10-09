@@ -128,6 +128,65 @@ class USMarketSchedulerTests(unittest.TestCase):
         self.assertEqual("failed", completion["status"])
         self.assertEqual("US input blocked", completion["message"])
 
+    def test_post_close_stages_rebuild_adjusted_view_before_training(self):
+        service = USMarketSchedulerService()
+        order: list[str] = []
+
+        def stage(name: str):
+            def _inner(*args, **kwargs):
+                order.append(name)
+                return {"stage": name, "status": "success"}
+
+            return _inner
+
+        with patch.object(service, "_run_risk_guardrail", side_effect=stage("risk_guardrail")), patch.object(
+            service, "_refresh_us_adjusted_view", side_effect=stage("us_adjusted_view")
+        ), patch.object(
+            service, "_run_signal_training", side_effect=stage("signal_training")
+        ), patch.object(
+            service, "_run_screener_precompute", side_effect=stage("screener_precompute")
+        ):
+            service._run_post_close_stages(source_job_id=1, trade_date="2026-10-08")
+
+        self.assertEqual(
+            ["risk_guardrail", "us_adjusted_view", "signal_training", "screener_precompute"],
+            order,
+        )
+
+    def test_adjusted_view_stage_skips_when_view_is_current(self):
+        service = USMarketSchedulerService()
+        with patch(
+            "app.services.us_market_scheduler.rebuild_adjusted_view_if_stale",
+            return_value={"status": "skipped", "latest_date": "2026-10-08", "required_date": "2026-10-08"},
+        ) as rebuild, patch(
+            "app.services.us_market_scheduler.us_adjusted_raw_glob",
+            return_value="data/lake/_us_alpaca/raw/*.parquet",
+        ):
+            result = service._refresh_us_adjusted_view(source_job_id=7, trade_date="2026-10-08")
+
+        self.assertEqual("skipped", result["status"])
+        self.assertEqual("us_adjusted_view", result["stage"])
+        rebuild.assert_called_once_with(
+            "US",
+            method="qfq",
+            raw_glob="data/lake/_us_alpaca/raw/*.parquet",
+            required_upper_bound="2026-10-08",
+        )
+
+    def test_adjusted_view_stage_contains_failure(self):
+        service = USMarketSchedulerService()
+        with patch(
+            "app.services.us_market_scheduler.rebuild_adjusted_view_if_stale",
+            side_effect=RuntimeError("raw namespace unreadable"),
+        ), patch(
+            "app.services.us_market_scheduler.us_adjusted_raw_glob",
+            return_value="data/lake/_us_alpaca/raw/*.parquet",
+        ):
+            result = service._refresh_us_adjusted_view(source_job_id=7, trade_date="2026-10-08")
+
+        self.assertEqual("failed", result["status"])
+        self.assertIn("raw namespace unreadable", result["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

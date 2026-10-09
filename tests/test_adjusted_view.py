@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
+import tempfile
 from unittest import TestCase
+from unittest.mock import patch
+
+import polars as pl
 
 from app.services.adjusted_view import (
     AdjustmentError,
     adjustment_version,
     build_adjusted_series,
     raw_series_digest,
+)
+from app.services.adjusted_view_builder import (
+    rebuild_adjusted_view_if_stale,
+    us_adjusted_raw_glob,
 )
 from app.services.corporate_actions import CorporateActionRecord
 
@@ -98,3 +107,82 @@ class AdjustedViewTests(TestCase):
             build_adjusted_series(bars, [], method="mystery")
         with self.assertRaisesRegex(AdjustmentError, "ascending"):
             build_adjusted_series([bars[0], _bar("2026-01-04", 99.0)], [], method="qfq")
+
+
+class AdjustedViewRebuildTests(TestCase):
+    """``rebuild_adjusted_view_if_stale`` gates the expensive rebuild on the
+    persisted view's newest date."""
+
+    def _write_view(self, lake_root: Path, dates: list[str]) -> None:
+        target = lake_root / "_adjusted_v2" / "us" / "method=qfq"
+        target.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({"date": dates, "symbol": ["AAA"] * len(dates)}).write_parquet(
+            target / "adjusted.parquet"
+        )
+
+    def test_skips_rebuild_when_view_covers_required_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lake_root = Path(tmp)
+            self._write_view(lake_root, ["2026-10-07", "2026-10-08"])
+            with patch(
+                "app.services.adjusted_view_builder.build_market_view"
+            ) as build, patch(
+                "app.services.adjusted_view_builder.write_view"
+            ) as write:
+                result = rebuild_adjusted_view_if_stale(
+                    "US",
+                    raw_glob="ignored/*.parquet",
+                    required_upper_bound="2026-10-08",
+                    lake_root=lake_root,
+                )
+        self.assertEqual("skipped", result["status"])
+        self.assertEqual("2026-10-08", result["latest_date"])
+        build.assert_not_called()
+        write.assert_not_called()
+
+    def test_rebuilds_when_view_lags_required_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lake_root = Path(tmp)
+            self._write_view(lake_root, ["2026-10-07"])
+            with patch(
+                "app.services.adjusted_view_builder.build_market_view",
+                return_value=([], {"symbols": 3, "rows": 30}),
+            ) as build, patch(
+                "app.services.adjusted_view_builder.write_view",
+                return_value={"parquet": "p", "parquet_sha256": "sha", "generated_at": "t"},
+            ) as write:
+                result = rebuild_adjusted_view_if_stale(
+                    "US",
+                    raw_glob="x/*.parquet",
+                    required_upper_bound="2026-10-08",
+                    lake_root=lake_root,
+                )
+        self.assertEqual("rebuilt", result["status"])
+        self.assertEqual("2026-10-07", result["previous_latest_date"])
+        self.assertEqual(3, result["symbols"])
+        build.assert_called_once_with("US", method="qfq", raw_glob="x/*.parquet")
+        write.assert_called_once()
+
+    def test_rebuilds_when_view_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lake_root = Path(tmp)
+            with patch(
+                "app.services.adjusted_view_builder.build_market_view",
+                return_value=([], {"symbols": 1, "rows": 1}),
+            ) as build, patch(
+                "app.services.adjusted_view_builder.write_view",
+                return_value={"parquet": "p", "parquet_sha256": "sha", "generated_at": "t"},
+            ):
+                result = rebuild_adjusted_view_if_stale(
+                    "US",
+                    raw_glob="x/*.parquet",
+                    required_upper_bound="2026-10-08",
+                    lake_root=lake_root,
+                )
+        self.assertEqual("rebuilt", result["status"])
+        self.assertIsNone(result["previous_latest_date"])
+        build.assert_called_once()
+
+    def test_us_raw_glob_points_at_single_basis_namespace(self) -> None:
+        glob = us_adjusted_raw_glob(Path("/lake"))
+        self.assertEqual("/lake/_us_alpaca/raw/*.parquet", glob)

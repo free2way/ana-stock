@@ -7,6 +7,10 @@ from datetime import datetime, timedelta
 
 from app.core.db import SessionLocal
 from app.services.backtester import BacktestRunner
+from app.services.adjusted_view_builder import (
+    rebuild_adjusted_view_if_stale,
+    us_adjusted_raw_glob,
+)
 from app.services.market_calendar import previous_market_open_date
 from app.services.data_quality import format_data_gate_failure, market_data_gate
 from app.services.market_lake import count_lake_symbols_for_trade_date, get_latest_lake_trade_date, list_lake_symbols
@@ -217,9 +221,9 @@ class USMarketSchedulerService:
                 resolved_trade_date = str(result.get("trade_date") or latest_lake_trade_date or "")
                 # Persist the regime for this close before evaluating predictions
                 # generated from it; otherwise today would be labelled unknown.
-                self._run_risk_guardrail(source_job_id=job_id)
-                self._run_signal_training(source_job_id=job_id, trade_date=resolved_trade_date)
-                self._run_screener_precompute(source_job_id=job_id)
+                self._run_post_close_stages(
+                    source_job_id=job_id, trade_date=resolved_trade_date
+                )
             return {"status": status, "job_id": job_id, "refresh_result": result}
         except Exception as exc:
             with SessionLocal() as db:
@@ -340,6 +344,53 @@ class USMarketSchedulerService:
         if status in {"disabled", "skipped"}:
             return base
         return f"{base} Priority fallback: {priority.get('message') or status}"
+
+    def _run_post_close_stages(self, *, source_job_id: int, trade_date: str) -> None:
+        """Run the ordered U.S. post-close stages.
+
+        Ordering guarantee: by the time this runs the close refresh has brought
+        the ``_us_alpaca`` raw namespace and the ``us_daily`` current-day
+        partition up to ``trade_date``. The adjusted view is rebuilt from that
+        single-basis raw namespace *before* signal training, so the label basis
+        can never lag the raw lake by a day (the failure this pipeline used to
+        hit: ``adjusted_coverage_share`` just under 1.0).
+        """
+        self._run_risk_guardrail(source_job_id=source_job_id)
+        self._refresh_us_adjusted_view(source_job_id=source_job_id, trade_date=trade_date)
+        self._run_signal_training(source_job_id=source_job_id, trade_date=trade_date)
+        self._run_screener_precompute(source_job_id=source_job_id)
+
+    def _refresh_us_adjusted_view(self, *, source_job_id: int, trade_date: str) -> dict:
+        """Rebuild the U.S. adjusted view from the single-basis Alpaca namespace.
+
+        Runs after the close refresh and before training. Skips the (expensive)
+        full rebuild when the persisted view already covers ``trade_date``, so
+        the stage is idempotent on days the view is already current.
+        """
+        try:
+            result = rebuild_adjusted_view_if_stale(
+                "US",
+                method="qfq",
+                raw_glob=us_adjusted_raw_glob(),
+                required_upper_bound=trade_date,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface as a stage result, do not abort the pipeline
+            logger.warning("U.S. adjusted view refresh failed before training: %s", exc)
+            return {
+                "stage": "us_adjusted_view",
+                "status": "failed",
+                "source_job_id": source_job_id,
+                "message": str(exc),
+            }
+        status = str(result.get("status") or "unknown")
+        if status == "rebuilt":
+            logger.info(
+                "Rebuilt U.S. adjusted view for %s: %s symbols, %s rows.",
+                trade_date,
+                result.get("symbols"),
+                result.get("rows"),
+            )
+        return {"stage": "us_adjusted_view", "source_job_id": source_job_id, **result}
 
     def _run_signal_training(self, *, source_job_id: int, trade_date: str) -> None:
         raw_us_tickers = sorted(list_lake_symbols(market="US"))
