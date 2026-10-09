@@ -28,6 +28,7 @@ from app.services.stock_selection.sentiment_forward_batch import (
     assess_sentiment_forward_maturity,
     build_sentiment_forward_batch_spec,
     build_sentiment_forward_panel,
+    build_sentiment_forward_panel_from_scores,
     build_sentiment_forward_scores,
     default_start_date,
     freeze_sentiment_forward_batch,
@@ -298,6 +299,101 @@ class SentimentForwardCoverageTests(TestCase):
         self.assertIn(report["decision"], {"PASS", "REJECT"})
         self.assertIn("ci95", report["overall"])
         self.assertEqual(batch.dataset_hash, report["dataset_hash"])
+
+
+RANKED_TICKERS = ("AAA", "BBB", "CCC", "DDD", "EEE")
+
+
+def _ranked_scores(*, feature_date: str = "2026-08-24") -> list[dict]:
+    return [
+        {
+            "feature_date": feature_date,
+            "ticker": ticker,
+            "composite_score": rank,
+            "cross_sectional_rank": rank,
+        }
+        for ticker, rank in zip(RANKED_TICKERS, (1.0, 0.9, 0.8, 0.7, 0.6))
+    ]
+
+
+def _prices_without_exit(*tickers: str) -> list[dict]:
+    """Prices for ``RANKED_TICKERS``; the named ones never reach the exit date."""
+
+    blocked = set(tickers)
+    rows: list[dict] = []
+    for index, ticker in enumerate(RANKED_TICKERS):
+        for offset, trade_date in enumerate(TRADING_DAYS):
+            if ticker in blocked and trade_date >= "2026-08-31":
+                continue
+            base = 10.0 + index + offset * 0.1
+            rows.append(
+                {"symbol": ticker, "date": trade_date, "open": base, "close": base + 0.05}
+            )
+    return rows
+
+
+class SentimentForwardSelectionBiasTests(TestCase):
+    """The treated/control split is frozen before outcomes are measured."""
+
+    def test_missing_return_does_not_backfill_the_frozen_top_n(self) -> None:
+        panel = build_sentiment_forward_panel_from_scores(
+            batch=_batch(),
+            score_rows=_ranked_scores(),
+            price_rows=_prices_without_exit("AAA"),
+            as_of_date="2026-09-30",
+        )
+
+        daily = panel["daily"][0]
+        # The frozen list still contains AAA; CCC is never promoted into it.
+        self.assertEqual(["AAA", "BBB"], daily["treated_frozen"])
+        self.assertEqual(["CCC", "DDD", "EEE"], daily["control_frozen"])
+        self.assertEqual(["AAA"], daily["missing_tickers"])
+        self.assertEqual(1, daily["treated_measured_count"])
+        self.assertEqual(3, daily["control_measured_count"])
+        self.assertEqual(4, daily["measured_count"])
+
+        self.assertEqual(["AAA"], [entry["ticker"] for entry in panel["missing_returns"]])
+        self.assertEqual("treated", panel["missing_returns"][0]["frozen_group"])
+        self.assertEqual(1, panel["missing_return_count"])
+        self.assertEqual(["2026-08-24"], panel["dates_with_missing_returns"])
+
+        treated = {row.ticker for row in panel["treated_rows"]}
+        self.assertEqual({"BBB"}, treated)
+        self.assertNotIn("CCC", treated)
+        self.assertIn("AAA", panel["frozen_candidates"][0]["treated"])
+
+    def test_all_frozen_names_missing_keeps_the_date_out_but_audited(self) -> None:
+        panel = build_sentiment_forward_panel_from_scores(
+            batch=_batch(),
+            score_rows=_ranked_scores(),
+            price_rows=_prices_without_exit("AAA", "BBB"),
+            as_of_date="2026-09-30",
+        )
+
+        self.assertEqual([], panel["matured_dates"])
+        self.assertEqual(0, panel["evaluated_date_count"])
+        self.assertEqual([], panel["treated_rows"])
+        self.assertEqual(["AAA", "BBB"], panel["frozen_candidates"][0]["missing"])
+        self.assertEqual(2, panel["missing_return_count"])
+        self.assertEqual(
+            {"treated"},
+            {entry["frozen_group"] for entry in panel["missing_returns"]},
+        )
+
+    def test_complete_names_still_form_the_frozen_top_n(self) -> None:
+        panel = build_sentiment_forward_panel_from_scores(
+            batch=_batch(),
+            score_rows=_ranked_scores(),
+            price_rows=_prices_without_exit(),
+            as_of_date="2026-09-30",
+        )
+
+        self.assertEqual(["2026-08-24"], panel["matured_dates"])
+        self.assertEqual(0, panel["missing_return_count"])
+        self.assertEqual({"AAA", "BBB"}, {row.ticker for row in panel["treated_rows"]})
+        self.assertEqual(
+            {"CCC", "DDD", "EEE"}, {row.ticker for row in panel["control_rows"]}
+        )
 
 
 if __name__ == "__main__":

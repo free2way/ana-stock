@@ -795,6 +795,8 @@ def build_sentiment_forward_panel_from_scores(
     treated_rows: list[ExperimentRow] = []
     control_rows: list[ExperimentRow] = []
     daily: list[dict[str, Any]] = []
+    frozen_candidates: list[dict[str, Any]] = []
+    missing_returns: list[dict[str, Any]] = []
     pending_dates: list[str] = []
     matured_dates: list[str] = []
     for feature_date in sorted(scheduled):
@@ -806,8 +808,19 @@ def build_sentiment_forward_panel_from_scores(
             pending_dates.append(feature_date.isoformat())
             continue
 
-        measured: list[tuple[float, ExperimentRow]] = []
-        for rank, composite, ticker in scheduled[feature_date]:
+        # Freeze treated/control membership from the frozen ranking *before* any
+        # outcome is inspected.  A frozen name with no measurable return is
+        # counted as missing and never backfilled by the next-ranked name, so the
+        # panel cannot silently re-select a later winner (selection bias).
+        ranked = sorted(scheduled[feature_date], key=lambda item: (-item[0], item[2]))
+        frozen_treated = [ticker for _, _, ticker in ranked[: batch.top_n]]
+        frozen_control = [ticker for _, _, ticker in ranked[batch.top_n :]]
+        treated_names = set(frozen_treated)
+        control_names = set(frozen_control)
+
+        measured: list[ExperimentRow] = []
+        missing_tickers: list[str] = []
+        for rank, composite, ticker in ranked:
             net = measure_forward_net_return(
                 index,
                 dates_by_ticker,
@@ -817,27 +830,50 @@ def build_sentiment_forward_panel_from_scores(
                 cost_bps=batch.cost_bps,
             )
             if net is None:
+                missing_tickers.append(ticker)
                 continue
             gross = net + batch.cost_bps / 10_000.0
             measured.append(
-                (
-                    rank,
-                    ExperimentRow(
-                        feature_date=feature_date,
-                        ticker=ticker,
-                        raw_score=composite,
-                        net_return=float(net),
-                        gross_return=float(gross),
-                        label_value=float(gross),
-                        ranking_values={"raw_score": composite},
-                    ),
+                ExperimentRow(
+                    feature_date=feature_date,
+                    ticker=ticker,
+                    raw_score=composite,
+                    net_return=float(net),
+                    gross_return=float(gross),
+                    label_value=float(gross),
+                    ranking_values={"raw_score": composite},
                 )
             )
+        for ticker in missing_tickers:
+            missing_returns.append(
+                {
+                    "feature_date": feature_date.isoformat(),
+                    "ticker": ticker,
+                    "reason": "no_measurable_forward_return",
+                    "frozen_group": "treated" if ticker in treated_names else "control",
+                }
+            )
+        frozen_candidates.append(
+            {
+                "feature_date": feature_date.isoformat(),
+                "entry_date": entry_date,
+                "exit_date": exit_date,
+                "top_n": batch.top_n,
+                "treated": frozen_treated,
+                "control": frozen_control,
+                "missing": missing_tickers,
+                "measured_count": len(measured),
+            }
+        )
         if len(measured) < 2 * batch.top_n:
+            # Too few measurable returns for a stable treated/control contrast:
+            # the date stays out of the matured set, but the frozen list above
+            # keeps the (unbackfilled) selection auditable.
             continue
-        measured.sort(key=lambda item: (-item[0], item[1].ticker))
-        treated = [row for _, row in measured[: batch.top_n]]
-        remainder = [row for _, row in measured[batch.top_n :]]
+        treated = [row for row in measured if row.ticker in treated_names]
+        remainder = [row for row in measured if row.ticker in control_names]
+        if not treated or not remainder:
+            continue
         treated_rows.extend(treated)
         control_rows.extend(remainder)
         matured_dates.append(feature_date.isoformat())
@@ -848,6 +884,12 @@ def build_sentiment_forward_panel_from_scores(
                 "exit_date": exit_date,
                 "measured_count": len(measured),
                 "top_n": batch.top_n,
+                "treated_frozen": frozen_treated,
+                "control_frozen": frozen_control,
+                "treated_measured_count": len(treated),
+                "control_measured_count": len(remainder),
+                "missing_count": len(missing_tickers),
+                "missing_tickers": missing_tickers,
                 "treated_mean_net_return": sum(row.net_return for row in treated) / len(treated),
                 "control_mean_net_return": sum(row.net_return for row in remainder)
                 / len(remainder),
@@ -870,6 +912,12 @@ def build_sentiment_forward_panel_from_scores(
         "treated_rows": treated_rows,
         "control_rows": control_rows,
         "daily": daily,
+        "frozen_candidates": frozen_candidates,
+        "missing_returns": missing_returns,
+        "missing_return_count": len(missing_returns),
+        "dates_with_missing_returns": sorted(
+            {entry["feature_date"] for entry in missing_returns}
+        ),
         "maturity": maturity,
     }
 
