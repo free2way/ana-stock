@@ -37,6 +37,23 @@ SAMPLE_DATA = {
 }
 
 
+def _curated_rows(ticker: str, *, market: str = "US") -> list[dict]:
+    """Return the curated fixture rows that fall on an open market session.
+
+    The fixture is hand-written and contains at least one closed session
+    (``2026-04-03`` is a US holiday), so every read of ``SAMPLE_DATA`` must be
+    filtered through the explicit market calendar. Keeping this in one place
+    stops the seed path and the ``extend_sample_rows`` path from disagreeing on
+    which bars are tradable.
+    """
+
+    from app.services.market_calendar import is_market_open_date
+
+    return [
+        row for row in SAMPLE_DATA[ticker] if is_market_open_date(market, str(row["date"]))
+    ]
+
+
 def _trading_days_before(end_date: _date, count: int, *, market: str = "US") -> list[_date]:
     from app.services.market_calendar import is_market_open_date
 
@@ -61,21 +78,17 @@ def extend_sample_rows(ticker: str, *, days: int, market: str = "US") -> list[di
     the first curated close, which keeps label eligibility meaningful.
 
     Curated rows that fall on a closed session (e.g. ``2026-04-03`` is a US
-    holiday) are dropped here only: the backtest engine refuses to emit
-    signals on dates outside the explicit market calendar, and the curated
-    tail would otherwise leak such a date into the prediction window. The
-    default ``seed_sample_data()`` path is unaffected.
+    holiday) are dropped here, and by the default ``seed_sample_data()`` path,
+    through the shared ``_curated_rows`` filter: the backtest engine refuses to
+    emit signals on dates outside the explicit market calendar, and the curated
+    tail would otherwise leak such a date into the prediction window.
 
     ``market`` selects the explicit market calendar used both to keep the
     curated tail and to synthesize the leading sessions, so a fixture can serve
     a non-US ticker without feeding it sessions its backtest calendar rejects.
     """
 
-    from app.services.market_calendar import is_market_open_date
-
-    base_rows = [
-        row for row in SAMPLE_DATA[ticker] if is_market_open_date(market, str(row["date"]))
-    ]
+    base_rows = _curated_rows(ticker, market=market)
     missing = int(days) - len(base_rows)
     if missing <= 0:
         return base_rows
@@ -134,7 +147,9 @@ def seed_sample_data(*, days: int | None = None) -> list[dict]:
 
     ``days`` optionally stretches each ticker's history to that many trading
     days (synthesizing the extra leading sessions). It defaults to ``None`` so
-    existing callers keep the original 5-10 session fixture.
+    existing callers keep the original 5-10 session fixture. Either way the
+    curated rows are filtered through the explicit market calendar, so a
+    fixture bar on a closed session (``2026-04-03``) is never written.
     """
 
     init_db()
@@ -147,6 +162,11 @@ def seed_sample_data(*, days: int | None = None) -> list[dict]:
         for ticker, rows in SAMPLE_DATA.items():
             if days is not None:
                 rows = extend_sample_rows(ticker, days=days)
+            else:
+                # Even the untouched fixture must honour the market calendar:
+                # the curated tail includes a closed session (2026-04-03) that
+                # the lake must never re-ingest as a tradable bar.
+                rows = _curated_rows(ticker)
             symbol = symbol_repo.get_by_ticker(ticker)
             if symbol is None:
                 symbol = symbol_repo.create_symbol(SymbolCreate(ticker=ticker, name=ticker, market="US"))
