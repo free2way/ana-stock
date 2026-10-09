@@ -2505,11 +2505,16 @@ class SignalTrainer:
     ) -> list[dict]:
         if not train_window:
             return []
-        predicted_scores = []
+        # One matrix for the whole window, through the exact same transform the
+        # fit and the walk-forward scoring use (`_feature_matrix` normalizes per
+        # trade date). Batching is applied to the *prediction* only: building
+        # per-chunk matrices would both skip the transform and cut a same-day
+        # cross-section in half.
+        matrix = self._feature_matrix(train_window, feature_names)
+        predicted_scores: list[float] = []
         for start in range(0, len(train_window), 4096):
-            chunk = train_window[start:start + 4096]
-            matrix = [[self._safe_float(sample["features"].get(name)) for name in feature_names] for sample in chunk]
-            scores = self._predict_scores(model, matrix)
+            chunk = matrix[start:start + 4096]
+            scores = self._predict_scores(model, chunk)
             if len(scores) != len(chunk):
                 raise RuntimeError("Calibration prediction count does not match training window")
             predicted_scores.extend(scores)

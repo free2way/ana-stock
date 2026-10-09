@@ -50,6 +50,20 @@ def _session_rows(
     return rows
 
 
+class _RecordingScoresModel:
+    """Predicts a trivial score and records every matrix chunk it is handed."""
+
+    def __init__(self) -> None:
+        self.seen: list[list[float]] = []
+        self.call_count = 0
+
+    def predict(self, rows) -> list[float]:
+        self.call_count += 1
+        chunk = [list(map(float, row)) for row in np.asarray(rows)]
+        self.seen.extend(chunk)
+        return [float(row[0]) for row in chunk]
+
+
 def _admitted_dates(rows: list[dict]) -> set[str]:
     """Dates the PIT universe rules admit as signal days (gate != False)."""
 
@@ -501,6 +515,87 @@ class EmbargoAndFeatureTransformTests(TestCase):
         self.assertEqual("cross_sectional_winsor_mad_zscore", config["method"])
         self.assertEqual("per_trade_date", config["scope"])
         self.assertTrue(math.isfinite(config["zscore_clip"]))
+
+    def test_calibration_shares_the_fit_and_inference_feature_space(self) -> None:
+        """P1-2 regression: calibration must not hand raw features to the model.
+
+        Fit and walk-forward inference both go through `_feature_matrix`
+        (per-trade-date winsor/MAD z-score). Calibration used to rebuild the raw
+        feature values, so the model saw a different space than it was fitted on.
+        """
+
+        trainer = SignalTrainer()
+        same_date = [
+            {"trade_date": "2026-02-04", "symbol": "AAA", "features": {"alpha": 10.0}},
+            {"trade_date": "2026-02-04", "symbol": "BBB", "features": {"alpha": 20.0}},
+            {"trade_date": "2026-02-04", "symbol": "CCC", "features": {"alpha": 30.0}},
+        ]
+        model = _RecordingScoresModel()
+        trainer._build_score_calibration(
+            model=model, train_window=same_date, feature_names=["alpha"]
+        )
+        calibration_matrix = np.asarray(model.seen)
+        fit_matrix = trainer._feature_matrix(same_date, ["alpha"])
+        inference_matrix = trainer._feature_matrix(same_date, ["alpha"])
+        self.assertTrue(np.array_equal(fit_matrix, calibration_matrix))
+        self.assertTrue(np.array_equal(inference_matrix, calibration_matrix))
+        # The raw cross-section is [10, 20, 30]; the shared transform is the
+        # MAD z-score, i.e. [-0.674491, 0, 0.674491].
+        self.assertAlmostEqual(-0.674491, float(calibration_matrix[0][0]), places=6)
+        self.assertAlmostEqual(0.0, float(calibration_matrix[1][0]), places=12)
+        self.assertAlmostEqual(0.674491, float(calibration_matrix[2][0]), places=6)
+
+    def test_calibration_matches_shared_space_across_dates(self) -> None:
+        trainer = SignalTrainer()
+        cross_date = [
+            {"trade_date": "2026-02-04", "symbol": "AAA", "features": {"alpha": 10.0}},
+            {"trade_date": "2026-02-04", "symbol": "BBB", "features": {"alpha": 20.0}},
+            {"trade_date": "2026-02-05", "symbol": "CCC", "features": {"alpha": 1000.0}},
+            {"trade_date": "2026-02-05", "symbol": "DDD", "features": {"alpha": 2000.0}},
+        ]
+        model = _RecordingScoresModel()
+        trainer._build_score_calibration(
+            model=model, train_window=cross_date, feature_names=["alpha"]
+        )
+        expected = trainer._feature_matrix(cross_date, ["alpha"])
+        self.assertTrue(np.array_equal(expected, np.asarray(model.seen)))
+        # Each date is normalized inside its own cross-section, so the score
+        # ordering is no longer driven by the raw per-date scale.
+        self.assertAlmostEqual(
+            float(expected[0][0]), -float(expected[1][0]), places=12
+        )
+        self.assertAlmostEqual(
+            float(expected[2][0]), -float(expected[3][0]), places=12
+        )
+
+    def test_calibration_batching_keeps_a_same_day_cross_section_whole(self) -> None:
+        """A >4096-row window is batched for prediction, not for the transform."""
+
+        trainer = SignalTrainer()
+        samples = [
+            {"trade_date": "2026-02-04", "symbol": f"S{index:05d}",
+             "features": {"alpha": float(index)}}
+            for index in range(4200)
+        ]
+        model = _RecordingScoresModel()
+        trainer._build_score_calibration(
+            model=model, train_window=samples, feature_names=["alpha"]
+        )
+        expected = trainer._feature_matrix(samples, ["alpha"])
+        self.assertEqual((4200, 1), tuple(np.asarray(model.seen).shape))
+        self.assertGreater(model.call_count, 1)
+        self.assertTrue(np.array_equal(expected, np.asarray(model.seen)))
+        # The shared matrix stays monotone in the raw ramp; a per-chunk transform
+        # would reset the scale at the batch boundary (index 4096).
+        self.assertTrue(np.all(np.diff(expected[:, 0]) >= -1e-12))
+        self.assertGreater(float(expected[4095][0]), 1.0)
+        # Discriminating check: a per-batch transform of the second chunk would
+        # produce a different (locally rescaled) block than the shared matrix.
+        local_second_chunk = trainer._feature_matrix(samples[4096:], ["alpha"])
+        self.assertFalse(
+            np.allclose(local_second_chunk, expected[4096:], atol=1e-9)
+        )
+
 
 if __name__ == "__main__":
     import unittest
