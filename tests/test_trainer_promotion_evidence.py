@@ -197,12 +197,52 @@ class TrainerPromotionEvidenceTests(TestCase):
         # declared so the gate never demands more than the trainer can produce.
         self.assertEqual(54, evaluation["window_capable_dates"])
         self.assertGreater(evaluation["evaluated_sample_count"], 0)
+        # P1-3: the candidate list is frozen before outcomes are read, and the
+        # audit counts the names the metric could not use instead of backfilling.
+        self.assertEqual(5, evaluation["top_n"])
+        self.assertEqual(
+            5 * evaluation["candidate_date_count"],
+            evaluation["frozen_candidate_count"],
+        )
+        # 60 prediction dates, 54 physically matured (window - horizon).
+        self.assertEqual(60, evaluation["candidate_date_count"])
+        self.assertEqual(54, evaluation["evaluated_date_count"])
+        # The six un-matured tail dates are counted as immature, not backfilled.
+        self.assertEqual(30, evaluation["missing_label_count"])
+        self.assertEqual(30, evaluation["immature_label_count"])
+        self.assertEqual(0, evaluation["missing_outcome_count"])
+        self.assertEqual(
+            {"label_window_not_available": 30},
+            evaluation["missing_label_reasons"],
+        )
+        self.assertEqual(
+            evaluation["missing_label_count"],
+            evaluation["immature_label_count"] + evaluation["missing_outcome_count"],
+        )
         self.assertGreater(evaluation["mean_risk_adjusted_return"], 0.0)
         self.assertGreater(evaluation["mean_net_return"], 0.0)
         self.assertEqual(1.0, evaluation["positive_date_rate"])
         self.assertEqual(6, evaluation["horizon_days"])
         self.assertEqual("executable_net_return_v1", evaluation["label_profile"])
         self.assertLess(evaluation["date_min"], evaluation["date_max"])
+        candidate_audit = merged["oos_candidate_audit"]
+        self.assertEqual(
+            evaluation["candidate_date_count"], len(candidate_audit)
+        )
+        self.assertEqual(
+            5,
+            evaluation["frozen_candidate_count"] // len(candidate_audit),
+        )
+        for row in candidate_audit:
+            self.assertEqual(5, row["candidate_count"])
+            self.assertEqual(
+                row["missing_label_count"],
+                row["immature_label_count"] + row["missing_outcome_count"],
+            )
+        # Exactly the un-matured tail dates report a gap.
+        self.assertEqual(
+            6, sum(1 for row in candidate_audit if row["missing_label_count"])
+        )
         self.assertEqual(
             evaluation,
             artifact_meta["oos_evaluation"],

@@ -597,6 +597,138 @@ class EmbargoAndFeatureTransformTests(TestCase):
         )
 
 
+class OosCandidateSelectionTests(TestCase):
+    """P1-3: the OOS evaluation list is frozen from scores, not from outcomes."""
+
+    @staticmethod
+    def _pairs() -> list[tuple[dict, float]]:
+        def sample(symbol: str, target, reason=None) -> dict:
+            return {
+                "symbol": symbol,
+                "trade_date": "2026-02-04",
+                "target": target,
+                "target_profile": ({"exclusion_reason": reason} if reason else {}),
+            }
+
+        return [
+            (sample("AAA", None, "label_window_immature"), 0.90),
+            (sample("BBB", 0.02), 0.80),
+            (sample("CCC", 0.01), 0.70),
+            (sample("DDD", -0.03), 0.60),
+            (sample("EEE", 0.04), 0.50),
+            (sample("FFF", 0.05), 0.40),
+        ]
+
+    def test_missing_exit_price_keeps_the_top_ranked_name_and_counts_it(self) -> None:
+        frozen = SignalTrainer._freeze_oos_candidates(self._pairs(), top_n=5)
+
+        # Before the fix the matured list was sliced first, so AAA dropped out
+        # and FFF (rank 6) took its slot.
+        self.assertEqual(
+            ["AAA", "BBB", "CCC", "DDD", "EEE"],
+            [sample["symbol"] for sample in frozen["candidates"]],
+        )
+        self.assertEqual(
+            ["BBB", "CCC", "DDD", "EEE"],
+            [sample["symbol"] for sample in frozen["labeled_samples"]],
+        )
+        self.assertEqual(5, frozen["candidate_count"])
+        self.assertEqual(4, frozen["labeled_count"])
+        self.assertEqual(1, frozen["missing_label_count"])
+        self.assertEqual(1, frozen["immature_label_count"])
+        self.assertEqual(0, frozen["missing_outcome_count"])
+        self.assertEqual(
+            {"label_window_immature": 1}, frozen["missing_label_reasons"]
+        )
+
+    def test_rejected_outcome_is_counted_separately_from_immaturity(self) -> None:
+        pairs = self._pairs()
+        pairs[1] = (
+            {
+                "symbol": "BBB",
+                "trade_date": "2026-02-04",
+                "target": None,
+                "target_profile": {
+                    "exclusion_reason": "suspected_corporate_action_discontinuity"
+                },
+            },
+            0.80,
+        )
+        frozen = SignalTrainer._freeze_oos_candidates(pairs, top_n=5)
+        self.assertEqual(
+            ["AAA", "BBB", "CCC", "DDD", "EEE"],
+            [sample["symbol"] for sample in frozen["candidates"]],
+        )
+        self.assertEqual(3, frozen["labeled_count"])
+        self.assertEqual(2, frozen["missing_label_count"])
+        self.assertEqual(1, frozen["immature_label_count"])
+        self.assertEqual(1, frozen["missing_outcome_count"])
+
+    def test_oos_summary_aggregates_the_unusable_candidate_counts(self) -> None:
+        per_date = [
+            {
+                "trade_date": "2026-02-04",
+                "metric_value": 0.01,
+                "net_return": 0.02,
+                "sample_count": 4,
+                "candidate_count": 5,
+                "missing_label_count": 1,
+                "immature_label_count": 1,
+                "missing_outcome_count": 0,
+                "missing_label_reasons": {"label_window_immature": 1},
+            },
+            {
+                # No matured candidate on this date: the metric is omitted but the
+                # frozen list and its gap are still audited.
+                "trade_date": "2026-02-05",
+                "metric_value": None,
+                "net_return": None,
+                "sample_count": 0,
+                "candidate_count": 5,
+                "missing_label_count": 5,
+                "immature_label_count": 5,
+                "missing_outcome_count": 0,
+                "missing_label_reasons": {"label_window_immature": 5},
+            },
+        ]
+        summary = SignalTrainer._summarize_oos_evaluation(
+            per_date,
+            horizon_days=6,
+            label_profile="executable_net_return_v1",
+            top_n=5,
+        )
+        self.assertIsNotNone(summary)
+        self.assertEqual(1, summary["evaluated_date_count"])
+        self.assertEqual(2, summary["candidate_date_count"])
+        self.assertEqual(10, summary["frozen_candidate_count"])
+        self.assertEqual(4, summary["evaluated_sample_count"])
+        self.assertEqual(6, summary["missing_label_count"])
+        self.assertEqual(6, summary["immature_label_count"])
+        self.assertEqual(0, summary["missing_outcome_count"])
+        self.assertEqual({"label_window_immature": 6}, summary["missing_label_reasons"])
+
+    def test_oos_summary_stays_unavailable_when_nothing_matured(self) -> None:
+        summary = SignalTrainer._summarize_oos_evaluation(
+            [
+                {
+                    "trade_date": "2026-02-05",
+                    "metric_value": None,
+                    "net_return": None,
+                    "sample_count": 0,
+                    "candidate_count": 5,
+                    "missing_label_count": 5,
+                    "immature_label_count": 5,
+                    "missing_outcome_count": 0,
+                    "missing_label_reasons": {"label_window_immature": 5},
+                }
+            ],
+            horizon_days=6,
+            label_profile="executable_net_return_v1",
+            top_n=5,
+        )
+        self.assertIsNone(summary)
+
+
 if __name__ == "__main__":
     import unittest
 

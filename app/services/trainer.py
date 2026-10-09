@@ -2394,6 +2394,56 @@ class SignalTrainer:
             return None
 
     @staticmethod
+    def _freeze_oos_candidates(
+        ranked_pairs: list[tuple[dict, float]],
+        *,
+        top_n: int = OOS_EVALUATION_TOP_N,
+    ) -> dict:
+        """Freeze the top-N scored candidates *before* reading any outcome.
+
+        P1-3: the evaluation list may never depend on post-hoc result
+        availability. The candidate list is the score-ranked head; a candidate
+        whose label is missing, rejected (e.g. a corporate-action discontinuity
+        leaves no usable exit price) or not yet matured is counted in place
+        instead of being backfilled by a lower-ranked name.
+        """
+
+        candidates = [
+            sample for sample, _score in ranked_pairs[: max(0, int(top_n))]
+        ]
+        labeled_samples: list[dict] = []
+        missing_reasons: Counter[str] = Counter()
+        immature = 0
+        for sample in candidates:
+            if sample.get("target") is not None:
+                labeled_samples.append(sample)
+                continue
+            reason = str(
+                (sample.get("target_profile") or {}).get("exclusion_reason") or ""
+            ).strip()
+            if reason and reason != "label_window_immature":
+                # The window existed but produced no usable outcome (missing exit
+                # price, unbuyable / locked entry, corporate-action discontinuity).
+                missing_reasons[reason] += 1
+                continue
+            # The label window is not observable yet: the sample builder skips the
+            # label branch entirely once the window would run past the data, and
+            # records `label_window_immature` when it runs but is not complete.
+            missing_reasons[reason or "label_window_not_available"] += 1
+            immature += 1
+        missing_label = sum(missing_reasons.values())
+        return {
+            "candidates": candidates,
+            "labeled_samples": labeled_samples,
+            "candidate_count": len(candidates),
+            "labeled_count": len(labeled_samples),
+            "missing_label_count": missing_label,
+            "immature_label_count": immature,
+            "missing_outcome_count": missing_label - immature,
+            "missing_label_reasons": dict(sorted(missing_reasons.items())),
+        }
+
+    @staticmethod
     def _summarize_oos_evaluation(
         per_date: list[dict],
         *,
@@ -2404,11 +2454,12 @@ class SignalTrainer:
     ) -> dict[str, object] | None:
         """Aggregate matured walk-forward predictions into gate-readable evidence.
 
-        ``per_date`` holds one record per prediction date whose top-N scored
-        samples already had a matured label (the point-in-time pool guarantees
-        such labels were never trained on). Returns ``None`` when no prediction
-        date matured, so the run stays honestly unevaluated instead of reporting
-        an empty metric.
+        ``per_date`` holds one record per prediction date that had a frozen
+        top-N candidate list (the point-in-time pool guarantees such labels were
+        never trained on). Returns ``None`` when no prediction date matured, so
+        the run stays honestly unevaluated instead of reporting an empty metric.
+        Dates whose candidates were all missing / rejected / immature still
+        contribute their counts below, so the omission is auditable.
 
         ``window_capable_dates`` declares the maximum number of matured
         evaluation dates this run's prediction window can physically produce
@@ -2426,6 +2477,9 @@ class SignalTrainer:
             for row in evaluated
             if row.get("net_return") is not None
         ]
+        missing_reasons: Counter[str] = Counter()
+        for row in per_date:
+            missing_reasons.update(dict(row.get("missing_label_reasons") or {}))
         summary: dict[str, object] = {
             "schema_version": "walk_forward_oos_evaluation_v1",
             "source": "trainer_walk_forward_predictions",
@@ -2433,6 +2487,23 @@ class SignalTrainer:
             "evaluated_sample_count": sum(
                 int(row.get("sample_count") or 0) for row in evaluated
             ),
+            # The frozen (pre-outcome) candidate list and everything the outcome
+            # availability removed from the metric, counted in place so a
+            # missing / rejected / immature name is never silently backfilled.
+            "frozen_candidate_count": sum(
+                int(row.get("candidate_count") or 0) for row in per_date
+            ),
+            "candidate_date_count": len(per_date),
+            "missing_label_count": sum(
+                int(row.get("missing_label_count") or 0) for row in per_date
+            ),
+            "immature_label_count": sum(
+                int(row.get("immature_label_count") or 0) for row in per_date
+            ),
+            "missing_outcome_count": sum(
+                int(row.get("missing_outcome_count") or 0) for row in per_date
+            ),
+            "missing_label_reasons": dict(sorted(missing_reasons.items())),
             "mean_risk_adjusted_return": round(
                 sum(metric_values) / len(metric_values), 8
             ),
@@ -2445,8 +2516,11 @@ class SignalTrainer:
             "date_min": str(evaluated[0].get("trade_date") or ""),
             "date_max": str(evaluated[-1].get("trade_date") or ""),
             "metric_definition": (
-                "mean realized label risk_adjusted_return of the top-N scored "
-                "walk-forward predictions per matured prediction date; the label "
+                "mean realized label risk_adjusted_return of the frozen top-N "
+                "scored walk-forward predictions per matured prediction date; the "
+                "candidate list is chosen before labels are read, and candidates "
+                "with a missing / rejected / immature label are counted under "
+                "missing_label_count instead of being backfilled; the label "
                 "path uses market/industry return 0.0, so this equals the "
                 "cost-adjusted net return minus the configured drawdown penalty"
             ),
@@ -3031,13 +3105,11 @@ class SignalTrainer:
                 # point-in-time pool only ever trains on labels available
                 # strictly before this date, so these are never in-sample.
                 if label_profile_setting in OOS_RETURN_LABEL_PROFILES:
-                    matured_pairs = [
-                        sample
-                        for sample, _ in ranked_pairs
-                        if sample.get("target") is not None
-                    ]
-                    selected_pairs = matured_pairs[:OOS_EVALUATION_TOP_N]
-                    if selected_pairs:
+                    # Freeze the candidate list from the scores first: outcome
+                    # availability may never re-order or backfill the top-N.
+                    frozen = self._freeze_oos_candidates(ranked_pairs)
+                    if frozen["candidate_count"]:
+                        selected_pairs = frozen["labeled_samples"]
                         metric_values = [
                             value
                             for value in (
@@ -3050,20 +3122,27 @@ class SignalTrainer:
                             self._safe_float(sample.get("target"))
                             for sample in selected_pairs
                         ]
-                        if metric_values:
-                            oos_evaluation_records.append(
-                                {
-                                    "trade_date": trade_date,
-                                    "metric_value": sum(metric_values)
-                                    / len(metric_values),
-                                    "net_return": (
-                                        sum(net_values) / len(net_values)
-                                        if net_values
-                                        else None
-                                    ),
-                                    "sample_count": len(selected_pairs),
-                                }
-                            )
+                        oos_evaluation_records.append(
+                            {
+                                "trade_date": trade_date,
+                                "metric_value": (
+                                    sum(metric_values) / len(metric_values)
+                                    if metric_values
+                                    else None
+                                ),
+                                "net_return": (
+                                    sum(net_values) / len(net_values)
+                                    if net_values
+                                    else None
+                                ),
+                                "sample_count": len(selected_pairs),
+                                "candidate_count": frozen["candidate_count"],
+                                "missing_label_count": frozen["missing_label_count"],
+                                "immature_label_count": frozen["immature_label_count"],
+                                "missing_outcome_count": frozen["missing_outcome_count"],
+                                "missing_label_reasons": frozen["missing_label_reasons"],
+                            }
+                        )
                 for rank_index, (sample, raw_score) in enumerate(ranked_pairs, start=1):
                     symbol = sample["symbol"]
                     symbol_id = symbol_map.get(symbol)
@@ -3171,6 +3250,26 @@ class SignalTrainer:
                     f"profile and at least one matured prediction date "
                     f"(label_profile={label_profile_setting!r})."
                 )
+            # Per-date audit of the frozen candidate list: missing / rejected /
+            # immature outcomes are visible in the artifact instead of being
+            # replaced by lower-ranked names.
+            if oos_evaluation_records:
+                promotion_evidence["oos_candidate_audit"] = [
+                    {
+                        "trade_date": row.get("trade_date"),
+                        "candidate_count": int(row.get("candidate_count") or 0),
+                        "labeled_count": int(row.get("sample_count") or 0),
+                        "missing_label_count": int(row.get("missing_label_count") or 0),
+                        "immature_label_count": int(
+                            row.get("immature_label_count") or 0
+                        ),
+                        "missing_outcome_count": int(
+                            row.get("missing_outcome_count") or 0
+                        ),
+                        "missing_label_reasons": row.get("missing_label_reasons") or {},
+                    }
+                    for row in oos_evaluation_records
+                ]
             promotion_evidence["data_readiness_evidence_missing_reason"] = (
                 DATA_READINESS_EVIDENCE_MISSING_REASON
             )
