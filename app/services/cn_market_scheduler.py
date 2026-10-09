@@ -5,6 +5,7 @@ import logging
 import threading
 from app.core.config import get_settings
 from app.core.db import SessionLocal
+from app.services.adjusted_view_builder import rebuild_adjusted_view_if_stale
 from app.services.ai_daily_report_delivery import deliver_cn_ai_daily_report_to_feishu
 from app.services.cn_fundamentals import sync_cn_fundamentals
 from app.services.cn_market_universe import refresh_cn_market_data_lake_only
@@ -525,6 +526,13 @@ class CNMarketSchedulerService:
         """Keep each stage visible in Task Center and isolate failures by stage."""
         stages: list[dict] = []
         try:
+            # The close refresh has brought ``cn_daily`` up to ``trade_date``.
+            # The adjusted (qfq) view is rebuilt from that raw lake *before*
+            # signal training so the label basis can never lag the raw lake by a
+            # day (the failure this pipeline used to hit: the trainer refusing an
+            # adjusted-view label run with incomplete coverage).  Mirrors the U.S.
+            # close pipeline (``us_market_scheduler._refresh_us_adjusted_view``).
+            stages.append(self._refresh_cn_adjusted_view(source_job_id=source_job_id, trade_date=trade_date))
             training = self._run_signal_training(source_job_id=source_job_id, trade_date=trade_date)
             stages.append(training)
             if str(training.get("status")) != "success":
@@ -646,6 +654,39 @@ class CNMarketSchedulerService:
                 message=message,
             )
             return job.id
+
+    def _refresh_cn_adjusted_view(self, *, source_job_id: int, trade_date: str) -> dict:
+        """Rebuild the A-share adjusted view from the raw ``cn_daily`` lake.
+
+        Runs after the close refresh and before training.  Skips the (expensive)
+        full rebuild when the persisted view already covers ``trade_date``, so the
+        stage is idempotent on days the view is already current.  Mirrors
+        ``us_market_scheduler._refresh_us_adjusted_view`` but uses the CN raw lake
+        (no single-basis ``raw_glob`` override).
+        """
+        try:
+            result = rebuild_adjusted_view_if_stale(
+                "CN",
+                method="qfq",
+                required_upper_bound=trade_date,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface as a stage result, do not abort the pipeline
+            logger.warning("A-share adjusted view refresh failed before training: %s", exc)
+            return {
+                "stage": "cn_adjusted_view",
+                "status": "failed",
+                "source_job_id": source_job_id,
+                "message": str(exc),
+            }
+        status = str(result.get("status") or "unknown")
+        if status == "rebuilt":
+            logger.info(
+                "Rebuilt A-share adjusted view for %s: %s symbols, %s rows.",
+                trade_date,
+                result.get("symbols"),
+                result.get("rows"),
+            )
+        return {"stage": "cn_adjusted_view", "source_job_id": source_job_id, **result}
 
     def _run_signal_training(self, *, source_job_id: int, trade_date: str) -> dict:
         tickers = sorted(list_lake_symbols(market="CN"))

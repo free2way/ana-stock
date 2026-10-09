@@ -190,7 +190,9 @@ class CNMarketSchedulerTests(unittest.TestCase):
             return _inner
 
         context = MagicMock()
-        with patch.object(service, "_run_signal_training", side_effect=stage("training")), patch.object(
+        with patch.object(service, "_refresh_cn_adjusted_view", side_effect=stage("cn_adjusted_view")), patch.object(
+            service, "_run_signal_training", side_effect=stage("training")
+        ), patch.object(
             service, "_run_screener_precompute_core", side_effect=stage("core")
         ), patch.object(service, "_run_screener_precompute_rest", side_effect=stage("rest")), patch.object(
             service, "_run_screener_precompute_combos", side_effect=stage("combos")
@@ -206,9 +208,45 @@ class CNMarketSchedulerTests(unittest.TestCase):
             service._run_post_close_pipeline(pipeline_job_id=1, source_job_id=2, trade_date="2026-10-09")
 
         self.assertEqual(
-            ["training", "core", "rest", "combos", "market_workspace_snapshots", "ai_daily_report"],
+            [
+                "cn_adjusted_view",
+                "training",
+                "core",
+                "rest",
+                "combos",
+                "market_workspace_snapshots",
+                "ai_daily_report",
+            ],
             order,
         )
+
+    def test_cn_adjusted_view_stage_skips_when_view_is_current(self) -> None:
+        service = CNMarketSchedulerService()
+        with patch(
+            "app.services.cn_market_scheduler.rebuild_adjusted_view_if_stale",
+            return_value={"status": "skipped", "latest_date": "2026-10-09", "required_date": "2026-10-09"},
+        ) as rebuild:
+            result = service._refresh_cn_adjusted_view(source_job_id=7, trade_date="2026-10-09")
+
+        self.assertEqual("skipped", result["status"])
+        self.assertEqual("cn_adjusted_view", result["stage"])
+        rebuild.assert_called_once_with(
+            "CN",
+            method="qfq",
+            required_upper_bound="2026-10-09",
+        )
+
+    def test_cn_adjusted_view_stage_contains_failure(self) -> None:
+        service = CNMarketSchedulerService()
+        with patch(
+            "app.services.cn_market_scheduler.rebuild_adjusted_view_if_stale",
+            side_effect=RuntimeError("raw lake unreadable"),
+        ):
+            result = service._refresh_cn_adjusted_view(source_job_id=7, trade_date="2026-10-09")
+
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("cn_adjusted_view", result["stage"])
+        self.assertIn("raw lake unreadable", result["message"])
 
 
 if __name__ == "__main__":
