@@ -316,7 +316,7 @@ def _render_dashboard_home_panels_fragment(
             f"<div class='leader-name'>{item['name']}</div>"
             f"<div class='leader-metrics'><span class='leader-chip'>{item['hits']}/{item['runs']} {t(lang, '次', 'hits')}</span><span class='leader-chip'>{item['score']:.4f}</span></div>"
             f"<div style='margin:0 0 8px 0;'>{_dashboard_model_badge(item.get('state'), confidence=item.get('confidence'), compact=True)}</div>"
-            f"<div style='margin-bottom:8px;'>{_signal_pill(item.get('score'), lang=lang, strength=int(item.get('signal_strength') or 0), compact=True)}</div>"
+            f"<div style='margin-bottom:8px;'>{_signal_pill(item.get('score'), lang=lang, strength=int(item.get('signal_strength') or 0), compact=True, percentile=item.get('percentile'))}</div>"
             f"<div class='leader-trend'>{_score_sparkline_svg(item.get('score_history', []))}</div>"
             f"<div class='leader-foot'><span>{item.get('trade_date') or '-'}</span><span style='display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;background:{state_bg};color:{state_fg};font-size:12px;font-weight:800;white-space:nowrap;'>{state_label}</span></div>"
             "</article>"
@@ -493,7 +493,7 @@ def _render_dashboard_top_fragment(
         f"<div class='signal-date'>{item['trade_date']}</div>"
         f"<div style='margin-bottom:8px;'><span style='display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;background:{build_model_state(item.get('score'), lang=lang, percentile=item.get('percentile'))['bg']};color:{build_model_state(item.get('score'), lang=lang, percentile=item.get('percentile'))['fg']};font-weight:800;font-size:12px;'>{build_model_state(item.get('score'), lang=lang, percentile=item.get('percentile'))['label']}</span></div>"
         f"<div class='signal-score'>{item['score']:.6f}</div>"
-        f"<div style='margin-top:6px;'>{_signal_pill(item.get('score'), lang=lang, compact=True)}</div>"
+        f"<div style='margin-top:6px;'>{_signal_pill(item.get('score'), lang=lang, compact=True, percentile=item.get('percentile'))}</div>"
         f"<div class='signal-foot' title='{latest_model['name'] if latest_model else (t(lang, '最新模型', 'Latest model'))}'>{_compact_run_name(latest_model['name'], 24) if latest_model else (t(lang, '最新模型', 'Latest model'))}"
         f"{' · ' + str(model_confidence(item.get('score'))) + '%' if model_confidence(item.get('score')) is not None else ''}</div>"
         "</article>"
@@ -593,7 +593,7 @@ def _dashboard_home_watchlist_rows(db: Session, *, lang: str, session_mode: str)
         model_output = outputs.get(item["ticker"]) or {}
         score = model_output.get("score")
         confidence = model_output.get("confidence")
-        label, tone = _dashboard_home_signal(score, lang)
+        label, tone = _dashboard_home_signal(score, lang, model_output.get("percentile"))
         decision = str(label).upper()
         mode_rank = (confidence or 0) * 2 + int(round(float(score or 0.0) * 100))
         if session_mode == "postmarket":
@@ -641,7 +641,7 @@ def _dashboard_home_portfolio_rows(db: Session, *, lang: str) -> tuple[list[dict
         pnl_pct = ((latest_price / cost_basis) - 1.0) * 100 if cost_basis else 0.0
         total_market_value += market_value
         total_cost += cost_value
-        signal_label, signal_tone = _dashboard_home_signal((latest_signal or {}).get("score"), lang)
+        signal_label, signal_tone = _dashboard_home_signal((latest_signal or {}).get("score"), lang, (latest_signal or {}).get("percentile"))
         rows.append(
             {
                 "ticker": item["ticker"],
@@ -791,7 +791,7 @@ def _render_dashboard_workspace(
     top_signal_html = "".join(
         "<article class='signal-row'>"
         f"<div><a class='ticker' href='/insights/{item.get('ticker')}?lang={lang}'>{item.get('ticker')}</a><div class='subtle'>{item.get('trade_date') or '-'}</div><div class='subtle'>{_compact_label(item.get('reason_summary'), 72) if item.get('reason_summary') else (item.get('name') or '-')}</div></div>"
-        f"<div class='row-right'><span class='signal {item.get('signal_tone') or _dashboard_home_signal(item.get('score'), lang)[1]}'>{item.get('signal_label') or _dashboard_home_signal(item.get('score'), lang)[0]}</span></div>"
+        f"<div class='row-right'><span class='signal {item.get('signal_tone') or _dashboard_home_signal(item.get('score'), lang, item.get('percentile'))[1]}'>{item.get('signal_label') or _dashboard_home_signal(item.get('score'), lang, item.get('percentile'))[0]}</span></div>"
         "</article>"
         for item in top_signals
     ) or f"<div class='empty'>{t(lang, '暂无模型结果', 'No model output yet')}</div>"

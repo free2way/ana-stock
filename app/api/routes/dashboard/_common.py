@@ -777,12 +777,12 @@ def _hydrate_ai_report_names(report: dict | None, *, db: Session) -> dict:
 
 
 
-def _dashboard_home_signal(score: float | None, lang: str) -> tuple[str, str]:
-    label = build_signal_label(score, lang=lang) or (t(lang, "观察", "Watch"))
+def _dashboard_home_signal(score: float | None, lang: str, percentile: float | None = None) -> tuple[str, str]:
+    label = build_signal_label(score, lang=lang, percentile=percentile) or (t(lang, "观察", "Watch"))
     normalized = str(label).strip().lower()
-    if normalized in {"buy", "买入"}:
+    if normalized in {"buy", "买点", "买入"}:
         return label, "sig-buy"
-    if normalized in {"sell", "卖出"}:
+    if normalized in {"sell", "卖点", "卖出"}:
         return label, "sig-sell"
     if normalized in {"watch", "观察"}:
         return label, "sig-watch"
@@ -975,8 +975,8 @@ def _dashboard_model_badge(state: dict | None, *, confidence: int | None = None,
 
 
 
-def _signal_pill(score: float | None, *, lang: str, strength: int | None = None, compact: bool = False) -> str:
-    label = build_signal_label(score, lang=lang) or ("Hold" if lang == "en" else "持有")
+def _signal_pill(score: float | None, *, lang: str, strength: int | None = None, compact: bool = False, percentile: float | None = None) -> str:
+    label = build_signal_label(score, lang=lang, percentile=percentile) or ("Hold" if lang == "en" else "持有")
     key = label.lower()
     bg = "#f3f4f6"
     fg = "#374151"

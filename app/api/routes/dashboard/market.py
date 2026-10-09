@@ -544,7 +544,7 @@ def dashboard_market_page(
         scope_buy_count = sum(
             1
             for item in scope_rows
-            if str(item.get("signal_label") or build_signal_label(item.get("score"), lang=lang) or "").strip().upper() == "BUY"
+            if str(item.get("signal_label") or build_signal_label(item.get("score"), lang=lang, percentile=item.get("percentile")) or "").strip().upper() == "BUY"
         )
         scope_risk_count = 0
         scope_strength_total = 0
@@ -583,7 +583,7 @@ def dashboard_market_page(
     top_signal_rows = "".join(
         "<article class='signal-row'>"
         f"<div><a class='ticker' href='/insights/{html.escape(str(item.get('ticker') or ''), quote=True)}?lang={lang}'>{html.escape(str(item.get('ticker') or '-'))}</a><div class='subtle'>{html.escape(str(item.get('trade_date') or '-'))} · {html.escape(str(item.get('market') or '-'))} · {int(item.get('snapshot_buy_hits') or 0)} {t(lang, '次买点', 'buy hits')}</div><div class='subtle'>{html.escape(_compact_label(item.get('reason_summary') or item.get('name') or '-', 72))}</div></div>"
-        f"<div class='row-right'><span class='signal {_dashboard_home_signal(item.get('score'), lang)[1]}'>{html.escape(str(item.get('signal_label') or _dashboard_home_signal(item.get('score'), lang)[0]))}</span><div class='mini-metric'>{int(item.get('signal_strength') or 0)}</div></div>"
+        f"<div class='row-right'><span class='signal {_dashboard_home_signal(item.get('score'), lang, item.get('percentile'))[1]}'>{html.escape(str(item.get('signal_label') or _dashboard_home_signal(item.get('score'), lang, item.get('percentile'))[0]))}</span><div class='mini-metric'>{int(item.get('signal_strength') or 0)}</div></div>"
         "</article>"
         for item in filtered_signals[:5]
     ) or f"<div class='empty'>{t(lang, '暂无符合条件的候选', 'No candidates match the current focus')}</div>"
@@ -655,7 +655,7 @@ def dashboard_market_page(
     buy_rows = [
         item
         for item in filtered_signals
-        if str(item.get("signal_label") or build_signal_label(item.get("score"), lang=lang) or "").strip().upper() == "BUY"
+        if str(item.get("signal_label") or build_signal_label(item.get("score"), lang=lang, percentile=item.get("percentile")) or "").strip().upper() == "BUY"
     ]
     risk_rows = [
         item
@@ -685,7 +685,7 @@ def dashboard_market_page(
             "<tr>"
             f"<td><a href='/insights/{html.escape(str(item.get('ticker') or ''), quote=True)}?lang={lang}'>{html.escape(str(item.get('ticker') or '-'))}</a><div class='muted'>{html.escape(str(item.get('name') or '-'))}</div></td>"
             f"<td>{html.escape(str(item.get('trade_date') or '-'))}</td>"
-            f"<td>{html.escape(str(item.get('signal_label') or build_signal_label(item.get('score'), lang=lang) or '-'))}</td>"
+            f"<td>{html.escape(str(item.get('signal_label') or build_signal_label(item.get('score'), lang=lang, percentile=item.get('percentile')) or '-'))}</td>"
             f"<td>{int(item.get('signal_strength') or 0)}</td>"
             f"<td>{int(item.get('snapshot_buy_hits') or 0)}</td>"
             f"<td>{' · '.join(str(tag).strip() for tag in ((item.get('market_risk_tags') or []) if kpi_focus == 'risk' else (item.get('risk_flags') or item.get('execution_tags') or [])) if str(tag).strip()) or '-'}</td>"

@@ -223,7 +223,7 @@ def _ensure_watchlist_execution_tags(items: list[dict]) -> None:
 
 def _lightweight_watchlist_analysis(model_output: dict | None) -> dict:
     score = None if model_output is None else model_output.get("score")
-    label = (model_output or {}).get("signal_label") or build_signal_label(score, lang="en") or "Hold"
+    label = (model_output or {}).get("signal_label") or build_signal_label(score, lang="en", percentile=(model_output or {}).get("percentile")) or "Hold"
     normalized_label = str(label).strip().lower()
     if normalized_label == "buy":
         decision = "BUY"

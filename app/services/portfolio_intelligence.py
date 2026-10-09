@@ -11,15 +11,15 @@ from app.services.repository import PredictionRepository, SymbolRepository
 from app.services.runtime_cache import get_or_set
 
 
-def _action_from_score(score: float | None, *, lang: str) -> str:
+def _action_from_score(score: float | None, *, lang: str, percentile: float | None = None) -> str:
     if score is None:
         return "等待更多数据" if lang == "zh" else "Wait for more data"
-    value = float(score)
-    if value >= 0.18:
+    label = build_signal_label(score, lang="en", percentile=percentile)
+    if label == "Buy":
         return "可考虑加仓" if lang == "zh" else "Consider adding"
-    if value >= 0.05:
+    if label == "Watch":
         return "继续持有观察" if lang == "zh" else "Hold and monitor"
-    if value <= -0.05:
+    if label == "Sell":
         return "考虑减仓或退出" if lang == "zh" else "Trim or exit"
     return "暂时持有" if lang == "zh" else "Hold for now"
 
@@ -77,7 +77,7 @@ def build_portfolio_ai_summary(
     tradability_status = str(signal.get("tradability_status") or "").strip().upper()
     invalidation_condition = str(signal.get("invalidation_condition") or "").strip()
     target_weight = signal.get("target_weight")
-    verdict = build_signal_label(score_value, lang=lang) if score_value is not None else _translate_signal_label(signal.get("signal_label"), lang=lang)
+    verdict = build_signal_label(score_value, lang=lang, percentile=signal.get("percentile")) if score_value is not None else _translate_signal_label(signal.get("signal_label"), lang=lang)
     if not verdict:
         verdict = "持有" if lang == "zh" else "Hold"
 
@@ -87,6 +87,7 @@ def build_portfolio_ai_summary(
         signal_label_value=signal.get("signal_label"),
         signal_strength_value=signal.get("signal_strength"),
         reward_risk_ratio=signal.get("model_reward_risk_ratio"),
+        percentile=signal.get("percentile"),
     ) if score_value is not None else _translate_entry_style(signal.get("entry_style"), lang=lang)
     raw_note = str(signal.get("execution_note") or "").strip()
     if raw_note:
@@ -477,8 +478,8 @@ def build_portfolio_intelligence(db: Session, *, lang: str = "zh") -> dict:
                     "data_unavailable": not market_data_supported(market),
                     "data_unavailable_reason": "unsupported_market" if not market_data_supported(market) else None,
                     "pnl_pct": pnl_pct,
-                    "signal_label": build_signal_label(score, lang=lang) or ("持有" if lang == "zh" else "Hold"),
-                    "action_hint": _action_from_score(score, lang=lang),
+                    "signal_label": build_signal_label(score, lang=lang, percentile=(latest_signal or {}).get("percentile")) or ("持有" if lang == "zh" else "Hold"),
+                    "action_hint": _action_from_score(score, lang=lang, percentile=(latest_signal or {}).get("percentile")),
                     "tradability_status": (latest_signal or {}).get("tradability_status"),
                     "target_weight": (latest_signal or {}).get("target_weight"),
                     "entry_trigger": (latest_signal or {}).get("entry_trigger"),

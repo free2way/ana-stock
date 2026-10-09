@@ -43,9 +43,34 @@ def model_confidence(score: float | None) -> int | None:
     return None
 
 
-def build_signal_label(score: float | None, *, lang: str) -> str | None:
+# Cross-sectional percentile quintile boundaries. ``build_model_state`` and
+# ``build_signal_label`` share these so a row's badge and its Buy/Watch/Hold/Sell
+# text can never disagree once the payload carries a percentile.
+PERCENTILE_STRONG = 80.0
+PERCENTILE_POSITIVE = 60.0
+PERCENTILE_CAUTIOUS = 40.0
+PERCENTILE_WEAK = 20.0
+
+
+def build_signal_label(
+    score: float | None, *, lang: str, percentile: float | None = None
+) -> str | None:
     if score is None:
         return None
+    rank_percentile = _safe_percentile(percentile)
+    if rank_percentile is not None:
+        # Same quintile contract as ``build_model_state``: once the payload
+        # carries a cross-sectional percentile the top quintile reads as a buy,
+        # the second quintile as watch, the bottom quintile as sell, and the
+        # middle band holds. Percentile-less callers keep the legacy absolute
+        # thresholds below so old caches are unchanged.
+        if rank_percentile >= PERCENTILE_STRONG:
+            return "Buy" if lang == "en" else "买点"
+        if rank_percentile >= PERCENTILE_POSITIVE:
+            return "Watch" if lang == "en" else "观察"
+        if rank_percentile <= PERCENTILE_WEAK:
+            return "Sell" if lang == "en" else "卖点"
+        return "Hold" if lang == "en" else "持有"
     value = float(score)
     if value >= 0.18:
         return "Buy" if lang == "en" else "买点"
@@ -129,11 +154,14 @@ def entry_style(
     signal_label_value: str | None = None,
     signal_strength_value: int | None = None,
     reward_risk_ratio: float | None = None,
+    percentile: float | None = None,
 ) -> str | None:
     if score is None:
         return None
 
-    label = (signal_label_value or build_signal_label(score, lang="en") or "").strip().lower()
+    label = (
+        signal_label_value or build_signal_label(score, lang="en", percentile=percentile) or ""
+    ).strip().lower()
     strength = signal_strength_value if signal_strength_value is not None else signal_strength(score)
     rr = float(reward_risk_ratio) if reward_risk_ratio is not None else None
     value = float(score)
@@ -279,7 +307,9 @@ def enrich_model_output(model_output: dict | None, *, lang: str) -> dict | None:
                 model_output.get("expected_drawdown_20d"),
             )
         if model_output.get("signal_label") is None:
-            model_output["signal_label"] = build_signal_label(score, lang=lang)
+            model_output["signal_label"] = build_signal_label(
+                score, lang=lang, percentile=model_output.get("percentile")
+            )
         if model_output.get("signal_strength") is None:
             model_output["signal_strength"] = signal_strength(score)
         if model_output.get("conviction_bucket") is None:
@@ -331,7 +361,9 @@ def enrich_model_output(model_output: dict | None, *, lang: str) -> dict | None:
         score, lang=lang, percentile=model_output.get("percentile")
     )
     if model_output.get("signal_label") is None:
-        model_output["signal_label"] = build_signal_label(score, lang=lang)
+        model_output["signal_label"] = build_signal_label(
+            score, lang=lang, percentile=model_output.get("percentile")
+        )
     if model_output.get("signal_strength") is None:
         model_output["signal_strength"] = signal_strength(score)
     if model_output.get("conviction_bucket") is None:
@@ -377,28 +409,28 @@ def build_model_state(score: float | None, *, lang: str, percentile: float | Non
 
     rank_percentile = _safe_percentile(percentile)
     if rank_percentile is not None:
-        if rank_percentile >= 80.0:
+        if rank_percentile >= PERCENTILE_STRONG:
             return {
                 "key": "strong",
                 "label": "Strong" if lang == "en" else "强",
                 "bg": "#dcfce7",
                 "fg": "#166534",
             }
-        if rank_percentile >= 60.0:
+        if rank_percentile >= PERCENTILE_POSITIVE:
             return {
                 "key": "positive",
                 "label": "Positive" if lang == "en" else "偏强",
                 "bg": "#ecfccb",
                 "fg": "#3f6212",
             }
-        if rank_percentile <= 20.0:
+        if rank_percentile <= PERCENTILE_WEAK:
             return {
                 "key": "weak",
                 "label": "Weak" if lang == "en" else "偏弱",
                 "bg": "#fee2e2",
                 "fg": "#991b1b",
             }
-        if rank_percentile <= 40.0:
+        if rank_percentile <= PERCENTILE_CAUTIOUS:
             return {
                 "key": "cautious",
                 "label": "Cautious" if lang == "en" else "谨慎",

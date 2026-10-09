@@ -45,18 +45,18 @@ def _signal_chip(label: str, value: str) -> str:
 
 def _lightweight_symbol_summary(overview: dict, latest_signal: dict | None) -> dict:
     score = None if latest_signal is None else latest_signal.get("score")
-    label = (latest_signal or {}).get("signal_label") or build_signal_label(score, lang="en") or "Hold"
+    label = (latest_signal or {}).get("signal_label") or build_signal_label(score, lang="en", percentile=(latest_signal or {}).get("percentile")) or "Hold"
     decision = str(label).strip().upper()
     confidence = (latest_signal or {}).get("confidence")
     if decision not in {"BUY", "SELL", "WATCH", "HOLD"}:
         decision = "HOLD"
     if score is None:
         reason = "Waiting for a fresh model update."
-    elif float(score) >= 0.18:
+    elif decision == "BUY":
         reason = "Model score is supportive, so this name stays on the long radar."
-    elif float(score) >= 0.05:
+    elif decision == "WATCH":
         reason = "Model score is constructive, but the setup still needs confirmation."
-    elif float(score) <= -0.05:
+    elif decision == "SELL":
         reason = "Model score is defensive, so risk control matters more here."
     else:
         reason = "Current setup is mixed and still needs more evidence."

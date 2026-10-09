@@ -189,35 +189,35 @@ def _snapshot_now_iso() -> str:
     return app_now_iso()
 
 
-def _action_hint_for_score(score: float | None, *, lang: str) -> str:
+def _action_hint_for_score(score: float | None, *, lang: str, percentile: float | None = None) -> str:
     if score is None:
         return "等待数据" if lang == "zh" else "Wait for data"
-    value = float(score)
-    if value >= 0.18:
+    label = build_signal_label(score, lang="en", percentile=percentile)
+    if label == "Buy":
         return "优先跟踪" if lang == "zh" else "Prioritize"
-    if value >= 0.05:
+    if label == "Watch":
         return "加入观察" if lang == "zh" else "Watch closely"
-    if value <= -0.05:
+    if label == "Sell":
         return "降低优先级" if lang == "zh" else "Deprioritize"
     return "继续观察" if lang == "zh" else "Keep watching"
 
 
-def _signal_tone_for_score(score: float | None) -> str:
+def _signal_tone_for_score(score: float | None, percentile: float | None = None) -> str:
     if score is None:
         return "sig-watch"
-    value = float(score)
-    if value >= 0.18:
+    label = build_signal_label(score, lang="en", percentile=percentile)
+    if label == "Buy":
         return "sig-buy"
-    if value <= -0.05:
+    if label == "Sell":
         return "sig-sell"
-    if value >= 0.05:
+    if label == "Watch":
         return "sig-watch"
     return "sig-hold"
 
 
 def _watchlist_combined_analysis(model_output: dict | None) -> dict:
     score = None if model_output is None else model_output.get("score")
-    label = (model_output or {}).get("signal_label") or build_signal_label(score, lang="en") or "Hold"
+    label = (model_output or {}).get("signal_label") or build_signal_label(score, lang="en", percentile=(model_output or {}).get("percentile")) or "Hold"
     normalized_label = str(label).strip().lower()
     if normalized_label == "buy":
         decision = "BUY"
@@ -302,7 +302,7 @@ def build_home_watchlist_snapshot(db: Session, *, lang: str = "zh") -> dict:
         output = prediction_repo._build_signal_decision(outputs.get(item["ticker"]) or {})
         score = output.get("score")
         confidence = output.get("confidence")
-        signal_label = output.get("signal_label") or build_signal_label(score, lang=lang) or ("观察" if lang == "zh" else "Watch")
+        signal_label = output.get("signal_label") or build_signal_label(score, lang=lang, percentile=output.get("percentile")) or ("观察" if lang == "zh" else "Watch")
         rows.append(
             {
                 "ticker": item["ticker"],
@@ -311,9 +311,9 @@ def build_home_watchlist_snapshot(db: Session, *, lang: str = "zh") -> dict:
                 "score": float(score or 0.0),
                 "confidence": confidence,
                 "signal_label": signal_label,
-                "signal_tone": _signal_tone_for_score(score),
+                "signal_tone": _signal_tone_for_score(score, output.get("percentile")),
                 "priority": confidence if confidence is not None else 0,
-                "action_hint": _action_hint_for_score(score, lang=lang),
+                "action_hint": _action_hint_for_score(score, lang=lang, percentile=output.get("percentile")),
                 "tradability_status": output.get("tradability_status"),
                 "target_weight": output.get("target_weight"),
                 "entry_trigger": output.get("entry_trigger"),
@@ -360,7 +360,7 @@ def build_home_portfolio_snapshot(db: Session, *, lang: str = "zh") -> dict:
         total_market_value += market_value
         total_cost += cost_value
         score = (latest_signal or {}).get("score")
-        signal_label = build_signal_label(score, lang=lang) or ("持有" if lang == "zh" else "Hold")
+        signal_label = build_signal_label(score, lang=lang, percentile=(latest_signal or {}).get("percentile")) or ("持有" if lang == "zh" else "Hold")
         rows.append(
             {
                 "ticker": item["ticker"],
@@ -370,9 +370,9 @@ def build_home_portfolio_snapshot(db: Session, *, lang: str = "zh") -> dict:
                 "pnl_pct": pnl_pct,
                 "market_value": market_value,
                 "signal_label": signal_label,
-                "signal_tone": _signal_tone_for_score(score),
+                "signal_tone": _signal_tone_for_score(score, (latest_signal or {}).get("percentile")),
                 "risk_flag": "关注回撤" if pnl_pct < -5 and lang == "zh" else ("Watch drawdown" if pnl_pct < -5 else ""),
-                "action_hint": _action_hint_for_score(score, lang=lang),
+                "action_hint": _action_hint_for_score(score, lang=lang, percentile=(latest_signal or {}).get("percentile")),
                 "tradability_status": (latest_signal or {}).get("tradability_status"),
                 "target_weight": (latest_signal or {}).get("target_weight"),
                 "entry_trigger": (latest_signal or {}).get("entry_trigger"),
@@ -419,7 +419,7 @@ def build_model_candidates_snapshot(db: Session, *, lang: str = "zh") -> dict:
                 "name": row.get("name") or row.get("ticker"),
                 "score": score,
                 "confidence": row.get("confidence"),
-                "signal_label": row.get("signal_label") or build_signal_label(score, lang=lang),
+                "signal_label": row.get("signal_label") or build_signal_label(score, lang=lang, percentile=row.get("percentile")),
                 "tradability_status": row.get("tradability_status"),
                 "action_bucket": row.get("action_bucket"),
                 "action_label": row.get("action_label"),

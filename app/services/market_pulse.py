@@ -46,7 +46,7 @@ def filter_market_pulse_signals(
             if str(tag).strip()
         ]
         row["market_risk_tags"] = [tag for tag in all_tags if tag not in MARKET_PULSE_SOFT_RISK_TAGS]
-        label = str(row.get("signal_label") or build_signal_label(row.get("score"), lang=lang) or "").strip().upper()
+        label = str(row.get("signal_label") or build_signal_label(row.get("score"), lang=lang, percentile=row.get("percentile")) or "").strip().upper()
         if selected_market != "ALL" and row["market"] != selected_market:
             continue
         if selected_signal != "ALL" and label != selected_signal:
@@ -85,7 +85,7 @@ def summarize_market_pulse_signals(
                 risk_counts[tag] = risk_counts.get(tag, 0) + 1
             if len(risk_examples) < 3:
                 risk_examples.append({"label": item.get("ticker") or "-", "tags": tags[:2]})
-        label = str(item.get("signal_label") or build_signal_label(item.get("score"), lang=lang) or "").strip().upper()
+        label = str(item.get("signal_label") or build_signal_label(item.get("score"), lang=lang, percentile=item.get("percentile")) or "").strip().upper()
         if label in bucket_counts:
             bucket_counts[label] += 1
 

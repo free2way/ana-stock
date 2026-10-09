@@ -262,7 +262,7 @@ def _build_chart_payload(*, insight: dict, prediction_history: list[dict], chart
         trade_date = row.get("trade_date")
         if not trade_date or trade_date not in candle_dates or trade_date in seen_dates:
             continue
-        label = row.get("signal_label") or build_signal_label(row.get("score"), lang=lang)
+        label = row.get("signal_label") or build_signal_label(row.get("score"), lang=lang, percentile=row.get("percentile"))
         if not label:
             continue
         seen_dates.add(trade_date)

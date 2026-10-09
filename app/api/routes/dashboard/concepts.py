@@ -63,14 +63,15 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
 
-def _mini_signal_direction(score: float | None) -> tuple[str, str] | None:
-    if score is None:
-        return None
-    if score >= 0.18:
+def _mini_signal_direction(
+    score: float | None, percentile: float | None = None
+) -> tuple[str, str] | None:
+    label = build_signal_label(score, lang="en", percentile=percentile)
+    if label == "Buy":
         return ("B", "#15803d")
-    if score <= -0.05:
+    if label == "Sell":
         return ("S", "#b91c1c")
-    if score >= 0.05:
+    if label == "Watch":
         return ("W", "#a16207")
     return None
 
@@ -106,7 +107,10 @@ def _price_signal_sparkline_svg(history_rows: list[dict], prediction_history: li
     hover_targets: list[str] = []
     for date_value, x, y, row in point_meta:
         signal = signal_map.get(date_value)
-        marker = _mini_signal_direction(signal.get("score") if signal else None)
+        marker = _mini_signal_direction(
+            signal.get("score") if signal else None,
+            signal.get("percentile") if signal else None,
+        )
         signal_text = ""
         if signal:
             label, _ = marker if marker else ("", "")
@@ -481,7 +485,7 @@ def dashboard_concept_detail(
         ticker_detail_rows.append(
             {
                 **detail,
-                "display_signal_label": build_signal_label(detail.get("score"), lang=lang) or ("Hold" if lang == "en" else "持有"),
+                "display_signal_label": build_signal_label(detail.get("score"), lang=lang, percentile=detail.get("percentile")) or ("Hold" if lang == "en" else "持有"),
                 "watch_state_label": state_label,
                 "watch_state_bg": state_bg,
                 "watch_state_fg": state_fg,
@@ -498,7 +502,7 @@ def dashboard_concept_detail(
     exclude_execution_tag_filter = exclude_execution_tag_filter.strip()
     if signal_filter != "ALL":
         def _signal_key(detail: dict) -> str:
-            label = build_signal_label(detail.get("score"), lang="en") or "Hold"
+            label = build_signal_label(detail.get("score"), lang="en", percentile=detail.get("percentile")) or "Hold"
             return label.upper()
         ticker_detail_rows = [detail for detail in ticker_detail_rows if _signal_key(detail) == signal_filter]
     if min_signal_strength > 0:
@@ -551,7 +555,7 @@ def dashboard_concept_detail(
             "<tr>"
             f"<td><a href='/insights/{detail['ticker']}?lang={lang}'>{detail['ticker']}</a></td>"
             f"<td>{detail.get('name') or detail['ticker']}</td>"
-            f"<td><div>{float(detail.get('score') or 0.0):.4f}</div><div style='margin-top:6px;'>{_dashboard_model_badge(detail.get('state'), confidence=detail.get('confidence'), compact=True)}</div><div style='margin-top:6px;'>{_signal_pill(detail.get('score'), lang=lang, strength=int(detail.get('signal_strength') or 0), compact=True)}</div><div style='margin-top:6px;font-size:12px;color:#6b7280;'>{('Pct ' + format(float(detail.get('percentile')), '.1f') + '%') if detail.get('percentile') is not None else ''}{(' · ' if detail.get('percentile') is not None and detail.get('target_horizon_days') is not None else '')}{('H ' + str(int(detail.get('target_horizon_days'))) + 'd') if detail.get('target_horizon_days') is not None else ''}{(' · ' if (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None) and detail.get('model_reward_risk_ratio') is not None else '')}{('R/R ' + format(float(detail.get('model_reward_risk_ratio')), '.2f')) if detail.get('model_reward_risk_ratio') is not None else ''}{(' · ' if (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None) and detail.get('conviction_bucket') else '')}{detail.get('conviction_bucket') or ''}{(' · ' if detail.get('position_size_hint') and (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None or detail.get('conviction_bucket')) else '')}{detail.get('position_size_hint') or ''}{(' · ' if detail.get('entry_style') and (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None or detail.get('conviction_bucket') or detail.get('position_size_hint')) else '')}{detail.get('entry_style') or ''}{(' · ' if detail.get('execution_tags') and (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None or detail.get('conviction_bucket') or detail.get('position_size_hint') or detail.get('entry_style')) else '')}{' / '.join((detail.get('execution_tags') or [])[:2])}</div></td>"
+            f"<td><div>{float(detail.get('score') or 0.0):.4f}</div><div style='margin-top:6px;'>{_dashboard_model_badge(detail.get('state'), confidence=detail.get('confidence'), compact=True)}</div><div style='margin-top:6px;'>{_signal_pill(detail.get('score'), lang=lang, strength=int(detail.get('signal_strength') or 0), compact=True, percentile=detail.get('percentile'))}</div><div style='margin-top:6px;font-size:12px;color:#6b7280;'>{('Pct ' + format(float(detail.get('percentile')), '.1f') + '%') if detail.get('percentile') is not None else ''}{(' · ' if detail.get('percentile') is not None and detail.get('target_horizon_days') is not None else '')}{('H ' + str(int(detail.get('target_horizon_days'))) + 'd') if detail.get('target_horizon_days') is not None else ''}{(' · ' if (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None) and detail.get('model_reward_risk_ratio') is not None else '')}{('R/R ' + format(float(detail.get('model_reward_risk_ratio')), '.2f')) if detail.get('model_reward_risk_ratio') is not None else ''}{(' · ' if (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None) and detail.get('conviction_bucket') else '')}{detail.get('conviction_bucket') or ''}{(' · ' if detail.get('position_size_hint') and (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None or detail.get('conviction_bucket')) else '')}{detail.get('position_size_hint') or ''}{(' · ' if detail.get('entry_style') and (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None or detail.get('conviction_bucket') or detail.get('position_size_hint')) else '')}{detail.get('entry_style') or ''}{(' · ' if detail.get('execution_tags') and (detail.get('percentile') is not None or detail.get('target_horizon_days') is not None or detail.get('model_reward_risk_ratio') is not None or detail.get('conviction_bucket') or detail.get('position_size_hint') or detail.get('entry_style')) else '')}{' / '.join((detail.get('execution_tags') or [])[:2])}</div></td>"
             f"<td>{_percent_chip(detail['five_day_move'])}</td>"
             f"<td><span style='display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;background:{detail['watch_state_bg']};color:{detail['watch_state_fg']};font-size:12px;font-weight:800;white-space:nowrap;'>{detail['watch_state_label']}</span></td>"
             f"<td>{detail.get('last_synced_date') or '-'}</td>"
@@ -585,7 +589,7 @@ def dashboard_concept_detail(
             f"<div class='mini-top'><a href='/insights/{detail['ticker']}?lang={lang}'>{detail['ticker']}</a><span class='mini-score'>{_concept_tr(lang, 'model_score').lower()} {detail['score']:.3f}</span></div>"
             f"<div class='mini-name'>{detail.get('name') or detail['ticker']}</div>"
             f"<div style='margin-bottom:10px;'>{_dashboard_model_badge(detail.get('state'), confidence=detail.get('confidence'), compact=True)}</div>"
-            f"<div style='margin-bottom:8px;'>{_signal_pill(detail.get('score'), lang=lang, strength=int(detail.get('signal_strength') or 0), compact=True)}</div>"
+            f"<div style='margin-bottom:8px;'>{_signal_pill(detail.get('score'), lang=lang, strength=int(detail.get('signal_strength') or 0), compact=True, percentile=detail.get('percentile'))}</div>"
             f"<div style='display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px;color:#6b7280;font-size:12px;font-weight:700;'><span>{('Pct ' + format(float(detail.get('percentile')), '.1f') + '%') if detail.get('percentile') is not None else 'Pct -'}</span><span>{('H ' + str(int(detail.get('target_horizon_days'))) + 'd') if detail.get('target_horizon_days') is not None else 'H -'}</span><span>{('R/R ' + format(float(detail.get('model_reward_risk_ratio')), '.2f')) if detail.get('model_reward_risk_ratio') is not None else 'R/R -'}</span><span>{detail.get('conviction_bucket') or ('Conviction -' if lang == 'en' else '信念 -')}</span><span>{detail.get('position_size_hint') or ('Sizing -' if lang == 'en' else '仓位 -')}</span><span>{detail.get('entry_style') or ('Entry -' if lang == 'en' else '进场 -')}</span>{comparison_tag_html}</div>"
             f"{_price_signal_sparkline_svg(history, prediction_history)}"
             "<div class='mini-metrics'>"
