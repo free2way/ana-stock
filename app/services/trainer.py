@@ -2668,6 +2668,66 @@ class SignalTrainer:
         )
         return dict(nearest.get("metrics") or {})
 
+    # Keys `_build_detail_row` reads to publish the expected-return / drawdown
+    # fields. Each is resolved independently so a source that lacks a horizon
+    # (an older out-of-sample snapshot without 20-day keys) cannot null-out the
+    # keys it does carry, and cannot borrow another horizon's value.
+    DETAIL_ESTIMATE_METRIC_KEYS: tuple[str, ...] = (
+        "next_3d_max_return_avg",
+        "next_5d_close_return_avg",
+        "next_20d_close_return_avg",
+        "next_20d_max_drawdown_avg",
+    )
+
+    def _resolve_detail_estimate_metrics(
+        self,
+        *,
+        score: float,
+        primary_buckets: list[dict],
+        fallback_buckets: list[dict] | None = None,
+        metric_keys: tuple[str, ...] | None = None,
+        primary_source: str = "model_calibration_snapshot",
+        fallback_source: str = "train_window_calibration",
+    ) -> tuple[dict[str, float | int | None] | None, dict[str, str]]:
+        """Resolve the published detail metrics key by key.
+
+        Each required key is taken from the primary bucket and, only when it is
+        absent there, from the fallback bucket for the *same* score band. A key
+        present in neither is published as ``None`` and reported
+        ``unavailable`` -- another horizon's value is never used as a stand-in
+        and zero is never fabricated. Returns ``(metrics, provenance)`` where
+        provenance maps every requested key to its resolving source label.
+        """
+        keys = metric_keys or self.DETAIL_ESTIMATE_METRIC_KEYS
+        primary = (
+            self._lookup_calibrated_metrics(score=score, calibration_buckets=primary_buckets)
+            if primary_buckets
+            else None
+        )
+        fallback = (
+            self._lookup_calibrated_metrics(score=score, calibration_buckets=fallback_buckets)
+            if fallback_buckets
+            else None
+        )
+        sources: dict[str, str] = {}
+        if primary is None and fallback is None:
+            return None, {key: "unavailable" for key in keys}
+        merged: dict[str, float | int | None] = {}
+        for key in keys:
+            value = primary.get(key) if primary else None
+            if value is not None:
+                merged[key] = value
+                sources[key] = primary_source
+                continue
+            value = fallback.get(key) if fallback else None
+            if value is not None:
+                merged[key] = value
+                sources[key] = fallback_source
+                continue
+            merged[key] = None
+            sources[key] = "unavailable"
+        return merged, sources
+
     def _load_oos_score_calibration(self, *, market: str | None) -> tuple[list[dict], dict]:
         market_code = self._normalize_market_code(market) or "ALL"
         try:
@@ -3064,6 +3124,9 @@ class SignalTrainer:
             # One matured top-N record per prediction date; aggregated after the
             # loop into the gate-readable `oos_evaluation` evidence.
             oos_evaluation_records: list[dict] = []
+            # Per-key provenance for the published detail estimates, keyed by
+            # metric name; recorded in the run config for auditability.
+            detail_calibration_key_sources: dict[str, str] = {}
             oos_calibration_buckets, oos_calibration_meta = self._load_oos_score_calibration(market=normalized_market)
 
             for index, trade_date in enumerate(prediction_dates):
@@ -3192,21 +3255,22 @@ class SignalTrainer:
                     )
                     if trade_date == latest_prediction_date:
                         # Expected-return/drawdown fields are published from the
-                        # out-of-sample calibration snapshot when one exists.
-                        # This repo has no producer for
-                        # ``model_calibration_snapshot`` yet, so fall back to the
-                        # run's own matured train-window calibration buckets
-                        # (20-day keys included) instead of publishing nulls.
-                        detail_calibration_buckets = (
-                            oos_calibration_buckets or calibration_buckets
-                        )
-                        calibrated_metrics = (
-                            self._lookup_calibrated_metrics(
+                        # out-of-sample calibration snapshot when one exists,
+                        # resolved per key. A snapshot produced before a horizon
+                        # landed (e.g. the 20-day keys) carries only the keys it
+                        # knew; a missing key falls back to the run's own matured
+                        # train-window calibration buckets and, if still absent,
+                        # stays null. A key is never aliased from another horizon
+                        # and never silently zero-filled. This repo still has no
+                        # persisting job for `model_calibration_snapshot` (only
+                        # the job-catalog description), so the train-window
+                        # fallback is the only 20-day source today.
+                        calibrated_metrics, detail_calibration_key_sources = (
+                            self._resolve_detail_estimate_metrics(
                                 score=score,
-                                calibration_buckets=detail_calibration_buckets,
+                                primary_buckets=oos_calibration_buckets,
+                                fallback_buckets=calibration_buckets,
                             )
-                            if detail_calibration_buckets
-                            else None
                         )
                         detail_rows.append(
                             self._build_detail_row(
@@ -3362,6 +3426,7 @@ class SignalTrainer:
                             if calibration_buckets
                             else "none"
                         ),
+                        "detail_estimate_calibration_key_sources": detail_calibration_key_sources,
                         "oos_calibration_meta": oos_calibration_meta,
                         "oos_calibration_bucket_count": len(oos_calibration_buckets),
                         "feature_names": feature_names,
