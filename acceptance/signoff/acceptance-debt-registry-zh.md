@@ -1,6 +1,6 @@
 # 验收债务登记表（存量测试失败，中文）
 
-- 生成日期：2026-10-05（最新重算：**2026-10-08**，**CAT-1 / CAT-4 收口**后重跑）
+- 生成日期：2026-10-05（最新重算：**2026-10-08**，**CAT-1 / CAT-4 收口**后重跑；**2026-10-09 复核**：三路审核 P1/P2 闭环 + 合树干净全量，见 §0「本轮审核修复（P1/P2）闭环与样本集影响」）
 - 负责人/期限：**已归口（Jacky Hu）**；期限：**下一批次待排期**（下表未闭环项统一归口，实际排期以下一批次计划为准）。
 - 范围：**E3 范围豁免项**（`acceptance/signoff/quant-remediation-final-signoff-2026-10-03-zh.md` §2 E3）——整改前既有、非本次引入的测试失败。
 - 当前基线证据（**本批收口提交之后的全量重跑**）：
@@ -58,6 +58,13 @@
   `test_dashboard_concept_detail_add_top_n_to_watchlist`、`test_dashboard_concept_detail_adds_tickers_to_watchlist_and_syncs`
   —— 美股当日盘中触发 `sync_market_data(tickers=["AAPL"], provider="auto")` 时，provider 返回的当日（`2026-10-08`）bar 被 `market_sync.py` 的“不写未完成交易日行”守卫拒绝，`Synced 0/1` 使断言失配。
 - **本轮已消除**：commit `d6bbdc5`（`test(dashboard): 显式打桩 US 价格 provider，消除盘中环境噪声`）对这两用例显式打桩 US 价格 provider，失败名集不再含这两项。本表当前**不含任何环境性失败**。
+
+### 本轮审核修复（P1/P2）闭环与样本集影响（2026-10-09 复核）
+
+- **闭环**：三路独立审核（A 砺行 `trainer.py` / C 秉直 执行与账本 / B 容之 校准·面板·健康）共 **8 条 P1/P2** 全部**复现属实**并闭环，对应 8 个修复提交：`e25e160`、`2eb469c`、`9a7bc4e`（A）；`015ef8d`、`36ca9fe`（C）；`4306b4e`、`3ef5f28`、`7a3a729`（B）。逐条复现/修复/回归明细见 `acceptance/supplements/audit-p1-closure-2026-10-09.md`。
+- **合树干净全量**（隔离库 `pqw_close_test`，确认无并发 sibling 全量；首次合树全量：此前三路 `added=0` 账本均早于秉直 11:50 的两个提交）：**两轮**全量——首轮 `Ran 1739 / pass 1733 / fail 3 / error 1 / skip 2`，相对基线 `added=3`（**经机制验证 + 单独复跑判定为 DB 并发死锁 → `setUp` 中止 → `PQW_DATA_DIR`/`PQW_OPTIN_REASON` 泄漏到下游模块的测试编排伪失败**，非产品回归），次轮同参复跑 **`added=0 / removed=0 / changed=0 / unchanged_failing=1`**（`Ran 1739 / pass 1736 / fail 1 / error 0 / skip 2`）。**产品代码回归集为空**；唯一失败仍为 **CAT-7-1**。**存量债务总数不变，仍为 1**（本条不新增债务）。明细见 `acceptance/supplements/audit-p1-closure-2026-10-09.md`。
+- **样本集变化（重要，影响可比性）**：砺行 **P1-1**（`e25e160`，标的池过滤改为样本门控）修复后，对照实验中**部分信号日的入场/持有窗口发生位移（15 个共同信号日）**，**标注样本 204 → 208**，训练样本集口径随之变化。**此前 v40/v41 冻结基准下的模型产出与本版不可直接比较**（口径不同，非同分布 A/B）；在**重训产出新模型**之前，请勿用旧基准的模型指标与本版对比。
+- **残余（未扩围，如实登记）**：① **reliability 元数据**仍是单一全局文件（本批仅对概率校准产物做了 thin refresh 失效，元数据未按市场/模型分区）；② 生产旧产物 `probability_calibration_latest.json`（无 `market` 标记）按设计**不再被加载**，需**下次调度刷新**才生成带 scope 的产物，在此之前发布估计为「**未校准**」；③ 账本从 `app_settings` JSON 迁移到结构化**持仓/成交流水表**属**中期事项**；④ 生产 runner **默认未开 `liquidate_at_end`**，T+1 强平缺陷为**防御性修复**（经引擎配置即可触发）。
 
 ## 1. 汇总
 
