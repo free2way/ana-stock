@@ -257,23 +257,28 @@ class BacktestEntryPointTests(TestCase):
         self.assertEqual("success", captured["status"])
         contract = captured["config"]["price_basis_contract"]
         self.assertEqual("backtest", contract["entry_point"])
-        # The real US view exists in this repo; the manifest must cite it, and
-        # the decision must be an allow (not a reject) for a clean run.
-        self.assertIn(contract["view_state"], {"present", "absent"})
-        self.assertNotEqual("reject", contract["decision"])
+        # The shared fixture supplies a real temporary Parquet view, with raw
+        # fallback disabled. No production lake or operator opt-in is needed.
+        self.assertEqual("present", contract["view_state"])
+        self.assertEqual(DECISION_ALLOW_ADJUSTED, contract["decision"])
+        self.assertEqual(64, len(contract["view_sha256"]))
+        self.assertEqual(captured["config"]["adjusted_view_sha256"], contract["view_sha256"])
         self.assertEqual(contract, captured["summary"]["price_basis_contract"])
 
+    def test_absent_view_refuses_without_raw_fallback(self) -> None:
+        captured = _run_backtest(records=[], adjusted_view_state="absent", expect_error=True)
+        self.assertEqual("failed", captured["status"])
+        self.assertIn(REASON_ADJUSTED_VIEW_ABSENT, str(captured["error"]))
+        contract = captured["summary"]["price_basis_contract"]
+        self.assertEqual("absent", contract["view_state"])
+        self.assertEqual(DECISION_REJECT, contract["decision"])
+        self.assertEqual("fail_closed", contract["fallback_policy"])
+        self.assertEqual(contract, captured["config"]["price_basis_contract"])
+
     def test_corrupt_view_refuses_and_records_failed_contract(self) -> None:
-        corrupt = AdjustedViewProbe(
-            market="US",
-            state="unreadable",
-            path="/lake/_adjusted_v2/us/adjusted.parquet",
-            error="duckdb.IOException: not a parquet file",
+        captured = _run_backtest(
+            records=[], adjusted_view_state="unreadable", expect_error=True
         )
-        with patch(
-            "app.services.backtesting.runner.probe_adjusted_view", return_value=corrupt
-        ):
-            captured = _run_backtest(records=[], expect_error=True)
         self.assertEqual("failed", captured["status"])
         self.assertIn("unreadable_view", str(captured["error"]))
         self.assertEqual("unreadable", captured["summary"]["price_basis_contract"]["view_state"])

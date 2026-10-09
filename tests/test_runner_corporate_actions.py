@@ -3,10 +3,14 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
+import polars as pl
+
+from app.services.adjusted_view_store import adjusted_view_path
 from app.services.backtesting.runner import EventDrivenBacktestRunner
 from app.services.corporate_actions import CorporateActionRecord
 
@@ -89,6 +93,34 @@ _LAKE_ROWS = [
 ]
 
 
+@contextmanager
+def _isolated_price_basis(*, view_state: str = "present"):
+    """Use real adjusted-view probing and hashing, never the operator's lake."""
+    if view_state not in {"present", "absent", "unreadable"}:
+        raise ValueError(f"Unsupported fixture view state: {view_state}")
+    with TemporaryDirectory(prefix="ana-backtest-basis-") as directory:
+        data_dir = Path(directory)
+        path = adjusted_view_path("US", root=data_dir / "lake")
+        if view_state != "absent":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if view_state == "present":
+                pl.DataFrame(_LAKE_ROWS).write_parquet(path)
+            else:
+                path.write_bytes(b"fixture: not a parquet file")
+        settings = SimpleNamespace(
+            data_dir=data_dir,
+            trainer_allow_raw_fallback=False,
+            optin_reason=None,
+            optin_operator=None,
+        )
+        with (
+            patch("app.services.adjusted_view_store.get_settings", return_value=settings),
+            patch("app.services.adjustment_snapshot.get_settings", return_value=settings),
+            patch("app.services.backtesting.runner.get_settings", return_value=settings),
+        ):
+            yield path
+
+
 def _run_backtest(
     *,
     records,
@@ -96,30 +128,24 @@ def _run_backtest(
     optin_reason: str | None = None,
     optin_operator: str | None = None,
     expect_error: bool = False,
+    adjusted_view_state: str = "present",
 ) -> dict:
     """Drive the real runner.run with fake repositories and a two-session lake.
 
-    Only the persistence boundary, the market lake and the corporate-action store
-    are faked; the event engine and the guard under test run for real.
+    Persistence, raw lake rows and corporate actions are faked. The adjusted view
+    is an isolated file; its probe/hash, the event engine and guards run for real.
     """
 
     captured: dict = {}
     _StrategyRepo, _ModelRepo, _SymbolRepo, _PredictionRepo = _fakes(captured)
     with (
+        _isolated_price_basis(view_state=adjusted_view_state),
         patch("app.services.backtesting.runner.SessionLocal", _session),
         patch("app.services.backtesting.runner.StrategyRunRepository", _StrategyRepo),
         patch("app.services.backtesting.runner.ModelRunRepository", _ModelRepo),
         patch("app.services.backtesting.runner.SymbolRepository", _SymbolRepo),
         patch("app.services.backtesting.runner.PredictionWriteRepository", _PredictionRepo),
         patch("app.services.backtesting.runner.load_lake_rows", return_value=_LAKE_ROWS),
-        patch(
-            "app.services.backtesting.runner.adjustment_version_binding",
-            return_value={
-                "adjustment_version": "adj_test",
-                "actions_snapshot_sha256": "a" * 64,
-                "adjusted_view_sha256": "v" * 64,
-            },
-        ),
         patch("app.services.corporate_actions.load_actions", return_value=records),
     ):
         try:
@@ -354,16 +380,9 @@ class RunnerCorporateActionConfigPersistenceTests(TestCase):
 
     def _run(self, *, records, allow: bool, expect_error: bool, reason: str | None = None) -> dict:
         with (
+            _isolated_price_basis(),
             patch("app.services.backtesting.runner.SessionLocal", self.SessionLocal),
             patch("app.services.backtesting.runner.load_lake_rows", return_value=_LAKE_ROWS),
-            patch(
-                "app.services.backtesting.runner.adjustment_version_binding",
-                return_value={
-                    "adjustment_version": "adj_test",
-                    "actions_snapshot_sha256": "a" * 64,
-                    "adjusted_view_sha256": "v" * 64,
-                },
-            ),
             patch("app.services.corporate_actions.load_actions", return_value=records),
         ):
             try:
