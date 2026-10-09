@@ -8,7 +8,7 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
-Licensed under the [Apache License 2.0](LICENSE).
+Licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-only).
 
 [![GitHub stars](https://img.shields.io/github/stars/free2way/ana-stock?style=social)](https://github.com/free2way/ana-stock/stargazers)
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)

@@ -134,7 +134,7 @@ ANA 是研究工具。排名分数不等于胜率；即便是经过校准的估�
 
 ## 许可证
 
-本项目采用 [Apache License 2.0](LICENSE) 许可证。
+本项目采用 [GNU Affero General Public License v3.0](LICENSE) 许可证（仅第 3 版，AGPL-3.0-only）。
 
 ## 公开仓库范围
 
