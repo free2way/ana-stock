@@ -299,6 +299,9 @@ class SignalTrainer:
         # call. Persisted into the run config so a filtered run is auditable;
         # `None` when rows were supplied without going through `_load_rows`.
         self._universe_filter_stats: dict | None = None
+        # Signal days suppressed by the point-in-time universe gate while the
+        # full timeline is retained (counted by `_build_lightgbm_samples`).
+        self._universe_gated_signal_days: int = 0
 
     def _training_window_policy(self, market: str | None) -> TrainingWindowPolicy:
         prefix = "trainer_cn_window" if str(market or "").upper() == "CN" else "trainer_us_window"
@@ -701,6 +704,8 @@ class SignalTrainer:
     def _load_rows(self, *, tickers: set[str] | None = None, market: str | None = None) -> list[dict]:
         rows = load_lake_rows(tickers=tickers)
         rows = self._filter_rows_by_market(rows, market=market)
+        # The universe rules only mark signal days; the returned row set is the
+        # complete (market-filtered) timeline used for features/entry/labels.
         rows, self._universe_filter_stats = self._apply_pit_universe_filter(rows, market=market)
         rows.sort(key=lambda row: (row.get("symbol") or "", row.get("date") or ""))
         self._attach_adjusted_basis(rows, market=market)
@@ -726,7 +731,7 @@ class SignalTrainer:
     def _apply_pit_universe_filter(
         self, rows: list[dict], *, market: str | None
     ) -> tuple[list[dict], dict]:
-        """Filter lake rows through the point-in-time tradable-universe rules.
+        """Gate signal days through the point-in-time tradable-universe rules.
 
         Thresholds are reused from
         ``stock_selection.universe.default_universe_rules``. Every decision for
@@ -737,6 +742,14 @@ class SignalTrainer:
         be entered the next session), while the existing executable-label path
         keeps its own next-open unbuyable check, so the two never double-count
         the same exclusion.
+
+        The rule only decides whether a symbol's signal day D may **produce a
+        sample**. It never deletes a market row: entry, hold period and label
+        construction must read the real consecutive-session timeline, so a
+        rejected day D is marked (``pit_universe_allowed=False``) and the
+        sample builder skips it while still walking the full date axis. Row
+        deletion here used to shift "next-session entry" onto the next surviving
+        row and stretch the fixed hold horizon into a variable one.
 
         The history rule is overridden by
         ``trainer_universe_min_history_sessions`` (0 = trainer ignores it),
@@ -749,12 +762,18 @@ class SignalTrainer:
             "enabled": enabled,
             "applied": False,
             "input_rows": len(rows),
+            "retained_rows": len(rows),
             "output_rows": len(rows),
             "excluded_rows": 0,
+            "row_deletion": False,
+            "gate_semantics": "sample_gate_full_timeline_retained",
             "exclusion_counts": {},
         }
         if not enabled:
             stats["skipped_reason"] = "trainer_universe_filter_enabled=false"
+            for row in rows:
+                row.pop("pit_universe_allowed", None)
+                row.pop("pit_universe_reasons", None)
             return list(rows), stats
         if not rows:
             stats["skipped_reason"] = "no_rows"
@@ -769,6 +788,9 @@ class SignalTrainer:
             market_code = inferred.most_common(1)[0][0] if inferred else None
         if market_code not in {"CN", "US"}:
             stats["skipped_reason"] = f"unsupported_market:{market_code or 'unknown'}"
+            for row in rows:
+                row.pop("pit_universe_allowed", None)
+                row.pop("pit_universe_reasons", None)
             return list(rows), stats
         rules = default_universe_rules(market_code)
         # 1a (2026-10-08): the training-side history rule is switchable. The
@@ -811,7 +833,11 @@ class SignalTrainer:
         exclusion_counter: Counter[str] = Counter()
         if missing_symbol:
             exclusion_counter["missing_symbol"] = missing_symbol
-        kept: list[dict] = []
+        admitted = 0
+        for row in rows:
+            if not str(row.get("symbol") or "").strip():
+                row["pit_universe_allowed"] = False
+                row["pit_universe_reasons"] = ("missing_symbol",)
         for symbol in sorted(grouped):
             symbol_rows = sorted(grouped[symbol], key=lambda item: str(item.get("date") or ""))
             closes = [self._safe_float(item.get("close")) for item in symbol_rows]
@@ -864,20 +890,27 @@ class SignalTrainer:
                     and (close / closes[index - 1]) - 1.0 >= (limit_band / 100.0) - 0.002
                 ):
                     reasons.append("signal_day_limit_up_locked")
+                # The row stays in the timeline either way; only its eligibility
+                # as a signal day is recorded.
                 if reasons:
                     for reason in reasons:
                         exclusion_counter[reason] += 1
+                    item["pit_universe_allowed"] = False
+                    item["pit_universe_reasons"] = tuple(reasons)
                     continue
-                kept.append(item)
+                item["pit_universe_allowed"] = True
+                item.pop("pit_universe_reasons", None)
+                admitted += 1
         stats.update(
             {
                 "applied": True,
-                "output_rows": len(kept),
-                "excluded_rows": len(rows) - len(kept),
+                "retained_rows": len(rows),
+                "output_rows": admitted,
+                "excluded_rows": len(rows) - admitted,
                 "exclusion_counts": dict(sorted(exclusion_counter.items())),
             }
         )
-        return kept, stats
+        return list(rows), stats
 
     def _attach_adjusted_basis(self, rows: list[dict], *, market: str | None) -> int:
         """Attach the versioned adjusted view onto rows for label construction (A1).
@@ -1702,6 +1735,7 @@ class SignalTrainer:
 
         samples: list[dict] = []
         self._label_price_stats = _empty_label_price_stats()
+        self._universe_gated_signal_days = 0
         for symbol, symbol_rows in grouped.items():
             symbol_market = self._sample_label_market(market=market, ticker=symbol)
             context = (symbol_feature_context or {}).get(symbol) or {}
@@ -1729,6 +1763,13 @@ class SignalTrainer:
                     cursor=concept_cursor,
                     trade_date=trade_date,
                 )
+                # Point-in-time universe gate. The rule rejects a *signal day*,
+                # never a market row: the full date axis above already supplied
+                # the real previous/next sessions, so the entry (`index + 1`)
+                # and the fixed hold horizon below stay on the true timeline.
+                if row.get("pit_universe_allowed") is False:
+                    self._universe_gated_signal_days += 1
+                    continue
                 close = closes[index]
                 day_open = opens[index]
                 day_high = highs[index]
@@ -2681,8 +2722,11 @@ class SignalTrainer:
             "applied": False,
             "skipped_reason": "rows_supplied_without_load_rows",
             "input_rows": len(rows),
+            "retained_rows": len(rows),
             "output_rows": len(rows),
             "excluded_rows": 0,
+            "row_deletion": False,
+            "gate_semantics": "sample_gate_full_timeline_retained",
             "exclusion_counts": {},
         }
         symbol_feature_context = self._load_symbol_feature_context(
@@ -2697,6 +2741,13 @@ class SignalTrainer:
             symbol_feature_context=symbol_feature_context,
             market=market,
         )
+        # Audit the gate's own output: how many signal days the tradable-universe
+        # rules suppressed while the full (undeleted) timeline fed the features,
+        # entry and label windows.
+        universe_filter_stats = {
+            **universe_filter_stats,
+            "gated_signal_days": int(self._universe_gated_signal_days),
+        }
         if not samples:
             raise RuntimeError("LightGBM trainer found no usable feature rows. The market lake may still be too short.")
         # Fail closed before any run row is created: a partially covered

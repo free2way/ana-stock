@@ -50,6 +50,16 @@ def _session_rows(
     return rows
 
 
+def _admitted_dates(rows: list[dict]) -> set[str]:
+    """Dates the PIT universe rules admit as signal days (gate != False)."""
+
+    return {
+        str(row.get("date") or "")
+        for row in rows
+        if row.get("pit_universe_allowed") is not False
+    }
+
+
 class UniverseFilterTests(TestCase):
     def test_history_and_adv_rules_are_point_in_time(self) -> None:
         rows = _session_rows("600000.SS", 160, volume=1_000_000.0)
@@ -71,11 +81,16 @@ class UniverseFilterTests(TestCase):
         # count therefore spans every thin-ADV row, not only post-warmup rows.
         self.assertEqual(155, stats["exclusion_counts"]["low_adv20"])
         self.assertEqual(5, stats["output_rows"])
-        self.assertEqual(5, len(kept))
-        self.assertNotIn(rows[130]["date"], {row["date"] for row in kept})
-        self.assertNotIn(rows[154]["date"], {row["date"] for row in kept})
-        self.assertIn(rows[155]["date"], {row["date"] for row in kept})
-        self.assertIn(rows[159]["date"], {row["date"] for row in kept})
+        # The rules only gate signal days now: no market row is deleted.
+        self.assertEqual(160, stats["retained_rows"])
+        self.assertEqual(160, len(kept))
+        self.assertFalse(stats["row_deletion"])
+        admitted = _admitted_dates(kept)
+        self.assertEqual(5, len(admitted))
+        self.assertNotIn(rows[130]["date"], admitted)
+        self.assertNotIn(rows[154]["date"], admitted)
+        self.assertIn(rows[155]["date"], admitted)
+        self.assertIn(rows[159]["date"], admitted)
 
     def test_appending_future_sessions_never_changes_earlier_decisions(self) -> None:
         rows = _session_rows("600000.SS", 160, volume=1_000_000.0)
@@ -94,9 +109,12 @@ class UniverseFilterTests(TestCase):
         base_kept, _ = trainer._apply_pit_universe_filter(rows, market="CN")
         extended_kept, _ = trainer._apply_pit_universe_filter(rows + future, market="CN")
 
-        base_dates = {row["date"] for row in base_kept}
+        base_dates = _admitted_dates(base_kept)
         extended_dates = {
-            row["date"] for row in extended_kept if row["date"] <= rows[-1]["date"]
+            row["date"]
+            for row in extended_kept
+            if row["date"] <= rows[-1]["date"]
+            and row.get("pit_universe_allowed") is not False
         }
         self.assertEqual(base_dates, extended_dates)
 
@@ -110,13 +128,19 @@ class UniverseFilterTests(TestCase):
 
         trainer = SignalTrainer()
         kept, stats = trainer._apply_pit_universe_filter(rows, market="CN")
-        kept_dates = {row["date"] for row in kept}
+        admitted = _admitted_dates(kept)
 
         self.assertEqual(1, stats["exclusion_counts"]["signal_day_limit_up_locked"])
         self.assertEqual(1, stats["exclusion_counts"]["low_price"])
-        self.assertNotIn(rows[125]["date"], kept_dates)
-        self.assertNotIn(rows[129]["date"], kept_dates)
-        self.assertIn(rows[124]["date"], kept_dates)
+        self.assertEqual(128, stats["output_rows"])
+        self.assertEqual(130, len(kept))
+        self.assertNotIn(rows[125]["date"], admitted)
+        self.assertNotIn(rows[129]["date"], admitted)
+        self.assertIn(rows[124]["date"], admitted)
+        self.assertFalse(kept[125]["pit_universe_allowed"])
+        self.assertEqual(
+            ("signal_day_limit_up_locked",), kept[125]["pit_universe_reasons"]
+        )
         # ST / suspension state is absent from the lake schema and must be
         # reported as unapplied rather than claimed.
         self.assertEqual(["st_security", "suspended"], stats["unapplied_rules"])
@@ -132,6 +156,8 @@ class UniverseFilterTests(TestCase):
         self.assertFalse(stats["enabled"])
         self.assertEqual(len(rows), len(kept))
         self.assertEqual("trainer_universe_filter_enabled=false", stats["skipped_reason"])
+        # A disabled filter must not leave stale gate flags behind.
+        self.assertTrue(all("pit_universe_allowed" not in row for row in kept))
 
     def test_market_is_inferred_from_tickers_when_unset(self) -> None:
         rows = _session_rows("600003.SS", 130)
@@ -150,7 +176,9 @@ class UniverseFilterTests(TestCase):
             trainer, "_attach_adjusted_basis", return_value=0
         ):
             loaded = trainer._load_rows(market="CN")
-        self.assertEqual(11, len(loaded))
+        # The full timeline is handed back; only 11 dates survive as signal days.
+        self.assertEqual(130, len(loaded))
+        self.assertEqual(11, len(_admitted_dates(loaded)))
         stats = trainer._universe_filter_stats
         self.assertIsNotNone(stats)
         self.assertTrue(stats["applied"])
@@ -158,6 +186,8 @@ class UniverseFilterTests(TestCase):
             119, stats["exclusion_counts"]["insufficient_history"]
         )
         self.assertEqual(130, stats["input_rows"])
+        self.assertEqual(130, stats["retained_rows"])
+        self.assertEqual(11, stats["output_rows"])
         self.assertTrue(stats["history_rule"]["enabled"])
         self.assertEqual(120, stats["history_rule"]["effective_min_history_sessions"])
 
@@ -176,16 +206,83 @@ class UniverseFilterTests(TestCase):
         self.assertEqual(0, stats["rules"]["min_history_sessions"])
         self.assertEqual(120, stats["history_rule"]["universe_default_min_history_sessions"])
         self.assertNotIn("insufficient_history", stats["exclusion_counts"])
-        # Every row survives: liquidity passes and history is not enforced.
+        # Every row survives and every date stays admissible: liquidity passes
+        # and history is not enforced.
         self.assertEqual(130, stats["output_rows"])
         self.assertEqual(130, len(kept))
+        self.assertEqual(130, len(_admitted_dates(kept)))
 
         trainer.settings = trainer.settings.model_copy(
             update={"trainer_universe_min_history_sessions": 120}
         )
         kept_enabled, enabled_stats = trainer._apply_pit_universe_filter(rows, market="CN")
         self.assertEqual(119, enabled_stats["exclusion_counts"]["insufficient_history"])
-        self.assertEqual(11, len(kept_enabled))
+        self.assertEqual(11, enabled_stats["output_rows"])
+        self.assertEqual(130, len(kept_enabled))
+
+    def test_filter_gate_does_not_move_next_session_entry_or_hold_period(self) -> None:
+        """P1-1 regression: gating a signal day must not shift other windows.
+
+        Session 31 (2026-02-05) is a low-price name, so it cannot host a sample
+        itself. Row deletion used to make session 30's "next session" resolve to
+        session 32; the gate must keep the real consecutive-session timeline so
+        the entry stays at session 31 and the fixed horizon ends at session 36.
+        """
+
+        rows = _session_rows("600030.SS", 40, close=1.02, volume=100_000_000.0)
+        self.assertEqual("2026-02-04", rows[30]["date"])
+        self.assertEqual("2026-02-05", rows[31]["date"])
+        rows[31].update(close=0.99, open=0.99, high=1.0, low=0.98)
+
+        trainer = SignalTrainer()
+        marked, stats = trainer._apply_pit_universe_filter(rows, market="CN")
+        self.assertEqual(sorted(stats["exclusion_counts"]), ["low_price"])
+        self.assertEqual(len(rows), len(marked))
+        self.assertFalse(marked[31]["pit_universe_allowed"])
+        self.assertEqual(("low_price",), marked[31]["pit_universe_reasons"])
+
+        samples = trainer._build_lightgbm_samples(
+            rows=marked, lookback_days=5, horizon_days=5, market="CN"
+        )
+        by_date = {sample["trade_date"]: sample for sample in samples}
+        # The rejected signal day produces no sample at all.
+        self.assertNotIn("2026-02-05", by_date)
+        # The admitted signal day keeps the true next session as its entry and
+        # the fixed 5-session horizon as its exit.
+        signal_day = by_date["2026-02-04"]
+        self.assertEqual("2026-02-05", signal_day["label_start_date"])
+        self.assertEqual("2026-02-09", signal_day["label_end_date"])
+        self.assertIsNotNone(signal_day["target"])
+        # Sample dates == the admitted dates except the first (needs a prior
+        # session for `previous_close`): the same signal-day set as before the
+        # gate, with the same hold-period semantics.
+        expected_signal_days = sorted(
+            row["date"] for row in marked if row.get("pit_universe_allowed") is not False
+        )
+        self.assertEqual(sorted(by_date), expected_signal_days[1:])
+
+    def test_gate_counts_signal_days_it_suppresses(self) -> None:
+        rows = _session_rows("600031.SS", 40, close=1.02, volume=100_000_000.0)
+        rows[31].update(close=0.99, open=0.99, high=1.0, low=0.98)
+        rows[33].update(close=0.5, open=0.5, high=0.51, low=0.49)
+
+        trainer = SignalTrainer()
+        marked, stats = trainer._apply_pit_universe_filter(rows, market="CN")
+        self.assertGreater(stats["excluded_rows"], 0)
+        trainer._build_lightgbm_samples(
+            rows=marked, lookback_days=5, horizon_days=5, market="CN"
+        )
+        # Every rejected date except the first (no prior session) is counted,
+        # and the count equals how many rows the rules gated.
+        expected = len(
+            [
+                row
+                for row in marked[1:]
+                if row.get("pit_universe_allowed") is False
+            ]
+        )
+        self.assertEqual(expected, trainer._universe_gated_signal_days)
+        self.assertEqual(stats["excluded_rows"], len(marked) - stats["output_rows"])
 
 
 class WinsorizeAndObjectiveTests(TestCase):
@@ -404,7 +501,6 @@ class EmbargoAndFeatureTransformTests(TestCase):
         self.assertEqual("cross_sectional_winsor_mad_zscore", config["method"])
         self.assertEqual("per_trade_date", config["scope"])
         self.assertTrue(math.isfinite(config["zscore_clip"]))
-
 
 if __name__ == "__main__":
     import unittest
