@@ -162,6 +162,7 @@ class ArtifactWiringTests(unittest.TestCase):
                 as_of_date=AS_OF,
                 key_map=_key_map(),
                 calibration_model_key=HIGH,
+                market="CN",
                 root=directory,
             )
             self.assertEqual("written", written["reliability_status"])
@@ -218,6 +219,7 @@ class ArtifactWiringTests(unittest.TestCase):
                 as_of_date=AS_OF,
                 key_map=_key_map(),
                 calibration_model_key=HIGH,
+                market="CN",
                 root=directory,
             )
             explicit = {"method": "bins", "bins": []}
@@ -535,6 +537,140 @@ class SchedulerIsolationTests(unittest.TestCase):
         completion = job_repo.complete_job.call_args.kwargs
         self.assertEqual("success", completion["status"])
         self.assertEqual("failed", completion["result"]["reliability_artifacts"]["status"])
+
+
+class CalibrationScopeIsolationTests(unittest.TestCase):
+    """A request may only ever see the calibration fit that applies to it."""
+
+    def _persist(
+        self,
+        root: str,
+        *,
+        market: str,
+        positive: tuple[float, ...] = (0.5, 0.7, 0.9),
+        as_of: date = AS_OF,
+        minimum_observations: int = 8,
+    ) -> dict:
+        return persist_reliability_artifacts(
+            _matured_rows(HIGH_VERSION, positive_scores=positive),
+            as_of_date=as_of,
+            key_map={HIGH_VERSION: HIGH},
+            calibration_model_key=HIGH,
+            market=market,
+            minimum_observations=minimum_observations,
+            root=root,
+        )
+
+    def test_market_request_only_sees_its_own_fit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cn = self._persist(directory, market="CN", positive=(0.5, 0.7, 0.9))
+            us = self._persist(directory, market="US", positive=(0.1,))
+            self.assertEqual("written", cn["calibration_status"])
+            self.assertEqual("written", us["calibration_status"])
+            self.assertNotEqual(cn["calibration_version"], us["calibration_version"])
+            self.assertNotEqual(cn["calibration_path"], us["calibration_path"])
+
+            cn_params = inject_calibration_defaults(
+                {"market": "CN", "multi_model_templates": [HIGH]}, root=directory
+            )
+            us_params = inject_calibration_defaults(
+                {"market": "US", "multi_model_templates": [HIGH]}, root=directory
+            )
+
+            self.assertEqual("applied", cn_params["probability_calibration_status"])
+            self.assertEqual("applied", us_params["probability_calibration_status"])
+            self.assertEqual(
+                cn["calibration_version"], cn_params["probability_calibration"]["source"]
+            )
+            self.assertEqual(
+                us["calibration_version"], us_params["probability_calibration"]["source"]
+            )
+            self.assertEqual("CN", cn_params["probability_calibration"]["market"])
+            self.assertEqual("US", us_params["probability_calibration"]["market"])
+
+    def test_future_artifact_is_never_applied_to_an_earlier_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            written = self._persist(directory, market="US", as_of=date(2026, 5, 1))
+            self.assertEqual("written", written["calibration_status"])
+
+            early = inject_calibration_defaults(
+                {"market": "US", "multi_model_templates": [HIGH], "as_of_date": "2026-03-10"},
+                root=directory,
+            )
+            self.assertEqual("uncalibrated:future_artifact",
+                             early["probability_calibration_status"])
+            self.assertIsNone(early.get("probability_calibration"))
+
+            applicable = inject_calibration_defaults(
+                {"market": "US", "multi_model_templates": [HIGH], "as_of_date": "2026-06-01"},
+                root=directory,
+            )
+            self.assertEqual("applied", applicable["probability_calibration_status"])
+
+    def test_insufficient_samples_invalidates_the_previous_fit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            written = self._persist(directory, market="CN")
+            self.assertEqual("written", written["calibration_status"])
+            applied = inject_calibration_defaults(
+                {"market": "CN", "multi_model_templates": [HIGH]}, root=directory
+            )
+            self.assertEqual("applied", applied["probability_calibration_status"])
+
+            thin = self._persist(directory, market="CN", minimum_observations=10_000)
+            self.assertEqual("insufficient_samples", thin["calibration_status"])
+
+            self.assertIsNone(load_latest_calibration_artifact(directory))
+            after = inject_calibration_defaults(
+                {"market": "CN", "multi_model_templates": [HIGH]}, root=directory
+            )
+            self.assertEqual(
+                "uncalibrated:invalidated:insufficient_samples",
+                after["probability_calibration_status"],
+            )
+            self.assertIsNone(after.get("probability_calibration"))
+
+    def test_horizon_score_field_and_model_mismatches_are_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self._persist(directory, market="CN")
+
+            horizon = inject_calibration_defaults(
+                {"market": "CN", "multi_model_templates": [HIGH]},
+                root=directory,
+                horizon_days=HORIZON + 5,
+            )
+            self.assertEqual("uncalibrated:horizon_mismatch",
+                             horizon["probability_calibration_status"])
+
+            score = inject_calibration_defaults(
+                {"market": "CN", "multi_model_templates": [HIGH]},
+                root=directory,
+                score_field="composite_score",
+            )
+            self.assertEqual("uncalibrated:score_field_mismatch",
+                             score["probability_calibration_status"])
+
+            model = inject_calibration_defaults(
+                {"market": "CN", "multi_model_templates": [LOW]}, root=directory
+            )
+            self.assertEqual("uncalibrated:model_mismatch",
+                             model["probability_calibration_status"])
+
+            hit = inject_calibration_defaults(
+                {"market": "CN", "multi_model_templates": [HIGH]},
+                root=directory,
+                horizon_days=HORIZON,
+                score_field="model_score",
+            )
+            self.assertEqual("applied", hit["probability_calibration_status"])
+
+    def test_no_artifact_reports_explicit_uncalibrated_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            params = inject_calibration_defaults(
+                {"market": "CN", "multi_model_templates": [HIGH]}, root=directory
+            )
+            self.assertEqual("uncalibrated:no_artifact",
+                             params["probability_calibration_status"])
+            self.assertIsNone(params.get("probability_calibration"))
 
 
 if __name__ == "__main__":

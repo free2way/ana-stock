@@ -746,6 +746,11 @@ class CalibrationArtifact:
     lookback_dates: int
     bins: tuple[dict[str, object], ...]
     samples: tuple[tuple[float, float], ...]
+    # Applicability scope: which market / model the fit belongs to.  ``None``
+    # marks a legacy or deliberately unscoped artifact that callers must treat
+    # as "not verifiably applicable" to a specific market.
+    market: str | None = None
+    model_key: str | None = None
 
     def calibration_params(self) -> dict[str, object]:
         params: dict[str, object] = {
@@ -759,6 +764,8 @@ class CalibrationArtifact:
             "sample_count": self.sample_count,
             "positive_count": self.positive_count,
             "definition": self.definition,
+            "market": self.market,
+            "model_key": self.model_key,
         }
         if self.method == "bins":
             params["bins"] = [dict(bin_row) for bin_row in self.bins]
@@ -786,6 +793,8 @@ class CalibrationArtifact:
             "lookback_dates": self.lookback_dates,
             "bins": [dict(bin_row) for bin_row in self.bins],
             "samples": [list(sample) for sample in self.samples],
+            "market": self.market,
+            "model_key": self.model_key,
         }
 
 
@@ -806,6 +815,8 @@ def build_probability_calibration_artifact(
     net_of_cost: bool = True,
     model_key: str | None = None,
     model_key_by_version: Mapping[str, str] | None = None,
+    market: str | None = None,
+    scope_model_key: str | None = None,
 ) -> CalibrationArtifact | None:
     """Fit calibration bins/samples from matured OOS rows; ``None`` if too thin.
 
@@ -913,6 +924,8 @@ def build_probability_calibration_artifact(
         lookback_dates=lookback_dates,
         bins=bins,
         samples=samples,
+        market=(str(market).strip().upper() or None) if market is not None else None,
+        model_key=(str(scope_model_key).strip() or None) if scope_model_key is not None else None,
     )
 
 
@@ -964,6 +977,8 @@ def calibration_artifact_from_payload(payload: Mapping[str, object]) -> Calibrat
         lookback_dates=int(payload.get("lookback_dates") or 0),
         bins=bins,
         samples=samples,
+        market=(str(payload["market"]).strip().upper() or None) if payload.get("market") else None,
+        model_key=(str(payload["model_key"]).strip() or None) if payload.get("model_key") else None,
     )
 
 

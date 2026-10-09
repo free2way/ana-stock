@@ -14,10 +14,15 @@ artifact persistence.  This module is the *call site* layer that was missing:
    artifact directories.  The schedulers call it right after structured
    evaluation; failures there only warn and never block the main flow.
 3. :func:`load_latest_reliability_metadata` /
-   :func:`load_latest_calibration_artifact` /
    :func:`attach_reliability_metadata` let the screener/fusion call sites load
-   the newest artifact and inject it, keeping legacy behaviour (equal weights,
-   ``expected_hit_probability=None``) whenever an artifact is missing.
+   the newest reliability metadata and inject it, keeping legacy behaviour
+   (equal weights, ``expected_hit_probability=None``) whenever an artifact is
+   missing.  :func:`inject_calibration_defaults` goes through
+   :func:`resolve_calibration_artifact`, which only applies a fit whose recorded
+   scope (market / model / horizon / score field) and coverage window match the
+   request and that has not been invalidated by a later thin refresh; a mismatch
+   is reported explicitly as ``uncalibrated:<reason>`` rather than silently
+   reusing another market's or a future fit.
 
 Key mapping
 -----------
@@ -35,7 +40,7 @@ import json
 import logging
 import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -55,7 +60,7 @@ from app.services.stock_selection.selective_calibration import (
     attach_oos_reliability_metadata,
     build_probability_calibration_artifact,
     build_rolling_oos_reliability,
-    load_calibration_artifact,
+    calibration_artifact_from_payload,
     load_oos_reliability_metadata,
     write_calibration_artifact,
     write_oos_reliability_metadata,
@@ -68,6 +73,17 @@ CALIBRATION_ARTIFACT_DIRNAME = "calibration"
 OOS_RELIABILITY_ARTIFACT_FILENAME = "oos_reliability_latest.json"
 PROBABILITY_CALIBRATION_ARTIFACT_FILENAME = "probability_calibration_latest.json"
 MODEL_KEY_RESOLUTION_FILENAME = "model_key_resolution_latest.json"
+
+# Sentinel dir/filename tokens for artifacts written without a verifiable scope.
+UNSCOPED_SCOPE_TOKEN = "UNSCOPED"
+# A refresh that cannot fit a calibration persists this marker instead of leaving
+# the previous artifact loadable, so "insufficient_samples" really means
+# "uncalibrated" for the scope rather than "use yesterday's bins".
+CALIBRATION_INVALIDATED_STATUS = "invalidated"
+CALIBRATION_STATUS_PARAM = "probability_calibration_status"
+CALIBRATION_STATUS_APPLIED = "applied"
+# Explicit "no calibration applies" semantics (never silent).
+UNSATISFIED_CALIBRATION_PREFIX = "uncalibrated"
 
 # Reconciled evaluation outcome rows carry a real cost-net return; nothing is
 # subtracted again, so the recorded flat bps stays zero and the definition is
@@ -807,8 +823,59 @@ def reliability_artifact_path(root: Path | str | None = None) -> Path:
     return artifact_root(root) / RELIABILITY_ARTIFACT_DIRNAME / OOS_RELIABILITY_ARTIFACT_FILENAME
 
 
-def calibration_artifact_path(root: Path | str | None = None) -> Path:
+def legacy_calibration_artifact_path(root: Path | str | None = None) -> Path:
+    """Pre-scoping calibration path, kept load-only for backward compatibility."""
+
     return artifact_root(root) / CALIBRATION_ARTIFACT_DIRNAME / PROBABILITY_CALIBRATION_ARTIFACT_FILENAME
+
+
+def _scope_token(value: object, *, default: str, upper: bool = False) -> str:
+    text = str(value or "").strip()
+    if upper:
+        text = text.upper()
+    cleaned = "".join(char if (char.isalnum() or char in "._-") else "_" for char in text)
+    cleaned = cleaned.strip("._-")[:64]
+    return cleaned or default
+
+
+def calibration_market_dir(root: Path | str | None, market: object) -> Path:
+    """Per-market calibration directory; an unknown market is its own bucket."""
+
+    token = _scope_token(market, default=UNSCOPED_SCOPE_TOKEN, upper=True)
+    return artifact_root(root) / CALIBRATION_ARTIFACT_DIRNAME / token
+
+
+def calibration_scope_filename(
+    *,
+    model_key: object = None,
+    horizon_days: object = None,
+    score_field: object = DEFAULT_CALIBRATION_SCORE_FIELD,
+) -> str:
+    try:
+        horizon = int(horizon_days)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        horizon = 0
+    return (
+        f"{_scope_token(model_key, default='unmapped')}"
+        f"__h{horizon}__{_scope_token(score_field, default=DEFAULT_CALIBRATION_SCORE_FIELD)}.json"
+    )
+
+
+def calibration_artifact_path(
+    root: Path | str | None = None,
+    *,
+    market: object = None,
+    model_key: object = None,
+    horizon_days: object = None,
+    score_field: object = DEFAULT_CALIBRATION_SCORE_FIELD,
+) -> Path:
+    """Scoped calibration artifact path: market / model / horizon / score field."""
+
+    return calibration_market_dir(root, market) / calibration_scope_filename(
+        model_key=model_key,
+        horizon_days=horizon_days,
+        score_field=score_field,
+    )
 
 
 def model_key_resolution_path(root: Path | str | None = None) -> Path:
@@ -824,6 +891,45 @@ def _atomic_write_json(payload: Mapping[str, object], target: Path) -> None:
     os.replace(temporary, target)
 
 
+def _invalidate_calibration_artifact(
+    root: Path | str | None,
+    *,
+    market: object,
+    model_key: object,
+    horizon_days: object,
+    score_field: object,
+    as_of_date: date,
+    reason: str,
+) -> Path:
+    """Replace the scope's calibration with an explicit invalidation marker.
+
+    A thin refresh must not leave the previous fit loadable: loading the marker
+    yields "uncalibrated" for the scope until a new fit is written.
+    """
+
+    target = calibration_artifact_path(
+        root,
+        market=market,
+        model_key=model_key,
+        horizon_days=horizon_days,
+        score_field=score_field,
+    )
+    _atomic_write_json(
+        {
+            "schema_version": "stock_selection_calibration_invalidation_v1",
+            "status": CALIBRATION_INVALIDATED_STATUS,
+            "reason": str(reason),
+            "market": (str(market).strip().upper() or None) if market else None,
+            "model_key": (str(model_key).strip() or None) if model_key else None,
+            "horizon_days": horizon_days,
+            "score_field": str(score_field),
+            "as_of_date": as_of_date.isoformat(),
+        },
+        target,
+    )
+    return target
+
+
 def persist_reliability_artifacts(
     matured_rows: Sequence[MaturedReliabilityRow],
     *,
@@ -833,6 +939,7 @@ def persist_reliability_artifacts(
     score_sources: Mapping[str, object] | None = None,
     run_selection: Mapping[str, object] | None = None,
     calibration_model_key: str | None = None,
+    market: str | None = None,
     lookback_dates: int = DEFAULT_LOOKBACK_DATES,
     minimum_observations: int = DEFAULT_MINIMUM_OBSERVATIONS,
     bin_count: int = DEFAULT_CALIBRATION_BINS,
@@ -842,9 +949,11 @@ def persist_reliability_artifacts(
     """Build + atomically persist both artifacts from matured evaluation rows.
 
     Under-sampled models simply produce no entry / ``None`` artifact, so the
-    fusion layer keeps its equal-weight and null-probability fallbacks.  The
-    ``score_sources`` / ``run_selection`` audits are recorded in the sidecar so
-    the score-join layer and the chosen evaluated run are traceable.
+    fusion layer keeps its equal-weight and null-probability fallbacks; an
+    already-persisted calibration for the same scope is explicitly invalidated
+    so a stale fit is never served as if it were current.  The ``score_sources``
+    / ``run_selection`` audits are recorded in the sidecar so the score-join
+    layer and the chosen evaluated run are traceable.
     """
 
     resolved_key_map = dict(key_map or {})
@@ -890,9 +999,19 @@ def persist_reliability_artifacts(
         written["reliability_path"] = str(reliability_artifact_path(root))
         written["reliability_sha256"] = reliability_payload.get("artifact_sha256")
     else:
+        # Explicitly retire the previous metadata: "insufficient_samples" must
+        # not keep serving a fit the newest evaluation can no longer support.
+        write_oos_reliability_metadata({}, reliability_artifact_path(root))
         written["reliability_status"] = "insufficient_samples"
         written["reliability_models"] = []
 
+    calibration_path = calibration_artifact_path(
+        root,
+        market=market,
+        model_key=calibration_model_key,
+        horizon_days=primary_horizon,
+        score_field=DEFAULT_CALIBRATION_SCORE_FIELD,
+    )
     calibration: CalibrationArtifact | None = None
     if calibration_model_key:
         calibration = build_probability_calibration_artifact(
@@ -911,15 +1030,33 @@ def persist_reliability_artifacts(
             net_of_cost=True,
             model_key=calibration_model_key,
             model_key_by_version=resolved_key_map,
+            market=market,
+            scope_model_key=calibration_model_key,
         )
     if calibration is not None:
-        calibration_payload = write_calibration_artifact(calibration, calibration_artifact_path(root))
+        calibration_payload = write_calibration_artifact(calibration, calibration_path)
         written["calibration_status"] = "written"
         written["calibration_version"] = calibration.version
-        written["calibration_path"] = str(calibration_artifact_path(root))
+        written["calibration_path"] = str(calibration_path)
         written["calibration_sha256"] = calibration_payload.get("artifact_sha256")
     else:
+        _invalidate_calibration_artifact(
+            root,
+            market=market,
+            model_key=calibration_model_key,
+            horizon_days=primary_horizon,
+            score_field=DEFAULT_CALIBRATION_SCORE_FIELD,
+            as_of_date=as_of_date,
+            reason="insufficient_samples",
+        )
         written["calibration_status"] = "insufficient_samples"
+        written["calibration_path"] = str(calibration_path)
+    written["calibration_scope"] = {
+        "market": (str(market).strip().upper() or None) if market else None,
+        "model_key": calibration_model_key,
+        "horizon_days": primary_horizon,
+        "score_field": DEFAULT_CALIBRATION_SCORE_FIELD,
+    }
     return written
 
 
@@ -961,11 +1098,219 @@ def load_latest_reliability_metadata(
     return {}
 
 
-def load_latest_calibration_artifact(root: Path | str | None = None) -> CalibrationArtifact | None:
-    """Load the newest calibration artifact; ``None`` when missing or unreadable."""
+def _read_calibration_entry(path: Path) -> tuple[str, object] | None:
+    """Return ``("artifact"|"invalidated", payload)`` or ``None`` when unusable."""
 
-    loaded = _read_cached(calibration_artifact_path(root), loader=load_calibration_artifact)
-    return loaded if isinstance(loaded, CalibrationArtifact) else None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning("ignoring unreadable calibration artifact %s: %s", path, exc)
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    if str(payload.get("status") or "") == CALIBRATION_INVALIDATED_STATUS:
+        return ("invalidated", str(payload.get("reason") or "unspecified"))
+    if str(payload.get("schema_version") or "") != "probability_calibration_artifact_v1":
+        return None
+    return ("artifact", calibration_artifact_from_payload(payload))
+
+
+def _calibration_candidate_paths(root: Path | str | None, *, market: object) -> list[Path]:
+    base = artifact_root(root) / CALIBRATION_ARTIFACT_DIRNAME
+    requested = str(market or "").strip().upper()
+    if requested:
+        return sorted((base / _scope_token(requested, default=UNSCOPED_SCOPE_TOKEN, upper=True)).glob("*.json"))
+    paths = sorted(base.glob("*/*.json"))
+    legacy = legacy_calibration_artifact_path(root)
+    if legacy.is_file():
+        paths.append(legacy)
+    return paths
+
+
+def _entry_sort_key(path: Path, entry: tuple[str, object]) -> tuple[date, int]:
+    kind, payload = entry
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = 0
+    if kind == "artifact" and isinstance(payload, CalibrationArtifact):
+        return (payload.as_of_date, mtime_ns)
+    return (date.min, mtime_ns)
+
+
+def load_latest_calibration_artifact(root: Path | str | None = None) -> CalibrationArtifact | None:
+    """Load the newest *valid* calibration artifact; ``None`` when missing.
+
+    An invalidation marker for the newest scope deliberately yields ``None`` so a
+    refresh that returned ``insufficient_samples`` cannot keep serving the fit it
+    just retired.
+    """
+
+    entries: list[tuple[Path, tuple[str, object]]] = []
+    for path in _calibration_candidate_paths(root, market=None):
+        entry = _read_cached(path, loader=_read_calibration_entry)
+        if entry is not None:
+            entries.append((path, entry))
+    if not entries:
+        return None
+    _path, (kind, payload) = max(entries, key=lambda item: _entry_sort_key(*item))
+    return payload if kind == "artifact" and isinstance(payload, CalibrationArtifact) else None
+
+
+def _applicability_reason(
+    artifact: CalibrationArtifact,
+    *,
+    market: str | None,
+    model_keys: frozenset[str] | None,
+    horizon_days: int | None,
+    score_field: str | None,
+    as_of_date: date | None,
+) -> str | None:
+    recorded_market = str(artifact.market or "").strip().upper() or None
+    if market and recorded_market != market:
+        return "market_mismatch"
+    if score_field and artifact.score_field != score_field:
+        return "score_field_mismatch"
+    if horizon_days is not None and int(artifact.horizon_days) != int(horizon_days):
+        return "horizon_mismatch"
+    if model_keys:
+        recorded_model = str(artifact.model_key or "").strip()
+        if recorded_model not in model_keys:
+            return "model_mismatch"
+    if as_of_date is not None:
+        if artifact.as_of_date > as_of_date:
+            return "future_artifact"
+        if artifact.window_end_date > as_of_date:
+            return "future_window"
+    return None
+
+
+def resolve_calibration_artifact(
+    root: Path | str | None = None,
+    *,
+    market: object = None,
+    model_keys: Iterable[str] | None = None,
+    horizon_days: int | None = None,
+    score_field: str | None = DEFAULT_CALIBRATION_SCORE_FIELD,
+    as_of_date: date | None = None,
+) -> tuple[CalibrationArtifact | None, str]:
+    """Pick the newest calibration artifact that is applicable to the request.
+
+    Returns ``(artifact_or_None, status)`` where status is ``"applied"`` or an
+    explicit ``"uncalibrated:<reason>"`` / ``"invalidated:<reason>"`` string --
+    a mismatch never silently falls back to a different market's fit.
+    """
+
+    requested_market = str(market or "").strip().upper() or None
+    requested_models = (
+        frozenset(str(key).strip() for key in model_keys if str(key).strip())
+        if model_keys is not None
+        else None
+    )
+    paths = _calibration_candidate_paths(root, market=requested_market)
+    reasons: list[str] = []
+    best: CalibrationArtifact | None = None
+    for path in paths:
+        entry = _read_cached(path, loader=_read_calibration_entry)
+        if entry is None:
+            reasons.append("unreadable")
+            continue
+        kind, payload = entry
+        if kind == "invalidated":
+            reasons.append(f"invalidated:{payload}")
+            continue
+        assert isinstance(payload, CalibrationArtifact)
+        reason = _applicability_reason(
+            payload,
+            market=requested_market,
+            model_keys=requested_models,
+            horizon_days=horizon_days,
+            score_field=score_field,
+            as_of_date=as_of_date,
+        )
+        if reason is not None:
+            reasons.append(reason)
+            continue
+        if best is None or payload.as_of_date > best.as_of_date:
+            best = payload
+    if best is not None:
+        return best, CALIBRATION_STATUS_APPLIED
+    return None, f"{UNSATISFIED_CALIBRATION_PREFIX}:{reasons[0] if reasons else 'no_artifact'}"
+
+
+def _requested_model_keys(params: Mapping[str, object]) -> frozenset[str] | None:
+    raw = params.get("multi_model_templates")
+    keys = {
+        str(key).strip()
+        for key in (raw if isinstance(raw, (list, tuple, set, frozenset)) else ())
+        if str(key).strip()
+    }
+    if keys:
+        return frozenset(keys)
+    single = str(params.get("model_template") or "").strip()
+    if single and single not in {"technical_momentum"}:
+        return frozenset({single})
+    return None
+
+
+def _requested_as_of_date(params: Mapping[str, object], override: object) -> date | None:
+    value = override
+    if value is None:
+        for key in ("as_of_date", "trade_date", "prediction_date"):
+            if params.get(key):
+                value = params.get(key)
+                break
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _inject_strategy_score_field(params: Mapping[str, object], override: object) -> str:
+    if override:
+        return str(override).strip()
+    configured = str(params.get("calibration_score_field") or "").strip()
+    return configured or DEFAULT_CALIBRATION_SCORE_FIELD
+
+
+def inject_calibration_defaults(
+    params: Mapping[str, object],
+    *,
+    root: Path | str | None = None,
+    market: object = None,
+    horizon_days: int | None = None,
+    score_field: object = None,
+    as_of_date: object = None,
+) -> dict:
+    """Fill ``probability_calibration`` from the newest *applicable* artifact.
+
+    An explicitly supplied spec always wins.  Otherwise the loader selects the
+    artifact whose recorded scope (market / model / horizon / score field) and
+    coverage window apply to this request; a mismatch injects nothing and records
+    an explicit ``probability_calibration_status`` instead of silently reusing
+    another market's or a future fit.
+    """
+
+    resolved = dict(params)
+    if resolved.get("probability_calibration") is not None:
+        return resolved
+    requested_market = market if market is not None else resolved.get("market")
+    artifact, status = resolve_calibration_artifact(
+        root,
+        market=requested_market,
+        model_keys=_requested_model_keys(resolved),
+        horizon_days=horizon_days,
+        score_field=_inject_strategy_score_field(resolved, score_field),
+        as_of_date=_requested_as_of_date(resolved, as_of_date),
+    )
+    resolved[CALIBRATION_STATUS_PARAM] = status
+    if artifact is not None:
+        resolved["probability_calibration"] = artifact.calibration_params()
+    return resolved
 
 
 def attach_reliability_metadata(
@@ -982,27 +1327,6 @@ def attach_reliability_metadata(
 
     resolved = dict(metadata) if metadata is not None else load_latest_reliability_metadata(root)
     return attach_oos_reliability_metadata(template_rows, resolved)
-
-
-def inject_calibration_defaults(
-    params: Mapping[str, object],
-    *,
-    root: Path | str | None = None,
-) -> dict:
-    """Fill ``probability_calibration`` from the newest artifact when absent.
-
-    An explicitly supplied spec always wins; a missing artifact is a no-op so the
-    legacy ``expected_hit_probability=None`` behaviour is preserved.
-    """
-
-    resolved = dict(params)
-    if resolved.get("probability_calibration") is not None:
-        return resolved
-    artifact = load_latest_calibration_artifact(root)
-    if artifact is None:
-        return resolved
-    resolved["probability_calibration"] = artifact.calibration_params()
-    return resolved
 
 
 def refresh_stock_selection_reliability_artifacts(
@@ -1062,6 +1386,9 @@ def refresh_stock_selection_reliability_artifacts(
         score_sources=key_map.get("score_sources") or {},
         run_selection=key_map.get("run_selection") or {},
         calibration_model_key=calibration_model_key,
+        # Schedulers refresh one market at a time; that market scopes the
+        # artifact so a CN request can never be served a US fit.
+        market=markets[0] if len(markets) == 1 else None,
         lookback_dates=lookback_dates,
         minimum_observations=minimum_observations,
         bin_count=bin_count,
