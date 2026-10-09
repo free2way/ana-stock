@@ -29,7 +29,10 @@ from app.services.stock_selection.forward_shadow_evaluation import (
 )
 from app.services.time_utils import app_now
 from app.services.trainer import SignalTrainer
-from app.services.workspace_snapshots import refresh_workspace_snapshots
+from app.services.workspace_snapshots import (
+    refresh_workspace_snapshots,
+    save_market_workspace_snapshots,
+)
 
 
 CN_MARKET_SCHEDULER_CONFIG_KEY = "cn_market_scheduler_config"
@@ -532,6 +535,7 @@ class CNMarketSchedulerService:
             # those prerequisites before evaluating combinations.
             stages.append(self._run_screener_precompute_rest(source_job_id=source_job_id, trade_date=trade_date))
             stages.append(self._run_screener_precompute_combos(source_job_id=source_job_id, trade_date=trade_date))
+            stages.append(self._refresh_market_workspace_snapshots(source_job_id=source_job_id))
             stages.append(self._run_ai_daily_report_delivery(source_job_id=source_job_id, trade_date=trade_date))
             failed = [stage for stage in stages if str(stage.get("status")) not in {"success", "partial"}]
             status = "success" if not failed else "partial"
@@ -551,6 +555,24 @@ class CNMarketSchedulerService:
                     message=f"A-share post-close pipeline failed: {exc}",
                     result={"market": "CN", "trade_date": trade_date, "stages": stages, "error": str(exc)},
                 )
+
+    def _refresh_market_workspace_snapshots(self, *, source_job_id: int) -> dict:
+        """Rebuild the market workspace snapshots (incl. the heatmap) on the CN side.
+
+        The shared ``refresh_workspace_snapshots`` has no heatmap builder, so the
+        CN close pipeline never rebuilt ``market_heatmap_workspace``.  The U.S.
+        close pipeline does so via ``save_market_workspace_snapshots`` after its
+        screener precompute; NOTE: this is deliberately called after the CN
+        candidate precompute stages so the heatmap reads the current-day
+        ``full_market`` screener snapshots (and before the AI daily report,
+        which consumes the heatmap snapshot).
+        """
+        try:
+            with SessionLocal() as db:
+                created = save_market_workspace_snapshots(db, source_job_id=source_job_id)
+            return {"stage": "market_workspace_snapshots", "status": "success", "snapshots": sorted(created)}
+        except Exception as exc:  # noqa: BLE001 - the refresh must not break later stages
+            return {"stage": "market_workspace_snapshots", "status": "failed", "message": str(exc)}
 
     def _run_ai_daily_report_delivery(self, *, source_job_id: int, trade_date: str) -> dict:
         with SessionLocal() as db:

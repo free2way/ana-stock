@@ -155,5 +155,61 @@ class CNMarketSchedulerTests(unittest.TestCase):
         self.assertEqual(["CN"], created["params"]["markets"])
 
 
+    def test_market_workspace_refresh_stage_rebuilds_heatmap_snapshot(self) -> None:
+        service = CNMarketSchedulerService()
+        fake_db = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = fake_db
+        context.__exit__.return_value = False
+        created = {
+            "market_heatmap_workspace": {"id": 7, "snapshot_date": "2026-10-09"},
+            "market_workspace": {"id": 8, "snapshot_date": "2026-10-09"},
+        }
+        with patch(
+            "app.services.cn_market_scheduler.SessionLocal",
+            return_value=context,
+        ), patch(
+            "app.services.cn_market_scheduler.save_market_workspace_snapshots",
+            return_value=created,
+        ) as save:
+            result = service._refresh_market_workspace_snapshots(source_job_id=123)
+
+        save.assert_called_once_with(fake_db, source_job_id=123)
+        self.assertEqual("success", result["status"])
+        self.assertIn("market_heatmap_workspace", result["snapshots"])
+
+    def test_post_close_pipeline_rebuilds_market_workspace_before_daily_report(self) -> None:
+        service = CNMarketSchedulerService()
+        order: list[str] = []
+
+        def stage(name: str):
+            def _inner(*args, **kwargs):
+                order.append(name)
+                return {"stage": name, "status": "success"}
+
+            return _inner
+
+        context = MagicMock()
+        with patch.object(service, "_run_signal_training", side_effect=stage("training")), patch.object(
+            service, "_run_screener_precompute_core", side_effect=stage("core")
+        ), patch.object(service, "_run_screener_precompute_rest", side_effect=stage("rest")), patch.object(
+            service, "_run_screener_precompute_combos", side_effect=stage("combos")
+        ), patch.object(
+            service, "_refresh_market_workspace_snapshots", side_effect=stage("market_workspace_snapshots")
+        ), patch.object(
+            service, "_run_ai_daily_report_delivery", side_effect=stage("ai_daily_report")
+        ), patch(
+            "app.services.cn_market_scheduler.SessionLocal", return_value=context
+        ), patch(
+            "app.services.cn_market_scheduler.DataJobRepository"
+        ):
+            service._run_post_close_pipeline(pipeline_job_id=1, source_job_id=2, trade_date="2026-10-09")
+
+        self.assertEqual(
+            ["training", "core", "rest", "combos", "market_workspace_snapshots", "ai_daily_report"],
+            order,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
