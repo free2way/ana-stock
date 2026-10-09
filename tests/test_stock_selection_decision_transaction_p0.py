@@ -58,6 +58,19 @@ class _TimeoutNotifier(_Notifier):
                 "failed": [{"channel": channels[0], "message": "provider request timeout after acceptance"}]}
 
 
+class _TransactionObservingNotifier(_Notifier):
+    """Records whether the DB session held an open transaction per send."""
+
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+        self.transaction_open_at_send: list[bool] = []
+
+    def send_event(self, *, event_type, title, body, channels):
+        self.transaction_open_at_send.append(self.db.in_transaction())
+        return super().send_event(event_type=event_type, title=title, body=body, channels=channels)
+
+
 class DecisionTransactionP0Tests(TestCase):
     def setUp(self):
         self.engine = create_engine("sqlite+pysqlite:///:memory:")
@@ -156,6 +169,20 @@ class DecisionTransactionP0Tests(TestCase):
             self.assertEqual("SENT", second["skipped"][0]["status"])
             row = db.scalar(select(CNSelectionPublication))
             self.assertEqual("om_test", row.provider_message_id)
+
+    def test_provider_call_happens_with_no_open_transaction(self):
+        message = {"market": "CN", "title": "日报", "body": "内容"}
+        with Session(self.engine) as db:
+            notifier = _TransactionObservingNotifier(db)
+            receipt = freeze_final_decisions(_report(), db=db, store=self.store,
+                                             publication_messages=[message], publication_channels=["feishu"])
+            dispatch_publication_message(
+                db=db, notifier=notifier, receipt=receipt, ordinal=1, message=message,
+                event_type="stock_recommendation", channels=["feishu"], store=self.store,
+            )
+            # The SENDING claim is committed first, so the slow external push
+            # never holds the connection open (idle_in_transaction).
+            self.assertEqual([False], notifier.transaction_open_at_send)
 
     def test_portfolio_summary_is_a_durable_cn_intent_not_a_direct_send(self):
         report = _report()

@@ -4,7 +4,7 @@ import json
 import math
 from collections import defaultdict
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.core.db import SessionLocal
 from app.models.tables import ModelRun, Prediction, PredictionDetail, Symbol
@@ -1138,6 +1138,14 @@ def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, t
         history_cache: dict[tuple[str, str], list[dict]] = {}
         sample_count = 0
         with SessionLocal() as db:
+            if db.get_bind().dialect.name == "postgresql":
+                # Materialising the joined LightGBM sample set is CPU-bound
+                # client work: the read transaction stays open with no server
+                # round trip until the rows are built, which can exceed the
+                # global 60s idle_in_transaction guard and kill the connection.
+                # Keep the guard bounded, but wide enough for this read-only
+                # evaluation (same pattern as build_ai_daily_report).
+                db.execute(text("SET LOCAL idle_in_transaction_session_timeout = '600s'"))
             runs_stmt = (
                 select(ModelRun)
                 .where(ModelRun.model_type == "lightgbm_multifactor", ModelRun.status == "success")
