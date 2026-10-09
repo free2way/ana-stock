@@ -104,6 +104,78 @@ class CommunityDataSourceTests(unittest.TestCase):
             datetime.fromisoformat(row["feature_times"]["pe_ttm"]["available_time"]),
         )
 
+    def test_roe_revision_tracks_annual_observations_not_just_latest_report(self):
+        provider = CommunityCNFundamentalProvider()
+
+        def build(oldest_annual_roe):
+            financial_rows = [
+                {
+                    "SECUCODE": "600519.SH",
+                    "SECURITY_NAME_ABBR": "贵州茅台",
+                    "REPORT_DATE": "2026-06-30 00:00:00",
+                    "NOTICE_DATE": "2026-08-10 00:00:00",
+                    "UPDATE_DATE": "2026-08-11 00:00:00",
+                    "PARENTNETPROFITTZ": 12.5,
+                    "TOTALOPERATEREVETZ": 8.4,
+                    "ZCFZL": 16.2,
+                    "ROEJQ": 15.0,
+                },
+                {
+                    "SECUCODE": "600519.SH",
+                    "REPORT_DATE": "2025-12-31 00:00:00",
+                    "NOTICE_DATE": "2026-03-30 00:00:00",
+                    "UPDATE_DATE": "2026-03-30 00:00:00",
+                    "ROEJQ": 30.0,
+                },
+                {
+                    "SECUCODE": "600519.SH",
+                    "REPORT_DATE": "2024-12-31 00:00:00",
+                    "NOTICE_DATE": "2025-03-30 00:00:00",
+                    "UPDATE_DATE": "2025-03-30 00:00:00",
+                    "ROEJQ": 27.0,
+                },
+                {
+                    "SECUCODE": "600519.SH",
+                    "REPORT_DATE": "2023-12-31 00:00:00",
+                    "NOTICE_DATE": "2024-03-30 00:00:00",
+                    "UPDATE_DATE": "2024-03-30 00:00:00",
+                    "ROEJQ": oldest_annual_roe,
+                },
+            ]
+            snapshots = provider._build_snapshots(
+                ["600519.SS"],
+                financial_rows=financial_rows,
+                valuation_by_ticker={"600519.SS": {"f14": "贵州茅台", "f20": 1.8e12, "f115": 20.5, "close": 1500.0}},
+                dividends_by_ticker={},
+                metadata={},
+                as_of_date=date(2026, 8, 14),
+            )
+            self.assertEqual(1, len(snapshots))
+            return snapshots[0]
+
+        before = build(24.0)
+        # An upstream restatement of an *older* annual report changes the
+        # trailing three-year ROE average without touching the latest report's
+        # fields, so the row-level identity is unchanged.
+        after = build(18.0)
+
+        self.assertEqual(before["revision_id"], after["revision_id"])
+        self.assertNotEqual(before["roe_avg_3y"], after["roe_avg_3y"])
+        # The feature therefore carries its own content revision over the
+        # annual series it is actually derived from...
+        self.assertNotEqual(
+            before["feature_times"]["roe_avg_3y"]["revision_id"],
+            after["feature_times"]["roe_avg_3y"]["revision_id"],
+        )
+        # ...while the event date stays at the report period end so the derived
+        # point-in-time source_record_id does not change for existing rows.
+        self.assertEqual("2026-06-30", before["feature_times"]["roe_avg_3y"]["event_time"][:10])
+        self.assertEqual("2026-06-30", after["feature_times"]["roe_avg_3y"]["event_time"][:10])
+        self.assertEqual(
+            before["feature_times"]["roe_avg_3y"]["available_time"],
+            before["available_time"],
+        )
+
     def test_tushare_endpoint_permission_errors_can_degrade_independently(self):
         client = TushareClient.__new__(TushareClient)
 

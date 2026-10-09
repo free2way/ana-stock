@@ -807,6 +807,37 @@ class CommunityCNFundamentalProvider(BaseFundamentalProvider):
                     "ingested_time": observed_at.isoformat(),
                     "revision_id": dividend_revision_id,
                 }
+            if annual_roe:
+                # ``roe_avg_3y`` is derived from the trailing three annual
+                # (Dec-31) ``ROEJQ`` observations, which are NOT part of the
+                # row-level ``revision_id`` (that hashes only ``latest``'s
+                # fields).  Without a dedicated content revision, an upstream
+                # restatement/backfill of an older annual report would keep the
+                # same identity while changing the value, tripping the
+                # append-only store's "revision identity collision" guard.  Pin
+                # the revision to the observations actually used so a data
+                # change appends a new revision instead of colliding.
+                roe_revision_id = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "ticker": ticker,
+                            "report_date": report_date.isoformat(),
+                            "annual_roe_observations": annual_roe,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    ).encode("utf-8")
+                ).hexdigest()[:20]
+                feature_times["roe_avg_3y"] = {
+                    # Keep the event date at the report period end so the
+                    # derived point-in-time ``source_record_id`` stays stable
+                    # for already-stored rows.
+                    "event_time": datetime.combine(report_date, datetime_time.min, tzinfo=self._timezone).isoformat(),
+                    "available_time": financial_available.isoformat(),
+                    "ingested_time": observed_at.isoformat(),
+                    "revision_id": roe_revision_id,
+                }
             raw_values = {
                 "SECUCODE": latest.get("SECUCODE"),
                 "REPORT_DATE": latest.get("REPORT_DATE"),
