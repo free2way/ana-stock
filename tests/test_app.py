@@ -3963,6 +3963,81 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual(200, page.status_code)
         self.assertIn("ASTS", page.text)
 
+    def test_sell_form_carries_idempotency_key_and_replay_does_not_deduct_twice(self) -> None:
+        from app.services.portfolio_book import load_portfolio_positions, load_portfolio_trades
+
+        with patch(
+            "app.api.routes.portfolio.load_latest_closes",
+            return_value={"ASTS": 21.0},
+        ):
+            self.client.post(
+                "/portfolio/add",
+                data={
+                    "ticker": "ASTS",
+                    "name": "AST SpaceMobile",
+                    "market": "US",
+                    "quantity": "100",
+                    "cost_basis": "18.5",
+                },
+                follow_redirects=False,
+            )
+            page = self.client.get("/portfolio")
+
+        self.assertIn('name="idempotency_key"', page.text)
+        nonce = page.text.split('name="idempotency_key" value="', 1)[1].split('"', 1)[0]
+        self.assertTrue(nonce)
+
+        sell_data = {
+            "ticker": "ASTS",
+            "quantity": "10",
+            "price": "21.0",
+            "trade_date": "2026-02-02",
+            "fee": "0",
+            "reason": "止盈/保护利润",
+            "idempotency_key": nonce,
+        }
+        with patch(
+            "app.api.routes.portfolio.load_latest_closes",
+            return_value={"ASTS": 21.0},
+        ):
+            first = self.client.post("/portfolio/sell", data=sell_data, follow_redirects=False)
+            replay = self.client.post("/portfolio/sell", data=sell_data, follow_redirects=False)
+
+        self.assertEqual(303, first.status_code)
+        self.assertEqual(303, replay.status_code)
+        position = next(item for item in load_portfolio_positions() if item["ticker"] == "ASTS")
+        self.assertEqual(90.0, position["quantity"])
+        self.assertEqual(1, len(load_portfolio_trades()))
+
+    def test_sell_route_rejects_nan_quantity_without_changing_the_book(self) -> None:
+        from app.services.portfolio_book import load_portfolio_positions, load_portfolio_trades
+
+        with patch(
+            "app.api.routes.portfolio.load_latest_closes",
+            return_value={"ASTS": 21.0},
+        ):
+            self.client.post(
+                "/portfolio/add",
+                data={
+                    "ticker": "ASTS",
+                    "name": "AST SpaceMobile",
+                    "market": "US",
+                    "quantity": "100",
+                    "cost_basis": "18.5",
+                },
+                follow_redirects=False,
+            )
+            response = self.client.post(
+                "/portfolio/sell",
+                data={"ticker": "ASTS", "quantity": "nan", "price": "21.0"},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(303, response.status_code)
+        position = next(item for item in load_portfolio_positions() if item["ticker"] == "ASTS")
+        self.assertEqual(100.0, position["quantity"])
+        self.assertEqual([], load_portfolio_trades())
+
     def test_notification_settings_page_renders_channel_status(self) -> None:
         response = self.client.get("/settings/notifications")
 

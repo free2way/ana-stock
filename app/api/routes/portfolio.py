@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import html
 import threading
+import uuid
 from io import StringIO
 from urllib.parse import urlencode
 
@@ -322,6 +323,9 @@ def portfolio_page(
         f"<option value='{html.escape(value, quote=True)}'>{html.escape(value if lang == 'zh' else en_label)}</option>"
         for value, en_label in SELL_REASON_OPTIONS
     )
+    # Double-submit guard: a repeated POST of the same rendered form reuses this
+    # key, so the ledger replays instead of deducting the position twice.
+    sell_idempotency_key = uuid.uuid4().hex
     snapshot_payload = (snapshot or {}).get("payload") if isinstance(snapshot, dict) else None
     intelligence = (snapshot_payload or {}).get("intelligence") if isinstance(snapshot_payload, dict) else None
     required_intelligence_keys = {
@@ -1438,6 +1442,7 @@ def portfolio_page(
               </div>
               <form action="/portfolio/sell" method="post" class="sell-modal-form">
                 <input id="sell-ticker" type="hidden" name="ticker" />
+                <input type="hidden" name="idempotency_key" value="{sell_idempotency_key}" />
                 <input type="hidden" name="lang" value="{lang}" />
                 <label class="muted">{'卖出日期' if lang == 'zh' else 'Sell Date'}</label>
                 <input id="sell-date" type="date" name="trade_date" value="{app_today_iso()}" required />
@@ -1701,6 +1706,7 @@ def sell_portfolio(
     fee: float = Form(0.0),
     reason: str | None = Form(None),
     note: str | None = Form(None),
+    idempotency_key: str | None = Form(None),
     db: Session = Depends(get_db_session),
 ) -> RedirectResponse:
     if not is_authenticated(request):
@@ -1724,6 +1730,7 @@ def sell_portfolio(
                 "fee": fee,
                 "reason": normalized_reason,
                 "note": note,
+                "idempotency_key": idempotency_key,
                 "action_hint_at_exit": audit_row.get("action_hint"),
                 "action_priority_at_exit": audit_row.get("action_priority"),
                 "action_reason_at_exit": audit_row.get("action_reason"),
