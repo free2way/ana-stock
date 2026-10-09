@@ -313,6 +313,80 @@ class EventDrivenBacktestTests(unittest.TestCase):
                 signals=[], corporate_actions=[MarketCorporateAction("AAA", "2026-01-06", "split", factor=2)],
             )
 
+    def test_cn_end_of_period_liquidation_cannot_sell_a_same_session_lot(self) -> None:
+        # P1: liquidate_at_end forced an exit on 2026-01-07 for a lot also
+        # opened on 2026-01-07, bypassing A-share T+1.  The lot must be kept
+        # open and marked instead of sold same-session.
+        cal = ["2026-01-05", "2026-01-06", "2026-01-07"]
+        engine = EventDrivenDailyEngine(EngineConfig(
+            market="CN", top_n=1, holding_days=2, initial_cash=100_000.0,
+            commission_bps=0.0, slippage_bps=0.0, max_position_weight=1.0,
+            liquidate_at_end=True,
+        ))
+        result = engine.run(
+            bars=[_bar("000001.SZ", day, open_price=10.0, close=10.0) for day in cal],
+            signals=[SignalCandidate("2026-01-06", "000001.SZ", score=1.0)],
+            calendar_sessions=cal,
+        )
+
+        self.assertEqual("buy", result.fills[0]["side"])
+        self.assertNotIn("sell", [fill["side"] for fill in result.fills])
+        self.assertEqual(1, result.gate_stats["cn_t1_same_session_exit"])
+        # Retained, marked as still open, with the blocking rule surfaced.
+        self.assertEqual(1, result.open_position_count)
+        self.assertEqual(1, result.portfolio_states[-1]["open_lots"])
+        blocked = result.outcomes[-1]
+        self.assertEqual("CN", engine.config.market)
+        self.assertEqual("2026-01-07", blocked["entry_date"])
+        self.assertEqual("EXIT_DEFERRED", blocked["status"])
+        self.assertEqual("cn_t1_same_session_exit", blocked["block_reason"])
+        self.assertEqual(1, len([row for row in result.rejects if row["side"] == "sell"]))
+
+    def test_cn_end_of_period_liquidation_still_sells_lots_bought_earlier(self) -> None:
+        # Control for the T+1 gate: a lot entered the prior session is sellable
+        # at the forced end-of-period close.
+        cal = ["2026-01-05", "2026-01-06", "2026-01-07"]
+        engine = EventDrivenDailyEngine(EngineConfig(
+            market="CN", top_n=1, holding_days=2, initial_cash=100_000.0,
+            commission_bps=0.0, slippage_bps=0.0, max_position_weight=1.0,
+            liquidate_at_end=True,
+        ))
+        result = engine.run(
+            bars=[_bar("000001.SZ", day, open_price=10.0, close=10.0) for day in cal],
+            signals=[SignalCandidate("2026-01-05", "000001.SZ", score=1.0)],
+            calendar_sessions=cal,
+        )
+
+        sells = [fill for fill in result.fills if fill["side"] == "sell"]
+        self.assertEqual(1, len(sells))
+        self.assertEqual("2026-01-07", sells[0]["fill_date"])
+        self.assertEqual("2026-01-06", sells[0]["entry_date"])
+        self.assertEqual("final_liquidation", sells[0]["exit_reason"])
+        self.assertEqual(0, result.open_position_count)
+        self.assertEqual(0, result.gate_stats.get("cn_t1_same_session_exit", 0))
+
+    def test_us_end_of_period_liquidation_keeps_same_session_ttm0_exit(self) -> None:
+        # Non-CN control: US allows a same-session round trip (T+0), so the
+        # forced liquidation must not be blocked by the CN T+1 gate.
+        cal = ["2026-01-05", "2026-01-06", "2026-01-07"]
+        engine = EventDrivenDailyEngine(EngineConfig(
+            market="US", top_n=1, holding_days=2, initial_cash=100_000.0,
+            commission_bps=0.0, slippage_bps=0.0, max_position_weight=1.0,
+            liquidate_at_end=True,
+        ))
+        result = engine.run(
+            bars=[_bar("AAA", day, open_price=10.0, close=10.0) for day in cal],
+            signals=[SignalCandidate("2026-01-06", "AAA", score=1.0)],
+            calendar_sessions=cal,
+        )
+
+        sells = [fill for fill in result.fills if fill["side"] == "sell"]
+        self.assertEqual(1, len(sells))
+        self.assertEqual("2026-01-07", sells[0]["fill_date"])
+        self.assertEqual("2026-01-07", sells[0]["entry_date"])
+        self.assertEqual(0, result.open_position_count)
+        self.assertEqual(0, result.gate_stats.get("cn_t1_same_session_exit", 0))
+
     def test_prior_adv_capacity_yields_partial_fill_without_spending_extra_cash(self) -> None:
         engine = EventDrivenDailyEngine(EngineConfig(
             market="US", top_n=1, holding_days=1, initial_cash=100_000,

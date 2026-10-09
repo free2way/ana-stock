@@ -5,7 +5,7 @@ from datetime import date, timedelta
 from dataclasses import replace
 from math import floor
 
-from app.services.backtesting.market_rules import entry_reject_reason, exit_reject_reason
+from app.services.backtesting.market_rules import entry_reject_reason, sell_reject_reason
 from app.services.backtesting.schemas import (
     DailyBar,
     EngineConfig,
@@ -338,7 +338,15 @@ class EventDrivenDailyEngine:
                     "exit_reason": "final_liquidation" if force_liquidation else "holding_period_expired",
                 }
                 orders.append(order)
-                reason = exit_reject_reason(bar, market=self.config.market)
+                # Single sell-eligibility gate: T+1 (and any other exit rule)
+                # applies to every exit path, forced liquidation included.  A
+                # blocked lot stays open and is surfaced in rejects/outcomes.
+                reason = sell_reject_reason(
+                    bar,
+                    market=self.config.market,
+                    entry_date=lot.entry_date,
+                    trade_date=trade_date,
+                )
                 if reason:
                     gate_stats[reason] += 1
                     rejects.append({**order, "reject_reason": reason})
@@ -440,12 +448,16 @@ class EventDrivenDailyEngine:
 
         last_session = calendar[-1]
         for lot in lots:
-            due_sell_rejected = any(
-                row.get("ticker") == lot.ticker
-                and row.get("side") == "sell"
-                and row.get("effective_date") <= last_session
-                and row.get("insight_id") == lot.insight_id
-                for row in rejects
+            reject_row = next(
+                (
+                    row
+                    for row in rejects
+                    if row.get("ticker") == lot.ticker
+                    and row.get("side") == "sell"
+                    and row.get("effective_date") <= last_session
+                    and row.get("insight_id") == lot.insight_id
+                ),
+                None,
             )
             outcomes.append({
                 "lot_id": lot.lot_id,
@@ -455,7 +467,10 @@ class EventDrivenDailyEngine:
                 "scheduled_exit_date": self._scheduled_exit(lot.entry_date, calendar),
                 "next_exit_attempt_date": lot.exit_date,
                 "as_of_date": last_session,
-                "status": "EXIT_DEFERRED" if due_sell_rejected else "PENDING",
+                "status": "EXIT_DEFERRED" if reject_row else "PENDING",
+                # Unsellable lots are retained, not dropped; the blocking rule
+                # is reported so the open position is auditable downstream.
+                "block_reason": (reject_row or {}).get("reject_reason"),
                 "net_return": None,
                 "net_pnl": None,
             })

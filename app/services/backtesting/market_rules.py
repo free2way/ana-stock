@@ -57,3 +57,21 @@ def exit_reject_reason(bar: DailyBar | None, *, market: str) -> str | None:
         if one_price and bar.close <= limit_price * (1.0 + 1e-4):
             return "cn_limit_down_sell_blocked"
     return None
+
+
+def sell_reject_reason(
+    bar: DailyBar | None,
+    *,
+    market: str,
+    entry_date: str,
+    trade_date: str,
+) -> str | None:
+    """Unified sell-eligibility gate for every exit path, including forced
+    liquidation / end-of-period settlement.
+
+    A-share ``T+1``: a lot opened this session is not sellable this session,
+    even when ``liquidate_at_end`` forces an otherwise unconstrained exit.
+    """
+    if str(market or "").upper() == "CN" and entry_date == trade_date:
+        return "cn_t1_same_session_exit"
+    return exit_reject_reason(bar, market=market)
