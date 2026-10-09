@@ -12,6 +12,13 @@ from app.services.market_lake import load_lake_price_history
 from app.services.repository import SymbolRepository, WorkspaceSnapshotRepository
 from app.services.runtime_cache import get_cached, get_or_set
 from app.services.screener_snapshots import build_base_precompute_params, screener_snapshot_type
+from app.services.time_utils import app_now_iso, app_today_iso
+
+
+# The single workspace-snapshot type consumed by ``SignalTrainer`` when it
+# publishes expected returns. Keep this literal in one place so the producer
+# (below) and the reader cannot drift apart.
+MODEL_CALIBRATION_SNAPSHOT_TYPE = "model_calibration_snapshot"
 
 
 def normalize_template_action(value: str | None) -> str:
@@ -1357,6 +1364,85 @@ def build_lightgbm_prediction_evaluation(*, market: str, recent_runs: int = 8, t
     if not allow_compute:
         return get_cached("template_eval_lightgbm_prediction", cache_key) or {}
     return get_or_set("template_eval_lightgbm_prediction", cache_key, ttl_seconds=600.0, loader=_loader)
+
+
+def save_model_calibration_snapshot(
+    *,
+    markets: list[str] | tuple[str, ...] | set[str] | None = None,
+    source_job_id: int | None = None,
+    recent_runs: int = 8,
+    top_n: int = 40,
+) -> dict:
+    """Persist the out-of-sample LightGBM execution calibration snapshot.
+
+    This is the producer that was missing: ``SignalTrainer`` reads a single
+    ``model_calibration_snapshot`` workspace snapshot (``MODEL_CALIBRATION_
+    SNAPSHOT_TYPE``) and gates it on the payload's ``markets`` list. The
+    snapshot is computed from *matured* out-of-sample predictions, so it must be
+    produced by a job run *before* a training run can publish matched-period
+    expected returns.
+
+    A snapshot is persisted for every market requested in one payload: when
+    both CN and US are requested the evaluation runs with ``market="ALL"`` so
+    the payload's ``markets`` lists both and each market's reader hits the same
+    snapshot. Nothing is written when the evaluation yields no score buckets,
+    so an empty recompute cannot clobber a usable snapshot.
+    """
+
+    requested: list[str] = []
+    for value in markets or ("CN", "US"):
+        code = str(value or "").strip().upper()
+        if code in {"CN", "US", "ALL"} and code not in requested:
+            requested.append(code)
+    target_markets = [code for code in requested if code in {"CN", "US"}]
+    if "ALL" in requested or not target_markets:
+        target_markets = ["CN", "US"]
+    eval_market = "ALL" if len(target_markets) == 2 else target_markets[0]
+
+    payload = build_lightgbm_prediction_evaluation(
+        market=eval_market,
+        recent_runs=recent_runs,
+        top_n=top_n,
+    )
+    buckets = payload.get("score_calibration_buckets") or []
+    if not buckets:
+        return {
+            "status": "empty",
+            "snapshot_id": None,
+            "markets": target_markets,
+            "bucket_count": 0,
+            "message": "No matured out-of-sample score buckets; calibration snapshot left unchanged.",
+        }
+
+    stored_payload = dict(payload)
+    stored_payload["schema_version"] = 1
+    stored_payload["snapshot_meta"] = {
+        "source": MODEL_CALIBRATION_SNAPSHOT_TYPE,
+        "markets": target_markets,
+        "generated_at": app_now_iso(),
+    }
+    snapshot_date = str(stored_payload.get("latest_trade_date") or "").strip() or app_today_iso()
+    with SessionLocal() as db:
+        row = WorkspaceSnapshotRepository(db).create_snapshot(
+            snapshot_type=MODEL_CALIBRATION_SNAPSHOT_TYPE,
+            snapshot_date=snapshot_date,
+            payload=stored_payload,
+            source_job_id=source_job_id,
+        )
+    return {
+        "status": "success",
+        "snapshot_id": row.id,
+        "snapshot_type": row.snapshot_type,
+        "snapshot_date": row.snapshot_date,
+        "markets": target_markets,
+        "sample_count": stored_payload.get("sample_count"),
+        "latest_trade_date": stored_payload.get("latest_trade_date"),
+        "bucket_count": len(buckets),
+        "message": (
+            f"Persisted model calibration snapshot {row.id} with {len(buckets)} "
+            f"score bucket(s) for {', '.join(target_markets)}."
+        ),
+    }
 
 
 def technical_momentum_maturity(payload: dict, *, lang: str) -> dict:

@@ -44,6 +44,7 @@ from app.services.model_evaluation import (
 from app.services.model_challenger import challenger_race_readiness
 from app.services.nlp_snapshots import NEWS_ENRICHMENT_JOB_TYPE, refresh_nlp_snapshots
 from app.services.model_selection_guidance import save_model_selection_guidance_snapshots
+from app.services.template_evaluation import save_model_calibration_snapshot
 from app.services.model_output_importer import ExternalModelOutputImporter
 from app.services.push_notifications import PushNotificationService
 from app.services.repository import DataJobRepository, PriceSyncStateRepository, utc_now_iso
@@ -1393,6 +1394,53 @@ async def run_model_selection_guidance_snapshot(request: Request, db: Session = 
             markets=list(snapshots.keys()),
             snapshots=snapshots,
             count=len(snapshots),
+        )
+        return _maybe_redirect(redirect_to, payload)
+    except Exception as exc:
+        payload = fail_job_and_build_payload(job_repo, job_id=job.id, exc=exc)
+        return _maybe_redirect(redirect_to, payload)
+
+
+@router.post("/model-calibration-snapshot")
+async def run_model_calibration_snapshot(request: Request, db: Session = Depends(get_db_session)):
+    if not is_authenticated(request):
+        return login_redirect("/dashboard")
+    redirect_to = await _request_value(request, "redirect_to")
+    markets_raw = str(await _request_value(request, "markets", "CN,US") or "CN,US").strip()
+    requested_markets = [item.strip().upper() for item in markets_raw.split(",") if item.strip()]
+    markets = [item for item in requested_markets if item in {"CN", "US"}] or ["CN", "US"]
+    recent_runs = max(1, min(20, _as_int(await _request_value(request, "recent_runs", 8), 8)))
+    top_n = max(1, min(200, _as_int(await _request_value(request, "top_n", 40), 40)))
+    job_repo = DataJobRepository(db)
+    existing = job_repo.get_running_job("model_calibration_snapshot")
+    if existing:
+        return _maybe_redirect(
+            redirect_to,
+            build_job_payload(
+                status="running",
+                job_id=existing.get("id"),
+                message="Model calibration snapshot is already running; this request reuses it.",
+            ),
+        )
+    job = job_repo.create_job(
+        job_type="model_calibration_snapshot",
+        status="running",
+        params={"markets": markets, "recent_runs": recent_runs, "top_n": top_n},
+        message="Persisting out-of-sample LightGBM execution calibration.",
+    )
+    try:
+        result = save_model_calibration_snapshot(
+            markets=markets,
+            source_job_id=job.id,
+            recent_runs=recent_runs,
+            top_n=top_n,
+        )
+        payload = complete_job_and_build_payload(
+            job_repo,
+            job_id=job.id,
+            status=_result_status(result),
+            message=result.get("message") or "Model calibration snapshot finished.",
+            **{key: value for key, value in result.items() if key not in {"status", "message"}},
         )
         return _maybe_redirect(redirect_to, payload)
     except Exception as exc:

@@ -58,6 +58,7 @@ from app.services.stock_selection.executable_outcomes import (
     limit_up_at_open,
     ExecutionEligibility,
 )
+from app.services.template_evaluation import MODEL_CALIBRATION_SNAPSHOT_TYPE
 from app.services.adjustment_snapshot import adjustment_version_binding
 from app.services.price_basis_contract import (
     DECISION_REJECT,
@@ -273,7 +274,7 @@ class SignalTrainer:
             selected.extend(group)
         return sorted(selected, key=lambda row: (str(row["trade_date"]), str(row.get("ticker") or row.get("symbol") or "")))
 
-    MODEL_CALIBRATION_SNAPSHOT_TYPE = "model_calibration_snapshot"
+    MODEL_CALIBRATION_SNAPSHOT_TYPE = MODEL_CALIBRATION_SNAPSHOT_TYPE
 
     @staticmethod
     def _process_peak_rss_bytes() -> int:
@@ -3261,10 +3262,11 @@ class SignalTrainer:
                         # knew; a missing key falls back to the run's own matured
                         # train-window calibration buckets and, if still absent,
                         # stays null. A key is never aliased from another horizon
-                        # and never silently zero-filled. This repo still has no
-                        # persisting job for `model_calibration_snapshot` (only
-                        # the job-catalog description), so the train-window
-                        # fallback is the only 20-day source today.
+                        # and never silently zero-filled. The persisting job is
+                        # `save_model_calibration_snapshot` (job type
+                        # `model_calibration_snapshot`); once a fresh snapshot with
+                        # the 20-day keys exists, both horizons resolve from it and
+                        # the train-window fallback is no longer needed.
                         calibrated_metrics, detail_calibration_key_sources = (
                             self._resolve_detail_estimate_metrics(
                                 score=score,
