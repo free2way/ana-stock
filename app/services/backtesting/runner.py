@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from math import sqrt
 
 from app.core.config import get_settings
 from app.core.db import SessionLocal
 from app.services.backtesting.engine import EventDrivenDailyEngine
 from app.services.backtesting.schemas import DailyBar, EngineConfig, MarketCorporateAction, SignalCandidate
+from app.services.corporate_action_coverage import (
+    corporate_action_window_end,
+    modeled_action,
+)
 from app.services.execution_costs import default_fill_cost_model
 from app.services.adjustment_snapshot import adjustment_version_binding
 from app.services.price_basis_contract import (
@@ -116,7 +120,7 @@ class EventDrivenBacktestRunner:
 
         from app.services.corporate_actions import load_actions
 
-        window_end = (date.fromisoformat(end_date) + timedelta(days=max(14, holding_days * 3 + 7))).isoformat()
+        window_end = corporate_action_window_end(end_date, holding_days=holding_days)
         wanted = {str(ticker).strip().upper() for ticker in tickers}
         actions: list[MarketCorporateAction] = []
         stats: dict = {"loaded": 0, "supported": 0, "unsupported": 0, "unsupported_details": []}
@@ -127,17 +131,27 @@ class EventDrivenBacktestRunner:
             if effective < start_date or effective > window_end:
                 continue
             stats["loaded"] += 1
-            if record.action_type in {"split", "stock_dividend"} and record.factor:
-                actions.append(
-                    MarketCorporateAction(record.symbol, effective, "split", factor=float(record.factor))
-                )
-                stats["supported"] += 1
-            elif record.action_type == "cash_dividend" and record.cash_amount is not None:
-                actions.append(
-                    MarketCorporateAction(
-                        record.symbol, effective, "cash_dividend", cash_amount=float(record.cash_amount)
+            # The "is this action modeled?" rule is shared with the trainer's
+            # coverage audit (`app.services.corporate_action_coverage`) so the
+            # two producers can never disagree about the same window.
+            if modeled_action(
+                record.action_type, factor=record.factor, cash_amount=record.cash_amount
+            ):
+                if str(record.action_type).strip().lower() == "cash_dividend":
+                    actions.append(
+                        MarketCorporateAction(
+                            record.symbol,
+                            effective,
+                            "cash_dividend",
+                            cash_amount=float(record.cash_amount),
+                        )
                     )
-                )
+                else:
+                    actions.append(
+                        MarketCorporateAction(
+                            record.symbol, effective, "split", factor=float(record.factor)
+                        )
+                    )
                 stats["supported"] += 1
             else:
                 stats["unsupported"] += 1

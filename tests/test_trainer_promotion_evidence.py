@@ -82,6 +82,22 @@ class TrainerPromotionEvidenceTests(TestCase):
         model.feature_importances_ = [1.0] * len(
             trainer._feature_names(lookback_days=3)
         )
+        # The corporate-action audit is a filesystem read in production; stub it
+        # here so this test only asserts the *wiring* (config + artifact
+        # manifest) and cannot be broken by a leaked PQW_DATA_DIR from another
+        # module. The rule itself is covered by
+        # tests/test_corporate_action_coverage.py.
+        coverage_audit = {
+            "audited": True,
+            "unmodeled_corporate_actions": [],
+            "unmodeled_opt_in": False,
+            "loaded": 0,
+            "modeled": 0,
+            "unmodeled": 0,
+            "window_start": dates[-61],
+            "window_end": dates[-1],
+            "symbol_count": len(symbols),
+        }
         repositories = (
             "SymbolRepository",
             "ModelRunRepository",
@@ -102,6 +118,12 @@ class TrainerPromotionEvidenceTests(TestCase):
             repo = mocks["ModelRunRepository"]
             repo.create_run.return_value = SimpleNamespace(id=9876)
             repo.merge_config.side_effect = _record_merge_config
+            stack.enter_context(
+                patch(
+                    "app.services.trainer.assess_corporate_action_coverage",
+                    return_value=dict(coverage_audit),
+                )
+            )
             stack.enter_context(
                 patch(
                     "app.services.trainer.get_latest_lake_trade_date",
@@ -250,6 +272,18 @@ class TrainerPromotionEvidenceTests(TestCase):
         self.assertEqual(
             merged["training_sample_count"], artifact_meta["training_sample_count"]
         )
+        # Corporate-action coverage: the trainer is the producer for its own
+        # traded window (the shared rule lives in
+        # `app.services.corporate_action_coverage`). The stubbed audit records
+        # "0 unmodeled events", which must reach both the run config (what the
+        # gate reads) and the artifact manifest.
+        coverage = merged["corporate_action_coverage_audit"]
+        self.assertTrue(coverage["audited"])
+        self.assertEqual(0, coverage["unmodeled"])
+        self.assertEqual(merged["unmodeled_corporate_actions"], coverage["unmodeled_corporate_actions"])
+        self.assertEqual([], merged["unmodeled_corporate_actions"])
+        self.assertIs(False, merged["unmodeled_opt_in"])
+        self.assertEqual(coverage, artifact_meta["corporate_action_coverage_audit"])
         # The trainer cannot produce these, so it must record the omission
         # instead of dropping the question silently.
         self.assertIn("data_readiness_evidence_missing_reason", merged)
@@ -354,15 +388,18 @@ class TrainerPromotionEvidenceTests(TestCase):
             "window_capable_dates", capped_report.evaluation["oos_threshold_source"]
         )
 
-        # The trainer alone still cannot satisfy the other checks honestly.
+        # The trainer alone still cannot satisfy the readiness / statistical
+        # checks honestly, but the corporate-action coverage audit it now
+        # produces for its own traded window does pass.
         trainer_only = evaluate_promotion_gate(
             PromotionCandidate.from_model_run(_model_run(full_config)),
             config=_GATE_CONFIG,
             code_version=_CODE_VERSION,
         )
         trainer_only_statuses = {item.key: item.status for item in trainer_only.checks}
+        self.assertEqual("PASS", trainer_only_statuses["corporate_action_coverage"])
         self.assertEqual(DECISION_OBSERVE, trainer_only.decision)
-        for key in ("data_readiness", "corporate_action_coverage", "statistical_evidence"):
+        for key in ("data_readiness", "statistical_evidence"):
             self.assertEqual("NOT_ENOUGH_EVIDENCE", trainer_only_statuses[key], key)
 
     def test_default_serving_gate_no_longer_blocks_trainer_artifact(self) -> None:

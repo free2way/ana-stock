@@ -15,6 +15,10 @@ from datetime import date, datetime
 
 from app.core.config import get_settings
 from app.core.db import SessionLocal
+from app.services.corporate_action_coverage import (
+    assess_corporate_action_coverage,
+    coverage_evidence_fields,
+)
 from app.services.market_lake import get_latest_lake_trade_date, load_lake_rows
 from app.services.market_hot_predictions import MarketHotPredictionRepository
 from app.services.market_storage_routing import legacy_mirror_write_enabled
@@ -3270,6 +3274,22 @@ class SignalTrainer:
                     }
                     for row in oos_evaluation_records
                 ]
+            # Corporate-action coverage audit for this run's traded window. The
+            # rule is shared with the backtest runner
+            # (`app.services.corporate_action_coverage`); before this the trainer
+            # path had no producer at all, so the gate could only report
+            # `NOT_ENOUGH_EVIDENCE` for a model run. A store that is absent or
+            # unreadable is recorded as an explicit missing reason -- never as a
+            # fabricated "0 unmodeled events".
+            coverage = assess_corporate_action_coverage(
+                market=run_market,
+                symbols=normalized_tickers,
+                start_date=prediction_dates[0],
+                end_date=prediction_dates[-1],
+                holding_days=horizon_days,
+            )
+            promotion_evidence.update(coverage_evidence_fields(coverage))
+            promotion_evidence["corporate_action_coverage_audit"] = coverage
             promotion_evidence["data_readiness_evidence_missing_reason"] = (
                 DATA_READINESS_EVIDENCE_MISSING_REASON
             )
@@ -3296,6 +3316,7 @@ class SignalTrainer:
                         "training_window_audits": training_window_audits,
                         "training_sample_count": latest_training_sample_count,
                         "oos_evaluation": oos_evaluation,
+                        "corporate_action_coverage_audit": coverage,
                         "training_window_policy": asdict(window_policy),
                         "score_semantics": score_semantics_version,
                         "score_contract_version": SCORE_CONTRACT_VERSION,
