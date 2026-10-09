@@ -228,13 +228,28 @@ class CNMarketSchedulerTests(unittest.TestCase):
         ) as rebuild:
             result = service._refresh_cn_adjusted_view(source_job_id=7, trade_date="2026-10-09")
 
-        self.assertEqual("skipped", result["status"])
+        # An idempotent skip is a usable stage (not a pipeline failure).
+        self.assertEqual("success", result["status"])
+        self.assertEqual("skipped", result["view_status"])
         self.assertEqual("cn_adjusted_view", result["stage"])
+        self.assertEqual("2026-10-09", result["latest_date"])
         rebuild.assert_called_once_with(
             "CN",
             method="qfq",
             required_upper_bound="2026-10-09",
         )
+
+    def test_cn_adjusted_view_stage_reports_rebuilt_as_usable(self) -> None:
+        service = CNMarketSchedulerService()
+        with patch(
+            "app.services.cn_market_scheduler.rebuild_adjusted_view_if_stale",
+            return_value={"status": "rebuilt", "symbols": 5583, "rows": 2076859},
+        ):
+            result = service._refresh_cn_adjusted_view(source_job_id=7, trade_date="2026-10-09")
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual("rebuilt", result["view_status"])
+        self.assertEqual(2076859, result["rows"])
 
     def test_cn_adjusted_view_stage_contains_failure(self) -> None:
         service = CNMarketSchedulerService()

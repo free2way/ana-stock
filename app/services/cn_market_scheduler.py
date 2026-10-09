@@ -678,15 +678,27 @@ class CNMarketSchedulerService:
                 "source_job_id": source_job_id,
                 "message": str(exc),
             }
-        status = str(result.get("status") or "unknown")
-        if status == "rebuilt":
+        view_status = str(result.get("status") or "unknown")
+        if view_status == "rebuilt":
             logger.info(
                 "Rebuilt A-share adjusted view for %s: %s symbols, %s rows.",
                 trade_date,
                 result.get("symbols"),
                 result.get("rows"),
             )
-        return {"stage": "cn_adjusted_view", "source_job_id": source_job_id, **result}
+        # The builder reports ``rebuilt`` / ``skipped``; the pipeline's stage
+        # accounting only treats ``success`` / ``partial`` as usable, so an
+        # idempotent skip (view already current) must not be counted as a failed
+        # stage or every normal day would be flagged partial.
+        stage_status = "success" if view_status in {"rebuilt", "skipped"} else "partial"
+        detail = {key: value for key, value in result.items() if key != "status"}
+        return {
+            "stage": "cn_adjusted_view",
+            "status": stage_status,
+            "view_status": view_status,
+            "source_job_id": source_job_id,
+            **detail,
+        }
 
     def _run_signal_training(self, *, source_job_id: int, trade_date: str) -> dict:
         tickers = sorted(list_lake_symbols(market="CN"))
