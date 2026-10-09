@@ -5413,43 +5413,53 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual(34.0, row.debt_to_assets)
 
     def test_watchlist_add_and_sync_now_works(self) -> None:
-        from app.services.openbb_client import OpenBBClient
+        # The `/watchlist/add` route hardcodes `provider="auto"`.  For a US
+        # symbol that resolves to Alpaca/yfinance and a live network call, and
+        # for a HK symbol the sync is intentionally fail-closed (S-13: the
+        # Parquet lake stores CN/US only).  Cover the real add + sync *success*
+        # path with a CN symbol and a stubbed resolved provider so the example
+        # stays offline and deterministic.
+        seeded_rows = [
+            {
+                "date": "2026-04-01",
+                "open": 10.0,
+                "high": 10.5,
+                "low": 9.8,
+                "close": 10.2,
+                "volume": 120000,
+            },
+            {
+                "date": "2026-04-02",
+                "open": 10.2,
+                "high": 10.8,
+                "low": 10.0,
+                "close": 10.7,
+                "volume": 140000,
+            },
+        ]
 
-        def fake_fetch(self, request) -> list[dict]:
-            symbol = request.ticker
-            return [
-                {
-                    "date": "2026-04-01",
-                    "symbol": symbol,
-                    "open": 10.0,
-                    "high": 10.5,
-                    "low": 9.8,
-                    "close": 10.2,
-                    "volume": 120000,
-                },
-                {
-                    "date": "2026-04-02",
-                    "symbol": symbol,
-                    "open": 10.2,
-                    "high": 10.8,
-                    "low": 10.0,
-                    "close": 10.7,
-                    "volume": 140000,
-                },
-            ]
+        class _StubPriceProvider:
+            name = "fixture"
+            last_source_used = "fixture"
 
-        with patch.object(OpenBBClient, "fetch_historical_prices", new=fake_fetch):
+            def fetch_historical_prices(self, request) -> list[dict]:
+                return [{**row, "symbol": request.ticker} for row in seeded_rows]
+
+        with patch(
+            "app.services.market_sync.resolve_price_provider",
+            return_value=_StubPriceProvider(),
+        ):
             add_response = self.client.post(
                 "/watchlist/add",
-                data={"ticker": "0700.HK", "market": "HK", "name": "", "sync_after_add": "true"},
+                data={"ticker": "600519.SH", "market": "CN", "name": "", "sync_after_add": "true"},
                 follow_redirects=True,
             )
             table_response = self.client.get("/watchlist/table-fragment?mode=monitor")
 
         self.assertEqual(200, add_response.status_code)
-        self.assertIn("Added 0700.HK and synced 2 rows.", add_response.text)
+        self.assertIn("Added 600519.SS and synced 2 rows.", add_response.text)
         self.assertEqual(200, table_response.status_code)
-        self.assertIn("腾讯控股", table_response.text)
+        self.assertIn("贵州茅台", table_response.text)
 
     def test_refresh_existing_watchlist_metadata_repairs_old_rows(self) -> None:
         from app.core.db import SessionLocal
