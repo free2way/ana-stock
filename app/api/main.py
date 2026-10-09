@@ -5,7 +5,7 @@ import time
 from datetime import date
 
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import select, text
 
 from app.api.routes import ai_chat, auth, backtests, dashboard, insights, jobs, portfolio, review_journal, screener, settings as settings_routes, signals, social_signals, symbols, watchlist
@@ -279,9 +279,13 @@ def _market_health_ticker_filters(
         return filters or None, scopes
 
 
-@app.get("/health/ready")
-def readiness() -> dict:
-    """Report dependency readiness, not merely whether the web process is alive."""
+def _collect_readiness_checks() -> dict[str, dict]:
+    """Build the full dependency readiness report, including diagnostics.
+
+    The detailed report intentionally carries exception text and artifact paths,
+    so it may only be served from the authenticated diagnostics endpoint; the
+    public ``/health/ready`` probe returns a sanitized summary instead.
+    """
     checks: dict[str, dict] = {}
     market_freshness: dict = {}
     capacity_report: dict | None = None
@@ -357,8 +361,75 @@ def readiness() -> dict:
         except Exception as exc:
             checks[f"lake_{market.lower()}"] = {"status": "failed", "message": str(exc)}
 
+    return checks
+
+
+def _readiness_overall(checks: dict[str, dict]) -> tuple[str, list[str], list[str], list[str]]:
     failed = [key for key, value in checks.items() if value.get("status") in {"failed", "missing"}]
     stale = [key for key, value in checks.items() if value.get("status") == "stale"]
     degraded = [key for key, value in checks.items() if value.get("status") == "degraded"]
     overall = "failed" if failed else "degraded" if stale or degraded else "ready"
-    return {"status": overall, "checks": checks, "failed": failed, "stale": stale, "degraded": degraded}
+    return overall, failed, stale, degraded
+
+
+def _unsatisfiable_readiness_checks(checks: dict[str, dict]) -> list[str]:
+    """Checks whose probe itself errored (a hard dependency is unavailable).
+
+    ``missing``/``stale`` market-lake states are data-freshness signals that the
+    endpoint reports but never turns into a 503; only an errored probe (the
+    database is unreachable, or a check raised) means the service cannot serve.
+    """
+    return [key for key, value in checks.items() if value.get("status") == "failed"]
+
+
+def _public_readiness_summary(
+    checks: dict[str, dict],
+    *,
+    overall: str,
+    failed: list[str],
+    stale: list[str],
+    degraded: list[str],
+) -> dict:
+    """Sanitized readiness body: statuses only, never messages or paths."""
+    return {
+        "status": overall,
+        "checks": {key: {"status": value.get("status")} for key, value in checks.items()},
+        "failed": failed,
+        "stale": stale,
+        "degraded": degraded,
+    }
+
+
+@app.get("/health/ready")
+def readiness() -> JSONResponse:
+    """Report dependency readiness, not merely whether the web process is alive."""
+    checks = _collect_readiness_checks()
+    overall, failed, stale, degraded = _readiness_overall(checks)
+    unsatisfiable = _unsatisfiable_readiness_checks(checks)
+    if unsatisfiable:
+        # Detailed diagnostics stay in the log and behind authentication.
+        logger.warning(
+            "readiness probe failed for %s: %s",
+            unsatisfiable,
+            {key: checks[key] for key in unsatisfiable},
+        )
+    return JSONResponse(
+        status_code=503 if unsatisfiable else 200,
+        content=_public_readiness_summary(
+            checks, overall=overall, failed=failed, stale=stale, degraded=degraded
+        ),
+    )
+
+
+@app.get("/health/ready/diagnostics")
+def readiness_diagnostics() -> dict:
+    """Authenticated dependency diagnostics: exception text and artifact paths."""
+    checks = _collect_readiness_checks()
+    overall, failed, stale, degraded = _readiness_overall(checks)
+    return {
+        "status": overall,
+        "checks": checks,
+        "failed": failed,
+        "stale": stale,
+        "degraded": degraded,
+    }
