@@ -190,7 +190,7 @@ class TrainerPromotionEvidenceTests(TestCase):
         self.assertTrue(create_config["label_winsorize"]["enabled"])
         self.assertEqual(0.025, create_config["label_winsorize"]["lower_quantile"])
         self.assertEqual("huber", create_config["objective"]["objective"])
-        self.assertEqual(0.12, create_config["drawdown_penalty"])
+        self.assertEqual(0.25, create_config["drawdown_penalty"])
         self.assertTrue(create_config["feature_transform"]["enabled"])
         self.assertEqual(
             "cross_sectional_winsor_mad_zscore",
