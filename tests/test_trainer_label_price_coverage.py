@@ -21,6 +21,8 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
+from app.services.adjusted_gap_availability import SourceAvailabilityEvidence
+from app.services.price_basis_contract import REASON_EXCESSIVE_UNAVAILABLE_EXCLUSION
 from app.services.stock_selection.training_weights import TRAINING_WEIGHT_POLICY
 from app.services.trainer import EXECUTABLE_LABEL_PROFILE, SignalTrainer
 
@@ -568,3 +570,65 @@ class TrainerLabelPriceCoverageTests(TestCase):
         self.assertEqual(
             config["prediction_price_basis_contract"], inference_contract
         )
+
+    def _availability_evidence(self, unavailable: set[tuple[str, str]]) -> SourceAvailabilityEvidence:
+        return SourceAvailabilityEvidence(
+            market="US",
+            source_glob="_us_alpaca/raw/*.parquet",
+            requested_pairs=len(unavailable),
+            live_symbols=tuple(sorted({symbol for symbol, _ in unavailable})),
+            unavailable_pairs=frozenset(unavailable),
+            unavailable_by_symbol={},
+        )
+
+    def test_source_unavailable_gap_is_excluded_and_counted_separately(self) -> None:
+        trainer = self._trainer_with_stats(
+            adjusted_count=1000, raw_fallback_count=1, dropped_missing_adjusted_count=0
+        )
+        pair = ("GORO", "2026-01-05")
+        trainer._label_basis_gap_windows = [("raw_fallback", (pair,))]
+        with patch(
+            "app.services.trainer.find_unavailable_pairs",
+            return_value=self._availability_evidence({pair}),
+        ) as probe:
+            contract = trainer._label_price_basis_contract(
+                label_profile=EXECUTABLE_LABEL_PROFILE
+            )
+        probe.assert_called_once()
+        # The gap is removed from the full-coverage requirement and counted
+        # separately -- never folded back into raw_fallback_count.
+        self.assertEqual(1, contract["excluded_unavailable_count"])
+        self.assertEqual(0, contract["raw_fallback_count"])
+        self.assertEqual(1000, contract["candidate_count"])
+        self.assertEqual(1.0, contract["adjusted_coverage_share"])
+        self.assertEqual("adjusted_view", contract["label_price_basis"])
+        self.assertIsNotNone(contract["excluded_unavailable_evidence"])
+
+    def test_gap_exclusion_over_limit_still_fails_closed(self) -> None:
+        trainer = self._trainer_with_stats(
+            adjusted_count=100, raw_fallback_count=5, dropped_missing_adjusted_count=0
+        )
+        pairs = {("GORO", f"2026-01-{index:02d}") for index in range(1, 6)}
+        trainer._label_basis_gap_windows = [
+            ("raw_fallback", (pair,)) for pair in sorted(pairs)
+        ]
+        with patch(
+            "app.services.trainer.find_unavailable_pairs",
+            return_value=self._availability_evidence(pairs),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "incomplete coverage"):
+                trainer._label_price_basis_contract(label_profile=EXECUTABLE_LABEL_PROFILE)
+        self.assertIn(
+            REASON_EXCESSIVE_UNAVAILABLE_EXCLUSION,
+            trainer._price_basis_decision.reasons,
+        )
+
+    def test_no_gap_behaviour_unchanged(self) -> None:
+        trainer = self._trainer_with_stats(
+            adjusted_count=10, raw_fallback_count=0, dropped_missing_adjusted_count=0
+        )
+        contract = trainer._label_price_basis_contract(label_profile=EXECUTABLE_LABEL_PROFILE)
+        self.assertEqual("adjusted_view", contract["label_price_basis"])
+        self.assertEqual(0, contract["excluded_unavailable_count"])
+        self.assertEqual(10, contract["candidate_count"])
+        self.assertEqual(1.0, contract["adjusted_coverage_share"])

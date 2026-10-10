@@ -60,6 +60,7 @@ from app.services.stock_selection.executable_outcomes import (
 )
 from app.services.template_evaluation import MODEL_CALIBRATION_SNAPSHOT_TYPE
 from app.services.adjustment_snapshot import adjustment_version_binding
+from app.services.adjusted_gap_availability import find_unavailable_pairs
 from app.services.price_basis_contract import (
     DECISION_REJECT,
     ENTRY_INFERENCE,
@@ -300,6 +301,13 @@ class SignalTrainer:
         self._price_basis_decision = None
         self._price_basis_requirements: PriceBasisRequirements | None = None
         self._label_price_stats: dict[str, int] = _empty_label_price_stats()
+        # Per-sample non-adjusted label windows recorded while building samples:
+        # ``(basis, ((symbol, date), ...))``. The pairs are the window's rows the
+        # adjusted view does not carry. At gate time they are checked against the
+        # declared source namespace so a window whose *only* gap is a proven
+        # source-unavailable bar can be excluded explicitly (and separately
+        # counted), instead of demanding an unattainable coverage == 1.0.
+        self._label_basis_gap_windows: list[tuple[str, tuple[tuple[str, str], ...]]] = []
         # Point-in-time universe filter outcome for the most recent `_load_rows`
         # call. Persisted into the run config so a filtered run is auditable;
         # `None` when rows were supplied without going through `_load_rows`.
@@ -1023,8 +1031,17 @@ class SignalTrainer:
         flags = [bool(row.get("adjusted_view_attached")) for row in window]
         if not flags or all(flags):
             return "adjusted"
+        gap_pairs = tuple(
+            sorted(
+                (str(row.get("symbol") or "").strip().upper(), str(row.get("date") or "")[:10])
+                for row, attached in zip(window, flags)
+                if not attached
+            )
+        )
         if not any(flags):
+            self._label_basis_gap_windows.append(("raw_fallback", gap_pairs))
             return "raw_fallback"
+        self._label_basis_gap_windows.append(("drop_missing_adjusted", gap_pairs))
         return "drop_missing_adjusted"
 
     def _label_price_basis_contract(
@@ -1073,6 +1090,39 @@ class SignalTrainer:
         view_state = str(getattr(self, "_adjusted_view_state", "absent") or "absent")
         view_present = view_state == "present"
         view_market = getattr(self, "_adjusted_view_market", None)
+        # Explicit, auditable exclusion of source-unavailable label windows.
+        # A window whose adjusted-view gap is *provably* a source gap (the
+        # declared raw source namespace has no such bar while the symbol is
+        # otherwise live there) is removed from the full-coverage requirement and
+        # counted separately. It is NEVER folded back into the raw/dropped
+        # counters ("missing counted separately, never backfilled"), and the
+        # total exclusion is capped by the contract's share guard.
+        excluded_unavailable_count = 0
+        excluded_unavailable_evidence = None
+        gap_windows = list(getattr(self, "_label_basis_gap_windows", None) or [])
+        if gap_windows and view_market:
+            requested_gap_pairs = {
+                pair for _basis, pairs in gap_windows for pair in pairs
+            }
+            excluded_unavailable_evidence = find_unavailable_pairs(
+                view_market, requested_gap_pairs
+            )
+            unavailable_pairs = excluded_unavailable_evidence.unavailable_pairs
+            for basis, pairs in gap_windows:
+                if pairs and all(pair in unavailable_pairs for pair in pairs):
+                    if basis == "drop_missing_adjusted":
+                        dropped_missing_adjusted_count = max(
+                            0, dropped_missing_adjusted_count - 1
+                        )
+                    else:
+                        raw_fallback_count = max(0, raw_fallback_count - 1)
+                    excluded_unavailable_count += 1
+            candidate_count = (
+                adjusted_count + raw_fallback_count + dropped_missing_adjusted_count
+            )
+            adjusted_coverage_share = (
+                adjusted_count / candidate_count if candidate_count else 1.0
+            )
         allow_raw_fallback = bool(
             getattr(self.settings, "trainer_allow_raw_fallback", False)
         )
@@ -1101,6 +1151,7 @@ class SignalTrainer:
             adjusted_count=adjusted_count,
             raw_fallback_count=raw_fallback_count,
             dropped_missing_adjusted_count=dropped_missing_adjusted_count,
+            excluded_unavailable_count=excluded_unavailable_count,
             gates_coverage=True,
         )
         decision = decide_price_basis(ENTRY_TRAIN, probe, requirements)
@@ -1116,6 +1167,19 @@ class SignalTrainer:
             "adjusted_count": adjusted_count,
             "raw_fallback_count": raw_fallback_count,
             "dropped_missing_adjusted_count": dropped_missing_adjusted_count,
+            "excluded_unavailable_count": int(decision.excluded_unavailable_count),
+            "excluded_unavailable_share": round(
+                float(decision.excluded_unavailable_share), 8
+            ),
+            "max_excluded_unavailable_share": float(
+                decision.max_excluded_unavailable_share
+            ),
+            "candidate_count": int(decision.candidate_count),
+            "excluded_unavailable_evidence": (
+                excluded_unavailable_evidence.as_dict()
+                if excluded_unavailable_evidence is not None
+                else None
+            ),
             "adjusted_coverage_share": round(decision.coverage_share, 8),
             "require_full_adjusted_coverage": bool(require_full),
         }
@@ -1166,6 +1230,8 @@ class SignalTrainer:
             "Trainer refused an adjusted-view label run with incomplete coverage: "
             f"adjusted_count={adjusted_count}, raw_fallback_count={raw_fallback_count}, "
             f"dropped_missing_adjusted_count={dropped_missing_adjusted_count}, "
+            f"excluded_unavailable_count={excluded_unavailable_count}, "
+            f"candidate_count={candidate_count}, "
             f"adjusted_coverage_share={adjusted_coverage_share:.8f}, "
             f"reasons={list(decision.reasons)}. "
             "Complete the adjusted view or set "
@@ -1198,6 +1264,8 @@ class SignalTrainer:
                 adjusted_count=requirements.adjusted_count,
                 raw_fallback_count=requirements.raw_fallback_count,
                 dropped_missing_adjusted_count=requirements.dropped_missing_adjusted_count,
+                excluded_unavailable_count=requirements.excluded_unavailable_count,
+                max_excluded_unavailable_share=requirements.max_excluded_unavailable_share,
                 gates_coverage=True,
             )
         inference = decide_price_basis(ENTRY_INFERENCE, probe, inference_requirements)
@@ -1769,6 +1837,7 @@ class SignalTrainer:
 
         samples: list[dict] = []
         self._label_price_stats = _empty_label_price_stats()
+        self._label_basis_gap_windows = []
         self._universe_gated_signal_days = 0
         for symbol, symbol_rows in grouped.items():
             symbol_market = self._sample_label_market(market=market, ticker=symbol)
@@ -3095,6 +3164,19 @@ class SignalTrainer:
                     "dropped_missing_adjusted_count": label_price_contract[
                         "dropped_missing_adjusted_count"
                     ],
+                    "excluded_unavailable_count": label_price_contract.get(
+                        "excluded_unavailable_count", 0
+                    ),
+                    "excluded_unavailable_share": label_price_contract.get(
+                        "excluded_unavailable_share", 0.0
+                    ),
+                    "max_excluded_unavailable_share": label_price_contract.get(
+                        "max_excluded_unavailable_share"
+                    ),
+                    "candidate_count": label_price_contract.get("candidate_count"),
+                    "excluded_unavailable_evidence": label_price_contract.get(
+                        "excluded_unavailable_evidence"
+                    ),
                     "adjusted_coverage_share": label_price_contract["adjusted_coverage_share"],
                     "require_full_adjusted_coverage": label_price_contract[
                         "require_full_adjusted_coverage"

@@ -67,6 +67,22 @@ REASON_UNREADABLE_VIEW = "unreadable_view"
 REASON_VIEW_VERSION_MISMATCH = "view_version_mismatch"
 REASON_ADJUSTED_VIEW_ABSENT = "adjusted_view_absent"
 REASON_INCOMPLETE_ADJUSTED_COVERAGE = "incomplete_adjusted_coverage"
+REASON_EXCESSIVE_UNAVAILABLE_EXCLUSION = "excessive_unavailable_exclusion"
+
+# Guard rail for the explicit, auditable exclusion of source-unavailable rows
+# (review comment #4: "missing counted separately, never backfilled"). A run may
+# excuse a label-window gap from the full-coverage requirement *only* when the
+# adjusted view's raw source has no bar for that (symbol, date) at all -- see
+# ``app.services.adjusted_gap_availability``. Such gaps are surface level: a
+# handful of names whose source history starts late. If the exclusions ever
+# cover more than ``DEFAULT_MAX_EXCLUDED_UNAVAILABLE_SHARE`` of the classified
+# sample domain, the mechanism is no longer isolating an isolated source gap --
+# it would be able to excuse an arbitrary slice of the market, so the run must
+# fail closed instead. 0.5% of the U.S. training domain is ~820 samples, i.e.
+# roughly seven full TEVA-sized missing histories (the observed residual gap is
+# ~0.07%, ~7x inside the guard); the historical view-lag defects that this gate
+# was built to catch ran at 1.3%-2.2%, comfortably outside it.
+DEFAULT_MAX_EXCLUDED_UNAVAILABLE_SHARE = 0.005
 
 # fallback_policy values recorded on the decision.
 FALLBACK_NONE = "none"
@@ -320,6 +336,13 @@ class PriceBasisRequirements:
     adjusted_count: int = 0
     raw_fallback_count: int = 0
     dropped_missing_adjusted_count: int = 0
+    # Samples whose only gap is a *proven source-unavailable* bar (the adjusted
+    # view's raw source has no such (symbol, date)). These are excluded from the
+    # full-coverage requirement and counted separately -- they must NEVER also be
+    # folded into ``raw_fallback_count`` / ``dropped_missing_adjusted_count``
+    # ("missing counted separately, never backfilled").
+    excluded_unavailable_count: int = 0
+    max_excluded_unavailable_share: float = DEFAULT_MAX_EXCLUDED_UNAVAILABLE_SHARE
     # Backtest replays raw bars + corporate actions: it binds the view by hash
     # and records coverage, but must not reject a complete backtest solely
     # because the view lacks an unrelated symbol.
@@ -347,6 +370,12 @@ class PriceBasisDecision:
     raw_fallback_count: int
     dropped_missing_adjusted_count: int
     label_price_basis: str
+    excluded_unavailable_count: int = 0
+    excluded_unavailable_share: float = 0.0
+    max_excluded_unavailable_share: float = DEFAULT_MAX_EXCLUDED_UNAVAILABLE_SHARE
+    # The "应有集合" (should-have-been-adjusted) denominator: classified samples
+    # minus the explicitly excluded source-unavailable ones.
+    candidate_count: int = 0
 
     @property
     def allowed(self) -> bool:
@@ -392,15 +421,41 @@ class PriceBasisDecision:
             "raw_fallback_count": self.raw_fallback_count,
             "dropped_missing_adjusted_count": self.dropped_missing_adjusted_count,
             "label_price_basis": self.label_price_basis,
+            "candidate_count": self.candidate_count,
+            "excluded_unavailable_count": self.excluded_unavailable_count,
+            "excluded_unavailable_share": round(
+                float(self.excluded_unavailable_share), 8
+            ),
+            "max_excluded_unavailable_share": float(
+                self.max_excluded_unavailable_share
+            ),
         }
 
 
-def _resolve_coverage(probe: AdjustedViewProbe, requirements: PriceBasisRequirements) -> float:
-    candidate_count = (
+def _classified_candidate_count(requirements: PriceBasisRequirements) -> int:
+    """The "应有集合": samples that should have adjusted labels.
+
+    The explicit source-unavailable exclusions are deliberately *not* part of
+    it -- they are counted in ``excluded_unavailable_count`` instead.
+    """
+
+    return (
         int(requirements.adjusted_count)
         + int(requirements.raw_fallback_count)
         + int(requirements.dropped_missing_adjusted_count)
     )
+
+
+def _excluded_unavailable_share(requirements: PriceBasisRequirements) -> float:
+    excluded = max(0, int(requirements.excluded_unavailable_count))
+    domain = _classified_candidate_count(requirements) + excluded
+    if domain <= 0:
+        return 0.0
+    return excluded / domain
+
+
+def _resolve_coverage(probe: AdjustedViewProbe, requirements: PriceBasisRequirements) -> float:
+    candidate_count = _classified_candidate_count(requirements)
     if candidate_count > 0:
         return int(requirements.adjusted_count) / candidate_count
     return float(probe.coverage_share)
@@ -453,6 +508,7 @@ def decide_price_basis(
     requirements = requirements or PriceBasisRequirements(entry_point=resolved_entry)
     applicable = bool(probe.applicable and requirements.requires_adjusted_prices)
     coverage_share = _resolve_coverage(probe, requirements)
+    excluded_share = _excluded_unavailable_share(requirements)
     authorized_by = (
         (requirements.authorization_source or RAW_FALLBACK_AUTHORIZATION_SOURCE)
         if requirements.allow_raw_fallback
@@ -473,7 +529,7 @@ def decide_price_basis(
         if label == "adjusted_view" and decision == DECISION_REJECT:
             # A rejected run must never carry a truthful-looking adjusted label.
             label = "raw"
-        return PriceBasisDecision(
+        return PriceBasisDecision(  # noqa: PLR0913 - audit record, one field per fact
             entry_point=resolved_entry,
             decision=decision,
             reasons=reasons,
@@ -493,6 +549,12 @@ def decide_price_basis(
             raw_fallback_count=int(requirements.raw_fallback_count),
             dropped_missing_adjusted_count=int(requirements.dropped_missing_adjusted_count),
             label_price_basis=label,
+            excluded_unavailable_count=max(0, int(requirements.excluded_unavailable_count)),
+            excluded_unavailable_share=excluded_share,
+            max_excluded_unavailable_share=float(
+                requirements.max_excluded_unavailable_share
+            ),
+            candidate_count=_classified_candidate_count(requirements),
         )
 
     if not applicable:
@@ -511,12 +573,20 @@ def decide_price_basis(
             )
         return _build(DECISION_REJECT, (REASON_ADJUSTED_VIEW_ABSENT,), FALLBACK_FAIL_CLOSED)
 
-    if (
-        requirements.gates_coverage
-        and requirements.require_full_coverage
-        and coverage_share < 1.0
-    ):
-        return _build(DECISION_REJECT, (REASON_INCOMPLETE_ADJUSTED_COVERAGE,), FALLBACK_FAIL_CLOSED)
+    if requirements.gates_coverage and requirements.require_full_coverage:
+        # The auditable source-unavailable exclusion is itself bounded: it may
+        # excuse an *isolated* source gap, never an arbitrary slice of the
+        # domain (else the mechanism becomes a universal pass-through).
+        if excluded_share > float(requirements.max_excluded_unavailable_share):
+            return _build(
+                DECISION_REJECT,
+                (REASON_EXCESSIVE_UNAVAILABLE_EXCLUSION,),
+                FALLBACK_FAIL_CLOSED,
+            )
+        if coverage_share < 1.0:
+            return _build(
+                DECISION_REJECT, (REASON_INCOMPLETE_ADJUSTED_COVERAGE,), FALLBACK_FAIL_CLOSED
+            )
 
     return _build(DECISION_ALLOW_ADJUSTED, (), FALLBACK_NONE)
 
