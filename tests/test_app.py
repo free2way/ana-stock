@@ -115,12 +115,36 @@ class AppFlowTests(unittest.TestCase):
         os.environ.setdefault("PQW_OPTIN_OPERATOR", "test_app_fixture")
 
     def _login(self) -> None:
+        # The login rate limiter is process-global in-memory state (see
+        # app/services/auth.py); isolate it so a counter leaked from an earlier
+        # example can never turn this fixture login into a silent no-op.
+        from app.services.auth import AUTH_COOKIE_NAME, reset_login_rate_limit_state
+
+        reset_login_rate_limit_state()
         response = self.client.post(
             "/login",
             data={"username": "admin", "password": "admin1234", "next": "/watchlist"},
             follow_redirects=False,
         )
         self.assertEqual(303, response.status_code)
+        # A 303 alone does not prove authentication: every branch of POST /login
+        # (success, rate limit, invalid credentials, unconfigured secret) answers
+        # 303. When a degraded login was silently accepted here it surfaced much
+        # later as an unrelated "bounced back to /login?next=..." assertion, so
+        # assert the success contract at the point where it can still be traced.
+        self.assertEqual(
+            "/watchlist",
+            response.headers.get("location"),
+            msg=(
+                "POST /login did not authenticate (hit a non-success branch): "
+                f"location={response.headers.get('location')!r}"
+            ),
+        )
+        self.assertIn(
+            AUTH_COOKIE_NAME,
+            self.client.cookies,
+            msg="POST /login succeeded but did not set the auth cookie",
+        )
 
     def _seed_symbol(self, ticker: str, name: str, market: str, exchange: str) -> None:
         from app.core.db import SessionLocal
