@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.models.tables import (
     FundamentalSnapshot,
+    PointInTimeFeatureConflict,
     PointInTimeFeatureSnapshot,
     Symbol,
 )
@@ -299,14 +300,57 @@ class PointInTimeFeatureSnapshotRepository:
             PointInTimeFeatureSnapshot.revision_id == revision_id,
         )
         existing = self.db.scalar(stmt) if write_legacy else None
-        if existing is not None:
-            if (
-                float(existing.feature_value) != numeric_value
-                or existing.event_time != normalized_event_time
-            ):
-                raise RuntimeError("revision identity collision in append-only feature store")
-            if physical_table is None:
-                return existing, False
+        physical_existing = None
+        if physical_table is not None:
+            physical_existing = self.db.scalar(
+                select(physical_table).where(
+                    physical_table.symbol_id == symbol_id,
+                    physical_table.feature_name == feature_name,
+                    physical_table.source == source,
+                    physical_table.source_record_id == source_record_id,
+                    physical_table.revision_id == revision_id,
+                )
+            )
+        # A revision identity that already exists with a different value is a
+        # record-level data conflict, not a batch-fatal error: isolate it in the
+        # conflict ledger so the remaining records keep landing. History stays
+        # append-only (never overwritten) and the conflict is never silently
+        # dropped -- it is persisted and returned as (existing, False).
+        legacy_conflict = existing is not None and (
+            float(existing.feature_value) != numeric_value
+            or existing.event_time != normalized_event_time
+        )
+        physical_conflict = physical_existing is not None and (
+            float(physical_existing.feature_value) != numeric_value
+            or _physical_datetime(physical_existing.event_time).astimezone(UTC)
+            != _physical_datetime(normalized_event_time).astimezone(UTC)
+        )
+        if legacy_conflict or physical_conflict:
+            store_kind = "legacy" if legacy_conflict else "physical"
+            conflicted = existing if legacy_conflict else physical_existing
+            if conflicted is None:  # defensive; the flags above imply a row
+                raise RuntimeError("Feature conflict detected without a colliding row.")
+            self._record_conflict(
+                symbol_id=symbol_id,
+                market=symbol_market,
+                feature_name=feature_name,
+                source=source,
+                source_record_id=source_record_id,
+                store_kind=store_kind,
+                conflicted=conflicted,
+                incoming_revision_id=revision_id,
+                incoming_feature_value=numeric_value,
+                incoming_event_time=normalized_event_time,
+                payload=payload,
+            )
+            if commit:
+                self.db.commit()
+                self.db.refresh(conflicted)
+            else:
+                self.db.flush()
+            return conflicted, False
+        if existing is not None and physical_table is None:
+            return existing, False
         created_at = utc_now_iso()
         snapshot = existing
         inserted = False
@@ -333,51 +377,31 @@ class PointInTimeFeatureSnapshotRepository:
             )
             inserted = True
             self.db.add(snapshot)
-        physical_existing = None
         physical_inserted = False
-        if physical_table is not None:
-            physical_existing = self.db.scalar(
-                select(physical_table).where(
-                    physical_table.symbol_id == symbol_id,
-                    physical_table.feature_name == feature_name,
-                    physical_table.source == source,
-                    physical_table.source_record_id == source_record_id,
-                    physical_table.revision_id == revision_id,
+        if physical_table is not None and physical_existing is None:
+            physical_existing = physical_table(
+                symbol_id=symbol_id,
+                market=symbol_market,
+                feature_name=feature_name,
+                feature_value=numeric_value,
+                event_time=_physical_datetime(normalized_event_time),
+                available_time=_physical_datetime(normalized_available_time),
+                ingested_time=_physical_datetime(normalized_ingested_time),
+                source=source,
+                source_record_id=source_record_id,
+                revision_id=revision_id,
+                payload_json=json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
                 )
+                if payload is not None
+                else None,
+                created_at=_physical_datetime(created_at),
             )
-            if physical_existing is not None:
-                if (
-                    float(physical_existing.feature_value) != numeric_value
-                    or _physical_datetime(physical_existing.event_time).astimezone(UTC)
-                    != _physical_datetime(normalized_event_time).astimezone(UTC)
-                ):
-                    raise RuntimeError(
-                        "revision identity collision in physical append-only feature store"
-                    )
-            else:
-                physical_existing = physical_table(
-                    symbol_id=symbol_id,
-                    market=symbol_market,
-                    feature_name=feature_name,
-                    feature_value=numeric_value,
-                    event_time=_physical_datetime(normalized_event_time),
-                    available_time=_physical_datetime(normalized_available_time),
-                    ingested_time=_physical_datetime(normalized_ingested_time),
-                    source=source,
-                    source_record_id=source_record_id,
-                    revision_id=revision_id,
-                    payload_json=json.dumps(
-                        payload,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        default=str,
-                    )
-                    if payload is not None
-                    else None,
-                    created_at=_physical_datetime(created_at),
-                )
-                physical_inserted = True
-                self.db.add(physical_existing)
+            physical_inserted = True
+            self.db.add(physical_existing)
         result = snapshot if write_legacy else physical_existing
         if result is None:
             raise RuntimeError("Feature write did not produce a legacy or physical row.")
@@ -388,6 +412,85 @@ class PointInTimeFeatureSnapshotRepository:
         else:
             self.db.flush()
         return result, result_inserted
+
+    def _record_conflict(
+        self,
+        *,
+        symbol_id: int,
+        market: str | None,
+        feature_name: str,
+        source: str,
+        source_record_id: str,
+        store_kind: str,
+        conflicted: PointInTimeFeatureSnapshot,
+        incoming_revision_id: str,
+        incoming_feature_value: float,
+        incoming_event_time: str,
+        payload: dict | None,
+    ) -> PointInTimeFeatureConflict:
+        """Persist one revision-identity collision (append-only audit row)."""
+        conflict = PointInTimeFeatureConflict(
+            symbol_id=symbol_id,
+            market=market,
+            feature_name=feature_name,
+            source=source,
+            source_record_id=source_record_id,
+            store_kind=store_kind,
+            existing_revision_id=str(conflicted.revision_id),
+            incoming_revision_id=incoming_revision_id,
+            existing_feature_value=float(conflicted.feature_value),
+            incoming_feature_value=incoming_feature_value,
+            existing_event_time=_physical_datetime(conflicted.event_time).astimezone(UTC).isoformat(),
+            incoming_event_time=incoming_event_time,
+            existing_snapshot_id=int(conflicted.id),
+            payload_json=json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            if payload is not None
+            else None,
+            detected_at=utc_now_iso(),
+        )
+        self.db.add(conflict)
+        return conflict
+
+    def list_conflicts(
+        self,
+        *,
+        symbol_id: int | None = None,
+        feature_name: str | None = None,
+        source: str | None = None,
+        limit: int = 200,
+    ) -> list[PointInTimeFeatureConflict]:
+        """Conflict-ledger query entry point (newest first, auditable)."""
+        stmt = select(PointInTimeFeatureConflict)
+        if symbol_id is not None:
+            stmt = stmt.where(PointInTimeFeatureConflict.symbol_id == symbol_id)
+        if feature_name:
+            stmt = stmt.where(PointInTimeFeatureConflict.feature_name == feature_name)
+        if source:
+            stmt = stmt.where(PointInTimeFeatureConflict.source == source)
+        stmt = stmt.order_by(PointInTimeFeatureConflict.id.desc()).limit(max(1, int(limit)))
+        return list(self.db.scalars(stmt))
+
+    def count_conflicts(
+        self,
+        *,
+        symbol_id: int | None = None,
+        feature_name: str | None = None,
+        source: str | None = None,
+    ) -> int:
+        """Count persisted revision-identity conflicts."""
+        stmt = select(func.count()).select_from(PointInTimeFeatureConflict)
+        if symbol_id is not None:
+            stmt = stmt.where(PointInTimeFeatureConflict.symbol_id == symbol_id)
+        if feature_name:
+            stmt = stmt.where(PointInTimeFeatureConflict.feature_name == feature_name)
+        if source:
+            stmt = stmt.where(PointInTimeFeatureConflict.source == source)
+        return int(self.db.scalar(stmt) or 0)
 
     def list_history_for_market(
         self,

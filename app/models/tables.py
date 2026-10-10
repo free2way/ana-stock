@@ -1122,6 +1122,47 @@ class PointInTimeFeatureSnapshot(Base):
     symbol: Mapped[Symbol] = relationship()
 
 
+class PointInTimeFeatureConflict(Base):
+    """Append-only ledger of revision-identity collisions.
+
+    A collision is an append that reuses an existing revision identity
+    (symbol / feature / source / source_record_id / revision_id) with a
+    different value or event time. It is a data conflict, not a batch-fatal
+    error: the observation is isolated here for audit while the rest of the
+    batch keeps writing. History is never overwritten (append-only) and the
+    conflicting observation is never silently dropped.
+    """
+
+    __tablename__ = "point_in_time_feature_conflicts"
+    __table_args__ = (
+        Index(
+            "ix_pit_conflicts_symbol_name_detected",
+            "symbol_id",
+            "feature_name",
+            "detected_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"), nullable=False)
+    market: Mapped[str | None] = mapped_column(Text, nullable=True)
+    feature_name: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    source_record_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # Which append-only store held the colliding row: "legacy" or "physical".
+    store_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    existing_revision_id: Mapped[str] = mapped_column(Text, nullable=False)
+    incoming_revision_id: Mapped[str] = mapped_column(Text, nullable=False)
+    existing_feature_value: Mapped[float] = mapped_column(Float, nullable=False)
+    incoming_feature_value: Mapped[float] = mapped_column(Float, nullable=False)
+    existing_event_time: Mapped[str] = mapped_column(Text, nullable=False)
+    incoming_event_time: Mapped[str] = mapped_column(Text, nullable=False)
+    # Primary key of the colliding row in its store, for direct audit lookup.
+    existing_snapshot_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    detected_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+
 class _PhysicalPointInTimeFeatureMixin:
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol_id: Mapped[int] = mapped_column(Integer, nullable=False)
