@@ -223,7 +223,7 @@ class FitTargetTrainingTests(TestCase):
 
         self.assertEqual("net_return", harness.create_config["fit_target"])
         self.assertEqual("net_return", harness.artifact_meta["fit_target"])
-        self.assertEqual(0.25, harness.create_config["drawdown_penalty"])
+        self.assertEqual(0.12, harness.create_config["drawdown_penalty"])
         self.assertEqual(42, harness.create_config["random_seed"])
 
         self.assertTrue(harness.raw_target_calls)
@@ -248,7 +248,7 @@ class FitTargetTrainingTests(TestCase):
 
         self.assertEqual("risk_adjusted_return", harness.create_config["fit_target"])
         self.assertEqual("risk_adjusted_return", harness.artifact_meta["fit_target"])
-        self.assertEqual(0.25, harness.create_config["drawdown_penalty"])
+        self.assertEqual(0.12, harness.create_config["drawdown_penalty"])
         self.assertEqual(7, harness.create_config["random_seed"])
 
         self.assertTrue(harness.raw_target_calls)

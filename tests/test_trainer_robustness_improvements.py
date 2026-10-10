@@ -414,11 +414,11 @@ class DrawdownPenaltyTests(TestCase):
         )
 
         self.assertIsNotNone(target)
-        self.assertEqual(0.25, profile["drawdown_penalty"])
+        self.assertEqual(0.12, profile["drawdown_penalty"])
         self.assertAlmostEqual(target, profile["net_return"], places=12)
         self.assertAlmostEqual(-0.05, profile["path_drawdown"], places=12)
         self.assertAlmostEqual(
-            target - 0.25 * 0.05, profile["risk_adjusted_return"], places=12
+            target - 0.12 * 0.05, profile["risk_adjusted_return"], places=12
         )
         # The OOS metric must cite the penalized return, not the raw net.
         metric = SignalTrainer._oos_metric_value(

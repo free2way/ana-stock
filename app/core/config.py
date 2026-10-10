@@ -165,7 +165,13 @@ class Settings(BaseSettings):
     # (3) Drawdown penalty lambda applied to the executable label's
     # risk_adjusted_return (net - lambda*|path_drawdown|) and reused as the OOS
     # metric. `net_return` itself is preserved unchanged on every sample.
-    trainer_drawdown_penalty: float = Field(default=0.25, ge=0.0)
+    # 2026-10-09 owner decision: lambda 0.25 -> 0.12. CN run 396's exact offline
+    # reproduction has mean_net=+1.065% and mean|path_dd|=8.798%, so the OOS
+    # gate's Lambda break-even is 0.1210; 0.12 is the smallest relaxation that
+    # clears it (see acceptance/supplements/decision-risk-budget-2026-10-09.md
+    # for the disclosed risks -- the OOS mean is not statistically distinguishable
+    # from zero and the sign is driven by a single July regime segment).
+    trainer_drawdown_penalty: float = Field(default=0.12, ge=0.0)
     # Fit-target switch (2026-10). False (default) keeps the historical GBDT
     # target -- the executable `net_return` -- so the drawdown penalty only
     # moves the OOS metric, not the fit. True makes the penalty actually change

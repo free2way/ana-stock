@@ -175,6 +175,38 @@ class PromotionGateV2Tests(unittest.TestCase):
         )
         self.assertEqual(54, report.evaluation["oos_window_capable_dates"])
 
+    def test_lambda_default_and_run_396_risk_adjusted_clears_oos_gate(self) -> None:
+        # Owner decision 2026-10-09: trainer_drawdown_penalty (lambda) 0.25 -> 0.12.
+        # Locked so a later silent revert re-fails loudly.
+        from app.core.config import get_settings
+
+        self.assertEqual(0.12, get_settings().trainer_drawdown_penalty)
+        # Run 396 (`cn_close_2026-10-09`) exact offline reproduction fixtures:
+        # mean_net = +1.065%, mean|path_drawdown| = 8.798% => break-even
+        # lambda = 0.01065 / 0.08798 = 0.1210. At lambda=0.12:
+        mean_net = 0.01065
+        mean_abs_path_dd = 0.08798
+        risk_adjusted = mean_net - 0.12 * mean_abs_path_dd
+        self.assertGreater(risk_adjusted, 0.0)
+        self.assertAlmostEqual(0.0000924, risk_adjusted, places=6)
+        # The same window under the retired lambda=0.25 stays FAIL...
+        self.assertLess(mean_net - 0.25 * mean_abs_path_dd, 0.0)
+        # ...and the gate reads the new-lambda value as PASS at the run's
+        # evaluated_date_count=54 / window_capable_dates=54.
+        report = evaluate_promotion_gate(
+            _candidate(
+                oos_evaluation={
+                    "evaluated_date_count": 54,
+                    "mean_risk_adjusted_return": risk_adjusted,
+                    "window_capable_dates": 54,
+                }
+            ),
+            config=PromotionGateV2Config(minimum_oos_dates=40),
+            code_version=_CODE_VERSION,
+        )
+        statuses = {item.key: item.status for item in report.checks}
+        self.assertEqual("PASS", statuses["oos_evaluation"])
+
     def test_rejected_price_basis_blocks_promotion(self) -> None:
         rejected = decide_price_basis(
             ENTRY_INFERENCE,
