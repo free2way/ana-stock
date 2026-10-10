@@ -157,6 +157,68 @@ class WorkspaceSnapshotRepository:
             "created_at": row.created_at,
         }
 
+    def get_latest_snapshot_for_market(
+        self, snapshot_type: str, market: str, *, limit: int = 200
+    ) -> dict | None:
+        """Newest snapshot explicitly partitioned for ``market``.
+
+        A per-market snapshot carries a singular ``market`` key in its payload
+        (the partitioned contract). Older combined snapshots do not, so this
+        lookup returns ``None`` for them and the caller falls back to
+        :meth:`get_latest_legacy_merged_snapshot`.
+        """
+        code = str(market or "").strip().upper()
+        if not code:
+            return None
+        for snapshot in self.list_snapshots(snapshot_type, limit=limit):
+            payload = snapshot.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("market") or "").strip().upper() == code:
+                return snapshot
+        return None
+
+    def get_latest_legacy_merged_snapshot(
+        self, snapshot_type: str, *, limit: int = 500
+    ) -> dict | None:
+        """Newest pre-partition snapshot: a ``markets`` list and no ``market``.
+
+        These combined snapshots predate the per-market contract and are still
+        readable, but callers must gate them on ``markets`` rather than trust a
+        single market partition.
+        """
+        for snapshot in self.list_snapshots(snapshot_type, limit=limit):
+            payload = snapshot.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("market") or "").strip():
+                continue
+            markets = payload.get("markets")
+            if isinstance(markets, list) and any(str(item or "").strip() for item in markets):
+                return snapshot
+        return None
+
+    def find_snapshot_for_market_date(
+        self, snapshot_type: str, *, market: str, snapshot_date: str, limit: int = 200
+    ) -> dict | None:
+        """Idempotency probe: the per-market snapshot already stored for a date.
+
+        Returns the existing row when one is present so a same-day rerun of the
+        producer reuses it instead of appending a duplicate.
+        """
+        code = str(market or "").strip().upper()
+        target_date = str(snapshot_date or "").strip()
+        if not code or not target_date:
+            return None
+        for snapshot in self.list_snapshots(snapshot_type, limit=limit):
+            if str(snapshot.get("snapshot_date") or "").strip() != target_date:
+                continue
+            payload = snapshot.get("payload")
+            if isinstance(payload, dict) and str(payload.get("market") or "").strip().upper() == code:
+                return snapshot
+        return None
+
+
 class DashboardReadRepository:
     def __init__(self, db: Session) -> None:
         self.db = db

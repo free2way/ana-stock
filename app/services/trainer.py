@@ -19,6 +19,12 @@ from app.services.corporate_action_coverage import (
     assess_corporate_action_coverage,
     coverage_evidence_fields,
 )
+from app.services.stock_selection.run_evidence import (
+    build_evidence_audit_config,
+    discover_robustness_evidence_dirs,
+    produce_data_readiness_evidence,
+    produce_statistical_gate_evidence,
+)
 from app.services.market_lake import get_latest_lake_trade_date, load_lake_rows
 from app.services.market_hot_predictions import MarketHotPredictionRepository
 from app.services.market_storage_routing import legacy_mirror_write_enabled
@@ -2799,34 +2805,77 @@ class SignalTrainer:
         return merged, sources
 
     def _load_oos_score_calibration(self, *, market: str | None) -> tuple[list[dict], dict]:
+        """Resolve the OOS calibration buckets for one training market.
+
+        The snapshot contract is partitioned by market: the reader takes the
+        newest snapshot explicitly stamped with this market (payload ``market``
+        key) and never merges another market's buckets. When no partition
+        exists it falls back to a *legacy* combined snapshot (a ``markets`` list
+        with no ``market`` key), gating that row by the requested market exactly
+        as before and labelling the provenance ``legacy_merged`` so the
+        fallback is auditable rather than a silent cross-market match. When
+        neither is available the market is reported ``uncalibrated``.
+        """
         market_code = self._normalize_market_code(market) or "ALL"
         try:
             with SessionLocal() as db:
-                snapshot = WorkspaceSnapshotRepository(db).get_latest_snapshot(self.MODEL_CALIBRATION_SNAPSHOT_TYPE)
+                repo = WorkspaceSnapshotRepository(db)
+                snapshot = None
+                match_kind = None
+                if market_code not in {"", "ALL"}:
+                    snapshot = repo.get_latest_snapshot_for_market(
+                        self.MODEL_CALIBRATION_SNAPSHOT_TYPE, market_code
+                    )
+                    if snapshot is not None:
+                        match_kind = "market_partition"
+                if snapshot is None:
+                    legacy = repo.get_latest_legacy_merged_snapshot(self.MODEL_CALIBRATION_SNAPSHOT_TYPE)
+                    if legacy is not None:
+                        legacy_payload = legacy.get("payload") or {}
+                        legacy_markets = {
+                            str(item or "").upper()
+                            for item in (legacy_payload.get("markets") or [])
+                            if str(item or "").strip()
+                        }
+                        if (
+                            market_code in {"", "ALL"}
+                            or not legacy_markets
+                            or market_code in legacy_markets
+                        ):
+                            snapshot = legacy
+                            match_kind = "legacy_merged"
+                        else:
+                            return [], {
+                                "source": "market_mismatch",
+                                "market": market_code,
+                                "legacy_merged": True,
+                                "payload_markets": sorted(legacy_markets),
+                            }
         except Exception:
             return [], {"source": "unavailable", "market": market_code}
-        payload = (snapshot or {}).get("payload") if isinstance(snapshot, dict) else None
+        if not isinstance(snapshot, dict):
+            return [], {"source": "uncalibrated", "market": market_code}
+        payload = snapshot.get("payload")
         if not isinstance(payload, dict):
-            return [], {"source": "missing", "market": market_code}
-        payload_markets = {str(item or "").upper() for item in (payload.get("markets") or []) if str(item or "").strip()}
-        if market_code not in {"", "ALL"} and payload_markets and market_code not in payload_markets:
-            return [], {"source": "market_mismatch", "market": market_code, "payload_markets": sorted(payload_markets)}
+            return [], {"source": "uncalibrated", "market": market_code}
         buckets = payload.get("score_calibration_buckets")
         if not isinstance(buckets, list) or not buckets:
-            return [], {"source": "empty", "market": market_code, "snapshot_id": (snapshot or {}).get("id")}
+            return [], {"source": "empty", "market": market_code, "snapshot_id": snapshot.get("id")}
         usable_buckets = [
             bucket
             for bucket in buckets
             if isinstance(bucket, dict) and isinstance(bucket.get("metrics"), dict) and int(bucket.get("sample_count") or 0) >= 5
         ]
         if not usable_buckets:
-            return [], {"source": "thin", "market": market_code, "snapshot_id": (snapshot or {}).get("id")}
+            return [], {"source": "thin", "market": market_code, "snapshot_id": snapshot.get("id")}
         return usable_buckets, {
             "source": "model_calibration_snapshot",
             "market": market_code,
-            "snapshot_id": (snapshot or {}).get("id"),
-            "snapshot_date": (snapshot or {}).get("snapshot_date"),
-            "created_at": (snapshot or {}).get("created_at"),
+            "match": match_kind,
+            "legacy_merged": match_kind == "legacy_merged",
+            "snapshot_id": snapshot.get("id"),
+            "snapshot_date": snapshot.get("snapshot_date"),
+            "created_at": snapshot.get("created_at"),
             "sample_count": payload.get("sample_count"),
             "latest_trade_date": payload.get("latest_trade_date"),
         }
@@ -3469,6 +3518,28 @@ class SignalTrainer:
             promotion_evidence["corporate_action_coverage_audit"] = coverage
             promotion_evidence["data_readiness_evidence_missing_reason"] = (
                 DATA_READINESS_EVIDENCE_MISSING_REASON
+            )
+            # Gap-4 wiring: genuinely run the readiness / statistical producers at
+            # training time and record their output under *audit* keys
+            # (`data_readiness_audit` / `statistical_gate_audit`).  The gate's own
+            # config keys (`data_readiness` / `statistical_gate`) are deliberately
+            # left untouched, so this wiring cannot change any promotion decision;
+            # see app/services/stock_selection/run_evidence.py for the red line.
+            research_root = self.settings.artifacts_dir / "stock_selection_research"
+            readiness_audit = produce_data_readiness_evidence(
+                market=run_market, artifact_root=research_root
+            )
+            statistical_audit = produce_statistical_gate_evidence(
+                robustness_evidence_dirs=discover_robustness_evidence_dirs(
+                    self.settings.artifacts_dir
+                )
+            )
+            promotion_evidence.update(
+                build_evidence_audit_config(
+                    {},
+                    data_readiness=readiness_audit,
+                    statistical_evidence=statistical_audit,
+                )
             )
             model_repo.merge_config(run_id, promotion_evidence)
             return self._persist_model_outputs(

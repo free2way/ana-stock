@@ -21,6 +21,7 @@ from app.services.market_sync import sync_market_data
 from app.services.portfolio_book import load_portfolio_positions
 from app.services.repository import AppSettingRepository, DataJobRepository, WatchlistRepository
 from app.services.screener_snapshots import refresh_precomputed_screener_snapshots
+from app.services.template_evaluation import save_model_calibration_snapshot
 from app.services.trainer import SignalTrainer
 from app.services.time_utils import app_now
 from app.services.us_market_universe import refresh_us_grouped_daily
@@ -358,6 +359,10 @@ class USMarketSchedulerService:
         self._run_risk_guardrail(source_job_id=source_job_id)
         self._refresh_us_adjusted_view(source_job_id=source_job_id, trade_date=trade_date)
         self._run_signal_training(source_job_id=source_job_id, trade_date=trade_date)
+        # Refresh the U.S. calibration partition once per close, right after
+        # training has landed the newest run. Keyed by (market, matured trade
+        # date) so a same-day rerun reuses the row instead of duplicating it.
+        self._run_model_calibration_snapshot(source_job_id=source_job_id, trade_date=trade_date)
         self._run_screener_precompute(source_job_id=source_job_id)
 
     def _refresh_us_adjusted_view(self, *, source_job_id: int, trade_date: str) -> dict:
@@ -489,6 +494,43 @@ class USMarketSchedulerService:
         except Exception as exc:
             with SessionLocal() as db:
                 DataJobRepository(db).complete_job(train_job_id, status="failed", message=str(exc))
+
+    def _run_model_calibration_snapshot(self, *, source_job_id: int, trade_date: str) -> None:
+        """Persist the U.S. out-of-sample calibration partition after training."""
+        with SessionLocal() as db:
+            job_repo = DataJobRepository(db)
+            if job_repo.has_running_job("model_calibration_snapshot"):
+                return
+            job = job_repo.create_job(
+                job_type="model_calibration_snapshot",
+                status="running",
+                params={
+                    "source_job_id": source_job_id,
+                    "trade_date": trade_date,
+                    "markets": ["US"],
+                    "trigger": "us_market_close_refresh",
+                },
+                message="Persisting U.S. out-of-sample execution calibration after training.",
+            )
+            calibration_job_id = job.id
+        try:
+            result = save_model_calibration_snapshot(markets=["US"], source_job_id=calibration_job_id)
+            written_or_reused = bool(result.get("written_markets") or result.get("reused_markets"))
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(
+                    calibration_job_id,
+                    status="success" if written_or_reused else "partial",
+                    message=result.get("message") or "U.S. model calibration snapshot finished.",
+                    result=result,
+                )
+        except Exception as exc:
+            with SessionLocal() as db:
+                DataJobRepository(db).complete_job(
+                    calibration_job_id,
+                    status="failed",
+                    message=f"U.S. model calibration snapshot failed after U.S. close refresh: {exc}",
+                    result={"error": str(exc), "source_job_id": source_job_id},
+                )
 
     def _run_structured_evaluation(self, *, source_job_id: int) -> None:
         with SessionLocal() as db:

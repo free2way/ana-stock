@@ -1377,16 +1377,23 @@ def save_model_calibration_snapshot(
 
     This is the producer that was missing: ``SignalTrainer`` reads a single
     ``model_calibration_snapshot`` workspace snapshot (``MODEL_CALIBRATION_
-    SNAPSHOT_TYPE``) and gates it on the payload's ``markets`` list. The
-    snapshot is computed from *matured* out-of-sample predictions, so it must be
-    produced by a job run *before* a training run can publish matched-period
-    expected returns.
+    SNAPSHOT_TYPE``) for the market it is training and gates it accordingly.
+    The snapshot is computed from *matured* out-of-sample predictions, so it
+    must be produced by a job run *before* a training run can publish
+    matched-period expected returns.
 
-    A snapshot is persisted for every market requested in one payload: when
-    both CN and US are requested the evaluation runs with ``market="ALL"`` so
-    the payload's ``markets`` lists both and each market's reader hits the same
-    snapshot. Nothing is written when the evaluation yields no score buckets,
-    so an empty recompute cannot clobber a usable snapshot.
+    Contract: snapshots are **partitioned by market**. One snapshot is written
+    per requested market, its payload carrying a singular ``market`` key (and a
+    matching one-element ``markets`` list). The evaluation for that partition
+    runs with ``market=<code>`` so a CN snapshot can only hold CN buckets and a
+    US snapshot only US buckets -- the reader for a market no longer relies on
+    a combined ``markets`` fallback that let one row mix periods/markets.
+
+    Idempotency: a partition is keyed by ``(market, snapshot_date)`` where the
+    date is the partition's latest matured trade date, so a same-day rerun of
+    the job reuses the existing row instead of appending a duplicate. Nothing
+    is written when a partition yields no score buckets, so an empty recompute
+    cannot clobber a usable snapshot.
     """
 
     requested: list[str] = []
@@ -1397,51 +1404,108 @@ def save_model_calibration_snapshot(
     target_markets = [code for code in requested if code in {"CN", "US"}]
     if "ALL" in requested or not target_markets:
         target_markets = ["CN", "US"]
-    eval_market = "ALL" if len(target_markets) == 2 else target_markets[0]
 
-    payload = build_lightgbm_prediction_evaluation(
-        market=eval_market,
-        recent_runs=recent_runs,
-        top_n=top_n,
-    )
-    buckets = payload.get("score_calibration_buckets") or []
-    if not buckets:
-        return {
-            "status": "empty",
-            "snapshot_id": None,
-            "markets": target_markets,
-            "bucket_count": 0,
-            "message": "No matured out-of-sample score buckets; calibration snapshot left unchanged.",
-        }
+    per_market: dict[str, dict] = {}
+    written: list[str] = []
+    reused: list[str] = []
+    empty: list[str] = []
+    primary_id: int | None = None
+    primary_date: str | None = None
+    total_buckets = 0
 
-    stored_payload = dict(payload)
-    stored_payload["schema_version"] = 1
-    stored_payload["snapshot_meta"] = {
-        "source": MODEL_CALIBRATION_SNAPSHOT_TYPE,
-        "markets": target_markets,
-        "generated_at": app_now_iso(),
-    }
-    snapshot_date = str(stored_payload.get("latest_trade_date") or "").strip() or app_today_iso()
-    with SessionLocal() as db:
-        row = WorkspaceSnapshotRepository(db).create_snapshot(
-            snapshot_type=MODEL_CALIBRATION_SNAPSHOT_TYPE,
-            snapshot_date=snapshot_date,
-            payload=stored_payload,
-            source_job_id=source_job_id,
+    for code in target_markets:
+        payload = build_lightgbm_prediction_evaluation(
+            market=code,
+            recent_runs=recent_runs,
+            top_n=top_n,
         )
+        buckets = payload.get("score_calibration_buckets") or []
+        if not buckets:
+            per_market[code] = {
+                "market": code,
+                "status": "empty",
+                "snapshot_id": None,
+                "bucket_count": 0,
+            }
+            empty.append(code)
+            continue
+
+        snapshot_date = str(payload.get("latest_trade_date") or "").strip() or app_today_iso()
+        with SessionLocal() as db:
+            repo = WorkspaceSnapshotRepository(db)
+            existing = repo.find_snapshot_for_market_date(
+                MODEL_CALIBRATION_SNAPSHOT_TYPE,
+                market=code,
+                snapshot_date=snapshot_date,
+            )
+            if existing is not None:
+                per_market[code] = {
+                    "market": code,
+                    "status": "exists",
+                    "snapshot_id": existing["id"],
+                    "snapshot_date": existing["snapshot_date"],
+                    "bucket_count": len(buckets),
+                }
+                reused.append(code)
+                if primary_id is None:
+                    primary_id = int(existing["id"])
+                    primary_date = str(existing["snapshot_date"])
+                total_buckets += len(buckets)
+                continue
+
+            stored_payload = dict(payload)
+            stored_payload["schema_version"] = 2
+            stored_payload["market"] = code
+            stored_payload["markets"] = [code]
+            stored_payload["snapshot_meta"] = {
+                "source": MODEL_CALIBRATION_SNAPSHOT_TYPE,
+                "market": code,
+                "markets": [code],
+                "generated_at": app_now_iso(),
+            }
+            row = repo.create_snapshot(
+                snapshot_type=MODEL_CALIBRATION_SNAPSHOT_TYPE,
+                snapshot_date=snapshot_date,
+                payload=stored_payload,
+                source_job_id=source_job_id,
+            )
+        per_market[code] = {
+            "market": code,
+            "status": "success",
+            "snapshot_id": row.id,
+            "snapshot_date": row.snapshot_date,
+            "sample_count": stored_payload.get("sample_count"),
+            "latest_trade_date": stored_payload.get("latest_trade_date"),
+            "bucket_count": len(buckets),
+        }
+        written.append(code)
+        if primary_id is None:
+            primary_id = int(row.id)
+            primary_date = str(row.snapshot_date)
+        total_buckets += len(buckets)
+
+    if written:
+        status = "success"
+    elif reused:
+        status = "exists"
+    else:
+        status = "empty"
+    message = (
+        f"Model calibration snapshots: {len(written)} written, {len(reused)} reused, "
+        f"{len(empty)} empty for {', '.join(target_markets)}."
+    )
     return {
-        "status": "success",
-        "snapshot_id": row.id,
-        "snapshot_type": row.snapshot_type,
-        "snapshot_date": row.snapshot_date,
+        "status": status,
+        "snapshot_id": primary_id,
+        "snapshot_type": MODEL_CALIBRATION_SNAPSHOT_TYPE,
+        "snapshot_date": primary_date,
         "markets": target_markets,
-        "sample_count": stored_payload.get("sample_count"),
-        "latest_trade_date": stored_payload.get("latest_trade_date"),
-        "bucket_count": len(buckets),
-        "message": (
-            f"Persisted model calibration snapshot {row.id} with {len(buckets)} "
-            f"score bucket(s) for {', '.join(target_markets)}."
-        ),
+        "written_markets": written,
+        "reused_markets": reused,
+        "empty_markets": empty,
+        "bucket_count": total_buckets,
+        "per_market": per_market,
+        "message": message,
     }
 
 

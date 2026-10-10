@@ -144,14 +144,75 @@ class USMarketSchedulerTests(unittest.TestCase):
         ), patch.object(
             service, "_run_signal_training", side_effect=stage("signal_training")
         ), patch.object(
+            service, "_run_model_calibration_snapshot", side_effect=stage("model_calibration_snapshot")
+        ), patch.object(
             service, "_run_screener_precompute", side_effect=stage("screener_precompute")
         ):
             service._run_post_close_stages(source_job_id=1, trade_date="2026-10-08")
 
         self.assertEqual(
-            ["risk_guardrail", "us_adjusted_view", "signal_training", "screener_precompute"],
+            [
+                "risk_guardrail",
+                "us_adjusted_view",
+                "signal_training",
+                "model_calibration_snapshot",
+                "screener_precompute",
+            ],
             order,
         )
+
+    def test_calibration_stage_persists_us_partition(self):
+        service = USMarketSchedulerService()
+        fake_db = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = fake_db
+        context.__exit__.return_value = False
+        job_repo = MagicMock()
+        job_repo.has_running_job.return_value = False
+        job_repo.create_job.return_value = SimpleNamespace(id=412)
+
+        with patch(
+            "app.services.us_market_scheduler.SessionLocal", return_value=context
+        ), patch(
+            "app.services.us_market_scheduler.DataJobRepository", return_value=job_repo
+        ), patch(
+            "app.services.us_market_scheduler.save_model_calibration_snapshot",
+            return_value={
+                "status": "success",
+                "written_markets": ["US"],
+                "reused_markets": [],
+                "snapshot_id": 9001,
+                "message": "ok",
+            },
+        ) as persist:
+            service._run_model_calibration_snapshot(source_job_id=100, trade_date="2026-10-08")
+
+        persist.assert_called_once_with(markets=["US"], source_job_id=412)
+        created = job_repo.create_job.call_args.kwargs
+        self.assertEqual("model_calibration_snapshot", created["job_type"])
+        self.assertEqual(["US"], created["params"]["markets"])
+        self.assertEqual("success", job_repo.complete_job.call_args.kwargs["status"])
+
+    def test_calibration_stage_is_idempotent_when_already_running(self):
+        service = USMarketSchedulerService()
+        fake_db = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = fake_db
+        context.__exit__.return_value = False
+        job_repo = MagicMock()
+        job_repo.has_running_job.return_value = True
+
+        with patch(
+            "app.services.us_market_scheduler.SessionLocal", return_value=context
+        ), patch(
+            "app.services.us_market_scheduler.DataJobRepository", return_value=job_repo
+        ), patch(
+            "app.services.us_market_scheduler.save_model_calibration_snapshot"
+        ) as persist:
+            service._run_model_calibration_snapshot(source_job_id=100, trade_date="2026-10-08")
+
+        job_repo.create_job.assert_not_called()
+        persist.assert_not_called()
 
     def test_adjusted_view_stage_skips_when_view_is_current(self):
         service = USMarketSchedulerService()

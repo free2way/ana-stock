@@ -154,6 +154,66 @@ class CNMarketSchedulerTests(unittest.TestCase):
         created = job_repo.create_job.call_args.kwargs
         self.assertEqual(["CN"], created["params"]["markets"])
 
+    def test_calibration_stage_persists_cn_partition_only(self) -> None:
+        service = CNMarketSchedulerService()
+        fake_db = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = fake_db
+        context.__exit__.return_value = False
+        job_repo = MagicMock()
+        job_repo.has_running_job.return_value = False
+        job_repo.create_job.return_value = SimpleNamespace(id=91)
+        with patch(
+            "app.services.cn_market_scheduler.SessionLocal",
+            return_value=context,
+        ), patch(
+            "app.services.cn_market_scheduler.DataJobRepository",
+            return_value=job_repo,
+        ), patch(
+            "app.services.cn_market_scheduler.save_model_calibration_snapshot",
+            return_value={
+                "status": "success",
+                "written_markets": ["CN"],
+                "reused_markets": [],
+                "message": "ok",
+            },
+        ) as persist:
+            stage = service._run_model_calibration_snapshot(source_job_id=77, trade_date="2026-10-09")
+
+        persist.assert_called_once_with(markets=["CN"], source_job_id=91)
+        self.assertEqual("success", stage["status"])
+        self.assertEqual("CN", stage["market"])
+        created = job_repo.create_job.call_args.kwargs
+        self.assertEqual("model_calibration_snapshot", created["job_type"])
+
+    def test_calibration_stage_without_buckets_is_partial_not_failed(self) -> None:
+        service = CNMarketSchedulerService()
+        fake_db = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = fake_db
+        context.__exit__.return_value = False
+        job_repo = MagicMock()
+        job_repo.has_running_job.return_value = False
+        job_repo.create_job.return_value = SimpleNamespace(id=92)
+        with patch(
+            "app.services.cn_market_scheduler.SessionLocal",
+            return_value=context,
+        ), patch(
+            "app.services.cn_market_scheduler.DataJobRepository",
+            return_value=job_repo,
+        ), patch(
+            "app.services.cn_market_scheduler.save_model_calibration_snapshot",
+            return_value={
+                "status": "empty",
+                "written_markets": [],
+                "reused_markets": [],
+                "message": "no buckets",
+            },
+        ):
+            stage = service._run_model_calibration_snapshot(source_job_id=77, trade_date="2026-10-09")
+
+        self.assertEqual("partial", stage["status"])
+        self.assertEqual("partial", job_repo.complete_job.call_args.kwargs["status"])
 
     def test_market_workspace_refresh_stage_rebuilds_heatmap_snapshot(self) -> None:
         service = CNMarketSchedulerService()
@@ -193,6 +253,8 @@ class CNMarketSchedulerTests(unittest.TestCase):
         with patch.object(service, "_refresh_cn_adjusted_view", side_effect=stage("cn_adjusted_view")), patch.object(
             service, "_run_signal_training", side_effect=stage("training")
         ), patch.object(
+            service, "_run_model_calibration_snapshot", side_effect=stage("model_calibration_snapshot")
+        ), patch.object(
             service, "_run_screener_precompute_core", side_effect=stage("core")
         ), patch.object(service, "_run_screener_precompute_rest", side_effect=stage("rest")), patch.object(
             service, "_run_screener_precompute_combos", side_effect=stage("combos")
@@ -211,6 +273,7 @@ class CNMarketSchedulerTests(unittest.TestCase):
             [
                 "cn_adjusted_view",
                 "training",
+                "model_calibration_snapshot",
                 "core",
                 "rest",
                 "combos",
