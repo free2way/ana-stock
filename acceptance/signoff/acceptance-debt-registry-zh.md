@@ -134,16 +134,20 @@
 
 > 以下为**已知、已定位、但未在本轮收口范围内处理**的缺口。均为**产品/口径决策项或外部数据缺口**，**不计入上表 E3 存量失败口径**（测试集当前全绿，但这些缺口的证据/门禁/数据自洽性仍待处理）。逐项如实登记，未做推测性修复。
 
-1. **CN `oos_evaluation` 仍 FAIL（服务面仍 withhold）**
-   - 证据（run 395 CN 实测）：`mean_risk_adjusted_return = -0.01683`（门禁要求 >0，**FAIL**）；`evaluated_date_count = 54`（≥40 通过）；`mean_net_return = +0.00578`（为正，但**不在**门读取的 `_OOS_PERFORMANCE_KEYS` 内）。
-   - 后果：`decision=REJECT` / `blocked=true` / `promotable=false`；**CN 服务面仍 withhold**（`list_latest_signal_decisions(market="CN")` = **0 行**；对照 US = 500 行）。
+1. **CN `oos_evaluation` — λ 已决策（0.25 → 0.12），服务面待重训核验**
+   - **决策（2026-10-09，owner 已确认）**：把风险惩罚系数 λ（`trainer_drawdown_penalty`）默认值由 **0.25 下调为 0.12**（取盈亏平衡点上界，= 最小放松）。详见 `acceptance/supplements/decision-risk-budget-2026-10-09.md`。
+   - 依据（离线精确复现，与 run 396 存档逐位吻合）：`mean_net_return = +1.065%`、`mean|path_drawdown| = 8.798%` → 旧判据 `+1.065% − 0.25×8.798% = −1.135%`（FAIL）；**λ 盈亏平衡点 = 0.01065 / 0.08798 = 0.1210**；λ=0.12 → risk ≈ +0.0001（贴线通过）。改善趋势：393 `+0.00485/−0.01895` → 395 `+0.00578/−0.01683` → 396 `+0.01065/−0.01135`。
+   - **已披露风险（如实登记，不得删除）**：run 396 OOS `t = −0.75`、**95% CI [−0.041, +0.018] 跨 0**、bootstrap **P(真均值>0)=0.224**；**符号由 7 月单一状态段决定**；**丢 3 个最差日即翻正**（反之亦然）。→ 该决策＝**承认门槛口径过严**，**不代表模型优势已被证实**。
+   - 生效范围：**serve-time 促销门判据**（OOS 指标 `mean_risk_adjusted_return` 的惩罚系数；run config / artifact 记录的 `drawdown_penalty`）；不改拟合目标、不回溯历史 run。
+   - **后续要求**：样本外确认（扩窗 / 分半稳健性）；未完成前结论仅限「旧门槛过严」。服务面恢复情况以本轮运维留档 `tmp/ops-20261009h/` 为准。
    - 关联：`non_promotable_reasons` 另含 `data_readiness`（NOT_ENOUGH_EVIDENCE）、`statistical_evidence`（NOT_ENOUGH_EVIDENCE）；`corporate_action_coverage` 已随 `9a43c19` 转 PASS。
-   - 依据：`tmp/ops-cn-retrain-20261009/SUMMARY.md`。
-2. **US 训练仍有 191 行缺口（覆盖率 0.99927 < 1.0）**
-   - 训练域「缺失于调整后视图」191 行：**TEVA 112 / GORO 73**（Alpaca IEX 与 SIP **均无** Apr–Sep 2026 数据，单基 Alpaca 无法补齐）；**2026-04-03（Good Friday，非交易日）脏行 3**；**FIRY/HAPN @2026-06-22 共 2**；**SGLD @2026-09-01 共 1**。
-   - 后果：`us_signal_train` 仍失败于 `incomplete_adjusted_coverage`（覆盖率 0.99434 → **0.99927406**，门禁要求**恰好 1.0**），**未创建 model_run / 未写预测**。
-   - 可选后续（均需显式授权，本轮未执行）：① 对 TEVA/GORO 改用另一数据源补 raw（会成为「多来源 raw」）；② 清理 `us_daily` 非交易日脏行并确认 Apr–Sep 来源有效性；③ 以 `PQW_TRAINER_REQUIRE_FULL_ADJUSTED_COVERAGE=false` 写入如实标注的 mixed-basis 运行。
-   - 依据：`tmp/ops-us-20261009/REPORT.md`。
+   - 依据：`tmp/research-oos-cn/REPORT.md`、`tmp/ops-cn-retrain-20261009/SUMMARY.md`。
+2. **US 收盘流水线在回测阶段失败于未建模公司行为 — owner 决定暂不处理（决策 c）**
+   - 现状（`tmp/ops-20261009g/report.md`，2026-10-10）：复权覆盖缺口已补齐，模型产出 **run 397**（US，`us_close_lightgbm`）**status=success**、`adjusted_coverage_share = 1.0`（无绕过；`raw_fallback_count=0`、`dropped_missing_adjusted_count=0`、`excluded_unavailable_share=0.00067709` ≤ 0.005 上限），预测 `predictions=76762`、`us_predictions` 12147 行 / 60 日。
+   - 失败点：下游**事件驱动回测**门禁判 failed——`Event-driven backtest refused to run: 2 event(s): CLBK merger 2026-07-20; MOD spinoff 2026-10-02`（引擎仅建模拆股/股票股利/现金股利，**未建模** merger/spinoff）。
+   - **owner 决定（c）：暂不处理**（**未使用任何绕过开关**，如 `allow_unmodeled_corporate_actions=True`）。
+   - 后续可选项（留档，均需显式授权）：① 扩展公司行为建模（merger/spinoff 对持仓与价格的调整）；② 提供**显式、可审计的 opt-in** 接受该风险后再放行回测；③ 维持现状（模型产出可用、回测 withheld）。
+   - 较早的覆盖缺口（191 行：TEVA 112 / GORO 73 等）已随修复关闭，**不再是**当前阻塞。
 3. **`model_calibration_snapshot` 仍无持久化生产者**
    - `app/api/routes/jobs.py:832` 仅有该 job 的**作业目录描述**（`{"job_type": "model_calibration_snapshot", "description": ...}`），**无实装处理器**。
    - 后果：当前 20d 明细的**唯一来源是本 run 训练窗桶**（`detail_calibration_buckets = oos_calibration_buckets or calibration_buckets`）；当 OOS 快照存在但缺 20d 键（如过期快照）时，逐键回退会使**同一行 5d/20d 期次不同源**（5d 取 OOS、20d 取训练窗）。
