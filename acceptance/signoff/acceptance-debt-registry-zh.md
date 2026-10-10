@@ -134,13 +134,14 @@
 
 > 以下为**已知、已定位、但未在本轮收口范围内处理**的缺口。均为**产品/口径决策项或外部数据缺口**，**不计入上表 E3 存量失败口径**（测试集当前全绿，但这些缺口的证据/门禁/数据自洽性仍待处理）。逐项如实登记，未做推测性修复。
 
-1. **CN `oos_evaluation` — λ 已决策（0.25 → 0.12），服务面待重训核验**
-   - **决策（2026-10-09，owner 已确认）**：把风险惩罚系数 λ（`trainer_drawdown_penalty`）默认值由 **0.25 下调为 0.12**（取盈亏平衡点上界，= 最小放松）。详见 `acceptance/supplements/decision-risk-budget-2026-10-09.md`。
-   - 依据（离线精确复现，与 run 396 存档逐位吻合）：`mean_net_return = +1.065%`、`mean|path_drawdown| = 8.798%` → 旧判据 `+1.065% − 0.25×8.798% = −1.135%`（FAIL）；**λ 盈亏平衡点 = 0.01065 / 0.08798 = 0.1210**；λ=0.12 → risk ≈ +0.0001（贴线通过）。改善趋势：393 `+0.00485/−0.01895` → 395 `+0.00578/−0.01683` → 396 `+0.01065/−0.01135`。
-   - **已披露风险（如实登记，不得删除）**：run 396 OOS `t = −0.75`、**95% CI [−0.041, +0.018] 跨 0**、bootstrap **P(真均值>0)=0.224**；**符号由 7 月单一状态段决定**；**丢 3 个最差日即翻正**（反之亦然）。→ 该决策＝**承认门槛口径过严**，**不代表模型优势已被证实**。
+1. **CN `oos_evaluation` — λ 已回退（0.12 → 0.25），附采纳门槛与复核触发条件**
+   - **回退决策（2026-10-09，owner 已确认）**：风险惩罚系数 λ（`trainer_drawdown_penalty`）默认值**由当日早先的 0.12 回退到历史默认 0.25**。原「0.25 → 0.12」决策见下，**已被扩窗研究推翻**，仅作决策史留档。
+   - **推翻依据（扩窗研究，逐位口径校验通过；83 个成熟日）**：top-5 `mean_net = −0.00051`、`mean_risk = −0.01234`、`t = −1.05`、**95% CI [−0.035, +0.011] 跨 0**；多数**月块为负**；top-5 名单跨重训**重合度仅 0.09**（近随机）。→ 单窗 run 396「贴线通过」是单一窗口/单一状态段产物，**不足以支撑 λ=0.12 上线**；为保持诚实回退 0.25。详见 `acceptance/supplements/decision-risk-budget-2026-10-09.md` §6。
+   - **采纳门槛（今后任何 λ 放松必须同时满足）**：① ≥ 90 个成熟日；② `mean_risk > 0` 且 95% CI 下界 > 0；③ ≥ 3/5 月块为正；④ ≥ 2 种广度（breadth）设定下成立。
+   - **复核触发条件**：月块中位数为负，或 `mean|dd|` 上行。
    - 生效范围：**serve-time 促销门判据**（OOS 指标 `mean_risk_adjusted_return` 的惩罚系数；run config / artifact 记录的 `drawdown_penalty`）；不改拟合目标、不回溯历史 run。
-   - **后续要求**：样本外确认（扩窗 / 分半稳健性）；未完成前结论仅限「旧门槛过严」。
-   - **生效核验（2026-10-10）**：新 run **398**（`cn_close_2026-10-09`，`drawdown_penalty=0.12`）`oos_evaluation` **PASS**（`mean_net_return=+1.0648%`、`mean_risk_adjusted_return=+8.968e-05`、`evaluated_date_count=54`）；整体 decision 由 **REJECT → OBSERVE**（`blocked=False`）。`list_latest_signal_decisions(market="CN")` = **4049 行**（原 0 行），**CN 服务面已恢复**。剩余 reasons（`data_readiness` / `statistical_evidence` = NOT_ENOUGH_EVIDENCE）为**证据生产者未接线**（见缺口 4），默认配置下不阻塞发布。详见 `tmp/ops-20261009h/`。
+   - **回退后服务面预期**：CN 促销门 `oos_evaluation` 重新 **FAIL**，CN 服务面**重新 withhold**（`list_latest_signal_decisions(market="CN")` 回到 **0 行**）——为预期结果，非故障。
+   - 决策史（原 0.25 → 0.12，已被推翻）：离线精确复现（与 run 396 存档逐位吻合）`mean_net_return=+1.065%`、`mean|path_drawdown|=8.798%`，λ 盈亏平衡点 = 0.1210，λ=0.12 → risk ≈ +0.0001；run 398（`drawdown_penalty=0.12`）曾 `oos_evaluation` PASS（`mean_risk_adjusted_return=+8.968e-05`）、CN 服务面曾恢复 4049 行（`tmp/ops-20261009h/`）。原披露风险：`t=−0.75`、CI [−0.041,+0.018] 跨 0、符号由 7 月单一状态段决定。
    - 关联：`non_promotable_reasons` 另含 `data_readiness`（NOT_ENOUGH_EVIDENCE）、`statistical_evidence`（NOT_ENOUGH_EVIDENCE）；`corporate_action_coverage` 已随 `9a43c19` 转 PASS。
    - 依据：`tmp/research-oos-cn/REPORT.md`、`tmp/ops-cn-retrain-20261009/SUMMARY.md`。
 2. **US 收盘流水线在回测阶段失败于未建模公司行为 — owner 决定暂不处理（决策 c）**
@@ -164,3 +165,20 @@
    - run 395（`cn_close_2026-10-08`）`prediction_details` 4060 行：`expected_return_5d` 有值（4060），`expected_return_20d` / `expected_drawdown_20d` **全 null**（0）。
    - 根因：该 run 走的是**过期 OOS `model_calibration_snapshot`（id=8997，latest_trade_date 2026-06-26）**，其 bucket **无 `next_20d_*` 键**；`af065b2` 只补 5d。**需重训或回填**后才自洽。
 8. **（审核残余，未扩围）** `reliability` 元数据仍为单一全局文件；生产旧概率校准产物需下次调度刷新才生成带 scope 版本，在此之前发布估计为「未校准」；`portfolio_book` 账本迁移到结构化表属中期事项。详见 `acceptance/supplements/audit-p1-closure-2026-10-09.md` §「残余与未扩围项」。
+
+## 6. 新增登记：B7 / B8（2026-10-09，commit 以实际核对为准）
+
+### B7 — `929ed2b` 校准快照按市场分发并纳入调度
+- `929ed2b`：`model_calibration_snapshot` 相关产物按**市场**分发，并**纳入调度**（此前缺口 3 记录其「无持久化生产者」）。
+- 性质：**证据/调度接线**，不含促销门行为变更；不改变门禁判定口径。
+
+### B8 — `389b74a` 证据接线，默认不启用强制
+- `389b74a`：`data_readiness` / `statistical_evidence` 证据生产者**接线**（对应缺口 4）。
+- **默认 non-enforcing**：默认配置下**不强制**，即这两项证据在默认条件下**不阻塞发布**；接线本身可收紧门禁（见缺口 4），故保持默认关闭、留待 owner 决策。
+
+### 强制开启的代价（如实登记）
+- 若把 B8 的证据**强制纳入**促销门：**CN run 398 会被拦下**——因 λ 回退至 **0.25** 后，CN 的 `oos_evaluation` 重新判 **FAIL**（见缺口 1），门会 REJECT。
+- **强制开启的前置条件**：
+  1. 补齐 **PIT 成分股 / 历史版本 store**（支撑 `data_readiness` 的时点证据）；
+  2. 产出 **multifactor robustness 报告**（支撑 `statistical_evidence`，并覆盖缺口 1 的采纳门槛/复核触发条件）。
+- 在满足上述前置前，B8 保持**默认不强制**，避免以未就绪的证据面误拦 CN。
