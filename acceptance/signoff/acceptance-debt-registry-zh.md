@@ -139,7 +139,8 @@
    - 依据（离线精确复现，与 run 396 存档逐位吻合）：`mean_net_return = +1.065%`、`mean|path_drawdown| = 8.798%` → 旧判据 `+1.065% − 0.25×8.798% = −1.135%`（FAIL）；**λ 盈亏平衡点 = 0.01065 / 0.08798 = 0.1210**；λ=0.12 → risk ≈ +0.0001（贴线通过）。改善趋势：393 `+0.00485/−0.01895` → 395 `+0.00578/−0.01683` → 396 `+0.01065/−0.01135`。
    - **已披露风险（如实登记，不得删除）**：run 396 OOS `t = −0.75`、**95% CI [−0.041, +0.018] 跨 0**、bootstrap **P(真均值>0)=0.224**；**符号由 7 月单一状态段决定**；**丢 3 个最差日即翻正**（反之亦然）。→ 该决策＝**承认门槛口径过严**，**不代表模型优势已被证实**。
    - 生效范围：**serve-time 促销门判据**（OOS 指标 `mean_risk_adjusted_return` 的惩罚系数；run config / artifact 记录的 `drawdown_penalty`）；不改拟合目标、不回溯历史 run。
-   - **后续要求**：样本外确认（扩窗 / 分半稳健性）；未完成前结论仅限「旧门槛过严」。服务面恢复情况以本轮运维留档 `tmp/ops-20261009h/` 为准。
+   - **后续要求**：样本外确认（扩窗 / 分半稳健性）；未完成前结论仅限「旧门槛过严」。
+   - **生效核验（2026-10-10）**：新 run **398**（`cn_close_2026-10-09`，`drawdown_penalty=0.12`）`oos_evaluation` **PASS**（`mean_net_return=+1.0648%`、`mean_risk_adjusted_return=+8.968e-05`、`evaluated_date_count=54`）；整体 decision 由 **REJECT → OBSERVE**（`blocked=False`）。`list_latest_signal_decisions(market="CN")` = **4049 行**（原 0 行），**CN 服务面已恢复**。剩余 reasons（`data_readiness` / `statistical_evidence` = NOT_ENOUGH_EVIDENCE）为**证据生产者未接线**（见缺口 4），默认配置下不阻塞发布。详见 `tmp/ops-20261009h/`。
    - 关联：`non_promotable_reasons` 另含 `data_readiness`（NOT_ENOUGH_EVIDENCE）、`statistical_evidence`（NOT_ENOUGH_EVIDENCE）；`corporate_action_coverage` 已随 `9a43c19` 转 PASS。
    - 依据：`tmp/research-oos-cn/REPORT.md`、`tmp/ops-cn-retrain-20261009/SUMMARY.md`。
 2. **US 收盘流水线在回测阶段失败于未建模公司行为 — owner 决定暂不处理（决策 c）**
